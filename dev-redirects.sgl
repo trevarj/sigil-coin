@@ -1,0 +1,47 @@
+;; Development redirects — point workspace deps at local checkouts.
+;; Use: sigil build --redirects ./dev-redirects.sgl
+;;      sigil test --redirects ./dev-redirects.sgl
+(import (sigil fs))
+
+(define (first-existing paths)
+  (cond ((null? paths) #f)
+        ((directory? (car paths)) (car paths))
+        (else (first-existing (cdr paths)))))
+
+(define (checkout-dep repo name)
+  (or (first-existing
+        (list
+          (string-append "../" repo "/packages/" name)
+          (string-append ".sigil/deps/" name)
+          (string-append "../../.sigil/deps/" name)
+          (string-append "../../../.sigil/deps/" name)))
+      (error "dev-redirects: missing dependency" name)))
+
+(define (dep name)
+  (for-package
+    name: name
+    use: (from-path dir: (checkout-dep "sigil" name))))
+
+(define (bitcoin-dep name)
+  (for-package
+    name: name
+    use: (from-path dir: (checkout-dep "sigil-bitcoin" name))))
+
+(redirects
+  packages: (list
+    ;; sigil monorepo runtime/test packages
+    (dep "sigil-lib")
+    (dep "sigil-stdlib")
+    (dep "sigil-test")
+    (dep "sigil-test-runner")
+    ;; sigil-bitcoin packages consumed by SigilCoin
+    (bitcoin-dep "sigil-bitcoin-utils")
+    (bitcoin-dep "sigil-bitcoin-primitives")
+    (bitcoin-dep "sigil-bitcoin-encoding")
+    (bitcoin-dep "sigil-secp256k1")
+    (bitcoin-dep "sigil-bitcoin-keys")
+    (bitcoin-dep "sigil-bitcoin-script")
+    (bitcoin-dep "sigil-bitcoin-tx")
+    (bitcoin-dep "sigil-bitcoin-consensus")
+    (bitcoin-dep "sigil-bitcoin-p2p")
+    (bitcoin-dep "sigil-bitcoin-node")))

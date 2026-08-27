@@ -1,0 +1,29 @@
+;;; sigil-coin-puzzle — Consensus-critical puzzle interpreter and generator
+;;;
+;;; Mini-interpreter and puzzle generator used by SigilCoin program-golf mining.
+
+(package
+  name: "sigil-coin-puzzle"
+  version: "0.1.0"
+  sigil: "0.20"
+  description: "SigilCoin puzzle language interpreter and puzzle generator"
+  url: "https://github.com/trevarj/sigil-coin"
+  license: "BSD-3-Clause"
+
+  dependencies: (list)
+
+  dev-dependencies: (list
+    (from-git url: "codeberg:sigil/sigil"
+              package: "sigil-stdlib" version: "^0.20")
+    (from-git url: "codeberg:sigil/sigil"
+              package: "sigil-test" version: "^0.20")
+    (from-git url: "codeberg:sigil/sigil"
+              package: "sigil-test-runner" version: "^0.20"))
+
+  tasks: (list
+    (task
+      name: 'build
+      description: "Build sigil-coin-puzzle"
+      steps: (list
+        (compile-sigil-modules
+          sources: "src/**/*.sgl")))))

@@ -1,0 +1,8 @@
+(import (sigil test)
+        (sigil coin cli))
+
+(test-group "sigil-coin-cli scaffold"
+  (test "reports the package version"
+    (assert-equal "0.1.0" (cli-package-version))))
+
+(run-tests)

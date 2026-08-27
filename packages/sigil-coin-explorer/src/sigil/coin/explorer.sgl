@@ -1,0 +1,14 @@
+;;; (sigil coin explorer) — SigilCoin web explorer scaffold
+
+(define-library (sigil coin explorer)
+  (export explorer-package-version)
+  (begin
+
+    ;;; Version of the explorer package, used as a scaffold placeholder until
+    ;;; the read-only web explorer lands.
+    ;;;
+    ;;; Example:
+    ;;;   (explorer-package-version) ;=> "0.1.0"
+    (define (explorer-package-version)
+      (: -> string?)
+      "0.1.0")))

@@ -1,0 +1,8 @@
+(import (sigil test)
+        (sigil coin consensus))
+
+(test-group "sigil-coin-consensus scaffold"
+  (test "reports the package version"
+    (assert-equal "0.1.0" (consensus-package-version))))
+
+(run-tests)

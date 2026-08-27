@@ -1,0 +1,14 @@
+;;; (sigil coin puzzle) — SigilCoin puzzle language scaffold
+
+(define-library (sigil coin puzzle)
+  (export puzzle-package-version)
+  (begin
+
+    ;;; Version of the puzzle package, used as a scaffold placeholder until
+    ;;; the puzzle interpreter lands.
+    ;;;
+    ;;; Example:
+    ;;;   (puzzle-package-version) ;=> "0.1.0"
+    (define (puzzle-package-version)
+      (: -> string?)
+      "0.1.0")))

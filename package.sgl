@@ -1,0 +1,26 @@
+;;; sigil-coin — SigilCoin, a program-golf-mined chain for Sigil
+;;;
+;;; Workspace building a fun blockchain on top of the sigil-bitcoin libraries.
+
+(workspace
+  name: "sigil-coin"
+  version: "0.1.0"
+  description: "SigilCoin: a program-golf-mined chain built on sigil-bitcoin"
+  url: "https://github.com/trevarj/sigil-coin"
+  license: "BSD-3-Clause"
+
+  packages: (list
+    ;; SigilCoin packages
+    "packages/sigil-coin-puzzle"
+    "packages/sigil-coin-consensus"
+    "packages/sigil-coin-node"
+    "packages/sigil-coin-cli"
+    "packages/sigil-coin-explorer")
+
+  configs: (list
+    (config
+      name: 'dev
+      output-dir: "build/dev"
+      debug?: #t
+      optimize: 0
+      bundle?: #f)))

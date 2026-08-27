@@ -1,0 +1,14 @@
+;;; (sigil coin node) — SigilCoin node runtime scaffold
+
+(define-library (sigil coin node)
+  (export node-package-version)
+  (begin
+
+    ;;; Version of the node package, used as a scaffold placeholder until the
+    ;;; chain config and node runtime land.
+    ;;;
+    ;;; Example:
+    ;;;   (node-package-version) ;=> "0.1.0"
+    (define (node-package-version)
+      (: -> string?)
+      "0.1.0")))

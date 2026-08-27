@@ -1,0 +1,8 @@
+(import (sigil test)
+        (sigil coin puzzle))
+
+(test-group "sigil-coin-puzzle scaffold"
+  (test "reports the package version"
+    (assert-equal "0.1.0" (puzzle-package-version))))
+
+(run-tests)

@@ -1,0 +1,30 @@
+;;; sigil-coin-node — SigilCoin chain config and node runtime
+
+(package
+  name: "sigil-coin-node"
+  version: "0.1.0"
+  sigil: "0.20"
+  description: "SigilCoin chain configuration and node runtime on sigil-bitcoin-node"
+  url: "https://github.com/trevarj/sigil-coin"
+  license: "BSD-3-Clause"
+
+  dependencies: (list
+    (from-workspace name: "sigil-coin-consensus")
+    (from-git url: "github:trevarj/sigil-bitcoin"
+              package: "sigil-bitcoin-node" version: "^0.1"))
+
+  dev-dependencies: (list
+    (from-git url: "codeberg:sigil/sigil"
+              package: "sigil-stdlib" version: "^0.20")
+    (from-git url: "codeberg:sigil/sigil"
+              package: "sigil-test" version: "^0.20")
+    (from-git url: "codeberg:sigil/sigil"
+              package: "sigil-test-runner" version: "^0.20"))
+
+  tasks: (list
+    (task
+      name: 'build
+      description: "Build sigil-coin-node"
+      steps: (list
+        (compile-sigil-modules
+          sources: "src/**/*.sgl")))))

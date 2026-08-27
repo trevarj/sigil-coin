@@ -1,0 +1,14 @@
+;;; (sigil coin consensus) — SigilCoin consensus rule scaffold
+
+(define-library (sigil coin consensus)
+  (export consensus-package-version)
+  (begin
+
+    ;;; Version of the consensus package, used as a scaffold placeholder until
+    ;;; emission and fork-choice rules land.
+    ;;;
+    ;;; Example:
+    ;;;   (consensus-package-version) ;=> "0.1.0"
+    (define (consensus-package-version)
+      (: -> string?)
+      "0.1.0")))

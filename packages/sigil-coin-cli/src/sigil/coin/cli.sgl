@@ -1,0 +1,14 @@
+;;; (sigil coin cli) — `sigilcoin` CLI scaffold
+
+(define-library (sigil coin cli)
+  (export cli-package-version)
+  (begin
+
+    ;;; Version of the CLI package, used as a scaffold placeholder until the
+    ;;; `sigilcoin` binary and its commands land.
+    ;;;
+    ;;; Example:
+    ;;;   (cli-package-version) ;=> "0.1.0"
+    (define (cli-package-version)
+      (: -> string?)
+      "0.1.0")))

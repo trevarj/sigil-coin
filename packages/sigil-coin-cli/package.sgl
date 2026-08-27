@@ -1,0 +1,28 @@
+;;; sigil-coin-cli — `sigilcoin` command-line interface
+
+(package
+  name: "sigil-coin-cli"
+  version: "0.1.0"
+  sigil: "0.20"
+  description: "SigilCoin command-line interface"
+  url: "https://github.com/trevarj/sigil-coin"
+  license: "BSD-3-Clause"
+
+  dependencies: (list
+    (from-workspace name: "sigil-coin-node"))
+
+  dev-dependencies: (list
+    (from-git url: "codeberg:sigil/sigil"
+              package: "sigil-stdlib" version: "^0.20")
+    (from-git url: "codeberg:sigil/sigil"
+              package: "sigil-test" version: "^0.20")
+    (from-git url: "codeberg:sigil/sigil"
+              package: "sigil-test-runner" version: "^0.20"))
+
+  tasks: (list
+    (task
+      name: 'build
+      description: "Build sigil-coin-cli"
+      steps: (list
+        (compile-sigil-modules
+          sources: "src/**/*.sgl")))))
