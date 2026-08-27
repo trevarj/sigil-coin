@@ -1,8 +1,980 @@
+;;; Golden vectors for puzzle-lang v1.
+;;;
+;;; These tests ARE the language specification. Every expectation here is
+;;; consensus-relevant: changing one changes what blocks a node accepts.
+
 (import (sigil test)
+        (sigil math)
         (sigil coin puzzle))
 
-(test-group "sigil-coin-puzzle scaffold"
-  (test "reports the package version"
-    (assert-equal "0.1.0" (puzzle-package-version))))
+;; ============================================================
+;; Helpers
+;; ============================================================
+
+(define (val src)
+  (puzzle-result-value (puzzle-run src)))
+
+(define (kind src)
+  (puzzle-result-error-kind (puzzle-run src)))
+
+(define (status src)
+  (puzzle-result-status (puzzle-run src)))
+
+(define (steps src)
+  (puzzle-result-steps (puzzle-run src)))
+
+(define (ast src)
+  (puzzle-result-value (puzzle-parse src)))
+
+(define (parse-kind src)
+  (puzzle-result-error-kind (puzzle-parse src)))
+
+;; Assert that `src` evaluates to `expected` under structural equality.
+(define (assert-value expected src)
+  (let ((result (puzzle-run src)))
+    (assert-equal 'ok (puzzle-result-status result))
+    (assert-true (puzzle-value=? expected (puzzle-result-value result)))))
+
+;; Assert that `src` fails with `expected-kind`.
+(define (assert-kind expected-kind src)
+  (assert-equal expected-kind (kind src)))
+
+(define (repeat-string s n)
+  (let loop ((i 0) (acc '()))
+    (if (>= i n) (string-join acc) (loop (+ i 1) (cons s acc)))))
+
+;; `k` nested parens around an empty list, e.g. (nest 2) => "(())".
+(define (nest k)
+  (string-append (repeat-string "(" k) (repeat-string ")" k)))
+
+;; ============================================================
+;; Caps and vocabulary
+;; ============================================================
+
+(test-group "puzzle caps"
+  (test "cap constants are frozen"
+    (assert-equal 256 puzzle-max-source-bytes)
+    (assert-equal 64 puzzle-max-parse-depth)
+    (assert-equal 1000000 puzzle-max-fuel)
+    (assert-equal 100000 puzzle-max-allocations)
+    (assert-equal 65536 puzzle-max-string-bytes)
+    (assert-equal 128 puzzle-max-eval-depth))
+
+  (test "integer magnitude cap is 2^256"
+    (assert-equal (expt 2 256) puzzle-max-integer))
+
+  (test "language version"
+    (assert-equal 1 (puzzle-language-version))
+    (assert-equal "0.1.0" (puzzle-package-version)))
+
+  (test "special forms are the frozen seven"
+    (assert-equal '(quote if lambda let letrec and or)
+                  (puzzle-special-forms)))
+
+  (test "builtin roster is frozen"
+    (assert-equal 41 (length (puzzle-builtin-names)))
+    (assert-equal
+      '(cons car cdr list null? pair? length reverse append map filter fold
+        iota list-ref
+        + - * quotient remainder modulo expt abs min max
+        = < > <= >=
+        zero? even? odd? not equal?
+        number? boolean? symbol? string?
+        string-append string-length number->string)
+      (puzzle-builtin-names))))
+
+;; ============================================================
+;; Literals
+;; ============================================================
+
+(test-group "puzzle literals"
+  (test "integers"
+    (assert-value 0 "0")
+    (assert-value 42 "42")
+    (assert-value -7 "-7")
+    (assert-value 1000000000000000000000000000 "1000000000000000000000000000"))
+
+  (test "booleans"
+    (assert-value #t "#t")
+    (assert-value #f "#f"))
+
+  (test "strings and escapes"
+    (assert-value "" "\"\"")
+    (assert-value "hi" "\"hi\"")
+    (assert-value "a\"b" "\"a\\\"b\"")
+    (assert-value "a\\b" "\"a\\\\b\"")
+    (assert-value "a\nb" "\"a\\nb\""))
+
+  (test "quoted symbols and lists"
+    (assert-value 'abc "'abc")
+    (assert-value '() "'()")
+    (assert-value '(1 2 3) "'(1 2 3)")
+    (assert-value '(1 (2 3) ()) "'(1 (2 3) ())"))
+
+  (test "whitespace is insignificant"
+    (assert-value 3 "  (+\t1\n2)  "))
+
+  (test "a bare symbol resolves to a builtin"
+    (assert-true (puzzle-procedure? (val "car")))
+    (assert-false (puzzle-closure? (val "car")))))
+
+;; ============================================================
+;; Special forms
+;; ============================================================
+
+(test-group "puzzle special forms"
+  (test "quote returns its datum verbatim"
+    (assert-value '(quote a) "''a")
+    (assert-value '(1 2) "(quote (1 2))"))
+
+  (test "if selects a branch"
+    (assert-value 1 "(if #t 1 2)")
+    (assert-value 2 "(if #f 1 2)"))
+
+  (test "only #f is false"
+    (assert-value 1 "(if 0 1 2)")
+    (assert-value 1 "(if '() 1 2)")
+    (assert-value 1 "(if \"\" 1 2)"))
+
+  (test "if does not evaluate the untaken branch"
+    (assert-value 1 "(if #t 1 (car '()))")
+    (assert-value 2 "(if #f (car '()) 2)"))
+
+  (test "lambda is fixed arity"
+    (assert-value 3 "((lambda (x y) (+ x y)) 1 2)")
+    (assert-value 7 "((lambda () 7))"))
+
+  (test "let binds in parallel from the outer scope"
+    (assert-value 3 "(let ((a 1) (b 2)) (+ a b))")
+    (assert-value 1 "(let ((a 1)) (let ((a 2) (b a)) b))"))
+
+  (test "let bodies see earlier bindings only through nesting"
+    (assert-value 5 "(let ((a 2)) (let ((b 3)) (+ a b)))"))
+
+  (test "letrec supports self recursion"
+    (assert-value 3628800
+                  "(letrec ((f (lambda (n) (if (zero? n) 1 (* n (f (- n 1))))))) (f 10))"))
+
+  (test "letrec supports mutual recursion"
+    (assert-value #t
+                  (string-append "(letrec ((ev? (lambda (n) (if (zero? n) #t (od? (- n 1)))))"
+                                 " (od? (lambda (n) (if (zero? n) #f (ev? (- n 1))))))"
+                                 " (ev? 10))")))
+
+  (test "letrec computes fibonacci"
+    (assert-value 55
+                  (string-append "(letrec ((f (lambda (n) (if (< n 2) n"
+                                 " (+ (f (- n 1)) (f (- n 2))))))) (f 10))")))
+
+  (test "and is variadic and short-circuits left to right"
+    (assert-value #t "(and)")
+    (assert-value 3 "(and 1 2 3)")
+    (assert-value #f "(and #f (car '()))")
+    (assert-value #f "(and 1 #f (car '()))"))
+
+  (test "or is variadic and short-circuits left to right"
+    (assert-value #f "(or)")
+    (assert-value 1 "(or 1 (car '()))")
+    (assert-value 2 "(or #f 2 (car '()))")
+    (assert-value #f "(or #f #f)"))
+
+  (test "and/or return the deciding value, not a boolean"
+    (assert-value 3 "(and 1 3)")
+    (assert-value '(1) "(or '(1) 2)"))
+
+  (test "inner bindings shadow outer ones"
+    (assert-value 9 "(let ((x 1)) (let ((x 9)) x))")
+    (assert-value 4 "(let ((x 1)) ((lambda (x) (+ x 1)) 3))"))
+
+  (test "builtin names can be shadowed"
+    (assert-value '(2) "(let ((car cdr)) (car '(1 2)))")
+    (assert-value 1 "((lambda (cons) cons) 1)")))
+
+;; ============================================================
+;; Closures and higher-order use
+;; ============================================================
+
+(test-group "puzzle closures"
+  (test "closures capture their defining environment"
+    (assert-value 5 "(let ((n 2)) ((lambda (x) (+ x n)) 3))")
+    (assert-value 11 "(let ((add (let ((n 10)) (lambda (x) (+ x n))))) (add 1))"))
+
+  (test "closures are first class"
+    (assert-value 4 "((lambda (f) (f 3)) (lambda (x) (+ x 1)))")
+    (assert-value '(1 2) "((lambda (f) (f '(0 1 2))) cdr)"))
+
+  (test "builtins are first class values"
+    (assert-value '(1 2 3) "(map (lambda (x) x) '(1 2 3))")
+    (assert-value '(2 3 4) "(map (let ((n 1)) (lambda (x) (+ x n))) '(1 2 3))"))
+
+  (test "closure values print opaquely"
+    (assert-equal "#<closure>" (puzzle-print-value (val "(lambda (x) x)")))
+    (assert-equal "#<builtin car>" (puzzle-print-value (val "car"))))
+
+  (test "lambda produces a closure, builtins do not"
+    (assert-true (puzzle-closure? (val "(lambda (x) x)")))
+    (assert-true (puzzle-procedure? (val "(lambda (x) x)")))
+    (assert-false (puzzle-closure? (val "cdr")))))
+
+;; ============================================================
+;; Builtins — happy paths
+;; ============================================================
+
+(test-group "puzzle list builtins"
+  (test "cons"
+    (assert-value '(1) "(cons 1 '())")
+    (assert-value '(1 2 3) "(cons 1 '(2 3))"))
+
+  (test "car and cdr"
+    (assert-value 1 "(car '(1 2))")
+    (assert-value '(2) "(cdr '(1 2))")
+    (assert-value '() "(cdr '(1))"))
+
+  (test "list"
+    (assert-value '() "(list)")
+    (assert-value '(1 2 3) "(list 1 2 3)")
+    (assert-value '(1 (2)) "(list 1 (list 2))"))
+
+  (test "null? and pair?"
+    (assert-value #t "(null? '())")
+    (assert-value #f "(null? '(1))")
+    (assert-value #f "(pair? '())")
+    (assert-value #t "(pair? '(1))")
+    (assert-value #f "(pair? 1)"))
+
+  (test "length"
+    (assert-value 0 "(length '())")
+    (assert-value 3 "(length '(1 2 3))"))
+
+  (test "reverse"
+    (assert-value '() "(reverse '())")
+    (assert-value '(3 2 1) "(reverse '(1 2 3))"))
+
+  (test "append"
+    (assert-value '() "(append)")
+    (assert-value '(1 2) "(append '(1 2))")
+    (assert-value '(1 2 3 4) "(append '(1 2) '(3 4))")
+    (assert-value '(1 2 3) "(append '(1) '() '(2 3))"))
+
+  (test "map"
+    (assert-value '() "(map (lambda (x) x) '())")
+    (assert-value '(0 1 4 9) "(map (lambda (x) (* x x)) (iota 4))"))
+
+  (test "filter"
+    (assert-value '(0 2 4) "(filter even? (iota 5))")
+    (assert-value '() "(filter odd? '())"))
+
+  (test "fold takes (element accumulator)"
+    (assert-value 10 "(fold + 0 '(1 2 3 4))")
+    (assert-value '(3 2 1) "(fold cons '() '(1 2 3))")
+    (assert-value 0 "(fold + 0 '())"))
+
+  (test "iota"
+    (assert-value '() "(iota 0)")
+    (assert-value '(0 1 2 3) "(iota 4)"))
+
+  (test "list-ref"
+    (assert-value 1 "(list-ref '(1 2 3) 0)")
+    (assert-value 3 "(list-ref '(1 2 3) 2)")))
+
+(test-group "puzzle arithmetic builtins"
+  (test "addition"
+    (assert-value 0 "(+)")
+    (assert-value 5 "(+ 5)")
+    (assert-value 6 "(+ 1 2 3)")
+    (assert-value -1 "(+ 2 -3)"))
+
+  (test "subtraction negates a single argument"
+    (assert-value -5 "(- 5)")
+    (assert-value 4 "(- 10 6)")
+    (assert-value 1 "(- 10 6 3)"))
+
+  (test "multiplication"
+    (assert-value 1 "(*)")
+    (assert-value 24 "(* 1 2 3 4)")
+    (assert-value 0 "(* 5 0)"))
+
+  (test "quotient, remainder and modulo follow the host truncation rules"
+    (assert-value 3 "(quotient 7 2)")
+    (assert-value -3 "(quotient -7 2)")
+    (assert-value 1 "(remainder 7 2)")
+    (assert-value -1 "(remainder -7 2)")
+    (assert-value 1 "(modulo -7 2)")
+    (assert-value -1 "(modulo 7 -2)"))
+
+  (test "expt"
+    (assert-value 1 "(expt 2 0)")
+    (assert-value 1024 "(expt 2 10)")
+    (assert-value 1 "(expt 1 1000)")
+    (assert-value -8 "(expt -2 3)"))
+
+  (test "abs, min and max"
+    (assert-value 5 "(abs -5)")
+    (assert-value 5 "(abs 5)")
+    (assert-value 1 "(min 3 1 2)")
+    (assert-value 3 "(max 3 1 2)")
+    (assert-value 7 "(min 7)"))
+
+  (test "min and max reject zero arguments"
+    ;; Unlike `+` and `*` these have no identity element in v1, so the empty
+    ;; call is an arity error rather than any sentinel value.
+    (assert-kind 'arity-error "(min)")
+    (assert-kind 'arity-error "(max)")))
+
+(test-group "puzzle comparison and predicate builtins"
+  (test "numeric comparisons are variadic chains"
+    (assert-value #t "(= 1 1 1)")
+    (assert-value #f "(= 1 1 2)")
+    (assert-value #t "(< 1 2 3)")
+    (assert-value #f "(< 1 3 2)")
+    (assert-value #t "(> 3 2 1)")
+    (assert-value #t "(<= 1 1 2)")
+    (assert-value #t "(>= 2 2 1)")
+    (assert-value #f "(>= 1 2)"))
+
+  (test "zero?, even?, odd?"
+    (assert-value #t "(zero? 0)")
+    (assert-value #f "(zero? 1)")
+    (assert-value #t "(even? 4)")
+    (assert-value #t "(even? -4)")
+    (assert-value #t "(odd? 3)")
+    (assert-value #t "(odd? -3)"))
+
+  (test "not"
+    (assert-value #t "(not #f)")
+    (assert-value #f "(not #t)")
+    (assert-value #f "(not 0)")
+    (assert-value #f "(not '())"))
+
+  (test "equal? is deep and structural"
+    (assert-value #t "(equal? '(1 (2 \"a\")) '(1 (2 \"a\")))")
+    (assert-value #f "(equal? '(1 (2 \"a\")) '(1 (2 \"b\")))")
+    (assert-value #t "(equal? 'a 'a)")
+    (assert-value #f "(equal? 'a \"a\")")
+    (assert-value #f "(equal? 1 #t)")
+    (assert-value #t "(equal? '() '())"))
+
+  (test "type predicates"
+    (assert-value #t "(number? 1)")
+    (assert-value #f "(number? #t)")
+    (assert-value #t "(boolean? #f)")
+    (assert-value #f "(boolean? 0)")
+    (assert-value #t "(symbol? 'a)")
+    (assert-value #f "(symbol? \"a\")")
+    (assert-value #t "(string? \"a\")")
+    (assert-value #f "(string? 'a)")))
+
+(test-group "puzzle string builtins"
+  (test "string-append"
+    (assert-value "" "(string-append)")
+    (assert-value "ab" "(string-append \"a\" \"b\")")
+    (assert-value "abc" "(string-append \"a\" \"\" \"bc\")"))
+
+  (test "string-length"
+    (assert-value 0 "(string-length \"\")")
+    (assert-value 3 "(string-length \"abc\")"))
+
+  (test "number->string"
+    (assert-value "42" "(number->string 42)")
+    (assert-value "-42" "(number->string -42)")
+    (assert-value "0" "(number->string 0)")))
+
+;; ============================================================
+;; Builtins — type and domain errors
+;; ============================================================
+
+(test-group "puzzle builtin type errors"
+  (test "cons rejects a non-list tail: improper lists do not exist in v1"
+    (assert-kind 'type-error "(cons 1 2)")
+    (assert-kind 'type-error "(cons 1 'a)"))
+
+  (test "car and cdr require a non-empty list"
+    (assert-kind 'type-error "(car '())")
+    (assert-kind 'type-error "(car 1)")
+    (assert-kind 'type-error "(cdr '())")
+    (assert-kind 'type-error "(cdr \"ab\")"))
+
+  (test "list traversal builtins require lists"
+    (assert-kind 'type-error "(length 1)")
+    (assert-kind 'type-error "(reverse 1)")
+    (assert-kind 'type-error "(append 1 '())")
+    (assert-kind 'type-error "(map car 1)")
+    (assert-kind 'type-error "(filter even? 1)")
+    (assert-kind 'type-error "(fold + 0 1)")
+    (assert-kind 'type-error "(list-ref 1 0)"))
+
+  (test "higher-order builtins require a procedure"
+    (assert-kind 'type-error "(map 1 '(1))")
+    (assert-kind 'type-error "(filter 1 '(1))")
+    (assert-kind 'type-error "(fold 1 0 '(1))"))
+
+  (test "iota requires a non-negative integer"
+    (assert-kind 'type-error "(iota \"a\")")
+    (assert-kind 'type-error "(iota -1)"))
+
+  (test "list-ref reports out-of-range access"
+    (assert-kind 'index-error "(list-ref '(1 2) 2)")
+    (assert-kind 'index-error "(list-ref '() 0)")
+    (assert-kind 'index-error "(list-ref '(1) -1)"))
+
+  (test "arithmetic requires integers"
+    (assert-kind 'type-error "(+ 1 #t)")
+    (assert-kind 'type-error "(- \"a\")")
+    (assert-kind 'type-error "(* 1 'a)")
+    (assert-kind 'type-error "(quotient #t 1)")
+    (assert-kind 'type-error "(remainder 1 'a)")
+    (assert-kind 'type-error "(modulo \"a\" 1)")
+    (assert-kind 'type-error "(expt \"a\" 1)")
+    (assert-kind 'type-error "(abs \"a\")")
+    (assert-kind 'type-error "(min 1 #f)")
+    (assert-kind 'type-error "(max 1 #f)"))
+
+  (test "division by zero is its own error kind"
+    (assert-kind 'division-by-zero "(quotient 1 0)")
+    (assert-kind 'division-by-zero "(remainder 1 0)")
+    (assert-kind 'division-by-zero "(modulo 1 0)"))
+
+  (test "expt rejects negative exponents"
+    (assert-kind 'type-error "(expt 2 -1)"))
+
+  (test "comparisons and numeric predicates require integers"
+    (assert-kind 'type-error "(= 1 #t)")
+    (assert-kind 'type-error "(< 1 'a)")
+    (assert-kind 'type-error "(> \"a\" 1)")
+    (assert-kind 'type-error "(<= 1 '())")
+    (assert-kind 'type-error "(>= #f 1)")
+    (assert-kind 'type-error "(zero? #t)")
+    (assert-kind 'type-error "(even? 'a)")
+    (assert-kind 'type-error "(odd? \"a\")"))
+
+  (test "string builtins require the right types"
+    (assert-kind 'type-error "(string-append 1)")
+    (assert-kind 'type-error "(string-append \"a\" 'b)")
+    (assert-kind 'type-error "(string-length 1)")
+    (assert-kind 'type-error "(number->string \"a\")"))
+
+  (test "arity is enforced for builtins"
+    (assert-kind 'arity-error "(car)")
+    (assert-kind 'arity-error "(car '(1) '(2))")
+    (assert-kind 'arity-error "(cons 1)")
+    (assert-kind 'arity-error "(-)")
+    (assert-kind 'arity-error "(= 1)")
+    (assert-kind 'arity-error "(fold + 0)"))
+
+  (test "arity is enforced for closures"
+    (assert-kind 'arity-error "((lambda (x) x))")
+    (assert-kind 'arity-error "((lambda (x) x) 1 2)"))
+
+  (test "applying a non-procedure is a type error"
+    (assert-kind 'type-error "(1 2)")
+    (assert-kind 'type-error "('(1) 2)")
+    (assert-kind 'type-error "(\"a\")")))
+
+;; ============================================================
+;; Evaluation errors that are not builtin failures
+;; ============================================================
+
+(test-group "puzzle evaluation errors"
+  (test "unbound variables"
+    (assert-kind 'unbound-variable "nope")
+    (assert-kind 'unbound-variable "(nope 1)")
+    (assert-kind 'unbound-variable "(let ((a 1)) b)"))
+
+  (test "letrec bindings are unassigned until initialised"
+    (assert-kind 'uninitialized "(letrec ((a b) (b 1)) a)")
+    (assert-value 1 "(letrec ((b 1) (a b)) a)"))
+
+  (test "empty application"
+    (assert-kind 'bad-syntax "()")
+    (assert-kind 'bad-syntax "(list ())"))
+
+  (test "malformed special forms"
+    (assert-kind 'bad-syntax "(quote)")
+    (assert-kind 'bad-syntax "(quote 1 2)")
+    (assert-kind 'bad-syntax "(if #t 1)")
+    (assert-kind 'bad-syntax "(if #t 1 2 3)")
+    (assert-kind 'bad-syntax "(lambda (x))")
+    (assert-kind 'bad-syntax "(lambda (x) 1 2)")
+    (assert-kind 'bad-syntax "(lambda x 1)")
+    (assert-kind 'bad-syntax "(let ((x)) x)")
+    (assert-kind 'bad-syntax "(let (x) x)")
+    (assert-kind 'bad-syntax "(let ((x 1)))")
+    (assert-kind 'bad-syntax "(letrec ((x)) x)"))
+
+  (test "duplicate binding names are rejected"
+    (assert-kind 'bad-syntax "(lambda (x x) x)")
+    (assert-kind 'bad-syntax "(let ((x 1) (x 2)) x)")
+    (assert-kind 'bad-syntax "(letrec ((x 1) (x 2)) x)"))
+
+  (test "special form names cannot be bound"
+    (assert-kind 'bad-syntax "(lambda (if) 1)")
+    (assert-kind 'bad-syntax "(let ((quote 1)) quote)")
+    (assert-kind 'bad-syntax "(letrec ((or 1)) or)"))
+
+  (test "a quoted non-value is rejected"
+    (assert-equal 'bad-syntax
+                  (puzzle-result-error-kind (puzzle-eval (list 'quote 1.5))))))
+
+;; ============================================================
+;; Evaluation order
+;; ============================================================
+;;
+;; Order is consensus-visible: it picks the error kind AND the step count.
+;; R7RS leaves `let` init order unspecified, so the evaluator uses `let*`
+;; everywhere an order is observable. These vectors are what pin it.
+
+(test-group "puzzle evaluation order"
+  (test "the operator is evaluated before the arguments"
+    ;; Arguments-first would report type-error here, with a different count.
+    (assert-kind 'unbound-variable "(zz (car '()))")
+    (assert-equal 2 (steps "(zz (car '()))"))
+    ;; Mirror: operator fails, and an argument would have failed differently.
+    (assert-kind 'type-error "((car '()) zz)")
+    (assert-equal 6 (steps "((car '()) zz)"))
+    (assert-kind 'division-by-zero "((quotient 1 0) zz)"))
+
+  (test "arguments are evaluated left to right"
+    (assert-kind 'unbound-variable "(+ zz (car '()))")
+    (assert-kind 'type-error "(+ (car '()) zz)")
+    (assert-kind 'unbound-variable "(list zz (car '()))"))
+
+  (test "let and letrec initialisers run left to right"
+    (assert-kind 'type-error "(let ((a (car '())) (b zz)) 1)")
+    (assert-kind 'unbound-variable "(let ((a zz) (b (car '()))) 1)")
+    (assert-kind 'type-error "(letrec ((a (car '())) (b zz)) 1)")
+    (assert-kind 'unbound-variable "(letrec ((a zz) (b (car '()))) 1)"))
+
+  (test "division builtins check the dividend before the divisor"
+    ;; Divisor-first would make all three of these division-by-zero.
+    (assert-kind 'type-error "(quotient \"a\" 0)")
+    (assert-kind 'type-error "(remainder \"a\" 0)")
+    (assert-kind 'type-error "(modulo \"a\" 0)")
+    (assert-kind 'division-by-zero "(quotient 0 0)")
+    (assert-kind 'division-by-zero "(remainder 0 0)")
+    (assert-kind 'division-by-zero "(modulo 0 0)")
+    (assert-kind 'division-by-zero "(quotient (expt 2 255) 0)"))
+
+  (test "expt checks argument types before the exponent sign"
+    (assert-kind 'type-error "(expt \"a\" -1)")
+    (assert-kind 'type-error "(expt 2 \"a\")"))
+
+  (test "map, filter and fold apply the procedure left to right"
+    ;; Element 0 raises division-by-zero, any other element type-error, so
+    ;; the surfaced kind names the element visited first.
+    (assert-kind 'division-by-zero
+                 "(map (lambda (x) (if (zero? x) (quotient 1 0) (car '()))) '(0 1))")
+    (assert-kind 'type-error
+                 "(map (lambda (x) (if (zero? x) (quotient 1 0) (car '()))) '(1 0))")
+    (assert-kind 'division-by-zero
+                 "(filter (lambda (x) (if (zero? x) (quotient 1 0) (car '()))) '(0 1))")
+    (assert-kind 'type-error
+                 "(filter (lambda (x) (if (zero? x) (quotient 1 0) (car '()))) '(1 0))")
+    (assert-kind 'division-by-zero
+                 "(fold (lambda (x a) (if (zero? x) (quotient 1 0) (car '()))) 0 '(0 1))")
+    (assert-kind 'type-error
+                 "(fold (lambda (x a) (if (zero? x) (quotient 1 0) (car '()))) 0 '(1 0))")
+    ;; The first element's failure is the one that escapes.
+    (assert-kind 'type-error "(map car '(1 2))")))
+
+;; ============================================================
+;; Parse errors
+;; ============================================================
+
+(test-group "puzzle parse errors"
+  (test "source over the byte cap is refused"
+    (assert-equal 'parse-oversize (parse-kind (make-string 257 #\a)))
+    (assert-equal 'ok (puzzle-result-status (puzzle-parse (make-string 256 #\a)))))
+
+  (test "the byte cap applies to bytevector sources too"
+    ;; #u8(40 43 32 49 32 50 41) is the ASCII for "(+ 1 2)".
+    (assert-equal 'ok
+                  (puzzle-result-status
+                    (puzzle-parse #u8(40 43 32 49 32 50 41))))
+    (assert-equal '(+ 1 2) (ast #u8(40 43 32 49 32 50 41)))
+    (assert-equal 'parse-oversize
+                  (parse-kind (make-bytevector 257 65))))
+
+  (test "nesting deeper than the cap is refused"
+    (assert-equal 'ok (puzzle-result-status (puzzle-parse (nest 64))))
+    (assert-equal 'parse-depth (parse-kind (nest 65))))
+
+  (test "quote shorthand counts towards nesting depth"
+    (assert-equal 'parse-depth (parse-kind (string-append (repeat-string "'" 64)
+                                                          (nest 1)))))
+
+  (test "dotted pairs are a parse error"
+    (assert-equal 'parse-syntax (parse-kind "(1 . 2)"))
+    (assert-equal 'parse-syntax (parse-kind "'(a . b)")))
+
+  (test "unterminated forms"
+    (assert-equal 'parse-syntax (parse-kind "(1"))
+    (assert-equal 'parse-syntax (parse-kind "\"abc"))
+    (assert-equal 'parse-syntax (parse-kind "\"abc\\"))
+    (assert-equal 'parse-syntax (parse-kind "'")))
+
+  (test "unknown string escapes"
+    (assert-equal 'parse-syntax (parse-kind "\"a\\q\"")))
+
+  (test "bad tokens"
+    (assert-equal 'parse-syntax (parse-kind "#x"))
+    (assert-equal 'parse-syntax (parse-kind "#"))
+    (assert-equal 'parse-syntax (parse-kind "1abc"))
+    (assert-equal 'parse-syntax (parse-kind "-1a"))
+    (assert-equal 'parse-syntax (parse-kind ")"))
+    (assert-equal 'parse-syntax (parse-kind "(1))")))
+
+  (test "empty and whitespace-only sources"
+    (assert-equal 'parse-syntax (parse-kind ""))
+    (assert-equal 'parse-syntax (parse-kind "   \n\t")))
+
+  (test "exactly one datum is allowed"
+    (assert-equal 'parse-syntax (parse-kind "1 2"))
+    (assert-equal 'parse-syntax (parse-kind "(+ 1 2) (+ 3 4)")))
+
+  (test "non-ASCII source is refused"
+    (assert-equal 'parse-syntax (parse-kind #u8(34 233 34)))
+    (assert-equal 'parse-syntax
+                  (parse-kind (list->string (list #\" (integer->char 233) #\")))))
+
+  (test "a non-string, non-bytevector source is refused"
+    (assert-equal 'parse-syntax (parse-kind 42)))
+
+  (test "integer literals over the magnitude cap are refused"
+    (assert-equal 'overflow
+                  (parse-kind (string-append "1" (repeat-string "0" 80)))))
+
+  (test "`-` alone is the subtraction symbol, not a malformed number"
+    (assert-value -1 "(- 1 2)")
+    (assert-equal '- (ast "-")))
+
+  (test "only a bare dot is rejected; dot-bearing tokens are symbols"
+    ;; Frozen quirk: v1 has no dotted-pair syntax, so a token that merely
+    ;; contains a dot is an ordinary symbol and `'(1 .2)` is a 2-element
+    ;; list. Harmless, round-trips, and pinned so it cannot drift.
+    (assert-equal 'parse-syntax (parse-kind "."))
+    (assert-equal (string->symbol "...") (ast "..."))
+    (assert-equal (string->symbol "a.b") (ast "a.b"))
+    (assert-equal (string->symbol ".2") (ast ".2"))
+    (assert-equal (list 'quote (list 1 (string->symbol ".2"))) (ast "'(1 .2)"))
+    (assert-equal "'(1 .2)" (puzzle-print-expression (ast "'(1 .2)")))))
+
+;; ============================================================
+;; Resource caps
+;; ============================================================
+
+(test-group "puzzle resource caps"
+  (test "fuel exhaustion stops an unbounded tail loop"
+    (let ((result (puzzle-run "(letrec ((f (lambda () (f)))) (f))")))
+      (assert-equal 'error (puzzle-result-status result))
+      (assert-equal 'fuel-exhausted (puzzle-result-error-kind result))
+      (assert-equal puzzle-max-fuel (puzzle-result-steps result))))
+
+  (test "runaway non-tail recursion hits the depth cap, not the host stack"
+    (let ((result (puzzle-run
+                    (string-append "(letrec ((f (lambda (n) (if (zero? n) 0"
+                                   " (+ 1 (f (- n 1))))))) (f 100000))"))))
+      (assert-equal 'depth-exceeded (puzzle-result-error-kind result))
+      (assert-true (< (puzzle-result-steps result) puzzle-max-fuel))))
+
+  (test "recursion just under the depth cap still evaluates"
+    (assert-value 120
+                  (string-append "(letrec ((f (lambda (n) (if (zero? n) 0"
+                                 " (+ 1 (f (- n 1))))))) (f 120))")))
+
+  (test "the depth boundary is frozen"
+    ;; This shape costs one depth level per recursion, so 125 levels fit
+    ;; under the 128 cap and 126 does not. Moving the cap moves this line.
+    (let ((countdown
+            (lambda (n)
+              (puzzle-run
+                (string-append "(letrec ((f (lambda (n) (if (zero? n) 0"
+                               " (+ 1 (f (- n 1))))))) (f "
+                               (number->string n) "))")))))
+      (assert-true (puzzle-ok? (countdown 125)))
+      (assert-equal 125 (puzzle-result-value (countdown 125)))
+      (assert-true (puzzle-failed? (countdown 126)))
+      (assert-equal 'depth-exceeded
+                    (puzzle-result-error-kind (countdown 126)))))
+
+  (test "tail recursion does not consume depth"
+    (assert-value 500500
+                  (string-append "(letrec ((f (lambda (n a) (if (zero? n) a"
+                                 " (f (- n 1) (+ a n)))))) (f 1000 0))")))
+
+  (test "expt cannot manufacture an oversized integer"
+    (assert-kind 'overflow "(expt 2 1000)")
+    (assert-kind 'overflow "(expt 2 256)")
+    (assert-value (expt 2 255) "(expt 2 255)"))
+
+  (test "arithmetic intermediates are bounded"
+    (assert-kind 'overflow "(* (expt 2 255) 4)")
+    (assert-kind 'overflow "(+ (expt 2 255) (expt 2 255))")
+    (assert-kind 'overflow "(- (- (expt 2 255)) (expt 2 255))"))
+
+  (test "allocation beyond the cap is refused"
+    (assert-kind 'allocation-exceeded "(iota 100001)")
+    (assert-kind 'allocation-exceeded "(append (iota 100000) (iota 1))"))
+
+  (test "allocation exactly at the cap is allowed"
+    (assert-value 100000 "(length (iota 100000))"))
+
+  (test "the allocation counter charges list-builtin cells only"
+    ;; `iota` charges n and `map` charges its input length, so this pair
+    ;; lands exactly on the cap even though `map` conses about 2n host
+    ;; pairs. The counter is a consensus budget, not a heap measurement.
+    (assert-value 50000 "(length (map (lambda (x) x) (iota 50000)))")
+    (assert-kind 'allocation-exceeded
+                 "(length (map (lambda (x) x) (iota 50001)))")
+    ;; Environment frames, binding boxes and closures are never charged:
+    ;; this loop makes 10000 bindings and spends none of the budget.
+    (assert-value 0
+                  "(letrec ((f (lambda (n) (if (zero? n) 0 (f (- n 1)))))) (f 10000))"))
+
+  (test "string construction beyond the cap is refused"
+    (assert-kind 'string-limit
+                 (string-append "(letrec ((f (lambda (n s) (if (zero? n) s"
+                                " (f (- n 1) (string-append s s))))))"
+                                " (f 40 \"ab\"))"))))
+
+;; ============================================================
+;; Determinism
+;; ============================================================
+
+(test-group "puzzle determinism"
+  (test "identical sources use identical step counts"
+    (let ((src "(map (lambda (x) (* x x)) (iota 20))"))
+      (assert-equal (steps src) (steps src))
+      (assert-true (> (steps src) 0))))
+
+  (test "step counts are frozen for reference expressions"
+    ;; (+ 1 2): one step for the form, one for `+`, one per literal, one for
+    ;; the application, plus one per argument inside the builtin.
+    (assert-equal 7 (steps "(+ 1 2)"))
+    (assert-equal 1 (steps "1"))
+    ;; '(1 2): one step for the quote form plus one per node of the datum.
+    (assert-equal 6 (steps "'(1 2)"))
+    (assert-equal 2 (steps "'a")))
+
+  (test "a failing evaluation still reports the steps it burned"
+    (let ((result (puzzle-run "(car '())")))
+      (assert-equal 'error (puzzle-result-status result))
+      (assert-true (> (puzzle-result-steps result) 0))))
+
+  (test "parse results carry no steps"
+    (assert-equal 0 (puzzle-result-steps (puzzle-parse "(+ 1 2)")))))
+
+;; ============================================================
+;; Canonical printing
+;; ============================================================
+
+(test-group "puzzle canonical printing"
+  (test "value printing"
+    (assert-equal "1" (puzzle-print-value 1))
+    (assert-equal "-1" (puzzle-print-value -1))
+    (assert-equal "#t" (puzzle-print-value #t))
+    (assert-equal "#f" (puzzle-print-value #f))
+    (assert-equal "sym" (puzzle-print-value 'sym))
+    (assert-equal "()" (puzzle-print-value '()))
+    (assert-equal "(1 2 3)" (puzzle-print-value '(1 2 3)))
+    (assert-equal "(1 (2 \"a\") sym)" (puzzle-print-value '(1 (2 "a") sym)))
+    (assert-equal "(() (()))" (puzzle-print-value '(() (())))))
+
+  (test "string escaping in printed values"
+    (assert-equal "\"\"" (puzzle-print-value ""))
+    (assert-equal "\"a\\\"b\"" (puzzle-print-value "a\"b"))
+    (assert-equal "\"a\\\\b\"" (puzzle-print-value "a\\b"))
+    (assert-equal "\"a\\nb\"" (puzzle-print-value "a\nb")))
+
+  (test "value printing keeps quote as ordinary data"
+    (assert-equal "(quote a)" (puzzle-print-value '(quote a))))
+
+  (test "expression printing uses the shortest accepted form"
+    (assert-equal "'a" (puzzle-print-expression '(quote a)))
+    (assert-equal "'(1 2)" (puzzle-print-expression '(quote (1 2))))
+    (assert-equal "(if #t 'a 2)" (puzzle-print-expression '(if #t (quote a) 2)))
+    (assert-equal "(quote a b)" (puzzle-print-expression '(quote a b))))
+
+  (test "printing round-trips through the parser"
+    (let loop ((sources '("1"
+                          "-42"
+                          "#t"
+                          "\"a\\nb\""
+                          "'a"
+                          "'(1 2 (3))"
+                          "(+ 1 2)"
+                          "(if (zero? x) '() (cons x '(1)))"
+                          "(lambda (x y) (map (lambda (z) (* z x)) y))"
+                          "(letrec ((f (lambda (n) (if (zero? n) '() (cons n (f (- n 1))))))) (f 5))")))
+      (if (pair? sources)
+          (let* ((source (car sources))
+                 (tree (ast source))
+                 (printed (puzzle-print-expression tree)))
+            (assert-equal tree (ast printed))
+            (assert-equal printed (puzzle-print-expression (ast printed)))
+            (loop (cdr sources))))))
+
+  (test "only quote, backslash and newline are escaped"
+    ;; Raw control characters survive parsing and print verbatim; the
+    ;; printer never widens its escape set.
+    (assert-equal (string-append "\"a" (string #\tab) "b\"")
+                  (puzzle-print-value (string-append "a" (string #\tab) "b")))
+    (assert-equal (string-append "\"a" (string #\return) "b\"")
+                  (puzzle-print-value (string-append "a" (string #\return) "b")))
+    (assert-equal (string-append "\"" (string (integer->char 1)) "\"")
+                  (puzzle-print-value (string (integer->char 1))))
+    ;; A raw tab inside a string literal is data, not whitespace.
+    (assert-value (string-append "a" (string #\tab) "b")
+                  (string-append "\"a" (string #\tab) "b\"")))
+
+  (test "canonical printing normalises whitespace"
+    (assert-equal "(+ 1 2)" (puzzle-print-expression (ast "(+   1\n\t2)")))))
+
+;; ============================================================
+;; Structural equality
+;; ============================================================
+
+(test-group "puzzle structural equality"
+  (test "atoms"
+    (assert-true (puzzle-value=? 1 1))
+    (assert-false (puzzle-value=? 1 2))
+    (assert-true (puzzle-value=? (expt 2 200) (expt 2 200)))
+    (assert-true (puzzle-value=? #t #t))
+    (assert-false (puzzle-value=? #t #f))
+    (assert-false (puzzle-value=? 1 #t))
+    (assert-true (puzzle-value=? "a" "a"))
+    (assert-false (puzzle-value=? "a" "b"))
+    (assert-true (puzzle-value=? 'a 'a))
+    (assert-false (puzzle-value=? 'a "a"))
+    (assert-true (puzzle-value=? '() '())))
+
+  (test "nested lists"
+    (assert-true (puzzle-value=? '(1 (2 (3 "x"))) '(1 (2 (3 "x")))))
+    (assert-false (puzzle-value=? '(1 (2 (3 "x"))) '(1 (2 (3 "y")))))
+    (assert-false (puzzle-value=? '(1 2) '(1 2 3)))
+    (assert-false (puzzle-value=? '(1 2 3) '(1 2)))
+    (assert-false (puzzle-value=? '(1 (2)) '(1 2))))
+
+  (test "procedures compare by identity"
+    (let ((closure (val "(lambda (x) x)")))
+      (assert-true (puzzle-value=? closure closure))
+      (assert-false (puzzle-value=? closure (val "(lambda (x) x)"))))
+    (assert-false (puzzle-value=? (val "car") (val "cdr"))))
+
+  (test "deeply nested values do not overflow the host stack"
+    (let loop ((i 0) (deep '()))
+      (if (< i 5000)
+          (loop (+ i 1) (list deep))
+          (begin
+            (assert-true (puzzle-value=? deep deep))
+            (assert-true (string? (puzzle-print-value deep)))))))
+
+  (test "puzzle-value? accepts the v1 domain only"
+    (assert-true (puzzle-value? 1))
+    (assert-true (puzzle-value? '(1 #t "a" sym ())))
+    (assert-false (puzzle-value? 1.5))
+    (assert-false (puzzle-value? (vector 1)))
+    (assert-false (puzzle-value? '(1 . 2))))
+
+  (test "procedures are runtime results, not puzzle values"
+    (assert-false (puzzle-value? (val "(lambda (x) x)")))
+    (assert-false (puzzle-value? (val "car")))
+    (assert-false (puzzle-value? (list 1 (val "car"))))
+    ;; `puzzle-procedure?` still recognises them; the two predicates are
+    ;; deliberately disjoint.
+    (assert-true (puzzle-procedure? (val "car")))
+    (assert-true (puzzle-procedure? (val "(lambda (x) x)")))))
+
+;; ============================================================
+;; API contract
+;; ============================================================
+
+(test-group "puzzle api contract"
+  (test "ok and error results are distinguishable without exceptions"
+    (assert-true (puzzle-ok? (puzzle-parse "1")))
+    (assert-false (puzzle-failed? (puzzle-parse "1")))
+    (assert-true (puzzle-failed? (puzzle-parse "(")))
+    (assert-false (puzzle-ok? (puzzle-parse "(")))
+    (assert-true (puzzle-ok? (puzzle-eval '(+ 1 2))))
+    (assert-true (puzzle-failed? (puzzle-eval '(car 1)))))
+
+  (test "every entry point returns a result record"
+    (assert-true (puzzle-result? (puzzle-parse "1")))
+    (assert-true (puzzle-result? (puzzle-parse "(")))
+    (assert-true (puzzle-result? (puzzle-eval '(+ 1 2))))
+    (assert-true (puzzle-result? (puzzle-run "1")))
+    (assert-true (puzzle-result? (puzzle-run "("))))
+
+  (test "an ok result carries no error kind, an error carries no value"
+    (assert-false (puzzle-result-error-kind (puzzle-run "1")))
+    (assert-false (puzzle-result-value (puzzle-run "(car 1)"))))
+
+  (test "puzzle-run propagates the parse failure unchanged"
+    (assert-equal 'parse-syntax (puzzle-result-error-kind (puzzle-run "(")))
+    (assert-equal 0 (puzzle-result-steps (puzzle-run "("))))
+
+  (test "puzzle-eval accepts a hand-built AST"
+    (assert-equal 3 (puzzle-result-value (puzzle-eval '(+ 1 2))))
+    (assert-equal "hi" (puzzle-result-value (puzzle-eval "hi")))
+    (assert-equal 7 (puzzle-result-value (puzzle-eval 7))))
+
+  (test "puzzle-eval refuses host values outside the v1 domain"
+    (assert-equal 'bad-syntax (puzzle-result-error-kind (puzzle-eval 1.5)))
+    (assert-equal 'bad-syntax
+                  (puzzle-result-error-kind (puzzle-eval (vector 1))))
+    (assert-equal 'bad-syntax (puzzle-result-error-kind (puzzle-eval '(if))))
+    (assert-equal 'bad-syntax
+                  (puzzle-result-error-kind (puzzle-eval '(lambda))))
+    ;; A host float in operator position is rejected as an expression before
+    ;; it can ever be applied.
+    (assert-equal 'bad-syntax
+                  (puzzle-result-error-kind (puzzle-eval (list 1.5 1))))
+    (assert-equal 'bad-syntax
+                  (puzzle-result-error-kind (puzzle-eval (list '+ 1 1.5)))))
+
+  (test "a hand-built AST cannot smuggle a procedure past puzzle-eval"
+    ;; Quoted data holding a procedure would otherwise evaluate to `ok`
+    ;; with a closure inside the result value.
+    (assert-equal 'bad-syntax
+                  (puzzle-result-error-kind
+                    (puzzle-eval (list 'quote (list (val "car"))))))
+    (assert-equal 'bad-syntax
+                  (puzzle-result-error-kind
+                    (puzzle-eval (list 'quote (val "(lambda (x) x)")))))
+    ;; A procedure object in operator position is not applied either.
+    (assert-equal 'bad-syntax
+                  (puzzle-result-error-kind
+                    (puzzle-eval (list (val "car") (list 'quote (list 1))))))
+    (assert-equal 'bad-syntax
+                  (puzzle-result-error-kind (puzzle-eval (val "car")))))
+
+  (test "error messages are strings and error kinds are symbols"
+    (let ((result (puzzle-run "(car '())")))
+      (assert-true (symbol? (puzzle-result-error-kind result)))
+      (assert-true (string? (puzzle-result-message result))))))
+
+;; ============================================================
+;; Golf-realistic programs
+;; ============================================================
+
+(test-group "puzzle golf programs"
+  (test "countdown list"
+    (assert-value '(5 4 3 2 1)
+                  "(letrec ((f (lambda (n) (if (zero? n) '() (cons n (f (- n 1))))))) (f 5))"))
+
+  (test "sum of squares"
+    (assert-value 285 "(fold + 0 (map (lambda (x) (* x x)) (iota 10)))"))
+
+  (test "reverse via fold"
+    (assert-value '(4 3 2 1 0) "(fold cons '() (iota 5))"))
+
+  (test "flatten one level"
+    (assert-value '(1 2 3 4)
+                  "(fold (lambda (x a) (append a x)) '() '((1 2) (3 4)))"))
+
+  (test "string building"
+    (assert-value "0-1-2"
+                  (string-append "(fold (lambda (x a) (if (string? a)"
+                                 " (string-append a \"-\" (number->string x))"
+                                 " (number->string x))) #f (iota 3))"))))
 
 (run-tests)

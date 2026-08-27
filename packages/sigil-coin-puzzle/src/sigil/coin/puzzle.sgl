@@ -1,14 +1,1303 @@
-;;; (sigil coin puzzle) — SigilCoin puzzle language scaffold
+;;; (sigil coin puzzle) — SigilCoin puzzle language v1
+;;;
+;;; A frozen, consensus-critical mini-language. Miners publish a solution
+;;; expression (at most `puzzle-max-source-bytes` bytes) that every node
+;;; re-evaluates while validating a block, so this module must be:
+;;;
+;;;   * total       — every input terminates with a value or a tagged error
+;;;   * deterministic — identical results and identical step counts on every
+;;;                     machine, with no host exception ever escaping
+;;;   * bounded     — fuel, allocation, string, integer-magnitude and depth
+;;;                   caps make abuse impossible
+;;;
+;;; The language deliberately excludes I/O, crypto, host `eval`, floats,
+;;; mutation, `call/cc`, `define` and macros. Semantics are frozen at v1: any
+;;; behavioural change here is a chain split.
+;;;
+;;; Grammar (the whole language):
+;;;
+;;;   datum   = integer | boolean | string | symbol | list | "'" datum
+;;;   list    = "(" datum* ")"
+;;;   special = (quote d) | (if t c a) | (lambda (v ...) body)
+;;;           | (let ((v e) ...) body) | (letrec ((v e) ...) body)
+;;;           | (and e ...) | (or e ...)
+;;;
+;;; Everything else is a procedure application. Only `#f` is false.
 
 (define-library (sigil coin puzzle)
-  (export puzzle-package-version)
+  (import (sigil struct)
+          (sigil math))
+  (export
+    ;; Package metadata
+    puzzle-package-version
+    puzzle-language-version
+
+    ;; Resource caps (consensus constants)
+    puzzle-max-source-bytes
+    puzzle-max-parse-depth
+    puzzle-max-fuel
+    puzzle-max-integer
+    puzzle-max-allocations
+    puzzle-max-string-bytes
+    puzzle-max-eval-depth
+
+    ;; Result record
+    puzzle-result
+    puzzle-result?
+    puzzle-result-status
+    puzzle-result-value
+    puzzle-result-steps
+    puzzle-result-error-kind
+    puzzle-result-message
+    puzzle-ok?
+    puzzle-failed?
+
+    ;; Front end
+    puzzle-parse
+    puzzle-eval
+    puzzle-run
+
+    ;; Values
+    puzzle-value?
+    puzzle-value=?
+    puzzle-closure?
+    puzzle-procedure?
+    puzzle-print-value
+    puzzle-print-expression
+
+    ;; Vocabulary
+    puzzle-special-forms
+    puzzle-builtin-names)
+
   (begin
 
-    ;;; Version of the puzzle package, used as a scaffold placeholder until
-    ;;; the puzzle interpreter lands.
+    ;; ============================================================
+    ;; Package metadata
+    ;; ============================================================
+
+    ;;; Version of the puzzle package.
     ;;;
-    ;;; Example:
-    ;;;   (puzzle-package-version) ;=> "0.1.0"
+    ;;; ```scheme
+    ;;; (puzzle-package-version) ; => "0.1.0"
+    ;;; ```
     (define (puzzle-package-version)
       (: -> string?)
-      "0.1.0")))
+      "0.1.0")
+
+    ;;; Frozen language version. Bumping this is a consensus change and
+    ;;; requires a new chain, not a soft fork.
+    ;;;
+    ;;; ```scheme
+    ;;; (puzzle-language-version) ; => 1
+    ;;; ```
+    (define (puzzle-language-version)
+      (: -> integer?)
+      1)
+
+    ;; ============================================================
+    ;; Resource caps
+    ;; ============================================================
+
+    ;;; Maximum solution source size, in bytes. Source is ASCII-only, so a
+    ;;; byte is a character.
+    (define puzzle-max-source-bytes 256)
+
+    ;;; Maximum datum nesting the parser accepts. A quote shorthand counts as
+    ;;; one level, matching the `(quote ...)` form it expands to.
+    (define puzzle-max-parse-depth 64)
+
+    ;;; Maximum evaluator steps ("fuel") for one evaluation.
+    (define puzzle-max-fuel 1000000)
+
+    ;;; Exclusive bound on integer magnitude: every literal, intermediate and
+    ;;; result must satisfy `(< (abs n) puzzle-max-integer)`.
+    (define puzzle-max-integer (expt 2 256))
+
+    ;;; Maximum *charged* list cells for one evaluation.
+    ;;;
+    ;;; This is a consensus budget, not a host heap measurement. Only the
+    ;;; list-producing builtins charge it: `cons`, `list`, `reverse`,
+    ;;; `append`, `map`, `filter` and `iota`. It deliberately undercounts
+    ;;; real host allocation, and the undercount is part of v1:
+    ;;;
+    ;;;   * environment frames, binding boxes and closure structs are free
+    ;;;   * the argument list `ev-args` builds per application is free
+    ;;;   * `append`, `map` and `filter` accumulate a reversed list and then
+    ;;;     copy it, so they touch about `2n` host pairs while charging `n`
+    ;;;
+    ;;; Both the charge and the undercount are deterministic, so every node
+    ;;; reaches `allocation-exceeded` on exactly the same step. The name is a
+    ;;; budget, not a byte count.
+    ;;;
+    ;;; Real memory is bounded by `puzzle-max-fuel` instead: every host
+    ;;; allocation an evaluation can make is charged at least one step within
+    ;;; a small constant factor, so peak residency is `O(puzzle-max-fuel)`
+    ;;; host objects. The measured worst case is a closure-retaining `letrec`
+    ;;; loop at roughly 124 MB RSS. That figure, not this constant, is the
+    ;;; memory ceiling to re-measure before either cap moves.
+    (define puzzle-max-allocations 100000)
+
+    ;;; Maximum bytes of string constructed during one evaluation.
+    (define puzzle-max-string-bytes 65536)
+
+    ;;; Maximum non-tail evaluation depth. Tail calls do not consume depth, so
+    ;;; loops are bounded by fuel alone; this cap only bounds nesting. It is
+    ;;; deliberately far below the host VM call limit so a runaway non-tail
+    ;;; recursion produces a `depth-exceeded` result instead of a host stack
+    ;;; overflow.
+    (define puzzle-max-eval-depth 128)
+
+    ;; ============================================================
+    ;; Result record
+    ;; ============================================================
+
+    ;;; Outcome of a parse or an evaluation.
+    ;;;
+    ;;; `status` is `ok` or `error`. On `ok`, `value` holds the AST (parse) or
+    ;;; the computed value (eval). On `error`, `error-kind` is one of the
+    ;;; frozen kind symbols and `message` is a human-readable detail that is
+    ;;; NOT consensus-relevant. `steps` is the fuel consumed, and is
+    ;;; meaningful for evaluation results only.
+    ;;;
+    ;;; ```scheme
+    ;;; (puzzle-result-status (puzzle-run "(+ 1 2)")) ; => ok
+    ;;; (puzzle-result-value (puzzle-run "(+ 1 2)"))  ; => 3
+    ;;; ```
+    (define-struct puzzle-result
+      (status)
+      (value default: #f)
+      (steps default: 0)
+      (error-kind default: #f)
+      (message default: ""))
+
+    ;;; True when a result carries a value.
+    ;;;
+    ;;; ```scheme
+    ;;; (puzzle-ok? (puzzle-run "1")) ; => #t
+    ;;; ```
+    (define (puzzle-ok? result)
+      (: any? -> boolean?)
+      (and (puzzle-result? result)
+           (eq? 'ok (puzzle-result-status result))))
+
+    ;;; True when a result carries an error kind.
+    ;;;
+    ;;; ```scheme
+    ;;; (puzzle-failed? (puzzle-run "(car '())")) ; => #t
+    ;;; ```
+    (define (puzzle-failed? result)
+      (: any? -> boolean?)
+      (and (puzzle-result? result)
+           (eq? 'error (puzzle-result-status result))))
+
+    ;; ============================================================
+    ;; Internal failure signalling
+    ;; ============================================================
+
+    ;; Internal abort payload. Raised inside the parser and evaluator and
+    ;; always caught at the API boundary, so callers never see a host
+    ;; exception.
+    (define-struct puzzle--abort
+      (kind)
+      (message))
+
+    (define (fail kind message)
+      (raise (puzzle--abort kind: kind message: message)))
+
+    ;; Convert any caught host condition into an error result. A non-abort
+    ;; condition means the interpreter itself misbehaved (or the host hit a
+    ;; limit we failed to bound); it is still reported deterministically.
+    (define (abort->result condition steps)
+      (if (puzzle--abort? condition)
+          (puzzle-result status: 'error
+                         steps: steps
+                         error-kind: (puzzle--abort-kind condition)
+                         message: (puzzle--abort-message condition))
+          (puzzle-result status: 'error
+                         steps: steps
+                         error-kind: 'internal-error
+                         message: "interpreter invariant violated")))
+
+    ;; ============================================================
+    ;; Values
+    ;; ============================================================
+
+    ;; A user-defined procedure. `params` is a list of distinct symbols,
+    ;; `body` a single expression, `env` the defining environment.
+    (define-struct puzzle-closure
+      (params)
+      (body)
+      (env))
+
+    ;; A primitive procedure. `arity-max` of #f means variadic.
+    (define-struct puzzle-builtin
+      (name)
+      (arity-min)
+      (arity-max)
+      (proc))
+
+    ;; A mutable binding cell. Only `letrec` ever rebinds one, and only during
+    ;; its own initialisation.
+    (define-struct puzzle--box
+      (value mutable: #t))
+
+    ;; Marker used by the iterative printer to emit literal text.
+    (define-struct puzzle--emit
+      (text))
+
+    ;; Placeholder stored in a letrec cell before its initialiser has run.
+    (define puzzle--unassigned (list 'puzzle-unassigned))
+
+    ;;; True for any applicable puzzle value (closure or builtin).
+    ;;;
+    ;;; ```scheme
+    ;;; (puzzle-procedure? (puzzle-result-value (puzzle-run "car"))) ; => #t
+    ;;; ```
+    (define (puzzle-procedure? value)
+      (: any? -> boolean?)
+      (or (puzzle-closure? value)
+          (puzzle-builtin? value)))
+
+    ;;; True when `value` inhabits the v1 datum domain: exact integer,
+    ;;; boolean, string, symbol, or proper list of those.
+    ;;;
+    ;;; Procedures are deliberately excluded. They are runtime results, never
+    ;;; data: the parser cannot produce one, quoted data must not contain
+    ;;; one, and a hand-built AST handed to `puzzle-eval` that embeds one is
+    ;;; rejected as `bad-syntax` rather than evaluated.
+    ;;;
+    ;;; ```scheme
+    ;;; (puzzle-value? '(1 #t "a")) ; => #t
+    ;;; (puzzle-value? 1.5)         ; => #f
+    ;;; ```
+    (define (puzzle-value? value)
+      (: any? -> boolean?)
+      (let loop ((pending (list value)))
+        (cond
+          ((null? pending) #t)
+          (else
+            (let ((v (car pending))
+                  (rest (cdr pending)))
+              (cond
+                ((null? v) (loop rest))
+                ((puzzle--atom? v) (loop rest))
+                ;; Only proper lists are values: an improper tail is not a v1
+                ;; datum, so `(1 . 2)` is rejected here as it is by the parser.
+                ((pair? v)
+                 (if (or (null? (cdr v)) (pair? (cdr v)))
+                     (loop (cons (car v) (cons (cdr v) rest)))
+                     #f))
+                (else #f)))))))
+
+    (define (puzzle--atom? v)
+      (or (and (number? v) (exact? v) (integer? v))
+          (boolean? v)
+          (string? v)
+          (symbol? v)))
+
+    ;; ============================================================
+    ;; Deep structural equality
+    ;; ============================================================
+
+    ;;; Deep structural equality over puzzle values. Integers compare by
+    ;;; magnitude, strings and symbols by contents, lists element-wise.
+    ;;; Procedures are equal only when identical objects. The walk is
+    ;;; iterative, so arbitrarily deep values cannot overflow the host stack.
+    ;;;
+    ;;; ```scheme
+    ;;; (puzzle-value=? '(1 (2 3)) '(1 (2 3))) ; => #t
+    ;;; (puzzle-value=? '(1 (2 3)) '(1 (2 4))) ; => #f
+    ;;; ```
+    (define (puzzle-value=? a b)
+      (: any? any? -> boolean?)
+      (let loop ((left (list a)) (right (list b)))
+        (cond
+          ((null? left) (null? right))
+          ((null? right) #f)
+          (else
+            (let ((x (car left))
+                  (y (car right)))
+              (cond
+                ((and (pair? x) (pair? y))
+                 (loop (cons (car x) (cons (cdr x) (cdr left)))
+                       (cons (car y) (cons (cdr y) (cdr right)))))
+                ((or (pair? x) (pair? y)) #f)
+                ((puzzle--atom=? x y) (loop (cdr left) (cdr right)))
+                (else #f)))))))
+
+    (define (puzzle--atom=? x y)
+      (cond
+        ((null? x) (null? y))
+        ((null? y) #f)
+        ((and (number? x) (number? y)) (= x y))
+        ((and (boolean? x) (boolean? y)) (eq? x y))
+        ((and (string? x) (string? y)) (string=? x y))
+        ((and (symbol? x) (symbol? y)) (eq? x y))
+        (else (eq? x y))))
+
+    ;; Number of nodes `puzzle-value=?` may visit, used to charge fuel for the
+    ;; `equal?` builtin.
+    (define (puzzle--value-size v limit)
+      (let loop ((pending (list v)) (count 0))
+        (cond
+          ((null? pending) count)
+          ((>= count limit) count)
+          (else
+            (let ((x (car pending))
+                  (rest (cdr pending)))
+              (if (pair? x)
+                  (loop (cons (car x) (cons (cdr x) rest)) (+ count 1))
+                  (loop rest (+ count 1))))))))
+
+    ;; ============================================================
+    ;; Canonical printing
+    ;; ============================================================
+
+    ;; Shared driver for both printers. `quote-shorthand?` selects the
+    ;; expression form, which renders `(quote x)` as `'x`.
+    (define (puzzle--print value quote-shorthand?)
+      (let loop ((stack (list value)) (chunks '()))
+        (if (null? stack)
+            (string-join (reverse chunks))
+            (let ((item (car stack))
+                  (rest (cdr stack)))
+              (cond
+                ((puzzle--emit? item)
+                 (loop rest (cons (puzzle--emit-text item) chunks)))
+                ((null? item)
+                 (loop rest (cons "()" chunks)))
+                ((pair? item)
+                 (if (and quote-shorthand?
+                          (eq? 'quote (car item))
+                          (pair? (cdr item))
+                          (null? (cdr (cdr item))))
+                     (loop (cons (car (cdr item)) rest) (cons "'" chunks))
+                     (loop (append (puzzle--list-items item quote-shorthand?)
+                                   (cons (puzzle--emit text: ")") rest))
+                           (cons "(" chunks))))
+                (else
+                  (loop rest (cons (puzzle--print-atom item) chunks))))))))
+
+    ;; Interleave a list's elements with separator markers. A host improper
+    ;; tail cannot come from the parser or the evaluator; if one is ever
+    ;; printed, it is dropped rather than crashing.
+    (define (puzzle--list-items lst quote-shorthand?)
+      (let loop ((items lst) (acc '()) (first? #t))
+        (if (not (pair? items))
+            (reverse acc)
+            (loop (cdr items)
+                  (cons (car items)
+                        (if first? acc (cons (puzzle--emit text: " ") acc)))
+                  #f))))
+
+    (define (puzzle--print-atom v)
+      (cond
+        ((eq? v #t) "#t")
+        ((eq? v #f) "#f")
+        ((number? v) (number->string v))
+        ((symbol? v) (symbol->string v))
+        ((string? v) (puzzle--print-string v))
+        ((puzzle-builtin? v)
+         (string-append "#<builtin "
+                        (symbol->string (puzzle-builtin-name v))
+                        ">"))
+        ((puzzle-closure? v) "#<closure>")
+        (else "#<opaque>")))
+
+    ;; Only `"`, `\` and newline are escaped. Any other character, including
+    ;; a raw control character the parser accepted inside a string literal,
+    ;; is emitted verbatim. That is frozen: the printer never widens.
+    (define (puzzle--print-string s)
+      (let ((n (string-length s)))
+        (let loop ((i 0) (acc (list "\"")))
+          (if (>= i n)
+              (string-join (reverse (cons "\"" acc)))
+              (let ((c (string-ref s i)))
+                (loop (+ i 1)
+                      (cons (cond
+                              ((char=? c #\") "\\\"")
+                              ((char=? c #\\) "\\\\")
+                              ((char=? c #\newline) "\\n")
+                              (else (string c)))
+                            acc)))))))
+
+    ;;; Canonical text for a puzzle value. Stable and machine-independent:
+    ;;; the same value always prints the same bytes.
+    ;;;
+    ;;; ```scheme
+    ;;; (puzzle-print-value '(1 (2 "a") sym)) ; => "(1 (2 \"a\") sym)"
+    ;;; (puzzle-print-value '())              ; => "()"
+    ;;; ```
+    (define (puzzle-print-value value)
+      (: any? -> string?)
+      (puzzle--print value #f))
+
+    ;;; Canonical source text for an expression. Emits the shortest form the
+    ;;; parser accepts — single spaces, no padding, `'x` for `(quote x)` — so
+    ;;; the puzzle generator can measure par directly from it. Re-parsing the
+    ;;; output yields the same AST.
+    ;;;
+    ;;; ```scheme
+    ;;; (puzzle-print-expression '(if #t (quote a) 2)) ; => "(if #t 'a 2)"
+    ;;; ```
+    (define (puzzle-print-expression expr)
+      (: any? -> string?)
+      (puzzle--print expr #t))
+
+    ;; ============================================================
+    ;; Parser
+    ;; ============================================================
+
+    ;; Characters that terminate a bare token.
+    (define (puzzle--delimiter? c)
+      (or (char=? c #\() (char=? c #\)) (char=? c #\")
+          (char=? c #\') (puzzle--space? c)))
+
+    (define (puzzle--space? c)
+      (or (char=? c #\space) (char=? c #\tab)
+          (char=? c #\newline) (char=? c #\return)))
+
+    (define (puzzle--digit? c)
+      (and (char>=? c #\0) (char<=? c #\9)))
+
+    ;; Decode the source into an ASCII string, enforcing the size cap. Source
+    ;; is restricted to ASCII so that byte counts and character counts agree
+    ;; on every host.
+    (define (puzzle--source->text source)
+      (cond
+        ((string? source)
+         (let ((n (string-length source)))
+           (if (> n puzzle-max-source-bytes)
+               (fail 'parse-oversize "source exceeds the byte cap"))
+           (let loop ((i 0))
+             (if (>= i n)
+                 source
+                 (begin
+                   (if (>= (char->integer (string-ref source i)) 128)
+                       (fail 'parse-syntax "source must be ASCII"))
+                   (loop (+ i 1)))))))
+        ((bytevector? source)
+         (let ((n (bytevector-length source)))
+           (if (> n puzzle-max-source-bytes)
+               (fail 'parse-oversize "source exceeds the byte cap"))
+           (let loop ((i 0) (acc '()))
+             (if (>= i n)
+                 (list->string (reverse acc))
+                 (let ((b (bytevector-u8-ref source i)))
+                   (if (>= b 128)
+                       (fail 'parse-syntax "source must be ASCII"))
+                   (loop (+ i 1) (cons (integer->char b) acc)))))))
+        (else (fail 'parse-syntax "source must be a string or bytevector"))))
+
+    (define (puzzle--skip-space text i n)
+      (if (and (< i n) (puzzle--space? (string-ref text i)))
+          (puzzle--skip-space text (+ i 1) n)
+          i))
+
+    ;; Read one datum starting at `i`. Returns (datum . next-index).
+    (define (puzzle--read text i n depth)
+      (if (> depth puzzle-max-parse-depth)
+          (fail 'parse-depth "expression nests too deeply"))
+      (let ((i (puzzle--skip-space text i n)))
+        (if (>= i n)
+            (fail 'parse-syntax "unexpected end of input"))
+        (let ((c (string-ref text i)))
+          (cond
+            ((char=? c #\() (puzzle--read-list text (+ i 1) n depth))
+            ((char=? c #\)) (fail 'parse-syntax "unexpected close paren"))
+            ((char=? c #\')
+             (let ((inner (puzzle--read text (+ i 1) n (+ depth 1))))
+               (cons (list 'quote (car inner)) (cdr inner))))
+            ((char=? c #\") (puzzle--read-string text (+ i 1) n))
+            (else (puzzle--read-token text i n))))))
+
+    (define (puzzle--read-list text i n depth)
+      (let loop ((i i) (acc '()))
+        (let ((i (puzzle--skip-space text i n)))
+          (if (>= i n)
+              (fail 'parse-syntax "unterminated list"))
+          (let ((c (string-ref text i)))
+            (if (char=? c #\))
+                (cons (reverse acc) (+ i 1))
+                (let ((item (puzzle--read text i n (+ depth 1))))
+                  (loop (cdr item) (cons (car item) acc))))))))
+
+    (define (puzzle--read-string text i n)
+      (let loop ((i i) (acc '()))
+        (if (>= i n)
+            (fail 'parse-syntax "unterminated string"))
+        (let ((c (string-ref text i)))
+          (cond
+            ((char=? c #\") (cons (list->string (reverse acc)) (+ i 1)))
+            ((char=? c #\\)
+             (if (>= (+ i 1) n)
+                 (fail 'parse-syntax "unterminated string escape"))
+             (let ((e (string-ref text (+ i 1))))
+               (cond
+                 ((char=? e #\") (loop (+ i 2) (cons #\" acc)))
+                 ((char=? e #\\) (loop (+ i 2) (cons #\\ acc)))
+                 ((char=? e #\n) (loop (+ i 2) (cons #\newline acc)))
+                 (else (fail 'parse-syntax "unknown string escape")))))
+            (else (loop (+ i 1) (cons c acc)))))))
+
+    ;; Read a bare token: `#t`, `#f`, an integer, or a symbol.
+    (define (puzzle--read-token text i n)
+      (let loop ((j i))
+        (if (and (< j n) (not (puzzle--delimiter? (string-ref text j))))
+            (loop (+ j 1))
+            (let ((token (substring text i j)))
+              (cons (puzzle--token->datum token) j)))))
+
+    (define (puzzle--token->datum token)
+      (cond
+        ((string=? token "#t") #t)
+        ((string=? token "#f") #f)
+        ((string=? token ".") (fail 'parse-syntax "dotted pairs are not v1"))
+        ((puzzle--integer-token? token)
+         (let ((value (string->number token)))
+           (if (not (and (number? value) (exact? value) (integer? value)))
+               (fail 'parse-syntax "malformed integer literal"))
+           (if (>= (abs value) puzzle-max-integer)
+               (fail 'overflow "integer literal exceeds the magnitude cap"))
+           value))
+        ((puzzle--symbol-token? token) (string->symbol token))
+        (else (fail 'parse-syntax "malformed token"))))
+
+    (define (puzzle--integer-token? token)
+      (let* ((n (string-length token))
+             (start (if (and (> n 0) (char=? (string-ref token 0) #\-)) 1 0)))
+        (and (> n start)
+             (let loop ((i start))
+               (cond
+                 ((>= i n) #t)
+                 ((puzzle--digit? (string-ref token i)) (loop (+ i 1)))
+                 (else #f))))))
+
+    ;; A symbol may not start with `#` or a digit, and may not look like a
+    ;; number. Everything else non-delimiting is allowed; there is no comment
+    ;; syntax in v1.
+    (define (puzzle--symbol-token? token)
+      (let ((n (string-length token)))
+        (and (> n 0)
+             (not (char=? (string-ref token 0) #\#))
+             (not (puzzle--digit? (string-ref token 0)))
+             (not (and (char=? (string-ref token 0) #\-)
+                       (> n 1)
+                       (puzzle--digit? (string-ref token 1)))))))
+
+    ;;; Parse solution source into an AST.
+    ;;;
+    ;;; Accepts a string or a bytevector of at most `puzzle-max-source-bytes`
+    ;;; ASCII bytes containing exactly one datum. Returns a `puzzle-result`:
+    ;;; `ok` with the AST in `value`, or `error` with kind `parse-oversize`,
+    ;;; `parse-depth`, `parse-syntax` or `overflow`.
+    ;;;
+    ;;; ```scheme
+    ;;; (puzzle-result-value (puzzle-parse "(+ 1 2)")) ; => (+ 1 2)
+    ;;; (puzzle-result-error-kind (puzzle-parse "(1"))  ; => parse-syntax
+    ;;; ```
+    (define (puzzle-parse source)
+      (: any? -> puzzle-result?)
+      (guard (e (#t (abort->result e 0)))
+        (let* ((text (puzzle--source->text source))
+               (n (string-length text))
+               (start (puzzle--skip-space text 0 n)))
+          (if (>= start n)
+              (fail 'parse-syntax "empty source"))
+          (let* ((parsed (puzzle--read text start n 1))
+                 (after (puzzle--skip-space text (cdr parsed) n)))
+            (if (< after n)
+                (fail 'parse-syntax "trailing input after the expression"))
+            (puzzle-result status: 'ok value: (car parsed))))))
+
+    ;; ============================================================
+    ;; Machine state
+    ;; ============================================================
+
+    (define-struct puzzle--machine
+      (fuel default: 0 mutable: #t)
+      (cells default: 0 mutable: #t)
+      (string-bytes default: 0 mutable: #t))
+
+    (define (spend! m cost)
+      (let ((left (- (puzzle--machine-fuel m) cost)))
+        (if (< left 0)
+            (begin
+              (set-puzzle--machine-fuel! m 0)
+              (fail 'fuel-exhausted "step limit reached")))
+        (set-puzzle--machine-fuel! m left)))
+
+    (define (alloc! m cells)
+      (let ((used (+ (puzzle--machine-cells m) cells)))
+        (if (> used puzzle-max-allocations)
+            (fail 'allocation-exceeded "list allocation limit reached"))
+        (set-puzzle--machine-cells! m used)))
+
+    (define (alloc-string! m bytes)
+      (let ((used (+ (puzzle--machine-string-bytes m) bytes)))
+        (if (> used puzzle-max-string-bytes)
+            (fail 'string-limit "string allocation limit reached"))
+        (set-puzzle--machine-string-bytes! m used)))
+
+    (define (steps-used m)
+      (- puzzle-max-fuel (puzzle--machine-fuel m)))
+
+    ;; ============================================================
+    ;; Environments
+    ;; ============================================================
+
+    ;; An environment is an association list of (symbol . box) holding only
+    ;; local bindings; shadowing is positional, so the most recent binding is
+    ;; found first. Builtins live in a table consulted after the locals miss,
+    ;; which keeps a builtin reference O(1) instead of a walk past all 41 of
+    ;; them, and still lets a local binding shadow a builtin name.
+    (define (env-lookup env name)
+      (let ((hit (assq name env)))
+        (if hit
+            (let ((value (puzzle--box-value (cdr hit))))
+              (if (eq? value puzzle--unassigned)
+                  (fail 'uninitialized (symbol->string name)))
+              value)
+            (let ((builtin (dict-ref %builtin-table name #f)))
+              (if (not builtin)
+                  (fail 'unbound-variable (symbol->string name)))
+              builtin))))
+
+    (define (env-bind env name value)
+      (cons (cons name (puzzle--box value: value)) env))
+
+    ;; ============================================================
+    ;; Special forms
+    ;; ============================================================
+
+    ;;; Symbols reserved as special forms. They cannot be shadowed or used as
+    ;;; binding names; builtin names can be.
+    ;;;
+    ;;; ```scheme
+    ;;; (puzzle-special-forms) ; => (quote if lambda let letrec and or)
+    ;;; ```
+    (define (puzzle-special-forms)
+      (: -> list?)
+      '(quote if lambda let letrec and or))
+
+    (define (reserved? name)
+      (memq name '(quote if lambda let letrec and or)))
+
+    (define (check-binding-name name)
+      (if (not (symbol? name))
+          (fail 'bad-syntax "binding name must be a symbol"))
+      (if (reserved? name)
+          (fail 'bad-syntax "cannot bind a special form name"))
+      name)
+
+    (define (list-of-length? x n)
+      (let loop ((x x) (n n))
+        (cond
+          ((= n 0) (null? x))
+          ((pair? x) (loop (cdr x) (- n 1)))
+          (else #f))))
+
+    (define (proper-list? x)
+      (let loop ((x x))
+        (cond
+          ((null? x) #t)
+          ((pair? x) (loop (cdr x)))
+          (else #f))))
+
+    (define (truthy? v)
+      (not (eq? v #f)))
+
+    ;; ============================================================
+    ;; Evaluator
+    ;; ============================================================
+
+    ;; Evaluate `expr`. Tail positions reuse `depth`, so tail recursion is
+    ;; bounded only by fuel; every non-tail subexpression takes `depth + 1`.
+    (define (ev m expr env depth)
+      (if (> depth puzzle-max-eval-depth)
+          (fail 'depth-exceeded "evaluation nests too deeply"))
+      (spend! m 1)
+      (cond
+        ((symbol? expr) (env-lookup env expr))
+        ((null? expr) (fail 'bad-syntax "empty application"))
+        ((pair? expr) (ev-form m expr env depth))
+        ((puzzle--atom? expr) expr)
+        ;; Procedures are not atoms, so a hand-built AST carrying a closure
+        ;; or builtin object is rejected here instead of self-evaluating.
+        (else (fail 'bad-syntax "not a valid expression"))))
+
+    (define (ev-form m expr env depth)
+      (if (not (proper-list? expr))
+          (fail 'bad-syntax "improper form"))
+      (let ((head (car expr))
+            (rest (cdr expr)))
+        (cond
+          ((eq? head 'quote) (ev-quote m rest))
+          ((eq? head 'if) (ev-if m rest env depth))
+          ((eq? head 'lambda) (ev-lambda m rest env))
+          ((eq? head 'let) (ev-let m rest env depth))
+          ((eq? head 'letrec) (ev-letrec m rest env depth))
+          ((eq? head 'and) (ev-and m rest env depth))
+          ((eq? head 'or) (ev-or m rest env depth))
+          ;; `let*`, not `let`: R7RS leaves `let` init order unspecified, and
+          ;; the choice is consensus-visible. `(zz (car '()))` must report
+          ;; `unbound-variable` after two steps, not the arguments' error.
+          (else
+            (let* ((proc (ev m head env (+ depth 1)))
+                   (args (ev-args m rest env (+ depth 1))))
+              (puzzle--apply m proc args depth))))))
+
+    ;; Quoted data is shared, not copied, so it costs no allocation. It does
+    ;; cost fuel proportional to its size, which bounds the validation walk
+    ;; even when `puzzle-eval` is handed a hand-built AST.
+    (define (ev-quote m rest)
+      (if (not (list-of-length? rest 1))
+          (fail 'bad-syntax "quote takes exactly one datum"))
+      (let* ((datum (car rest))
+             (size (puzzle--value-size datum puzzle-max-allocations)))
+        (spend! m size)
+        (if (>= size puzzle-max-allocations)
+            (fail 'bad-syntax "quoted datum is too large"))
+        (if (not (puzzle-value? datum))
+            (fail 'bad-syntax "quoted datum is not a v1 value"))
+        datum))
+
+    (define (ev-if m rest env depth)
+      (if (not (list-of-length? rest 3))
+          (fail 'bad-syntax "if takes exactly three subexpressions"))
+      (if (truthy? (ev m (car rest) env (+ depth 1)))
+          (ev m (car (cdr rest)) env depth)
+          (ev m (car (cdr (cdr rest))) env depth)))
+
+    (define (ev-lambda m rest env)
+      (if (not (list-of-length? rest 2))
+          (fail 'bad-syntax "lambda takes a parameter list and one body"))
+      (let ((params (car rest)))
+        (if (not (proper-list? params))
+            (fail 'bad-syntax "lambda parameters must be a proper list"))
+        (let loop ((ps params))
+          (if (pair? ps)
+              (begin
+                (check-binding-name (car ps))
+                (if (memq (car ps) (cdr ps))
+                    (fail 'bad-syntax "duplicate lambda parameter"))
+                (loop (cdr ps)))))
+        (puzzle-closure params: params
+                        body: (car (cdr rest))
+                        env: env)))
+
+    (define (ev-bindings rest form)
+      (if (not (list-of-length? rest 2))
+          (fail 'bad-syntax (string-append form " takes bindings and one body")))
+      (let ((bindings (car rest)))
+        (if (not (proper-list? bindings))
+            (fail 'bad-syntax "bindings must be a proper list"))
+        (let loop ((bs bindings) (names '()))
+          (if (null? bs)
+              bindings
+              (let ((b (car bs)))
+                (if (not (list-of-length? b 2))
+                    (fail 'bad-syntax "each binding must be (name expr)"))
+                (check-binding-name (car b))
+                (if (memq (car b) names)
+                    (fail 'bad-syntax "duplicate binding name"))
+                (loop (cdr bs) (cons (car b) names)))))))
+
+    (define (ev-let m rest env depth)
+      (let ((bindings (ev-bindings rest "let")))
+        (let loop ((bs bindings) (new-env env))
+          (if (null? bs)
+              (ev m (car (cdr rest)) new-env depth)
+              (let ((value (ev m (car (cdr (car bs))) env (+ depth 1))))
+                (loop (cdr bs) (env-bind new-env (car (car bs)) value)))))))
+
+    (define (ev-letrec m rest env depth)
+      (let* ((bindings (ev-bindings rest "letrec"))
+             (new-env
+               (let loop ((bs bindings) (acc env))
+                 (if (null? bs)
+                     acc
+                     (loop (cdr bs)
+                           (env-bind acc (car (car bs)) puzzle--unassigned))))))
+        (let loop ((bs bindings))
+          (if (null? bs)
+              (ev m (car (cdr rest)) new-env depth)
+              (let* ((name (car (car bs)))
+                     (value (ev m (car (cdr (car bs))) new-env (+ depth 1)))
+                     (cell (cdr (assq name new-env))))
+                (set-puzzle--box-value! cell value)
+                (loop (cdr bs)))))))
+
+    (define (ev-and m rest env depth)
+      (cond
+        ((null? rest) #t)
+        ((null? (cdr rest)) (ev m (car rest) env depth))
+        (else
+          (if (truthy? (ev m (car rest) env (+ depth 1)))
+              (ev-and m (cdr rest) env depth)
+              #f))))
+
+    (define (ev-or m rest env depth)
+      (cond
+        ((null? rest) #f)
+        ((null? (cdr rest)) (ev m (car rest) env depth))
+        (else
+          (let ((value (ev m (car rest) env (+ depth 1))))
+            (if (truthy? value)
+                value
+                (ev-or m (cdr rest) env depth))))))
+
+    (define (ev-args m exprs env depth)
+      (let loop ((exprs exprs) (acc '()))
+        (if (null? exprs)
+            (reverse acc)
+            (loop (cdr exprs)
+                  (cons (ev m (car exprs) env depth) acc)))))
+
+    (define (count-args args)
+      (let loop ((a args) (n 0))
+        (if (null? a) n (loop (cdr a) (+ n 1)))))
+
+    ;; Apply a closure or builtin. Closure bodies are evaluated in tail
+    ;; position at the caller's depth, which is what makes puzzle-level tail
+    ;; recursion iterative.
+    (define (puzzle--apply m proc args depth)
+      (if (> depth puzzle-max-eval-depth)
+          (fail 'depth-exceeded "evaluation nests too deeply"))
+      (spend! m 1)
+      (cond
+        ((puzzle-closure? proc)
+         (let ((params (puzzle-closure-params proc)))
+           (if (not (= (count-args params) (count-args args)))
+               (fail 'arity-error "closure called with the wrong argument count"))
+           (let loop ((ps params) (as args) (env (puzzle-closure-env proc)))
+             (if (null? ps)
+                 (ev m (puzzle-closure-body proc) env depth)
+                 (loop (cdr ps) (cdr as)
+                       (env-bind env (car ps) (car as)))))))
+        ((puzzle-builtin? proc)
+         (let ((n (count-args args))
+               (lo (puzzle-builtin-arity-min proc))
+               (hi (puzzle-builtin-arity-max proc)))
+           (if (or (< n lo) (and hi (> n hi)))
+               (fail 'arity-error
+                     (string-append (symbol->string (puzzle-builtin-name proc))
+                                    ": wrong argument count")))
+           ((puzzle-builtin-proc proc) m args depth)))
+        (else (fail 'type-error "attempt to apply a non-procedure"))))
+
+    ;; ============================================================
+    ;; Builtin helpers
+    ;; ============================================================
+
+    (define (need-integer name v)
+      (if (not (and (number? v) (exact? v) (integer? v)))
+          (fail 'type-error (string-append name ": expected an integer")))
+      v)
+
+    (define (need-list name v)
+      (if (not (or (null? v) (pair? v)))
+          (fail 'type-error (string-append name ": expected a list")))
+      v)
+
+    (define (need-pair name v)
+      (if (not (pair? v))
+          (fail 'type-error (string-append name ": expected a non-empty list")))
+      v)
+
+    (define (need-string name v)
+      (if (not (string? v))
+          (fail 'type-error (string-append name ": expected a string")))
+      v)
+
+    (define (need-procedure name v)
+      (if (not (or (puzzle-closure? v) (puzzle-builtin? v)))
+          (fail 'type-error (string-append name ": expected a procedure")))
+      v)
+
+    ;; Every arithmetic result passes through here, so no intermediate can
+    ;; escape the magnitude cap.
+    (define (bounded name n)
+      (if (>= (abs n) puzzle-max-integer)
+          (fail 'overflow (string-append name ": integer magnitude cap")))
+      n)
+
+    (define (list-length name v)
+      (let loop ((x v) (n 0))
+        (cond
+          ((null? x) n)
+          ((pair? x) (loop (cdr x) (+ n 1)))
+          (else (fail 'type-error (string-append name ": expected a list"))))))
+
+    (define (integers name args)
+      (let loop ((a args))
+        (if (pair? a)
+            (begin (need-integer name (car a)) (loop (cdr a)))))
+      args)
+
+    ;; ============================================================
+    ;; Builtins
+    ;; ============================================================
+
+    ;; Every builtin below checks its arguments strictly left to right, via
+    ;; `let*`. With `let` the order is unspecified, and for the division
+    ;; builtins it selects between `type-error` and `division-by-zero`.
+    (define (bi-cons m args depth)
+      (let* ((head (car args))
+             (tail (need-list "cons" (car (cdr args)))))
+        (alloc! m 1)
+        (cons head tail)))
+
+    (define (bi-car m args depth)
+      (car (need-pair "car" (car args))))
+
+    (define (bi-cdr m args depth)
+      (cdr (need-pair "cdr" (car args))))
+
+    (define (bi-list m args depth)
+      (let ((n (count-args args)))
+        (spend! m n)
+        (alloc! m n)
+        args))
+
+    (define (bi-null? m args depth)
+      (null? (car args)))
+
+    (define (bi-pair? m args depth)
+      (pair? (car args)))
+
+    (define (bi-length m args depth)
+      (let ((n (list-length "length" (car args))))
+        (spend! m n)
+        n))
+
+    (define (bi-reverse m args depth)
+      (let* ((lst (need-list "reverse" (car args)))
+             (n (list-length "reverse" lst)))
+        (spend! m n)
+        (alloc! m n)
+        (let loop ((x lst) (acc '()))
+          (if (null? x) acc (loop (cdr x) (cons (car x) acc))))))
+
+    (define (bi-append m args depth)
+      (cond
+        ((null? args) '())
+        (else
+          (let loop ((rest args) (acc '()))
+            (if (null? (cdr rest))
+                (let ((tail (need-list "append" (car rest))))
+                  (let build ((x acc) (out tail))
+                    (if (null? x) out (build (cdr x) (cons (car x) out)))))
+                (let* ((lst (need-list "append" (car rest)))
+                       (n (list-length "append" lst)))
+                  (spend! m n)
+                  (alloc! m n)
+                  (let copy ((x lst) (acc acc))
+                    (if (null? x)
+                        (loop (cdr rest) acc)
+                        (copy (cdr x) (cons (car x) acc))))))))))
+
+    (define (bi-map m args depth)
+      (let* ((proc (need-procedure "map" (car args)))
+             (lst (need-list "map" (car (cdr args))))
+             (n (list-length "map" lst)))
+        (spend! m n)
+        (alloc! m n)
+        (let loop ((x lst) (acc '()))
+          (if (null? x)
+              (reverse acc)
+              (loop (cdr x)
+                    (cons (puzzle--apply m proc (list (car x)) (+ depth 1))
+                          acc))))))
+
+    (define (bi-filter m args depth)
+      (let* ((proc (need-procedure "filter" (car args)))
+             (lst (need-list "filter" (car (cdr args))))
+             (n (list-length "filter" lst)))
+        (spend! m n)
+        (let loop ((x lst) (acc '()))
+          (if (null? x)
+              (reverse acc)
+              (let ((keep (puzzle--apply m proc (list (car x)) (+ depth 1))))
+                (if (truthy? keep)
+                    (begin
+                      (alloc! m 1)
+                      (loop (cdr x) (cons (car x) acc)))
+                    (loop (cdr x) acc)))))))
+
+    ;; `(fold kons knil lst)` — kons receives (element accumulator), the
+    ;; SRFI-1 argument order.
+    (define (bi-fold m args depth)
+      (let* ((proc (need-procedure "fold" (car args)))
+             (seed (car (cdr args)))
+             (lst (need-list "fold" (car (cdr (cdr args)))))
+             (n (list-length "fold" lst)))
+        (spend! m n)
+        (let loop ((x lst) (acc seed))
+          (if (null? x)
+              acc
+              (loop (cdr x)
+                    (puzzle--apply m proc (list (car x) acc) (+ depth 1)))))))
+
+    (define (bi-iota m args depth)
+      (let ((n (need-integer "iota" (car args))))
+        (if (< n 0)
+            (fail 'type-error "iota: expected a non-negative count"))
+        (if (> n puzzle-max-allocations)
+            (fail 'allocation-exceeded "iota: list allocation limit reached"))
+        (spend! m n)
+        (alloc! m n)
+        (let loop ((i (- n 1)) (acc '()))
+          (if (< i 0) acc (loop (- i 1) (cons i acc))))))
+
+    (define (bi-list-ref m args depth)
+      (let* ((lst (need-list "list-ref" (car args)))
+             (k (need-integer "list-ref" (car (cdr args)))))
+        (if (< k 0)
+            (fail 'index-error "list-ref: negative index"))
+        ;; Charge per cell actually walked, so an absurd index costs an
+        ;; index-error rather than the whole fuel budget.
+        (let loop ((x lst) (i k))
+          (spend! m 1)
+          (cond
+            ((not (pair? x)) (fail 'index-error "list-ref: index out of range"))
+            ((= i 0) (car x))
+            (else (loop (cdr x) (- i 1)))))))
+
+    (define (bi-add m args depth)
+      (integers "+" args)
+      (spend! m (count-args args))
+      (bounded "+" (let loop ((a args) (acc 0))
+                     (if (null? a) acc (loop (cdr a) (+ acc (car a)))))))
+
+    (define (bi-sub m args depth)
+      (integers "-" args)
+      (spend! m (count-args args))
+      (if (null? (cdr args))
+          (bounded "-" (- (car args)))
+          (bounded "-" (let loop ((a (cdr args)) (acc (car args)))
+                         (if (null? a) acc (loop (cdr a) (- acc (car a))))))))
+
+    (define (bi-mul m args depth)
+      (integers "*" args)
+      (spend! m (count-args args))
+      (bounded "*" (let loop ((a args) (acc 1))
+                     (if (null? a)
+                         acc
+                         (loop (cdr a) (bounded "*" (* acc (car a))))))))
+
+    (define (divisor name v)
+      (need-integer name v)
+      (if (= v 0)
+          (fail 'division-by-zero (string-append name ": division by zero")))
+      v)
+
+    (define (bi-quotient m args depth)
+      (let* ((a (need-integer "quotient" (car args)))
+             (b (divisor "quotient" (car (cdr args)))))
+        (bounded "quotient" (quotient a b))))
+
+    (define (bi-remainder m args depth)
+      (let* ((a (need-integer "remainder" (car args)))
+             (b (divisor "remainder" (car (cdr args)))))
+        (bounded "remainder" (remainder a b))))
+
+    (define (bi-modulo m args depth)
+      (let* ((a (need-integer "modulo" (car args)))
+             (b (divisor "modulo" (car (cdr args)))))
+        (bounded "modulo" (modulo a b))))
+
+    ;; `expt` is the cheapest way to manufacture an enormous integer, so the
+    ;; exponent is screened before any bignum work happens.
+    (define (bi-expt m args depth)
+      (let* ((base (need-integer "expt" (car args)))
+             (power (need-integer "expt" (car (cdr args)))))
+        (if (< power 0)
+            (fail 'type-error "expt: expected a non-negative exponent"))
+        (if (and (> (abs base) 1) (> power 256))
+            (fail 'overflow "expt: integer magnitude cap"))
+        (spend! m (+ 1 power))
+        (bounded "expt" (expt base power))))
+
+    (define (bi-abs m args depth)
+      (bounded "abs" (abs (need-integer "abs" (car args)))))
+
+    (define (bi-min m args depth)
+      (integers "min" args)
+      (spend! m (count-args args))
+      (let loop ((a (cdr args)) (acc (car args)))
+        (if (null? a) acc (loop (cdr a) (if (< (car a) acc) (car a) acc)))))
+
+    (define (bi-max m args depth)
+      (integers "max" args)
+      (spend! m (count-args args))
+      (let loop ((a (cdr args)) (acc (car args)))
+        (if (null? a) acc (loop (cdr a) (if (> (car a) acc) (car a) acc)))))
+
+    (define (compare name test)
+      (lambda (m args depth)
+        (integers name args)
+        (spend! m (count-args args))
+        (let loop ((a args))
+          (cond
+            ((null? (cdr a)) #t)
+            ((test (car a) (car (cdr a))) (loop (cdr a)))
+            (else #f)))))
+
+    (define (bi-zero? m args depth)
+      (= 0 (need-integer "zero?" (car args))))
+
+    (define (bi-even? m args depth)
+      (= 0 (remainder (need-integer "even?" (car args)) 2)))
+
+    (define (bi-odd? m args depth)
+      (not (= 0 (remainder (need-integer "odd?" (car args)) 2))))
+
+    (define (bi-not m args depth)
+      (eq? #f (car args)))
+
+    (define (bi-equal? m args depth)
+      (let ((a (car args))
+            (b (car (cdr args))))
+        (spend! m (+ 1 (puzzle--value-size a puzzle-max-allocations)))
+        (puzzle-value=? a b)))
+
+    (define (bi-number? m args depth)
+      (let ((v (car args)))
+        (and (number? v) (exact? v) (integer? v))))
+
+    (define (bi-boolean? m args depth)
+      (boolean? (car args)))
+
+    (define (bi-symbol? m args depth)
+      (symbol? (car args)))
+
+    (define (bi-string? m args depth)
+      (string? (car args)))
+
+    (define (bi-string-append m args depth)
+      (let loop ((a args) (total 0))
+        (if (pair? a)
+            (loop (cdr a)
+                  (+ total (string-length (need-string "string-append" (car a)))))
+            (begin
+              (spend! m (+ 1 total))
+              (alloc-string! m total)
+              (string-join args)))))
+
+    (define (bi-string-length m args depth)
+      (string-length (need-string "string-length" (car args))))
+
+    (define (bi-number->string m args depth)
+      (let* ((n (need-integer "number->string" (car args)))
+             (s (number->string n)))
+        (spend! m (+ 1 (string-length s)))
+        (alloc-string! m (string-length s))
+        s))
+
+    (define %builtin-specs
+      (list
+        (list 'cons 2 2 bi-cons)
+        (list 'car 1 1 bi-car)
+        (list 'cdr 1 1 bi-cdr)
+        (list 'list 0 #f bi-list)
+        (list 'null? 1 1 bi-null?)
+        (list 'pair? 1 1 bi-pair?)
+        (list 'length 1 1 bi-length)
+        (list 'reverse 1 1 bi-reverse)
+        (list 'append 0 #f bi-append)
+        (list 'map 2 2 bi-map)
+        (list 'filter 2 2 bi-filter)
+        (list 'fold 3 3 bi-fold)
+        (list 'iota 1 1 bi-iota)
+        (list 'list-ref 2 2 bi-list-ref)
+        (list '+ 0 #f bi-add)
+        (list '- 1 #f bi-sub)
+        (list '* 0 #f bi-mul)
+        (list 'quotient 2 2 bi-quotient)
+        (list 'remainder 2 2 bi-remainder)
+        (list 'modulo 2 2 bi-modulo)
+        (list 'expt 2 2 bi-expt)
+        (list 'abs 1 1 bi-abs)
+        (list 'min 1 #f bi-min)
+        (list 'max 1 #f bi-max)
+        (list '= 2 #f (compare "=" =))
+        (list '< 2 #f (compare "<" <))
+        (list '> 2 #f (compare ">" >))
+        (list '<= 2 #f (compare "<=" <=))
+        (list '>= 2 #f (compare ">=" >=))
+        (list 'zero? 1 1 bi-zero?)
+        (list 'even? 1 1 bi-even?)
+        (list 'odd? 1 1 bi-odd?)
+        (list 'not 1 1 bi-not)
+        (list 'equal? 2 2 bi-equal?)
+        (list 'number? 1 1 bi-number?)
+        (list 'boolean? 1 1 bi-boolean?)
+        (list 'symbol? 1 1 bi-symbol?)
+        (list 'string? 1 1 bi-string?)
+        (list 'string-append 0 #f bi-string-append)
+        (list 'string-length 1 1 bi-string-length)
+        (list 'number->string 1 1 bi-number->string)))
+
+    ;; Keyed by the raw builtin symbol; `alist->dict` would keyword-ify the
+    ;; keys, which is not what the evaluator looks up.
+    (define %builtin-table
+      (let loop ((specs %builtin-specs) (table (dict)))
+        (if (null? specs)
+            table
+            (let ((spec (car specs)))
+              (loop (cdr specs)
+                    (dict-set table
+                              (car spec)
+                              (puzzle-builtin
+                                name: (car spec)
+                                arity-min: (car (cdr spec))
+                                arity-max: (car (cdr (cdr spec)))
+                                proc: (car (cdr (cdr (cdr spec)))))))))))
+
+    ;;; Names of every v1 builtin, in their frozen order.
+    ;;;
+    ;;; ```scheme
+    ;;; (length (puzzle-builtin-names)) ; => 41
+    ;;; ```
+    (define (puzzle-builtin-names)
+      (: -> list?)
+      (map car %builtin-specs))
+
+    ;; ============================================================
+    ;; Public entry points
+    ;; ============================================================
+
+    ;;; Evaluate a parsed AST under the v1 caps.
+    ;;;
+    ;;; Always returns a `puzzle-result`; no host exception escapes. On
+    ;;; failure `error-kind` is one of `bad-syntax`, `unbound-variable`,
+    ;;; `uninitialized`, `arity-error`, `type-error`, `division-by-zero`,
+    ;;; `index-error`, `overflow`, `fuel-exhausted`, `allocation-exceeded`,
+    ;;; `string-limit`, `depth-exceeded` or `internal-error`.
+    ;;;
+    ;;; ```scheme
+    ;;; (puzzle-result-value (puzzle-eval '(+ 1 2)))     ; => 3
+    ;;; (puzzle-result-error-kind (puzzle-eval '(car 1))) ; => type-error
+    ;;; ```
+    (define (puzzle-eval ast)
+      (: any? -> puzzle-result?)
+      (let ((m (puzzle--machine fuel: puzzle-max-fuel)))
+        (guard (e (#t (abort->result e (steps-used m))))
+          (let ((value (ev m ast '() 1)))
+            (puzzle-result status: 'ok
+                           value: value
+                           steps: (steps-used m))))))
+
+    ;;; Parse and evaluate solution source in one step.
+    ;;;
+    ;;; ```scheme
+    ;;; (puzzle-result-value (puzzle-run "(map (lambda (x) (* x x)) (iota 4))"))
+    ;;; ; => (0 1 4 9)
+    ;;; ```
+    (define (puzzle-run source)
+      (: any? -> puzzle-result?)
+      (let ((parsed (puzzle-parse source)))
+        (if (puzzle-ok? parsed)
+            (puzzle-eval (puzzle-result-value parsed))
+            parsed)))))
