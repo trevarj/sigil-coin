@@ -1,0 +1,135 @@
+;;; (sigil coin consensus emission) — the SigilCoin emission schedule
+;;;
+;;; A pure function of height, in daviwils (1 SGL = 100,000,000 daviwils).
+;;; Blocks land roughly once a day, so a halving interval of 730 blocks is
+;;; roughly two years.
+;;;
+;;;   height 0        genesis, reward 0
+;;;   heights 1..30   warmup, 1 SGL per block
+;;;   heights >= 31   floor(100 SGL / 2^floor((height - 1) / 730))
+;;;
+;;; The shift exhausts the value at `coin-final-reward-height`; every later
+;;; height pays nothing, so the supply is capped at `coin-max-supply`
+;;; (14,302,999,991,970 daviwils, about 143,030 SGL).
+;;;
+;;; Consensus-critical: a one-daviwil drift here is a chain split.
+
+(define-library (sigil coin consensus emission)
+  (import (sigil math))
+  (export
+    coin-daviwils-per-sigil
+    coin-warmup-height
+    coin-warmup-reward
+    coin-initial-reward
+    coin-halving-interval
+    coin-final-reward-height
+    coin-max-supply
+    coin-block-reward
+    coin-cumulative-supply)
+
+  (begin
+
+    ;; ============================================================
+    ;; Constants
+    ;; ============================================================
+
+    ;;; Smallest unit per SGL. One daviwil is the SigilCoin satoshi.
+    (define coin-daviwils-per-sigil 100000000)
+
+    ;;; Last warmup height. Heights 1 through this one pay
+    ;;; `coin-warmup-reward` regardless of the halving schedule.
+    (define coin-warmup-height 30)
+
+    ;;; Warmup block reward, in daviwils (1 SGL).
+    (define coin-warmup-reward 100000000)
+
+    ;;; Reward of the first post-warmup epoch, in daviwils (100 SGL).
+    (define coin-initial-reward 10000000000)
+
+    ;;; Blocks per halving epoch. At one block per day this is about two
+    ;;; years.
+    (define coin-halving-interval 730)
+
+    ;; Heights are bounded by the BIP34 domain, which is what the coinbase
+    ;; payload can carry and what the block header's u32 fields imply.
+    (define %max-height #xffffffff)
+
+    (define (require-height who height)
+      (if (not (and (number? height) (exact? height) (integer? height)
+                    (<= 0 height %max-height)))
+          (error (string-append who ": height out of range")))
+      height)
+
+    ;; ============================================================
+    ;; Schedule
+    ;; ============================================================
+
+    ;;; Block reward for `height`, in daviwils.
+    ;;;
+    ;;; Genesis pays nothing, the warmup pays 1 SGL, and every later height
+    ;;; pays 100 SGL right-shifted once per completed halving epoch. The
+    ;;; shift is exact integer division, so the tail decays to 0 rather than
+    ;;; to a fraction.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-block-reward 0)   ; => 0
+    ;;; (coin-block-reward 1)   ; => 100000000
+    ;;; (coin-block-reward 31)  ; => 10000000000
+    ;;; (coin-block-reward 731) ; => 5000000000
+    ;;; ```
+    (define (coin-block-reward height)
+      (: integer? -> integer?)
+      (require-height "coin-block-reward" height)
+      (cond
+        ((= height 0) 0)
+        ((<= height coin-warmup-height) coin-warmup-reward)
+        (else
+          (arithmetic-shift
+            coin-initial-reward
+            (- (quotient (- height 1) coin-halving-interval))))))
+
+    ;; Sum of the post-warmup rewards for heights `coin-warmup-height + 1`
+    ;; through `height`, epoch by epoch. Epoch `k` covers the heights
+    ;; `730k + 1` through `730(k + 1)`, so the walk is 34 iterations at most
+    ;; rather than one per block.
+    (define (post-warmup-supply height)
+      (let loop ((k 0) (total 0))
+        (let ((reward (arithmetic-shift coin-initial-reward (- k)))
+              (lo (max (+ coin-warmup-height 1)
+                       (+ (* k coin-halving-interval) 1))))
+          (if (or (= reward 0) (> lo height))
+              total
+              (let ((hi (min height (* (+ k 1) coin-halving-interval))))
+                (loop (+ k 1) (+ total (* (+ (- hi lo) 1) reward))))))))
+
+    ;;; Total daviwils emitted by heights 0 through `height`, inclusive.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-cumulative-supply 0)   ; => 0
+    ;;; (coin-cumulative-supply 30)  ; => 3000000000
+    ;;; (coin-cumulative-supply 730) ; => 7003000000000
+    ;;; ```
+    (define (coin-cumulative-supply height)
+      (: integer? -> integer?)
+      (require-height "coin-cumulative-supply" height)
+      (if (= height 0)
+          0
+          (+ (* coin-warmup-reward (min height coin-warmup-height))
+             (post-warmup-supply height))))
+
+    ;;; Last height that pays a non-zero reward: 24820.
+    ;;;
+    ;;; Derived rather than written down, so it cannot drift away from
+    ;;; `coin-block-reward`. The first epoch whose shifted reward is 0 is
+    ;;; `k`, so the last paying height is the final height of epoch `k - 1`.
+    (define coin-final-reward-height
+      (let loop ((k 0))
+        (if (= 0 (arithmetic-shift coin-initial-reward (- k)))
+            (* k coin-halving-interval)
+            (loop (+ k 1)))))
+
+    ;;; Total daviwils the schedule ever emits: 14,302,999,991,970, about
+    ;;; 143,030 SGL. Nothing is emitted after `coin-final-reward-height`, so
+    ;;; this is a hard cap rather than an asymptote.
+    (define coin-max-supply
+      (coin-cumulative-supply coin-final-reward-height))))

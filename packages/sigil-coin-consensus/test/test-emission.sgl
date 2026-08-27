@@ -1,0 +1,174 @@
+;;; Golden vectors for the SigilCoin emission schedule.
+;;;
+;;; Emission is consensus: every reward and the cap they sum to are frozen.
+;;; A failure here is a chain split, so these expectations must be
+;;; investigated rather than updated.
+
+(import (sigil test)
+        (sigil math)
+        (sigil coin consensus))
+
+;; ============================================================
+;; Constants
+;; ============================================================
+
+(test-group "sigil-coin emission constants"
+  (test "one SGL is a hundred million daviwils"
+    (assert-equal 100000000 coin-daviwils-per-sigil))
+
+  (test "the warmup runs to height 30 at 1 SGL"
+    (assert-equal 30 coin-warmup-height)
+    (assert-equal coin-daviwils-per-sigil coin-warmup-reward))
+
+  (test "the post-warmup epoch starts at 100 SGL"
+    (assert-equal (* 100 coin-daviwils-per-sigil) coin-initial-reward))
+
+  (test "a halving epoch is 730 blocks"
+    (assert-equal 730 coin-halving-interval)))
+
+;; ============================================================
+;; Block reward boundaries
+;; ============================================================
+
+(test-group "sigil-coin block reward"
+  (test "genesis pays nothing"
+    (assert-equal 0 (coin-block-reward 0)))
+
+  (test "the warmup pays exactly 1 SGL"
+    (assert-equal 100000000 (coin-block-reward 1))
+    (assert-equal 100000000 (coin-block-reward 2))
+    (assert-equal 100000000 (coin-block-reward 29))
+    (assert-equal 100000000 (coin-block-reward 30)))
+
+  (test "the first post-warmup height jumps to 100 SGL"
+    (assert-equal 10000000000 (coin-block-reward 31)))
+
+  (test "epoch 0 runs through height 730"
+    (assert-equal 10000000000 (coin-block-reward 729))
+    (assert-equal 10000000000 (coin-block-reward 730)))
+
+  (test "the first halving lands on height 731"
+    (assert-equal 5000000000 (coin-block-reward 731)))
+
+  (test "epoch 1 runs through height 1460"
+    (assert-equal 5000000000 (coin-block-reward 1459))
+    (assert-equal 5000000000 (coin-block-reward 1460)))
+
+  (test "the second halving lands on height 1461"
+    (assert-equal 2500000000 (coin-block-reward 1461)))
+
+  (test "the reward decays to a single daviwil before it stops"
+    (assert-equal 1 (coin-block-reward 24819))
+    (assert-equal 1 (coin-block-reward coin-final-reward-height)))
+
+  (test "the last paying height is 24820"
+    (assert-equal 24820 coin-final-reward-height)
+    (assert-true (> (coin-block-reward coin-final-reward-height) 0))
+    (assert-equal 0 (coin-block-reward (+ coin-final-reward-height 1))))
+
+  (test "the first zero-reward height is 24821 and nothing pays after it"
+    (assert-equal 0 (coin-block-reward 24821))
+    (assert-equal 0 (coin-block-reward 24822))
+    (assert-equal 0 (coin-block-reward 100000))
+    (assert-equal 0 (coin-block-reward #xffffffff)))
+
+  ;; The halving is a right shift, so the first height of an epoch is the
+  ;; FLOOR of half the last height of the one before. Once the reward turns
+  ;; odd (it does at epoch 11, since 100 SGL is 2^10 * 9765625 daviwils) a
+  ;; daviwil is dropped rather than carried.
+  (test "the reward halves once per interval, rounding down"
+    (let loop ((k 1))
+      (if (< k 34)
+          (begin
+            (assert-equal
+              (quotient (coin-block-reward (* k coin-halving-interval)) 2)
+              (coin-block-reward (+ (* k coin-halving-interval) 1)))
+            (loop (+ k 1))))))
+
+  (test "the halving drops a daviwil once the reward turns odd"
+    (assert-equal 9765625 (coin-block-reward (* 11 coin-halving-interval)))
+    (assert-equal 4882812
+                  (coin-block-reward (+ (* 11 coin-halving-interval) 1))))
+
+  (test "the reward never rises with height"
+    (let loop ((h 31))
+      (if (< h 2200)
+          (begin
+            (assert-true (<= (coin-block-reward (+ h 1))
+                             (coin-block-reward h)))
+            (loop (+ h 1))))))
+
+  (test "an out-of-range height is rejected"
+    (assert-error (coin-block-reward -1))
+    (assert-error (coin-block-reward (+ #xffffffff 1)))
+    (assert-error (coin-block-reward "31"))))
+
+;; ============================================================
+;; Cumulative supply
+;; ============================================================
+
+;; The schedule summed the slow way, one height at a time. The closed form
+;; in the module walks epochs instead, so this is an independent witness
+;; rather than a restatement.
+(define (supply-by-summation height)
+  (let loop ((h 0) (total 0))
+    (if (> h height)
+        total
+        (loop (+ h 1) (+ total (coin-block-reward h))))))
+
+(test-group "sigil-coin cumulative supply"
+  (test "nothing is emitted at genesis"
+    (assert-equal 0 (coin-cumulative-supply 0)))
+
+  (test "the warmup accumulates 1 SGL per block"
+    (assert-equal 100000000 (coin-cumulative-supply 1))
+    (assert-equal 2900000000 (coin-cumulative-supply 29))
+    (assert-equal 3000000000 (coin-cumulative-supply 30)))
+
+  (test "the boundary heights match the summed schedule"
+    (assert-equal 13000000000 (coin-cumulative-supply 31))
+    (assert-equal 6993000000000 (coin-cumulative-supply 729))
+    (assert-equal 7003000000000 (coin-cumulative-supply 730))
+    (assert-equal 7008000000000 (coin-cumulative-supply 731))
+    (assert-equal 10653000000000 (coin-cumulative-supply 1460))
+    (assert-equal 10655500000000 (coin-cumulative-supply 1461)))
+
+  (test "the closed form agrees with summation over the early chain"
+    (let loop ((h 0))
+      (if (<= h 1500)
+          (begin
+            (assert-equal (supply-by-summation h) (coin-cumulative-supply h))
+            (loop (+ h 1))))))
+
+  (test "the closed form agrees with summation across the whole schedule"
+    (assert-equal (supply-by-summation coin-final-reward-height)
+                  (coin-cumulative-supply coin-final-reward-height)))
+
+  (test "the total supply is pinned"
+    (assert-equal 14302999991970 coin-max-supply)
+    (assert-equal 14302999991970
+                  (coin-cumulative-supply coin-final-reward-height))
+    (assert-equal 14302999991970 (supply-by-summation 24821)))
+
+  (test "the cap is about 143,030 SGL"
+    (assert-equal 143029 (quotient coin-max-supply coin-daviwils-per-sigil)))
+
+  (test "supply stops growing past the final paying height"
+    (assert-equal coin-max-supply (coin-cumulative-supply 24821))
+    (assert-equal coin-max-supply (coin-cumulative-supply 25000))
+    (assert-equal coin-max-supply (coin-cumulative-supply 1000000))
+    (assert-equal coin-max-supply (coin-cumulative-supply #xffffffff)))
+
+  (test "supply is monotonic"
+    (let loop ((h 1))
+      (if (< h 2200)
+          (begin
+            (assert-true (>= (coin-cumulative-supply h)
+                             (coin-cumulative-supply (- h 1))))
+            (loop (+ h 1))))))
+
+  (test "an out-of-range height is rejected"
+    (assert-error (coin-cumulative-supply -1))
+    (assert-error (coin-cumulative-supply (+ #xffffffff 1)))))
+
+(run-tests)

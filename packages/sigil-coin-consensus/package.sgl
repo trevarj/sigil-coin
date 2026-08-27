@@ -11,6 +11,14 @@
   dependencies: (list
     (from-workspace name: "sigil-coin-puzzle")
     (from-git url: "github:trevarj/sigil-bitcoin"
+              package: "sigil-bitcoin-utils" version: "^0.1")
+    (from-git url: "github:trevarj/sigil-bitcoin"
+              package: "sigil-bitcoin-primitives" version: "^0.1")
+    (from-git url: "github:trevarj/sigil-bitcoin"
+              package: "sigil-bitcoin-script" version: "^0.1")
+    (from-git url: "github:trevarj/sigil-bitcoin"
+              package: "sigil-bitcoin-tx" version: "^0.1")
+    (from-git url: "github:trevarj/sigil-bitcoin"
               package: "sigil-bitcoin-consensus" version: "^0.1"))
 
   dev-dependencies: (list

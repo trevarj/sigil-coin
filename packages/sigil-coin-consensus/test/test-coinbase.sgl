@@ -1,0 +1,322 @@
+;;; Coinbase scriptSig payload encoding, decoding, and hostile inputs.
+;;;
+;;; The decoder is the package's only attacker-facing parser, so most of
+;;; this file is malformed input: the encoding is consensus, and anything
+;;; that is not the canonical form must be rejected rather than tolerated.
+
+(import (sigil test)
+        (sigil math)
+        (sigil bitcoin script)
+        (sigil bitcoin tx)
+        (sigil bitcoin consensus)
+        (sigil coin puzzle)
+        (sigil coin consensus))
+
+;; ============================================================
+;; Helpers
+;; ============================================================
+
+(define %zero32 (make-bytevector 32 0))
+
+(define (bytes-of . values)
+  (let* ((n (length values))
+         (bv (make-bytevector n 0)))
+    (let loop ((i 0) (xs values))
+      (if (null? xs)
+          bv
+          (begin
+            (bytevector-u8-set! bv i (car xs))
+            (loop (+ i 1) (cdr xs)))))))
+
+(define (filled n byte)
+  (make-bytevector n byte))
+
+(define (payload height solution graffiti)
+  (coin-coinbase-payload height: height
+                         solution: solution
+                         graffiti: graffiti))
+
+(define (encode height solution graffiti)
+  (coin-coinbase-payload-encode (payload height solution graffiti)))
+
+(define (decode script)
+  (coin-coinbase-payload-decode script))
+
+(define (reason script)
+  (coin-result-reason (decode script)))
+
+;; Round-trip one payload and assert every field survives.
+(define (round-trips? height solution graffiti)
+  (let ((result (decode (encode height solution graffiti))))
+    (and (coin-ok? result)
+         (let ((back (coin-result-value result)))
+           (and (= height (coin-coinbase-payload-height back))
+                (equal? solution (coin-coinbase-payload-solution back))
+                (equal? graffiti (coin-coinbase-payload-graffiti back)))))))
+
+(define (coinbase-tx script-sig)
+  (transaction
+    version: 1
+    inputs: (list (txin previous-output: (outpoint txid: %zero32
+                                                   index: #xffffffff)
+                        script-sig: script-sig
+                        sequence: #xffffffff
+                        witness: '()))
+    outputs: (list (txout value: 0 script-pubkey: (bytes-of #x6a)))
+    lock-time: 0))
+
+(define (plain-tx)
+  (transaction
+    version: 1
+    inputs: (list (txin previous-output: (outpoint txid: (filled 32 1) index: 0)
+                        script-sig: (bytes-of)
+                        sequence: #xffffffff
+                        witness: '()))
+    outputs: (list (txout value: 0 script-pubkey: (bytes-of #x6a)))
+    lock-time: 0))
+
+(define (block-with txs)
+  (block header-field: (block-header version: 1
+                                     previous-block: %zero32
+                                     merkle-root: %zero32
+                                     time: 0
+                                     bits: 0
+                                     nonce: 0)
+         transactions: txs))
+
+;; ============================================================
+;; Constants
+;; ============================================================
+
+(test-group "sigil-coin coinbase constants"
+  (test "the solution cap matches the interpreter's source cap"
+    (assert-equal puzzle-max-source-bytes coin-max-solution-bytes)
+    (assert-equal 256 coin-max-solution-bytes))
+
+  (test "the graffiti cap is 400 bytes"
+    (assert-equal 400 coin-max-graffiti-bytes)))
+
+;; ============================================================
+;; Encoding
+;; ============================================================
+
+(test-group "sigil-coin coinbase encoding"
+  (test "the field order is height, solution, graffiti"
+    ;; 0x01 0x01 pushes the one-byte height 1, 0x02 'h' 'i' the solution,
+    ;; 0x01 'g' the graffiti.
+    (assert-equal (bytes-of #x01 #x01 #x02 #x68 #x69 #x01 #x67)
+                  (encode 1 (bytes-of #x68 #x69) (bytes-of #x67))))
+
+  (test "height 0 is the empty BIP34 push"
+    (assert-equal (bytes-of #x00 #x01 #x31 #x00)
+                  (encode 0 (bytes-of #x31) (bytes-of))))
+
+  (test "the height push is a Bitcoin script number"
+    (let ((script (encode 300 (bytes-of #x31) (bytes-of))))
+      (assert-equal 300
+                    (script-number-decode
+                      (script-chunk-data (car (script-parse script)))))))
+
+  (test "a long solution uses OP_PUSHDATA2"
+    (let ((script (encode 1 (filled 256 #x31) (bytes-of))))
+      (assert-equal op-pushdata2
+                    (script-chunk-opcode
+                      (car (cdr (script-parse script)))))))
+
+  (test "a mid-length graffiti uses OP_PUSHDATA1"
+    (let ((script (encode 1 (bytes-of #x31) (filled 200 #x41))))
+      (assert-equal op-pushdata1
+                    (script-chunk-opcode
+                      (car (cdr (cdr (script-parse script))))))))
+
+  (test "an out-of-range field is rejected"
+    (assert-error (encode -1 (bytes-of #x31) (bytes-of)))
+    (assert-error (encode (+ #xffffffff 1) (bytes-of #x31) (bytes-of)))
+    (assert-error (encode 1 (bytes-of) (bytes-of)))
+    (assert-error (encode 1 (filled 257 #x31) (bytes-of)))
+    (assert-error (encode 1 (bytes-of #x31) (filled 401 #x41)))
+    (assert-error (encode 1 "not-bytes" (bytes-of)))
+    (assert-error (coin-coinbase-payload-encode 42))))
+
+;; ============================================================
+;; Round trips
+;; ============================================================
+
+(test-group "sigil-coin coinbase round trips"
+  (test "a minimal payload round-trips"
+    (assert-true (round-trips? 0 (bytes-of #x31) (bytes-of))))
+
+  (test "a typical payload round-trips"
+    (assert-true (round-trips? 4321
+                               (bytes-of #x27 #x28 #x31 #x20 #x32 #x29)
+                               (bytes-of #x68 #x69 #x21))))
+
+  (test "every field at its maximum round-trips"
+    (assert-true (round-trips? #xffffffff
+                               (filled coin-max-solution-bytes #x31)
+                               (filled coin-max-graffiti-bytes #x41))))
+
+  (test "each push-length boundary round-trips"
+    (let loop ((n 1))
+      (if (<= n coin-max-solution-bytes)
+          (begin
+            (assert-true (round-trips? n (filled n #x31) (filled n #x41)))
+            (loop (+ n 1))))))
+
+  (test "heights that straddle the script-number widths round-trip"
+    (let loop ((values (list 0 1 16 17 127 128 129 255 256 32767 32768
+                             8388607 8388608 2147483647 2147483648
+                             #xffffffff)))
+      (if (pair? values)
+          (begin
+            (assert-true (round-trips? (car values)
+                                       (bytes-of #x31)
+                                       (bytes-of)))
+            (loop (cdr values))))))
+
+  (test "graffiti is opaque, including bytes that look like opcodes"
+    (assert-true (round-trips? 7
+                               (bytes-of #x31)
+                               (bytes-of #x00 #x4c #x4e #xff #x51)))))
+
+;; ============================================================
+;; Hostile inputs
+;; ============================================================
+
+(test-group "sigil-coin coinbase hostile inputs"
+  (test "a non-bytevector is rejected"
+    (assert-equal 'not-bytevector (reason "0101013100"))
+    (assert-equal 'not-bytevector (reason 42))
+    (assert-equal 'not-bytevector (reason '())))
+
+  (test "an empty scriptSig is rejected"
+    (assert-equal 'wrong-field-count (reason (bytes-of))))
+
+  (test "a truncated direct push is rejected"
+    (assert-equal 'malformed-script (reason (bytes-of #x02 #x01))))
+
+  (test "a truncated OP_PUSHDATA1 is rejected"
+    (assert-equal 'malformed-script (reason (bytes-of #x4c)))
+    (assert-equal 'malformed-script (reason (bytes-of #x4c #x05 #x01))))
+
+  (test "a truncated OP_PUSHDATA2 is rejected"
+    (assert-equal 'malformed-script (reason (bytes-of #x4d #x00)))
+    (assert-equal 'malformed-script
+                  (reason (bytes-of #x4d #x00 #x01 #x01))))
+
+  (test "a truncated payload is rejected"
+    ;; Drop the trailing graffiti push from a valid encoding.
+    (let* ((script (encode 1 (bytes-of #x31) (bytes-of #x41)))
+           (n (bytevector-length script)))
+      (assert-equal 'wrong-field-count
+                    (reason (bytevector-copy script 0 (- n 2))))))
+
+  (test "a missing field is rejected"
+    (assert-equal 'wrong-field-count
+                  (reason (bytes-of #x01 #x01 #x01 #x31)))
+    (assert-equal 'wrong-field-count (reason (bytes-of #x01 #x01))))
+
+  (test "an extra trailing push is rejected"
+    (assert-equal 'wrong-field-count
+                  (reason (bytes-of #x01 #x01 #x01 #x31 #x00 #x00))))
+
+  (test "extra trailing bytes are rejected"
+    (let ((script (encode 1 (bytes-of #x31) (bytes-of))))
+      ;; A trailing OP_1 parses as a fourth chunk, so the field count
+      ;; rejects it before the push-shape check ever looks at it.
+      (assert-equal 'wrong-field-count
+                    (reason (bytevector-append script (bytes-of #x51))))
+      ;; A trailing byte that starts a push nobody completed is malformed.
+      (assert-equal 'malformed-script
+                    (reason (bytevector-append script (bytes-of #x05))))))
+
+  (test "a non-push opcode in a field slot is rejected"
+    ;; OP_1 OP_1 OP_1 parses as three chunks, none of them data.
+    (assert-equal 'not-a-push (reason (bytes-of #x51 #x51 #x51))))
+
+  (test "a non-minimal push opcode is rejected"
+    ;; OP_PUSHDATA1 for a one-byte height, which fits a direct push.
+    (assert-equal 'non-canonical
+                  (reason (bytes-of #x4c #x01 #x01 #x01 #x31 #x00)))
+    ;; OP_PUSHDATA1 for a one-byte solution.
+    (assert-equal 'non-canonical
+                  (reason (bytes-of #x01 #x01 #x4c #x01 #x31 #x00)))
+    ;; OP_PUSHDATA2 for an empty graffiti.
+    (assert-equal 'non-canonical
+                  (reason (bytes-of #x01 #x01 #x01 #x31 #x4d #x00 #x00))))
+
+  (test "a non-minimal height encoding is rejected"
+    ;; 0x01 0x00 decodes as 1 but is not how script-number-encode writes it.
+    (assert-equal 'non-canonical
+                  (reason (bytes-of #x02 #x01 #x00 #x01 #x31 #x00))))
+
+  (test "a negative height is rejected"
+    ;; 0x81 is script-number -1.
+    (assert-equal 'bad-height (reason (bytes-of #x01 #x81 #x01 #x31 #x00))))
+
+  (test "a height past the BIP34 domain is rejected"
+    ;; Five bytes decode above 2^32 - 1.
+    (assert-equal 'bad-height
+                  (reason (bytes-of #x05 #x00 #x00 #x00 #x00 #x01
+                                    #x01 #x31 #x00))))
+
+  (test "an empty solution push is rejected"
+    (assert-equal 'solution-empty (reason (bytes-of #x01 #x01 #x00 #x00))))
+
+  (test "an oversized solution is rejected"
+    (let ((script (bytevector-append
+                    (bytes-of #x01 #x01)
+                    (script-push-data (filled 257 #x31))
+                    (bytes-of #x00))))
+      (assert-equal 'solution-oversize (reason script))))
+
+  (test "an oversized graffiti is rejected"
+    (let ((script (bytevector-append
+                    (bytes-of #x01 #x01 #x01 #x31)
+                    (script-push-data (filled 401 #x41)))))
+      (assert-equal 'graffiti-oversize (reason script))))
+
+  (test "a field exactly at its cap is accepted"
+    (assert-true (coin-ok? (decode (encode 1
+                                           (filled 256 #x31)
+                                           (filled 400 #x41)))))))
+
+;; ============================================================
+;; Block-level extraction
+;; ============================================================
+
+(test-group "sigil-coin coinbase extraction"
+  (test "a coinbase block yields its payload"
+    (let* ((script (encode 9 (bytes-of #x31) (bytes-of #x67)))
+           (result (coin-block-coinbase-payload
+                     (block-with (list (coinbase-tx script))))))
+      (assert-true (coin-ok? result))
+      (assert-equal 9 (coin-coinbase-payload-height
+                        (coin-result-value result)))))
+
+  (test "a non-block yields missing-coinbase rather than a raise"
+    (assert-equal 'missing-coinbase
+                  (coin-result-reason (coin-block-coinbase-payload 42)))
+    (assert-equal 'missing-coinbase
+                  (coin-result-reason (coin-block-coinbase-payload '())))
+    (assert-equal #f (coin-block-coinbase 42)))
+
+  (test "a block whose first transaction is not a coinbase is rejected"
+    (assert-equal 'missing-coinbase
+                  (coin-result-reason
+                    (coin-block-coinbase-payload
+                      (block-with (list (plain-tx)))))))
+
+  (test "a block with no transactions is rejected"
+    (assert-equal 'missing-coinbase
+                  (coin-result-reason
+                    (coin-block-coinbase-payload (block-with '())))))
+
+  (test "a coinbase carrying garbage yields the decoder's reason"
+    (assert-equal 'not-a-push
+                  (coin-result-reason
+                    (coin-block-coinbase-payload
+                      (block-with
+                        (list (coinbase-tx (bytes-of #x51 #x51 #x51)))))))))
+
+(run-tests)

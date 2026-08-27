@@ -1,0 +1,133 @@
+;;; (sigil coin consensus solution) — the mining rule
+;;;
+;;; This is where SigilCoin replaces hash grinding. A block is mined when
+;;; its coinbase carries a puzzle-lang program that, re-run by every node
+;;; under the frozen v1 caps, reproduces the puzzle derived from the parent
+;;; hash and the height.
+;;;
+;;; A solution must clear four hurdles, in order:
+;;;
+;;;   1. it parses inside `puzzle-max-source-bytes`
+;;;   2. it evaluates without exhausting fuel, allocations or depth
+;;;   3. its result is a `puzzle-value?` — never a procedure. A closure is
+;;;      not data: `(lambda(x)x)` is a 13-byte program that would otherwise
+;;;      "solve" every puzzle whose target it is never compared against, so
+;;;      the rejection is explicit rather than left to `puzzle-value?`.
+;;;   4. its result is deeply equal to the target
+;;;
+;;; `puzzle-spec-par` is NOT a bound here. Par is the shortest solution the
+;;; generator happens to know, an upper bound on the true optimum and often
+;;; a loose one; shorter solutions are legal, expected, and the whole point
+;;; of the game.
+;;;
+;;; Nothing raises. Every entry point returns a `coin-result`, so a node can
+;;; reject a hostile block without a handler on the validation path.
+
+(define-library (sigil coin consensus solution)
+  (import (sigil math)
+          (sigil coin puzzle)
+          (sigil coin puzzle generator)
+          (sigil coin consensus result)
+          (sigil coin consensus seed)
+          (sigil coin consensus coinbase))
+  (export
+    coin-check-solution
+    coin-verify-block-solution)
+
+  (begin
+
+    (define (kind-detail result)
+      (let ((kind (puzzle-result-error-kind result)))
+        (if (symbol? kind) (symbol->string kind) "unknown")))
+
+    ;; `puzzle-parse` accepts both, and a node reading a block always has
+    ;; bytes; strings are accepted so tests and miners can pass source text.
+    (define (solution-length solution)
+      (if (bytevector? solution)
+          (bytevector-length solution)
+          (string-length solution)))
+
+    ;;; Check `solution` against an already-generated `spec`.
+    ;;;
+    ;;; Returns `ok` carrying the evaluated value, or an error naming
+    ;;; `solution-malformed`, `solution-oversize`, `solution-parse-failed`,
+    ;;; `solution-eval-failed`, `solution-not-a-value`, `solution-mismatch`
+    ;;; or `internal-error`. The detail on a parse or eval failure is the
+    ;;; interpreter's own error kind.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-ok? (coin-check-solution spec (puzzle-spec-solution spec)))
+    ;;; ; => #t
+    ;;; ```
+    (define (coin-check-solution spec solution)
+      (: any? any? -> coin-result?)
+      (guard (e (#t (coin-error 'internal-error
+                                "the solution check raised")))
+        (cond
+          ((not (puzzle-spec? spec))
+           (coin-error 'internal-error "expected a puzzle spec"))
+          ((not (or (bytevector? solution) (string? solution)))
+           (coin-error 'solution-malformed
+                       "solution must be bytes or a string"))
+          ((> (solution-length solution) coin-max-solution-bytes)
+           (coin-error 'solution-oversize "solution exceeds the byte cap"))
+          ((= 0 (solution-length solution))
+           (coin-error 'solution-malformed "solution is empty"))
+          (else
+            (let ((parsed (puzzle-parse solution)))
+              (if (puzzle-failed? parsed)
+                  (coin-error 'solution-parse-failed (kind-detail parsed))
+                  (let ((evaluated (puzzle-eval (puzzle-result-value parsed))))
+                    (if (puzzle-failed? evaluated)
+                        (coin-error 'solution-eval-failed
+                                    (kind-detail evaluated))
+                        (let ((value (puzzle-result-value evaluated)))
+                          (cond
+                            ((puzzle-procedure? value)
+                             (coin-error 'solution-not-a-value
+                                         "solution produced a procedure"))
+                            ((not (puzzle-value? value))
+                             (coin-error 'solution-not-a-value
+                                         "solution produced a non-value"))
+                            ((not (puzzle-value=? (puzzle-spec-target spec)
+                                                  value))
+                             (coin-error 'solution-mismatch
+                                         "solution does not produce the target"))
+                            (else (coin-ok value))))))))))))
+
+    ;;; Verify a whole block's mining claim.
+    ;;;
+    ;;; `previous-hash` is the internal 32-byte header hash of the parent,
+    ;;; supplied by the chain rather than read out of the block, so the
+    ;;; puzzle a block is judged against cannot be chosen by the block. The
+    ;;; header's own `previous-block` field is checked separately, by
+    ;;; `coin-validate-header-context`.
+    ;;;
+    ;;; Adds `missing-coinbase`, the decoder's reasons, and `height-mismatch`
+    ;;; (the BIP34 height push disagreeing with the height the chain expects)
+    ;;; to those of `coin-check-solution`. On success the value is the
+    ;;; decoded coinbase payload, which is what fork choice ranks.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-result-reason (coin-verify-block-solution zero32 1 42))
+    ;;; ; => missing-coinbase
+    ;;; ```
+    (define (coin-verify-block-solution previous-hash height b)
+      (: any? any? any? -> coin-result?)
+      (guard (e (#t (coin-error 'internal-error
+                                "the block solution check raised")))
+        (let ((decoded (coin-block-coinbase-payload b)))
+          (if (coin-failed? decoded)
+              decoded
+              (let ((payload (coin-result-value decoded)))
+                (if (not (= height (coin-coinbase-payload-height payload)))
+                    (coin-error 'height-mismatch
+                                "the coinbase height is not the block height")
+                    (let* ((spec (coin-puzzle-for previous-hash height))
+                           (checked (coin-check-solution
+                                      spec
+                                      (coin-coinbase-payload-solution
+                                        payload))))
+                      (if (coin-failed? checked)
+                          checked
+                          (coin-ok payload)))))))))))

@@ -1,0 +1,152 @@
+;;; (sigil coin consensus rules) — size and pacing
+;;;
+;;; SigilCoin blocks are small and slow. A block serializes to at most
+;;; `coin-max-block-bytes`, and consecutive headers must be at least
+;;; `coin-min-block-spacing` seconds apart — 20 hours, under a one-per-day
+;;; cadence, which leaves room for a solution to be found and propagated
+;;; without letting a miner sprint a private chain forward.
+;;;
+;;; On top of the spacing floor the usual Bitcoin timestamp rules apply: a
+;;; header's time must exceed the median of the last `coin-median-time-span`
+;;; headers, and may not sit more than `coin-max-future-drift` seconds ahead
+;;; of the validating node's clock.
+;;;
+;;; Both are implemented here rather than imported: `sigil-bitcoin-consensus`
+;;; supplies header linkage, serialization and proof-of-work helpers, but no
+;;; median-time-past or future-drift check, so there is nothing to reuse.
+;;;
+;;; Every check is total and returns a `coin-result`.
+
+(define-library (sigil coin consensus rules)
+  (import (sigil math)
+          (sigil list)
+          (sigil bitcoin consensus)
+          (sigil coin consensus result))
+  (export
+    coin-max-block-bytes
+    coin-min-block-spacing
+    coin-max-future-drift
+    coin-median-time-span
+    coin-median-time-past
+    coin-block-size
+    coin-validate-block-size
+    coin-validate-header-context)
+
+  (begin
+
+    ;;; Maximum serialized block size, in bytes.
+    (define coin-max-block-bytes 8192)
+
+    ;;; Minimum seconds between a header and its parent: 20 hours.
+    (define coin-min-block-spacing 72000)
+
+    ;;; Maximum seconds a header's time may lead the validating clock.
+    (define coin-max-future-drift 7200)
+
+    ;;; Number of trailing headers the median-time-past window spans.
+    (define coin-median-time-span 11)
+
+    (define (last-of xs)
+      (if (null? (cdr xs)) (car xs) (last-of (cdr xs))))
+
+    ;; The trailing `count` items of `xs`, or all of them when it is shorter.
+    (define (trailing xs count)
+      (let ((n (length xs)))
+        (if (<= n count)
+            xs
+            (let loop ((ys xs) (drop (- n count)))
+              (if (= drop 0) ys (loop (cdr ys) (- drop 1)))))))
+
+    ;;; Median timestamp of the last `coin-median-time-span` headers.
+    ;;;
+    ;;; `headers` runs oldest to newest and must be non-empty. The median is
+    ;;; the middle element of the sorted window, matching Bitcoin's
+    ;;; `GetMedianTimePast`, so an even window takes the upper middle.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-median-time-past (list h1 h2 h3)) ; => the middle timestamp
+    ;;; ```
+    (define (coin-median-time-past headers)
+      (: list? -> integer?)
+      (if (not (pair? headers))
+          (error "coin-median-time-past: expected at least one header"))
+      (let* ((window (trailing headers coin-median-time-span))
+             (times (list-sort < (map block-header-time window))))
+        (list-ref times (quotient (length times) 2))))
+
+    ;;; Serialized size of a block, in bytes, or `#f` when it does not
+    ;;; serialize at all.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-block-size 42) ; => #f
+    ;;; ```
+    (define (coin-block-size b)
+      (: any? -> any?)
+      (guard (e (#t #f))
+        (bytevector-length (block-serialize b))))
+
+    ;;; Check a block against the size cap.
+    ;;;
+    ;;; Rejection reasons are `malformed-block` and `block-oversize`. On
+    ;;; success the value is the serialized size.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-result-reason (coin-validate-block-size 42)) ; => malformed-block
+    ;;; ```
+    (define (coin-validate-block-size b)
+      (: any? -> coin-result?)
+      (let ((size (coin-block-size b)))
+        (cond
+          ((not size)
+           (coin-error 'malformed-block "block does not serialize"))
+          ((> size coin-max-block-bytes)
+           (coin-error 'block-oversize "block exceeds the size cap"))
+          (else (coin-ok size)))))
+
+    ;;; Check a header against the chain it claims to extend.
+    ;;;
+    ;;; `previous-headers` runs oldest to newest and is empty only for
+    ;;; genesis, which has no parent to link to, no spacing to satisfy and no
+    ;;; median to clear; the future-drift rule still applies to it. `now` is
+    ;;; the validating node's clock in Unix seconds.
+    ;;;
+    ;;; Rejection reasons are `malformed-header`, `bad-prev-hash`,
+    ;;; `insufficient-spacing`, `time-too-old` and `time-too-far-ahead`. On
+    ;;; success the value is the header.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-result-reason (coin-validate-header-context '() header now))
+    ;;; ; => #f, when the header is not from the future
+    ;;; ```
+    (define (coin-validate-header-context previous-headers header now)
+      (: any? any? any? -> coin-result?)
+      (guard (e (#t (coin-error 'malformed-header
+                                "header context check raised")))
+        (cond
+          ((not (block-header? header))
+           (coin-error 'malformed-header "expected a block header"))
+          ((not (list? previous-headers))
+           (coin-error 'malformed-header "expected a header list"))
+          ((not (and (number? now) (exact? now) (integer? now)))
+           (coin-error 'malformed-header "expected an integer clock"))
+          (else
+            (let ((time (block-header-time (validate-block-header header))))
+              (cond
+                ((> time (+ now coin-max-future-drift))
+                 (coin-error 'time-too-far-ahead
+                             "header time is too far in the future"))
+                ((null? previous-headers) (coin-ok header))
+                (else
+                  (let ((parent (last-of previous-headers)))
+                    (cond
+                      ((not (block-header-links? parent header))
+                       (coin-error 'bad-prev-hash
+                                   "header does not link to its parent"))
+                      ((< time (+ (block-header-time parent)
+                                  coin-min-block-spacing))
+                       (coin-error 'insufficient-spacing
+                                   "header is too close to its parent"))
+                      ((<= time (coin-median-time-past previous-headers))
+                       (coin-error 'time-too-old
+                                   "header time is at or below median time past"))
+                      (else (coin-ok header)))))))))))))

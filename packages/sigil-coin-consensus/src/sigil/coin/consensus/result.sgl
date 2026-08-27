@@ -1,0 +1,81 @@
+;;; (sigil coin consensus result) — tagged consensus outcomes
+;;;
+;;; Consensus checks in this package never raise on attacker-supplied data.
+;;; They hand back a `coin-result`, mirroring the `puzzle-result` style the
+;;; interpreter uses, so a node can branch on `coin-ok?` instead of wrapping
+;;; every call in a handler.
+;;;
+;;; `reason` is a frozen symbol callers may switch on. `detail` is a
+;;; human-readable string and is NOT consensus-relevant: two nodes may print
+;;; different details for the same rejection and still agree on the chain.
+
+(define-library (sigil coin consensus result)
+  (import (sigil struct))
+  (export
+    coin-result
+    coin-result?
+    coin-result-status
+    coin-result-value
+    coin-result-reason
+    coin-result-detail
+    coin-ok
+    coin-error
+    coin-ok?
+    coin-failed?)
+
+  (begin
+
+    ;;; Outcome of one consensus check.
+    ;;;
+    ;;; `status` is `ok` or `error`. On `ok`, `value` carries whatever the
+    ;;; check produced. On `error`, `reason` is the frozen rejection symbol
+    ;;; and `detail` an advisory message.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-result-status (coin-ok 7))           ; => ok
+    ;;; (coin-result-reason (coin-error 'nope "")) ; => nope
+    ;;; ```
+    (define-struct coin-result
+      (status)
+      (value default: #f)
+      (reason default: #f)
+      (detail default: ""))
+
+    ;;; Build a successful result carrying `value`.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-result-value (coin-ok 42)) ; => 42
+    ;;; ```
+    (define (coin-ok value)
+      (: any? -> coin-result?)
+      (coin-result status: 'ok value: value))
+
+    ;;; Build a failed result naming `reason`.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-result-reason (coin-error 'solution-mismatch "wrong target"))
+    ;;; ; => solution-mismatch
+    ;;; ```
+    (define (coin-error reason detail)
+      (: symbol? string? -> coin-result?)
+      (coin-result status: 'error reason: reason detail: detail))
+
+    ;;; True when a check succeeded.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-ok? (coin-ok 1)) ; => #t
+    ;;; ```
+    (define (coin-ok? result)
+      (: any? -> boolean?)
+      (and (coin-result? result)
+           (eq? 'ok (coin-result-status result))))
+
+    ;;; True when a check rejected its input.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-failed? (coin-error 'bad-height "negative")) ; => #t
+    ;;; ```
+    (define (coin-failed? result)
+      (: any? -> boolean?)
+      (and (coin-result? result)
+           (eq? 'error (coin-result-status result))))))

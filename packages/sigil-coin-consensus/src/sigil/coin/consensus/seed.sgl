@@ -1,0 +1,99 @@
+;;; (sigil coin consensus seed) — puzzle seed derivation
+;;;
+;;; Every block's puzzle is a pure function of the chain, so the seed handed
+;;; to `puzzle-for` must be unambiguous down to the byte:
+;;;
+;;;   seed(height) = SHA256d(previous-block-hash || u64le(height))
+;;;
+;;; Two encoding decisions are frozen here:
+;;;
+;;;   * `previous-block-hash` is the INTERNAL 32-byte double-SHA256 header
+;;;     hash, exactly the bytes `block-header-hash` returns and exactly the
+;;;     bytes a header carries in its `previous-block` field. It is NOT the
+;;;     reversed, big-endian display id that `block-header-id` prints.
+;;;   * the height is a fixed-width 8-byte unsigned LITTLE-ENDIAN integer,
+;;;     matching every other integer on the Bitcoin wire. Fixed width means
+;;;     the concatenation is injective, so no two (hash, height) pairs share
+;;;     a seed.
+;;;
+;;; Genesis has no predecessor, so its seed cannot be derived and is defined
+;;; outright as SHA256d over a domain-separated ASCII tag. Deriving it from
+;;; the all-zero previous hash instead would collide with any future height
+;;; whose parent hash happened to be zero, which is not a risk worth leaving
+;;; open for the sake of one branch.
+
+(define-library (sigil coin consensus seed)
+  (import (sigil math)
+          (sigil bitcoin utils)
+          (sigil bitcoin primitives)
+          (sigil coin puzzle generator))
+  (export
+    coin-genesis-seed-tag
+    coin-genesis-seed
+    coin-height-encode
+    coin-puzzle-seed
+    coin-puzzle-for)
+
+  (begin
+
+    (define %max-height #xffffffff)
+    (define %zero-hash (make-bytevector 32 0))
+
+    ;;; Domain-separation tag whose SHA256d is the genesis puzzle seed.
+    (define coin-genesis-seed-tag "SigilCoin/genesis/puzzle/v1")
+
+    ;;; The genesis puzzle seed: 32 bytes, defined rather than derived.
+    (define coin-genesis-seed (hash256 coin-genesis-seed-tag))
+
+    (define (require-height who height)
+      (if (not (and (number? height) (exact? height) (integer? height)
+                    (<= 0 height %max-height)))
+          (error (string-append who ": height out of range")))
+      height)
+
+    ;;; Encode a height as the 8 fixed-width little-endian bytes the seed
+    ;;; preimage uses.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-height-encode 1) ; => #u8(1 0 0 0 0 0 0 0)
+    ;;; ```
+    (define (coin-height-encode height)
+      (: integer? -> bytevector?)
+      (require-height "coin-height-encode" height)
+      (u64-le height))
+
+    ;;; Derive the 32-byte puzzle seed for a block.
+    ;;;
+    ;;; `previous-hash` is the internal 32-byte header hash of the parent.
+    ;;; At height 0 there is no parent: the previous hash must be the 32 zero
+    ;;; bytes a genesis header carries, and the frozen `coin-genesis-seed` is
+    ;;; returned instead of a derivation.
+    ;;;
+    ;;; ```scheme
+    ;;; (bytevector-length (coin-puzzle-seed (make-bytevector 32 0) 0)) ; => 32
+    ;;; (equal? coin-genesis-seed (coin-puzzle-seed (make-bytevector 32 0) 0))
+    ;;; ; => #t
+    ;;; ```
+    (define (coin-puzzle-seed previous-hash height)
+      (: bytevector? integer? -> bytevector?)
+      (require-bytevector-length "coin-puzzle-seed" previous-hash 32)
+      (require-height "coin-puzzle-seed" height)
+      (if (= height 0)
+          (begin
+            (if (not (equal? %zero-hash previous-hash))
+                (error "coin-puzzle-seed: genesis must have a zero previous hash"))
+            coin-genesis-seed)
+          (hash256 (bytevector-append previous-hash
+                                      (coin-height-encode height)))))
+
+    ;;; Regenerate the puzzle a block at `height` must solve.
+    ;;;
+    ;;; Pure: the same parent hash and height always produce a byte-identical
+    ;;; puzzle on every node.
+    ;;;
+    ;;; ```scheme
+    ;;; (puzzle-spec? (coin-puzzle-for (make-bytevector 32 7) 12)) ; => #t
+    ;;; ```
+    (define (coin-puzzle-for previous-hash height)
+      (: bytevector? integer? -> puzzle-spec?)
+      (puzzle-for (coin-puzzle-seed previous-hash height) height))))

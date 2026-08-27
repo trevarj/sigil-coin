@@ -1,0 +1,223 @@
+;;; (sigil coin consensus coinbase) — the coinbase scriptSig payload
+;;;
+;;; A SigilCoin coinbase input carries the block's mining claim in its
+;;; scriptSig, as exactly three minimally-encoded data pushes, in this order:
+;;;
+;;;   1. HEIGHT    — BIP34-style, the block height as a Bitcoin script number
+;;;                  (little-endian sign-magnitude). Height 0 is the empty
+;;;                  push, `OP_0`.
+;;;   2. SOLUTION  — the puzzle-lang source the miner is claiming, 1 to
+;;;                  `coin-max-solution-bytes` bytes. Fork choice ranks
+;;;                  blocks by this push's length, so it is consensus.
+;;;   3. GRAFFITI  — 0 to `coin-max-graffiti-bytes` opaque bytes. Consensus
+;;;                  never looks inside; it is a channel quote.
+;;;
+;;; Bitcoin caps a coinbase scriptSig at 100 bytes. SigilCoin does not: the
+;;; solution and the graffiti live here, so `sigil-bitcoin`'s coinbase
+;;; validator is deliberately not reused for this field.
+;;;
+;;; Decoding is strict and total. The decoder rebuilds the canonical
+;;; encoding from what it read and rejects anything that does not reproduce
+;;; the input byte for byte, which is what closes off non-minimal pushes,
+;;; non-minimal height encodings and trailing bytes in one check.
+
+(define-library (sigil coin consensus coinbase)
+  (import (sigil struct)
+          (sigil math)
+          (sigil bitcoin utils)
+          (sigil bitcoin script)
+          (sigil bitcoin tx)
+          (sigil bitcoin consensus)
+          (sigil coin puzzle)
+          (sigil coin consensus result))
+  (export
+    coin-max-solution-bytes
+    coin-max-graffiti-bytes
+    coin-coinbase-payload
+    coin-coinbase-payload?
+    coin-coinbase-payload-height
+    coin-coinbase-payload-solution
+    coin-coinbase-payload-graffiti
+    coin-coinbase-payload-encode
+    coin-coinbase-payload-decode
+    coin-block-coinbase
+    coin-block-coinbase-payload)
+
+  (begin
+
+    (define %max-height #xffffffff)
+
+    ;;; Maximum solution length, in bytes. Tied to the interpreter's own
+    ;;; source cap: a longer push could never parse anyway.
+    (define coin-max-solution-bytes puzzle-max-source-bytes)
+
+    ;;; Maximum graffiti length, in bytes.
+    (define coin-max-graffiti-bytes 400)
+
+    ;;; The decoded contents of a coinbase scriptSig.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-coinbase-payload-height
+    ;;;   (coin-coinbase-payload height: 7 solution: #u8(49) graffiti: #u8()))
+    ;;; ; => 7
+    ;;; ```
+    (define-struct coin-coinbase-payload
+      (height integer?)
+      (solution bytevector?)
+      (graffiti bytevector?))
+
+    ;; Shared field checks. The encoder raises on a violation because it is
+    ;; only ever handed locally built data; the decoder converts the same
+    ;; conditions into tagged results.
+    (define (height-ok? height)
+      (and (number? height) (exact? height) (integer? height)
+           (<= 0 height %max-height)))
+
+    (define (solution-ok? solution)
+      (and (bytevector? solution)
+           (>= (bytevector-length solution) 1)
+           (<= (bytevector-length solution) coin-max-solution-bytes)))
+
+    (define (graffiti-ok? graffiti)
+      (and (bytevector? graffiti)
+           (<= (bytevector-length graffiti) coin-max-graffiti-bytes)))
+
+    ;;; Encode a payload as coinbase scriptSig bytes.
+    ;;;
+    ;;; Raises when a field is out of range: a miner building a block is
+    ;;; expected to hand over legal fields, and a silent truncation here
+    ;;; would produce an unminable block.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-coinbase-payload-encode
+    ;;;   (coin-coinbase-payload height: 1 solution: #u8(49) graffiti: #u8()))
+    ;;; ; => #u8(#x01 #x01 #x01 #x31 #x00)
+    ;;; ```
+    (define (coin-coinbase-payload-encode payload)
+      (: coin-coinbase-payload? -> bytevector?)
+      (if (not (coin-coinbase-payload? payload))
+          (error "coin-coinbase-payload-encode: expected a coinbase payload"))
+      (let ((height (coin-coinbase-payload-height payload))
+            (solution (coin-coinbase-payload-solution payload))
+            (graffiti (coin-coinbase-payload-graffiti payload)))
+        (if (not (height-ok? height))
+            (error "coin-coinbase-payload-encode: height out of range"))
+        (if (not (solution-ok? solution))
+            (error "coin-coinbase-payload-encode: solution length out of range"))
+        (if (not (graffiti-ok? graffiti))
+            (error "coin-coinbase-payload-encode: graffiti length out of range"))
+        (script-append
+          (script-push-data (script-number-encode height))
+          (script-push-data solution)
+          (script-push-data graffiti))))
+
+    ;; Parse the script into chunks, or #f when it is malformed. `script-parse`
+    ;; raises on a truncated push, so the raise is absorbed here.
+    (define (parse-chunks script)
+      (guard (e (#t #f))
+        (script-parse script)))
+
+    (define (chunk-count chunks)
+      (let loop ((xs chunks) (n 0))
+        (if (null? xs) n (loop (cdr xs) (+ n 1)))))
+
+    ;; True when every chunk carries pushed data rather than a bare opcode.
+    (define (all-pushes? chunks)
+      (let loop ((xs chunks))
+        (cond
+          ((null? xs) #t)
+          ((bytevector? (script-chunk-data (car xs))) (loop (cdr xs)))
+          (else #f))))
+
+    ;;; Decode coinbase scriptSig bytes into a payload.
+    ;;;
+    ;;; Total: any input, however hostile, yields a `coin-result`. Rejection
+    ;;; reasons are `not-bytevector`, `malformed-script`, `wrong-field-count`,
+    ;;; `not-a-push`, `bad-height`, `solution-empty`, `solution-oversize`,
+    ;;; `graffiti-oversize` and `non-canonical`.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-ok? (coin-coinbase-payload-decode #u8(#x01 #x01 #x01 #x31 #x00)))
+    ;;; ; => #t
+    ;;; (coin-result-reason (coin-coinbase-payload-decode #u8(#x02 #x01)))
+    ;;; ; => malformed-script
+    ;;; ```
+    (define (coin-coinbase-payload-decode script)
+      (: any? -> coin-result?)
+      (guard (e (#t (coin-error 'malformed-script
+                                "coinbase scriptSig could not be decoded")))
+        (if (not (bytevector? script))
+            (coin-error 'not-bytevector "coinbase scriptSig must be bytes")
+            (let ((chunks (parse-chunks script)))
+              (cond
+                ((not chunks)
+                 (coin-error 'malformed-script "truncated pushdata"))
+                ((not (= 3 (chunk-count chunks)))
+                 (coin-error 'wrong-field-count
+                             "expected exactly three pushes"))
+                ((not (all-pushes? chunks))
+                 (coin-error 'not-a-push "expected data pushes only"))
+                (else
+                  (let* ((height-bytes (script-chunk-data (car chunks)))
+                         (solution (script-chunk-data (car (cdr chunks))))
+                         (graffiti (script-chunk-data
+                                     (car (cdr (cdr chunks)))))
+                         (height (script-number-decode height-bytes)))
+                    (cond
+                      ((not (height-ok? height))
+                       (coin-error 'bad-height "height out of range"))
+                      ((= 0 (bytevector-length solution))
+                       (coin-error 'solution-empty "solution push is empty"))
+                      ((> (bytevector-length solution) coin-max-solution-bytes)
+                       (coin-error 'solution-oversize
+                                   "solution exceeds the byte cap"))
+                      ((> (bytevector-length graffiti) coin-max-graffiti-bytes)
+                       (coin-error 'graffiti-oversize
+                                   "graffiti exceeds the byte cap"))
+                      (else
+                        (let ((payload (coin-coinbase-payload
+                                         height: height
+                                         solution: solution
+                                         graffiti: graffiti)))
+                          ;; One canonicality check covers non-minimal
+                          ;; pushes and non-minimal height encodings: the
+                          ;; canonical encoding of what we read must be the
+                          ;; bytes we were given.
+                          (if (not (equal? script
+                                           (coin-coinbase-payload-encode
+                                             payload)))
+                              (coin-error 'non-canonical
+                                          "scriptSig is not the canonical encoding")
+                              (coin-ok payload))))))))))))
+
+    ;;; Return a block's coinbase transaction, or `#f` when it has none.
+    ;;;
+    ;;; Total: a malformed block yields `#f` rather than a raise.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-block-coinbase 42) ; => #f
+    ;;; ```
+    (define (coin-block-coinbase b)
+      (: any? -> any?)
+      (guard (e (#t #f))
+        (and (block? b)
+             (pair? (block-transactions b))
+             (let ((tx (car (block-transactions b))))
+               (and (coinbase-transaction? tx) tx)))))
+
+    ;;; Decode a block's coinbase payload.
+    ;;;
+    ;;; Adds `missing-coinbase` to the decoder's rejection reasons.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-result-reason (coin-block-coinbase-payload 42))
+    ;;; ; => missing-coinbase
+    ;;; ```
+    (define (coin-block-coinbase-payload b)
+      (: any? -> coin-result?)
+      (let ((tx (coin-block-coinbase b)))
+        (if (not tx)
+            (coin-error 'missing-coinbase
+                        "block has no coinbase transaction")
+            (coin-coinbase-payload-decode
+              (txin-script-sig (car (transaction-inputs tx)))))))))

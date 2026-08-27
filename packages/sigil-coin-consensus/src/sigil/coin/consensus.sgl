@@ -1,14 +1,108 @@
-;;; (sigil coin consensus) — SigilCoin consensus rule scaffold
+;;; (sigil coin consensus) — SigilCoin consensus rules
+;;;
+;;; Facade over the rule modules. SigilCoin reuses Bitcoin's header,
+;;; transaction, UTXO and script machinery from `sigil-bitcoin-consensus`
+;;; wholesale; what lives here is only what SigilCoin changes:
+;;;
+;;;   (sigil coin consensus emission)    the daviwil emission schedule
+;;;   (sigil coin consensus seed)        puzzle seed derivation
+;;;   (sigil coin consensus coinbase)    the coinbase scriptSig payload
+;;;   (sigil coin consensus solution)    the mining rule
+;;;   (sigil coin consensus fork-choice) shortest solution wins
+;;;   (sigil coin consensus rules)       size and pacing
+;;;   (sigil coin consensus result)      the tagged result all of them return
+;;;
+;;; The package is pure: it validates data it is handed. No database, no
+;;; network, no node runtime.
+;;;
+;;; ```scheme
+;;; (import (sigil coin consensus))
+;;; (coin-block-reward 31)  ; => 10000000000
+;;; (coin-ok? (coin-verify-block-solution parent-hash height block))
+;;; ```
 
 (define-library (sigil coin consensus)
-  (export consensus-package-version)
+  (import (sigil coin consensus result)
+          (sigil coin consensus emission)
+          (sigil coin consensus seed)
+          (sigil coin consensus coinbase)
+          (sigil coin consensus solution)
+          (sigil coin consensus fork-choice)
+          (sigil coin consensus rules))
+  (export
+    ;; Package metadata
+    consensus-package-version
+
+    ;; Tagged results
+    coin-result
+    coin-result?
+    coin-result-status
+    coin-result-value
+    coin-result-reason
+    coin-result-detail
+    coin-ok
+    coin-error
+    coin-ok?
+    coin-failed?
+
+    ;; Emission
+    coin-daviwils-per-sigil
+    coin-warmup-height
+    coin-warmup-reward
+    coin-initial-reward
+    coin-halving-interval
+    coin-final-reward-height
+    coin-max-supply
+    coin-block-reward
+    coin-cumulative-supply
+
+    ;; Puzzle seed
+    coin-genesis-seed-tag
+    coin-genesis-seed
+    coin-height-encode
+    coin-puzzle-seed
+    coin-puzzle-for
+
+    ;; Coinbase payload
+    coin-max-solution-bytes
+    coin-max-graffiti-bytes
+    coin-coinbase-payload
+    coin-coinbase-payload?
+    coin-coinbase-payload-height
+    coin-coinbase-payload-solution
+    coin-coinbase-payload-graffiti
+    coin-coinbase-payload-encode
+    coin-coinbase-payload-decode
+    coin-block-coinbase
+    coin-block-coinbase-payload
+
+    ;; Solution verification
+    coin-check-solution
+    coin-verify-block-solution
+
+    ;; Fork choice
+    coin-hash-compare
+    coin-solution-compare
+    coin-better-solution?
+    coin-replaces-tip?
+
+    ;; Size and pacing
+    coin-max-block-bytes
+    coin-min-block-spacing
+    coin-max-future-drift
+    coin-median-time-span
+    coin-median-time-past
+    coin-block-size
+    coin-validate-block-size
+    coin-validate-header-context)
+
   (begin
 
-    ;;; Version of the consensus package, used as a scaffold placeholder until
-    ;;; emission and fork-choice rules land.
+    ;;; Version of the consensus package.
     ;;;
-    ;;; Example:
-    ;;;   (consensus-package-version) ;=> "0.1.0"
+    ;;; ```scheme
+    ;;; (consensus-package-version) ; => "0.1.0"
+    ;;; ```
     (define (consensus-package-version)
       (: -> string?)
       "0.1.0")))
