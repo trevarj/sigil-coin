@@ -1,0 +1,509 @@
+;;; Golden vectors for the SigilCoin puzzle generator.
+;;;
+;;; The generator is consensus: a puzzle is a pure function of the block seed
+;;; and the height. Every expectation here freezes that function — a drifting
+;;; target, par or retry count is a chain split, so these tests must fail
+;;; loudly rather than be updated.
+
+(import (sigil test)
+        (sigil math)
+        (sigil coin puzzle)
+        (sigil coin puzzle generator))
+
+;; ============================================================
+;; Helpers
+;; ============================================================
+
+;; Deterministic test seed: 32 bytes derived from a small index.
+(define (seed-of k)
+  (let ((bv (make-bytevector puzzle-seed-bytes 0)))
+    (let loop ((i 0))
+      (if (>= i puzzle-seed-bytes)
+          bv
+          (begin
+            (bytevector-u8-set! bv i (modulo (+ (* i 7) (* k 31) 11) 256))
+            (loop (+ i 1)))))))
+
+;; `n` consecutive draws from a fresh stream.
+(define (draws seed height retry n)
+  (let ((g (puzzle-prng-open seed height retry)))
+    (let loop ((i 0) (acc '()))
+      (if (>= i n)
+          (reverse acc)
+          (loop (+ i 1) (cons (puzzle-prng-next! g) acc))))))
+
+(define (run-value source)
+  (puzzle-result-value (puzzle-run source)))
+
+(define (runs-to? source target)
+  (let ((result (puzzle-run source)))
+    (and (puzzle-ok? result)
+         (puzzle-value=? target (puzzle-result-value result)))))
+
+(define (literal-size spec)
+  (string-length (puzzle-print-value (puzzle-spec-target spec))))
+
+;; True when the target is exactly the prefix run `(0 1 ... n-1)`, which
+;; `(iota n)` rebuilds in nine bytes or so however long its literal is.
+(define (iota-run? value)
+  (let loop ((x value) (i 0))
+    (cond
+      ((null? x) (> i 0))
+      ((not (pair? x)) #f)
+      ((and (number? (car x)) (exact? (car x)) (integer? (car x))
+            (= (car x) i))
+       (loop (cdr x) (+ i 1)))
+      (else #f))))
+
+;; The sweep: every puzzle generated once, then asserted over from several
+;; angles. 200 seeds x 4 heights = 800 puzzles.
+(define %sweep-seeds 200)
+(define %sweep-heights '(0 1 7 4096))
+
+(define %sweep
+  (let loop ((k 0) (acc '()))
+    (if (>= k %sweep-seeds)
+        (reverse acc)
+        (loop (+ k 1)
+              (let heights ((hs %sweep-heights) (acc acc))
+                (if (null? hs)
+                    acc
+                    (heights (cdr hs)
+                             (cons (puzzle-for (seed-of k) (car hs)) acc))))))))
+
+(define %sweep-size (length %sweep))
+
+(define (sweep-count pred)
+  (let loop ((specs %sweep) (n 0))
+    (if (null? specs)
+        n
+        (loop (cdr specs) (if (pred (car specs)) (+ n 1) n)))))
+
+;; True when every generated puzzle satisfies `pred`.
+(define (sweep-all? pred)
+  (= %sweep-size (sweep-count pred)))
+
+;; ============================================================
+;; Constants
+;; ============================================================
+
+(test-group "puzzle generator constants"
+  (test "generator constants are frozen"
+    (assert-equal 1 (puzzle-generator-version))
+    (assert-equal 32 puzzle-seed-bytes)
+    (assert-equal 32 puzzle-min-target-bytes)
+    (assert-equal 192 puzzle-max-target-bytes)
+    (assert-equal 24 puzzle-min-par-bytes)
+    (assert-equal 64 puzzle-max-generator-retries)
+    (assert-equal "(map (lambda (x) (* x 7)) (iota 12))"
+                  puzzle-fallback-source))
+
+  (test "the band leaves room for the quoting solution"
+    (assert-true (< puzzle-min-target-bytes puzzle-max-target-bytes))
+    ;; literal + the quote byte must fit the solution cap
+    (assert-true (<= (+ 1 puzzle-max-target-bytes) puzzle-max-source-bytes)))
+
+  (test "the par floor clears the trivial programs"
+    ;; `(iota 16)` is 9 bytes and `(reverse (iota 16))` is 19; both must sit
+    ;; below the floor, or a height decays into a lowest-hash lottery.
+    (assert-true (> puzzle-min-par-bytes 19))
+    (assert-true (<= puzzle-min-par-bytes puzzle-max-source-bytes)))
+
+  (test "the prng word width is 64 bits"
+    (assert-equal 64 (puzzle-prng-word-bits))))
+
+;; ============================================================
+;; PRNG
+;; ============================================================
+
+(test-group "puzzle generator prng"
+  (test "the stream is a pure function of seed, height and retry"
+    (assert-equal (draws (seed-of 3) 11 0 16)
+                  (draws (seed-of 3) 11 0 16)))
+
+  (test "seed, height and retry each change the stream"
+    (assert-false (equal? (draws (seed-of 3) 11 0 8)
+                          (draws (seed-of 4) 11 0 8)))
+    (assert-false (equal? (draws (seed-of 3) 11 0 8)
+                          (draws (seed-of 3) 12 0 8)))
+    (assert-false (equal? (draws (seed-of 3) 11 0 8)
+                          (draws (seed-of 3) 11 1 8))))
+
+  (test "draws are masked to 64 unsigned bits"
+    (let ((bound (expt 2 64)))
+      (let loop ((words (draws (seed-of 9) 5 0 256)))
+        (if (null? words)
+            (assert-true #t)
+            (let ((w (car words)))
+              (assert-true (and (number? w) (exact? w) (integer? w)))
+              (assert-true (>= w 0))
+              (assert-true (< w bound))
+              (loop (cdr words)))))))
+
+  (test "height and retry are absorbed injectively"
+    ;; Minimal little-endian without a length prefix collides across the
+    ;; pair: (height 1, retry 770) and (height 513, retry 3) both absorb
+    ;; 01 02 03. Distinct inputs must never share a stream.
+    (assert-false (equal? (draws (seed-of 1) 1 770 4)
+                          (draws (seed-of 1) 513 3 4)))
+    (assert-false (equal? (draws (seed-of 1) 0 1 4)
+                          (draws (seed-of 1) 1 0 4)))
+    (assert-false (equal? (draws (seed-of 1) 2 128 4)
+                          (draws (seed-of 1) 130 0 4)))
+    ;; A grid of pairs, all distinct.
+    (let ((heights '(0 1 127 128 129 255 256 4096 65535 16777216))
+          (retries '(0 1 63 127 128 770)))
+      (let outer ((hs heights) (seen '()))
+        (if (null? hs)
+            (assert-true #t)
+            (let inner ((rs retries) (seen seen))
+              (if (null? rs)
+                  (outer (cdr hs) seen)
+                  (let ((word (car (draws (seed-of 1) (car hs) (car rs) 1))))
+                    (assert-false (memv word seen))
+                    (inner (cdr rs) (cons word seen)))))))))
+
+  (test "consecutive draws differ"
+    (let ((words (draws (seed-of 2) 0 0 8)))
+      (assert-false (equal? (car words) (car (cdr words))))))
+
+  (test "bounded draws stay in range"
+    (let ((g (puzzle-prng-open (seed-of 1) 0 0)))
+      (let loop ((i 0))
+        (if (>= i 512)
+            (assert-true #t)
+            (let ((one (puzzle-prng-below! g 1))
+                  (r (puzzle-prng-below! g 7)))
+              (assert-equal 0 one)
+              (assert-true (>= r 0))
+              (assert-true (< r 7))
+              (loop (+ i 1)))))))
+
+  (test "a non-positive bound is rejected"
+    (let ((g (puzzle-prng-open (seed-of 1) 0 0)))
+      (assert-error (puzzle-prng-below! g 0))
+      (assert-error (puzzle-prng-below! g -3))))
+
+  (test "malformed generator inputs are rejected"
+    (assert-error (puzzle-prng-open (make-bytevector 31 0) 0 0))
+    (assert-error (puzzle-prng-open (make-bytevector 33 0) 0 0))
+    (assert-error (puzzle-prng-open "not-a-bytevector" 0 0))
+    (assert-error (puzzle-for (make-bytevector 16 0) 0))
+    (assert-error (puzzle-for (seed-of 0) -1))
+    (assert-error (puzzle-attempt (seed-of 0) 0 -1))))
+
+;; ============================================================
+;; Determinism
+;; ============================================================
+
+(test-group "puzzle generator determinism"
+  (test "the same seed and height give a byte-identical puzzle"
+    (let ((a (puzzle-for (seed-of 5) 42))
+          (b (puzzle-for (seed-of 5) 42)))
+      (assert-true (puzzle-value=? (puzzle-spec-target a)
+                                   (puzzle-spec-target b)))
+      (assert-equal (puzzle-spec-source a) (puzzle-spec-source b))
+      (assert-equal (puzzle-spec-solution a) (puzzle-spec-solution b))
+      (assert-equal (puzzle-spec-par a) (puzzle-spec-par b))
+      (assert-equal (puzzle-spec-retries a) (puzzle-spec-retries b))
+      (assert-equal (puzzle-spec-height a) (puzzle-spec-height b))))
+
+  (test "a different height gives a different puzzle"
+    (assert-false (equal? (puzzle-spec-solution (puzzle-for (seed-of 5) 42))
+                          (puzzle-spec-solution (puzzle-for (seed-of 5) 43)))))
+
+  (test "a different seed gives a different puzzle"
+    (assert-false (equal? (puzzle-spec-solution (puzzle-for (seed-of 5) 42))
+                          (puzzle-spec-solution (puzzle-for (seed-of 6) 42)))))
+
+  (test "the height is carried on the puzzle"
+    (assert-equal 4096 (puzzle-spec-height (puzzle-for (seed-of 7) 4096))))
+
+  ;; Golden vectors. Any drift here changes which blocks nodes accept.
+  (test "golden puzzle 0"
+    (let ((spec (puzzle-for (seed-of 0) 0)))
+      (assert-equal
+        "(map (lambda (x) (number->string (+ x 43))) (iota 7))"
+        (puzzle-spec-source spec))
+      (assert-equal "'(\"43\" \"44\" \"45\" \"46\" \"47\" \"48\" \"49\")"
+                    (puzzle-spec-solution spec))
+      (assert-true (puzzle-value=? '("43" "44" "45" "46" "47" "48" "49")
+                                   (puzzle-spec-target spec)))
+      (assert-equal 37 (puzzle-spec-par spec))
+      (assert-equal 1 (puzzle-spec-retries spec))))
+
+  (test "golden puzzle 1"
+    (let ((spec (puzzle-for (seed-of 1) 3)))
+      (assert-equal
+        (string-append "(cons 60 (list (iota 16) (string-append \"ok\" \"gold\")"
+                       " 'b (list 508 'x 931 877) (- 725 796)))")
+        (puzzle-spec-source spec))
+      (assert-equal
+        (string-append "'(60 (0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15)"
+                       " \"okgold\" b (508 x 931 877) -71)")
+        (puzzle-spec-solution spec))
+      (assert-equal 76 (puzzle-spec-par spec))
+      (assert-equal 0 (puzzle-spec-retries spec))))
+
+  (test "golden puzzle 2"
+    (let ((spec (puzzle-for (seed-of 2) 6)))
+      (assert-equal
+        (string-append "(list (list 200 \"coin\" \"zz\") (expt 4 6) (iota 15)"
+                       " (string-append \"a\" \"hi\") (iota 6))")
+        (puzzle-spec-source spec))
+      (assert-equal
+        (string-append "'((200 \"coin\" \"zz\") 4096"
+                       " (0 1 2 3 4 5 6 7 8 9 10 11 12 13 14) \"ahi\""
+                       " (0 1 2 3 4 5))")
+        (puzzle-spec-solution spec))
+      (assert-equal 82 (puzzle-spec-par spec))
+      (assert-equal 1 (puzzle-spec-retries spec))))
+
+  (test "golden puzzle 3"
+    (let ((spec (puzzle-for (seed-of 3) 9)))
+      (assert-equal "(append (iota 13) (list \"rune\" 'd 84921))"
+                    (puzzle-spec-source spec))
+      (assert-equal "'(0 1 2 3 4 5 6 7 8 9 10 11 12 \"rune\" d 84921)"
+                    (puzzle-spec-solution spec))
+      (assert-equal 41 (puzzle-spec-par spec))
+      (assert-equal 0 (puzzle-spec-retries spec))))
+
+  ;; This seed used to settle on `(iota 15)` at retry 2 — a 9-byte race every
+  ;; miner wins at once. The par floor rejects it, so it re-rolls once more.
+  (test "golden puzzle 5 (formerly degenerate)"
+    (let ((spec (puzzle-for (seed-of 2) 7)))
+      (assert-equal
+        (string-append "(list (list 742 \"gold\" 'sigil \"gold\" #t) \"rune\""
+                       " (list #t 712 #f 918) (list -424889 641 972))")
+        (puzzle-spec-source spec))
+      (assert-equal
+        (string-append "'((742 \"gold\" sigil \"gold\" #t) \"rune\""
+                       " (#t 712 #f 918) (-424889 641 972))")
+        (puzzle-spec-solution spec))
+      (assert-equal 72 (puzzle-spec-par spec))
+      (assert-equal 3 (puzzle-spec-retries spec))))
+
+  ;; A height above 127 takes the multi-byte absorption path, so this vector
+  ;; also freezes how height bytes are folded into the seed material.
+  (test "golden puzzle 6 (multi-byte height)"
+    (let ((spec (puzzle-for (seed-of 8) 4096)))
+      (assert-equal
+        "(reverse (append (iota 11) (list 196345 'dot 498 276 \"a\")))"
+        (puzzle-spec-source spec))
+      (assert-equal "'(\"a\" 276 498 dot 196345 10 9 8 7 6 5 4 3 2 1 0)"
+                    (puzzle-spec-solution spec))
+      (assert-equal 48 (puzzle-spec-par spec))
+      (assert-equal 0 (puzzle-spec-retries spec))))
+
+  (test "golden puzzle 4"
+    (let ((spec (puzzle-for (seed-of 4) 12)))
+      (assert-equal
+        (string-append "(reverse (list (+ -96 230) (list \"block\" 154 55 814"
+                       " #t) (list \"a\" #t 319) (list #f 580 366)"
+                       " (string-append \"zz\" \"rune\")))")
+        (puzzle-spec-source spec))
+      (assert-equal
+        (string-append "'(\"zzrune\" (#f 580 366) (\"a\" #t 319)"
+                       " (\"block\" 154 55 814 #t) 134)")
+        (puzzle-spec-solution spec))
+      (assert-equal 65 (puzzle-spec-par spec))
+      (assert-equal 2 (puzzle-spec-retries spec)))))
+
+;; ============================================================
+;; Always-solvable invariant
+;; ============================================================
+
+(test-group "puzzle generator solvability"
+  (test "the sweep really generated puzzles"
+    (assert-equal 800 %sweep-size))
+
+  (test "quoting the target literal always solves the puzzle"
+    (assert-true
+      (sweep-all?
+        (lambda (spec)
+          (and (<= (string-length (puzzle-spec-solution spec))
+                   puzzle-max-source-bytes)
+               (puzzle-ok? (puzzle-parse (puzzle-spec-solution spec)))
+               (runs-to? (puzzle-spec-solution spec)
+                         (puzzle-spec-target spec)))))))
+
+  (test "the generator expression is itself a legal solution"
+    (assert-true
+      (sweep-all?
+        (lambda (spec)
+          (and (<= (string-length (puzzle-spec-source spec))
+                   puzzle-max-source-bytes)
+               (runs-to? (puzzle-spec-source spec)
+                         (puzzle-spec-target spec)))))))
+
+  (test "the stored expression prints back to the stored source"
+    (assert-true
+      (sweep-all?
+        (lambda (spec)
+          (string=? (puzzle-spec-source spec)
+                    (puzzle-print-expression
+                      (puzzle-spec-expression spec)))))))
+
+  (test "the solution is exactly a quote plus the target literal"
+    (assert-true
+      (sweep-all?
+        (lambda (spec)
+          (string=? (puzzle-spec-solution spec)
+                    (string-append "'" (puzzle-print-value
+                                         (puzzle-spec-target spec)))))))))
+
+;; ============================================================
+;; Band and par
+;; ============================================================
+
+(test-group "puzzle generator band"
+  (test "no target falls below the lower bound"
+    (assert-true
+      (sweep-all? (lambda (spec)
+                    (>= (literal-size spec) puzzle-min-target-bytes)))))
+
+  (test "no target exceeds the upper bound"
+    (assert-true
+      (sweep-all? (lambda (spec)
+                    (<= (literal-size spec) puzzle-max-target-bytes)))))
+
+  (test "targets are not all the same size"
+    ;; A degenerate band would make every solution tie on length.
+    (assert-true (> (sweep-count (lambda (spec) (> (literal-size spec) 48)))
+                    0))
+    (assert-true (> (sweep-count (lambda (spec) (< (literal-size spec) 48)))
+                    0)))
+
+  (test "par is the shorter of the expression and the quoted literal"
+    ;; Plus the `iota` rewrite when the target is a prefix run, which is why
+    ;; par can only ever be lower than this minimum, never higher.
+    (assert-true
+      (sweep-all?
+        (lambda (spec)
+          (= (puzzle-spec-par spec)
+             (min (string-length (puzzle-spec-source spec))
+                  (string-length (puzzle-spec-solution spec))))))))
+
+  (test "par always fits the solution cap"
+    (assert-true
+      (sweep-all? (lambda (spec)
+                    (and (> (puzzle-spec-par spec) 0)
+                         (<= (puzzle-spec-par spec)
+                             puzzle-max-source-bytes))))))
+
+  ;; Non-degeneracy invariant. Fork choice ranks solution length, so the
+  ;; floor is on par, not on the literal.
+  (test "no puzzle falls below the par floor"
+    (assert-true
+      (sweep-all? (lambda (spec)
+                    (>= (puzzle-spec-par spec) puzzle-min-par-bytes)))))
+
+  (test "no target is a bare iota run"
+    ;; `(iota n)` solves such a target in nine bytes whatever the band says.
+    (assert-equal 0
+                  (sweep-count (lambda (spec)
+                                 (iota-run? (puzzle-spec-target spec)))))
+    ;; The helper detects the shape it is there to detect.
+    (assert-true (iota-run? (run-value "(iota 20)")))
+    (assert-false (iota-run? (run-value "(reverse (iota 20))"))))
+
+  (test "a short-par target is rejected even when its literal is in band"
+    ;; `(iota 15)` prints a 34-byte literal — comfortably inside the band —
+    ;; and is exactly the puzzle the literal-only check used to accept.
+    (let ((literal (puzzle-print-value (run-value "(iota 15)"))))
+      (assert-true (>= (string-length literal) puzzle-min-target-bytes))
+      (assert-true (<= (string-length literal) puzzle-max-target-bytes))
+      (assert-false (puzzle-attempt (seed-of 2) 7 2)))))
+
+;; ============================================================
+;; Target rejection
+;; ============================================================
+
+(test-group "puzzle generator target rejection"
+  (test "a closure can never be a target"
+    (let ((closure (run-value "(lambda (x) x)")))
+      (assert-true (puzzle-closure? closure))
+      (assert-false (puzzle-target-ok? closure))))
+
+  (test "a builtin can never be a target"
+    (let ((builtin (run-value "car")))
+      (assert-true (puzzle-procedure? builtin))
+      (assert-false (puzzle-target-ok? builtin))))
+
+  (test "a value containing a closure can never be a target"
+    (let ((wrapped (run-value "(list 1 (lambda (x) x))")))
+      (assert-false (puzzle-target-ok? wrapped))))
+
+  (test "structured values are accepted targets"
+    (assert-true (puzzle-target-ok? '(1 (2 "a") sym)))
+    (assert-true (puzzle-target-ok? (run-value "(iota 20)"))))
+
+  (test "no generated target is a procedure"
+    (assert-true
+      (sweep-all? (lambda (spec)
+                    (and (puzzle-target-ok? (puzzle-spec-target spec))
+                         (not (puzzle-procedure? (puzzle-spec-target spec)))
+                         (puzzle-value? (puzzle-spec-target spec))))))))
+
+;; ============================================================
+;; Retries and fallback
+;; ============================================================
+
+(test-group "puzzle generator retries"
+  (test "a rejected attempt returns #f"
+    ;; Seed 0 at height 0 is rejected on its first draw and accepted on the
+    ;; second, which is what its retry count of 1 records.
+    (assert-false (puzzle-attempt (seed-of 0) 0 0))
+    (assert-true (puzzle-spec? (puzzle-attempt (seed-of 0) 0 1))))
+
+  (test "a re-roll is the accepted attempt, unchanged"
+    (let ((spec (puzzle-for (seed-of 0) 0))
+          (attempt (puzzle-attempt (seed-of 0) 0 1)))
+      (assert-equal (puzzle-spec-source attempt) (puzzle-spec-source spec))
+      (assert-equal (puzzle-spec-solution attempt) (puzzle-spec-solution spec))
+      (assert-equal 1 (puzzle-spec-retries spec))))
+
+  (test "the sweep exercises the retry path"
+    (assert-true (> (sweep-count (lambda (spec)
+                                   (> (puzzle-spec-retries spec) 0)))
+                    0)))
+
+  (test "no puzzle exhausts the retry bound"
+    (assert-true
+      (sweep-all? (lambda (spec)
+                    (and (>= (puzzle-spec-retries spec) 0)
+                         (< (puzzle-spec-retries spec)
+                            puzzle-max-generator-retries))))))
+
+  (test "the fallback puzzle is valid and in band"
+    (let ((spec (puzzle-fallback 5)))
+      (assert-equal 5 (puzzle-spec-height spec))
+      (assert-equal "(map (lambda (x) (* x 7)) (iota 12))"
+                    (puzzle-spec-source spec))
+      (assert-equal "'(0 7 14 21 28 35 42 49 56 63 70 77)"
+                    (puzzle-spec-solution spec))
+      (assert-true (puzzle-value=? (run-value puzzle-fallback-source)
+                                   (puzzle-spec-target spec)))
+      (assert-equal 36 (puzzle-spec-par spec))
+      (assert-equal puzzle-max-generator-retries (puzzle-spec-retries spec))
+      (assert-true (>= (literal-size spec) puzzle-min-target-bytes))
+      (assert-true (<= (literal-size spec) puzzle-max-target-bytes))
+      (assert-true (runs-to? (puzzle-spec-solution spec)
+                             (puzzle-spec-target spec)))
+      (assert-true (runs-to? (puzzle-spec-source spec)
+                             (puzzle-spec-target spec)))))
+
+  ;; The fallback is the one puzzle no attempt vetted, so it must clear every
+  ;; check an accepted attempt clears — par floor included.
+  (test "the fallback puzzle passes the acceptance checks"
+    (let ((spec (puzzle-fallback 0)))
+      (assert-true (puzzle-target-ok? (puzzle-spec-target spec)))
+      (assert-false (iota-run? (puzzle-spec-target spec)))
+      (assert-true (>= (puzzle-spec-par spec) puzzle-min-par-bytes))
+      (assert-true (<= (string-length (puzzle-spec-solution spec))
+                       puzzle-max-source-bytes))
+      (assert-true (<= (string-length (puzzle-spec-source spec))
+                       puzzle-max-source-bytes))
+      (assert-true (puzzle-ok? (puzzle-parse (puzzle-spec-solution spec))))
+      (assert-equal (puzzle-spec-source spec)
+                    (puzzle-print-expression (puzzle-spec-expression spec))))))

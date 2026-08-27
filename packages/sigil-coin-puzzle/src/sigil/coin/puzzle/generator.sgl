@@ -1,0 +1,592 @@
+;;; (sigil coin puzzle generator) — deterministic puzzle generation
+;;;
+;;; Turns a 32-byte block seed and a height into the puzzle miners golf
+;;; toward. Every node regenerates the puzzle while validating a block, so
+;;; this module is consensus-critical and must be a pure function of its
+;;; inputs: no clock, no filesystem, no host randomness, no crypto. The
+;;; consensus layer computes the seed (`H(prev-block-hash || height)`) and
+;;; passes it in; hashing deliberately does not happen here.
+;;;
+;;; Pipeline for one attempt, keyed by `(seed, height, retry)`:
+;;;
+;;;   1. open a SplitMix64 stream seeded by FNV-1a over the inputs
+;;;   2. synthesise a depth-bounded expression from the puzzle-lang grammar,
+;;;      always rooted at a list-producing form
+;;;   3. print it canonically and run it through the real v1 interpreter
+;;;      under the real caps
+;;;   4. accept only a `puzzle-value?` result whose canonical literal sits
+;;;      inside the target band, whose quoted form re-evaluates to it, and
+;;;      whose par clears `puzzle-min-par-bytes`
+;;;
+;;; A rejected attempt re-rolls with `retry + 1` folded back into the seed
+;;; material, so re-rolls are as deterministic as the first draw.
+;;;
+;;; ALWAYS-SOLVABLE INVARIANT: for every puzzle this module returns, the
+;;; string `puzzle-spec-solution` — a quote followed by the canonical literal
+;;; of the target — is at most `puzzle-max-source-bytes` bytes, parses, and
+;;; evaluates to the target under the v1 caps. Every attempt verifies this by
+;;; construction, so no block can carry a puzzle nobody can solve.
+;;;
+;;; NON-DEGENERACY INVARIANT: for every puzzle this module returns, `par` is
+;;; at least `puzzle-min-par-bytes`. Fork choice ranks *solution* length, not
+;;; literal length, so the floor is enforced on par — the shortest solution
+;;; this generator knows: the synthesised source, the quoting solution, and,
+;;; when the target is the prefix run `(0 1 ... n-1)`, the `iota` call that
+;;; rebuilds it. Par is an upper bound on the true optimum, never a lower
+;;; one: a miner may still find something shorter than par, and no computable
+;;; check can rule that out. What the floor does guarantee is that the
+;;; generator never publishes a puzzle it can itself solve in a handful of
+;;; bytes — the case that collapses a height into a lowest-hash lottery,
+;;; because every miner finds the same minimal program immediately.
+
+(define-library (sigil coin puzzle generator)
+  (import (sigil struct)
+          (sigil math)
+          (sigil coin puzzle))
+  (export
+    ;; Generator constants (consensus)
+    puzzle-generator-version
+    puzzle-seed-bytes
+    puzzle-min-target-bytes
+    puzzle-max-target-bytes
+    puzzle-min-par-bytes
+    puzzle-max-generator-retries
+    puzzle-fallback-source
+
+    ;; Generated puzzle record
+    puzzle-spec
+    puzzle-spec?
+    puzzle-spec-height
+    puzzle-spec-target
+    puzzle-spec-expression
+    puzzle-spec-source
+    puzzle-spec-solution
+    puzzle-spec-par
+    puzzle-spec-retries
+
+    ;; Generation
+    puzzle-for
+    puzzle-attempt
+    puzzle-fallback
+    puzzle-target-ok?
+
+    ;; Deterministic PRNG
+    puzzle-prng
+    puzzle-prng?
+    puzzle-prng-state
+    puzzle-prng-open
+    puzzle-prng-next!
+    puzzle-prng-below!
+    puzzle-prng-word-bits)
+
+  (begin
+
+    ;; ============================================================
+    ;; Constants
+    ;; ============================================================
+
+    ;;; Frozen generator version. Bumping it changes which puzzle a seed
+    ;;; produces, which is a chain split, not a soft fork.
+    ;;;
+    ;;; ```scheme
+    ;;; (puzzle-generator-version) ; => 1
+    ;;; ```
+    (define (puzzle-generator-version)
+      (: -> integer?)
+      1)
+
+    ;;; Required seed length, in bytes. The consensus layer supplies a
+    ;;; 32-byte digest.
+    (define puzzle-seed-bytes 32)
+
+    ;;; Lower bound on the canonical literal of a target, in bytes.
+    ;;;
+    ;;; This bounds the *data* a solution must reproduce; it says nothing
+    ;;; about how short a program can produce it. `puzzle-min-par-bytes` is
+    ;;; what keeps the race non-degenerate. Anything shorter is re-rolled.
+    (define puzzle-min-target-bytes 32)
+
+    ;;; Upper bound on the canonical literal of a target, in bytes.
+    ;;;
+    ;;; The quoted literal costs one extra byte, so the band top sits well
+    ;;; under `puzzle-max-source-bytes` (256) and always leaves the quoting
+    ;;; solution legal. The band is [32, 192].
+    (define puzzle-max-target-bytes 192)
+
+    ;;; Lower bound on `puzzle-spec-par`, in bytes.
+    ;;;
+    ;;; The non-degeneracy invariant lives here, not on the target literal: a
+    ;;; 51-byte literal reached by `(iota 20)` is a 9-byte race that every
+    ;;; miner wins at once. 24 bytes leaves the shortest known solution well
+    ;;; clear of the trivial forms (`(iota 16)` is 9 bytes,
+    ;;; `(reverse (iota 16))` is 19) while rejecting only a few percent more
+    ;;; attempts than the band alone.
+    (define puzzle-min-par-bytes 24)
+
+    ;;; Maximum re-rolls before the fallback puzzle is used.
+    (define puzzle-max-generator-retries 64)
+
+    ;;; Source of the fallback puzzle.
+    ;;;
+    ;;; Used only if all `puzzle-max-generator-retries` attempts are
+    ;;; rejected, which the observed acceptance rate makes unreachable in
+    ;;; practice. It is a fixed expression whose 35-byte target literal sits
+    ;;; inside the band and whose par is 36, so it satisfies every check an
+    ;;; attempt must pass. `puzzle-fallback` re-checks all of them rather
+    ;;; than trusting this comment.
+    (define puzzle-fallback-source "(map (lambda (x) (* x 7)) (iota 12))")
+
+    ;; ============================================================
+    ;; Deterministic PRNG
+    ;; ============================================================
+    ;;
+    ;; SplitMix64 over a 64-bit state, seeded by FNV-1a over the seed bytes,
+    ;; the height and the retry counter. Every operation masks back to 64
+    ;; bits explicitly, so nothing depends on host word size or bignum
+    ;; behaviour; only exact integer arithmetic is used.
+
+    (define %word-bits 64)
+    (define %word-mask 18446744073709551615)   ; 2^64 - 1
+    (define %fnv-offset 14695981039346656037)  ; FNV-1a 64-bit offset basis
+    (define %fnv-prime 1099511628211)          ; FNV-1a 64-bit prime
+    (define %gamma 11400714819323198485)       ; 0x9E3779B97F4A7C15
+    (define %mix1 13787848793156543929)        ; 0xBF58476D1CE4E5B9
+    (define %mix2 10723151780598845931)        ; 0x94D049BB133111EB
+
+    (define (mask64 n)
+      (bitwise-and n %word-mask))
+
+    (define (shift-right n k)
+      (arithmetic-shift n (- k)))
+
+    ;; State of one deterministic stream.
+    (define-struct puzzle-prng
+      (state mutable: #t))
+
+    ;;; Word width of the PRNG, in bits.
+    ;;;
+    ;;; ```scheme
+    ;;; (puzzle-prng-word-bits) ; => 64
+    ;;; ```
+    (define (puzzle-prng-word-bits)
+      (: -> integer?)
+      %word-bits)
+
+    (define (absorb-byte h b)
+      (mask64 (* %fnv-prime (bitwise-xor h (bitwise-and b 255)))))
+
+    (define (absorb-bytevector h bv)
+      (let ((n (bytevector-length bv)))
+        (let loop ((i 0) (h h))
+          (if (>= i n)
+              h
+              (loop (+ i 1) (absorb-byte h (bytevector-u8-ref bv i)))))))
+
+    ;; Absorb a non-negative integer as self-delimiting LEB128: seven bits
+    ;; per byte, low group first, the high bit set while more groups follow.
+    ;;
+    ;; Self-delimiting matters because several integers are absorbed in a
+    ;; row. Plain little-endian bytes are not injective across a sequence —
+    ;; (height 1, retry 770) and (height 513, retry 3) both absorb 01 02 03 —
+    ;; so two different blocks could share a PRNG stream. LEB128 always emits
+    ;; at least one byte, so 0 still differs from "nothing".
+    (define (absorb-integer h n)
+      (let loop ((h h) (n n))
+        (if (< n 128)
+            (absorb-byte h n)
+            (loop (absorb-byte h (bitwise-ior 128 (bitwise-and n 127)))
+                  (shift-right n 7)))))
+
+    (define (check-inputs seed height retry)
+      (if (not (bytevector? seed))
+          (error "puzzle generator: seed must be a bytevector"))
+      (if (not (= puzzle-seed-bytes (bytevector-length seed)))
+          (error "puzzle generator: seed must be 32 bytes"))
+      (if (not (and (number? height) (exact? height) (integer? height)
+                    (>= height 0)))
+          (error "puzzle generator: height must be a non-negative integer"))
+      (if (not (and (number? retry) (exact? retry) (integer? retry)
+                    (>= retry 0)))
+          (error "puzzle generator: retry must be a non-negative integer"))
+      #t)
+
+    ;;; Open the deterministic stream for one generation attempt.
+    ;;;
+    ;;; The same `(seed, height, retry)` always yields the same sequence of
+    ;;; draws on every machine.
+    ;;;
+    ;;; ```scheme
+    ;;; (puzzle-prng-next! (puzzle-prng-open seed 7 0)) ; => a 64-bit integer
+    ;;; ```
+    (define (puzzle-prng-open seed height retry)
+      (: bytevector? integer? integer? -> puzzle-prng?)
+      (check-inputs seed height retry)
+      (let* ((h (absorb-bytevector %fnv-offset seed))
+             (h (absorb-integer h height))
+             (h (absorb-integer h retry)))
+        (puzzle-prng state: h)))
+
+    ;;; Draw the next 64-bit word. Always in `[0, 2^64)`.
+    ;;;
+    ;;; ```scheme
+    ;;; (< (puzzle-prng-next! g) (expt 2 64)) ; => #t
+    ;;; ```
+    (define (puzzle-prng-next! g)
+      (: puzzle-prng? -> integer?)
+      (let ((s (mask64 (+ (puzzle-prng-state g) %gamma))))
+        (set-puzzle-prng-state! g s)
+        (let* ((z (mask64 (* %mix1 (bitwise-xor s (shift-right s 30)))))
+               (z (mask64 (* %mix2 (bitwise-xor z (shift-right z 27))))))
+          (bitwise-xor z (shift-right z 31)))))
+
+    ;;; Draw an integer in `[0, bound)` for `bound >= 1`.
+    ;;;
+    ;;; ```scheme
+    ;;; (< (puzzle-prng-below! g 10) 10) ; => #t
+    ;;; ```
+    (define (puzzle-prng-below! g bound)
+      (: puzzle-prng? integer? -> integer?)
+      (if (not (and (number? bound) (exact? bound) (integer? bound)
+                    (>= bound 1)))
+          (error "puzzle generator: bound must be a positive integer"))
+      ;; ponytail: plain modulo, so draws are biased by at most
+      ;; bound / 2^64; every bound used here is under 2^20, and the bias is
+      ;; identical on every node, so rejection sampling buys nothing.
+      (modulo (puzzle-prng-next! g) bound))
+
+    ;; Inclusive integer draw.
+    (define (prng-range g lo hi)
+      (+ lo (puzzle-prng-below! g (+ 1 (- hi lo)))))
+
+    (define (choose g items)
+      (list-ref items (puzzle-prng-below! g (length items))))
+
+    ;; ============================================================
+    ;; Grammar-directed synthesis
+    ;; ============================================================
+    ;;
+    ;; Only v1 constructs appear here. The root is always list-producing, so
+    ;; targets are structured (nested lists of integers, strings and symbols)
+    ;; rather than bare scalars, and a closure can never be the result. The
+    ;; closure rejection in `puzzle-target-ok?` is still enforced, because
+    ;; consensus code does not rely on a grammar argument.
+
+    (define %symbols
+      '(a b c d x y z ok up dot fizz buzz sigil coin gold rune node hash))
+
+    (define %strings
+      '("a" "b" "hi" "ok" "sigil" "coin" "gold" "rune" "block" "zz"))
+
+    (define (gen-integer g)
+      ;; Mostly small, occasionally wide, so literals vary in length.
+      (if (= 0 (puzzle-prng-below! g 4))
+          (prng-range g -500000 500000)
+          (prng-range g -99 999)))
+
+    ;; Every form below that draws more than once binds the draws with `let*`
+    ;; before assembling the result. Sigil does not specify argument
+    ;; evaluation order, so two draws inside one argument list would tie the
+    ;; whole chain's history to the compiler's current left-to-right choice.
+    (define (gen-integer-expr g depth)
+      (if (<= depth 0)
+          (gen-integer g)
+          (let ((form (choose g '(lit lit lit add sub mul pow))))
+            (cond
+              ((eq? form 'add)
+               (let* ((a (gen-integer g))
+                      (b (gen-integer g)))
+                 (list '+ a b)))
+              ((eq? form 'sub)
+               (let* ((a (gen-integer g))
+                      (b (gen-integer g)))
+                 (list '- a b)))
+              ((eq? form 'mul)
+               (let* ((a (prng-range g 2 99))
+                      (b (prng-range g 2 999)))
+                 (list '* a b)))
+              ;; 12^8 is far under the magnitude cap.
+              ((eq? form 'pow)
+               (let* ((base (prng-range g 2 12))
+                      (power (prng-range g 2 8)))
+                 (list 'expt base power)))
+              (else (gen-integer g))))))
+
+    (define (gen-string-expr g depth)
+      (if (<= depth 0)
+          (choose g %strings)
+          (let ((form (choose g '(lit lit cat num))))
+            (cond
+              ((eq? form 'cat)
+               (let* ((a (choose g %strings))
+                      (b (choose g %strings)))
+                 (list 'string-append a b)))
+              ((eq? form 'num) (list 'number->string (gen-integer g)))
+              (else (choose g %strings))))))
+
+    ;; A unary mapper, always total on the integers `iota` produces.
+    (define (gen-mapper g)
+      (let ((form (choose g '(mul add sqr pair str))))
+        (list 'lambda '(x)
+              (cond
+                ((eq? form 'mul) (list '* 'x (prng-range g 2 99)))
+                ((eq? form 'add) (list '+ 'x (prng-range g -99 999)))
+                ((eq? form 'sqr) (list '* 'x 'x))
+                ((eq? form 'pair) (list 'list 'x (list 'quote (choose g %symbols))))
+                (else (list 'number->string (list '+ 'x (prng-range g 0 99))))))))
+
+    ;; A unary predicate that keeps a healthy fraction of its input, so
+    ;; `filter` rarely returns the empty list.
+    (define (gen-predicate g)
+      (let ((form (choose g '(odd even gt not-zero))))
+        (list 'lambda '(x)
+              (cond
+                ((eq? form 'odd) (list 'odd? 'x))
+                ((eq? form 'even) (list 'even? 'x))
+                ((eq? form 'gt) (list '> 'x (prng-range g 0 3)))
+                (else (list 'not (list 'zero? (list 'modulo 'x 3))))))))
+
+    (define (gen-items g count depth)
+      (let loop ((i 0) (acc '()))
+        (if (>= i count)
+            (reverse acc)
+            (loop (+ i 1) (cons (gen-any g depth) acc)))))
+
+    (define (gen-list-expr g depth)
+      (let ((form (if (<= depth 0)
+                      (choose g '(list list iota))
+                      (choose g '(list list list iota map filter reverse
+                                  append cons)))))
+        (cond
+          ((eq? form 'iota) (list 'iota (prng-range g 6 16)))
+          ((eq? form 'map)
+           (let* ((mapper (gen-mapper g))
+                  (count (prng-range g 4 9)))
+             (list 'map mapper (list 'iota count))))
+          ((eq? form 'filter)
+           (let* ((predicate (gen-predicate g))
+                  (count (prng-range g 6 16)))
+             (list 'filter predicate (list 'iota count))))
+          ((eq? form 'reverse) (list 'reverse (gen-list-expr g (- depth 1))))
+          ((eq? form 'append)
+           (let* ((left (gen-list-expr g (- depth 1)))
+                  (right (gen-list-expr g (- depth 1))))
+             (list 'append left right)))
+          ((eq? form 'cons)
+           (let* ((head (gen-any g (- depth 1)))
+                  (tail (gen-list-expr g (- depth 1))))
+             (list 'cons head tail)))
+          (else
+            (cons 'list (gen-items g (prng-range g 3 5) (- depth 1)))))))
+
+    (define (gen-any g depth)
+      (if (<= depth 0)
+          (let ((kind (choose g '(int int int str sym bool))))
+            (cond
+              ((eq? kind 'str) (choose g %strings))
+              ((eq? kind 'sym) (list 'quote (choose g %symbols)))
+              ((eq? kind 'bool) (= 0 (puzzle-prng-below! g 2)))
+              (else (gen-integer g))))
+          (let ((kind (choose g '(lst lst lst int int str sym))))
+            (cond
+              ((eq? kind 'lst) (gen-list-expr g (- depth 1)))
+              ((eq? kind 'str) (gen-string-expr g depth))
+              ((eq? kind 'sym) (list 'quote (choose g %symbols)))
+              (else (gen-integer-expr g depth))))))
+
+    ;; The synthesis entry point: a list-producing root at depth 2 or 3.
+    (define (gen-expression g)
+      (gen-list-expr g (prng-range g 2 3)))
+
+    ;; ============================================================
+    ;; Generated puzzle record
+    ;; ============================================================
+
+    ;;; One generated puzzle.
+    ;;;
+    ;;; `target` is the value a solution must produce, `expression` the AST
+    ;;; the generator synthesised and `source` its canonical text.
+    ;;; `solution` is the quoting solution — a quote plus the canonical
+    ;;; literal of the target — which is always legal (see the always-solvable
+    ;;; invariant). `par` is the shortest solution the generator itself
+    ;;; knows, in bytes, and is always at least `puzzle-min-par-bytes`.
+    ;;; `retries` counts the rejected attempts consumed before this one was
+    ;;; accepted.
+    ;;;
+    ;;; ```scheme
+    ;;; (puzzle-spec-source (puzzle-fallback 1))
+    ;;; ; => "(map (lambda (x) (* x 7)) (iota 12))"
+    ;;; (puzzle-spec-par (puzzle-fallback 1))      ; => 36
+    ;;; ```
+    (define-struct puzzle-spec
+      (height)
+      (target)
+      (expression)
+      (source)
+      (solution)
+      (par)
+      (retries))
+
+    ;; Length of `(0 1 ... n-1)` as a prefix run, or #f when `value` is not
+    ;; one. Such a target is rebuilt by `(iota n)` in 7 + |n| bytes however
+    ;; long its literal is, which is the degenerate case par has to see.
+    (define (iota-run-length value)
+      (let loop ((x value) (i 0))
+        (cond
+          ((null? x) (if (> i 0) i #f))
+          ((not (pair? x)) #f)
+          ((and (number? (car x)) (exact? (car x)) (integer? (car x))
+                (= (car x) i))
+           (loop (cdr x) (+ i 1)))
+          (else #f))))
+
+    ;; The shortest solution this generator knows: the synthesised source,
+    ;; the quoting solution, and the `iota` rewrite when it applies. An upper
+    ;; bound on the true optimum — see the non-degeneracy invariant.
+    (define (known-par source solution target)
+      (let ((best (min (string-length source) (string-length solution)))
+            (run (iota-run-length target)))
+        (if run
+            (min best (+ 7 (string-length (number->string run))))
+            best)))
+
+    (define (make-spec height expr source target retries)
+      (let ((solution (string-append "'" (puzzle-print-value target))))
+        (puzzle-spec height: height
+                     target: target
+                     expression: expr
+                     source: source
+                     solution: solution
+                     par: (known-par source solution target)
+                     retries: retries)))
+
+    ;; ============================================================
+    ;; Acceptance
+    ;; ============================================================
+
+    ;;; True when `value` may serve as a puzzle target.
+    ;;;
+    ;;; A closure or builtin must never become a target: it cannot be written
+    ;;; as a literal, so quoting it is not a solution and the always-solvable
+    ;;; invariant would be lost. `puzzle-value?` already excludes procedures;
+    ;;; the explicit procedure test keeps that guarantee local to this module.
+    ;;;
+    ;;; ```scheme
+    ;;; (puzzle-target-ok? '(1 2 3)) ; => #t
+    ;;; (puzzle-target-ok? (puzzle-result-value (puzzle-run "(lambda (x) x)")))
+    ;;; ; => #f
+    ;;; ```
+    (define (puzzle-target-ok? value)
+      (: any? -> boolean?)
+      (and (not (puzzle-procedure? value))
+           (puzzle-value? value)))
+
+    ;; Does `source` evaluate to `target` under the real caps?
+    (define (solves? source target)
+      (let ((result (puzzle-run source)))
+        (and (puzzle-ok? result)
+             (puzzle-value=? target (puzzle-result-value result)))))
+
+    ;;; Run one generation attempt, returning a `puzzle-spec` or `#f`.
+    ;;;
+    ;;; An attempt is rejected when the synthesised source does not fit the
+    ;;; solution cap, fails or exceeds a cap while evaluating, produces a
+    ;;; non-value (a closure, notably), lands outside the target band, when
+    ;;; its quoting solution would not fit or would not re-evaluate to the
+    ;;; target, or when its par falls below `puzzle-min-par-bytes`.
+    ;;;
+    ;;; ```scheme
+    ;;; (puzzle-spec? (puzzle-attempt seed 1 0)) ; => #t
+    ;;; ```
+    (define (puzzle-attempt seed height retry)
+      (: bytevector? integer? integer? -> any?)
+      (check-inputs seed height retry)
+      (let* ((g (puzzle-prng-open seed height retry))
+             (expr (gen-expression g))
+             (source (puzzle-print-expression expr)))
+        (if (> (string-length source) puzzle-max-source-bytes)
+            #f
+            (let ((result (puzzle-run source)))
+              (if (not (puzzle-ok? result))
+                  #f
+                  (let ((target (puzzle-result-value result)))
+                    (if (not (puzzle-target-ok? target))
+                        #f
+                        (let* ((literal (puzzle-print-value target))
+                               (size (string-length literal)))
+                          (cond
+                            ((< size puzzle-min-target-bytes) #f)
+                            ((> size puzzle-max-target-bytes) #f)
+                            ;; Always-solvable invariant, checked rather than
+                            ;; assumed: the quoted literal must fit the cap
+                            ;; and evaluate back to the target.
+                            ((> (+ 1 size) puzzle-max-source-bytes) #f)
+                            ((not (solves? (string-append "'" literal) target))
+                             #f)
+                            (else
+                              ;; Non-degeneracy is a floor on par, not on the
+                              ;; literal: fork choice ranks solution length.
+                              (let ((spec (make-spec height expr source
+                                                     target retry)))
+                                (if (< (puzzle-spec-par spec)
+                                       puzzle-min-par-bytes)
+                                    #f
+                                    spec))))))))))))
+
+    ;;; The fallback puzzle, used only when every attempt is rejected.
+    ;;;
+    ;;; It must satisfy everything an accepted attempt satisfies, so it
+    ;;; re-checks the band, par and solvability instead of asserting them in
+    ;;; a comment. A failure here means the frozen fallback source is wrong,
+    ;;; which is a bug in this module rather than a bad block, so it raises
+    ;;; instead of returning a puzzle nobody can trust.
+    ;;;
+    ;;; ```scheme
+    ;;; (puzzle-spec-source (puzzle-fallback 3))
+    ;;; ; => "(map (lambda (x) (* x 7)) (iota 12))"
+    ;;; ```
+    (define (puzzle-fallback height)
+      (: integer? -> puzzle-spec?)
+      (let ((parsed (puzzle-parse puzzle-fallback-source)))
+        (if (not (puzzle-ok? parsed))
+            (error "puzzle generator: the fallback source does not parse"))
+        (let* ((expr (puzzle-result-value parsed))
+               (result (puzzle-eval expr)))
+          (if (not (puzzle-ok? result))
+              (error "puzzle generator: the fallback source does not evaluate"))
+          (let ((target (puzzle-result-value result)))
+            (if (not (puzzle-target-ok? target))
+                (error "puzzle generator: the fallback target is not a value"))
+            (let* ((spec (make-spec height expr puzzle-fallback-source target
+                                    puzzle-max-generator-retries))
+                   (size (string-length (puzzle-print-value target))))
+              (if (or (< size puzzle-min-target-bytes)
+                      (> size puzzle-max-target-bytes)
+                      (< (puzzle-spec-par spec) puzzle-min-par-bytes)
+                      (> (string-length (puzzle-spec-solution spec))
+                         puzzle-max-source-bytes)
+                      (not (solves? (puzzle-spec-solution spec) target))
+                      (not (solves? puzzle-fallback-source target)))
+                  (error "puzzle generator: the fallback puzzle fails a check"))
+              spec)))))
+
+    ;;; Generate the puzzle for a block seed and height.
+    ;;;
+    ;;; `seed` is the 32-byte digest the consensus layer derives from the
+    ;;; previous block hash and the height. Pure and total: the same inputs
+    ;;; always produce a byte-identical puzzle, and a puzzle is always
+    ;;; returned.
+    ;;;
+    ;;; ```scheme
+    ;;; (puzzle-spec? (puzzle-for seed 1))                   ; => #t
+    ;;; (puzzle-target-ok? (puzzle-spec-target (puzzle-for seed 1))) ; => #t
+    ;;; ```
+    (define (puzzle-for seed height)
+      (: bytevector? integer? -> puzzle-spec?)
+      (check-inputs seed height 0)
+      (let loop ((retry 0))
+        (if (>= retry puzzle-max-generator-retries)
+            (puzzle-fallback height)
+            (let ((spec (puzzle-attempt seed height retry)))
+              (if spec
+                  spec
+                  (loop (+ retry 1)))))))))
