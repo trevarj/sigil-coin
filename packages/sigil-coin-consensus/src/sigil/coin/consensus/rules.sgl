@@ -6,6 +6,13 @@
 ;;; cadence, which leaves room for a solution to be found and propagated
 ;;; without letting a miner sprint a private chain forward.
 ;;;
+;;; The spacing floor is the one rule here that is chain policy rather than
+;;; a fixed constant: mainnet uses `coin-min-block-spacing`, and a local
+;;; test chain that has to mine consecutive blocks in seconds passes its own
+;;; floor to `coin-validate-header-context`. The floor a chain applies comes
+;;; from its chain config, so this package stays pure and knows only the
+;;; mainnet default.
+;;;
 ;;; On top of the spacing floor the usual Bitcoin timestamp rules apply: a
 ;;; header's time must exceed the median of the last `coin-median-time-span`
 ;;; headers, and may not sit more than `coin-max-future-drift` seconds ahead
@@ -37,7 +44,8 @@
     ;;; Maximum serialized block size, in bytes.
     (define coin-max-block-bytes 8192)
 
-    ;;; Minimum seconds between a header and its parent: 20 hours.
+    ;;; Minimum seconds between a header and its parent on mainnet: 20 hours.
+    ;;; This is the default floor; a chain config may supply its own.
     (define coin-min-block-spacing 72000)
 
     ;;; Maximum seconds a header's time may lead the validating clock.
@@ -48,6 +56,19 @@
 
     (define (last-of xs)
       (if (null? (cdr xs)) (car xs) (last-of (cdr xs))))
+
+    ;; Resolve the optional spacing floor. Raising here is deliberate: the
+    ;; floor comes from the node's own chain config, never from the network.
+    (define (spacing-argument args)
+      (cond
+        ((null? args) coin-min-block-spacing)
+        ((not (null? (cdr args)))
+         (error "coin-validate-header-context: too many arguments"))
+        ((and (number? (car args)) (exact? (car args))
+              (integer? (car args)) (>= (car args) 0))
+         (car args))
+        (else
+          (error "coin-validate-header-context: expected a spacing floor"))))
 
     ;; The trailing `count` items of `xs`, or all of them when it is shorter.
     (define (trailing xs count)
@@ -110,6 +131,11 @@
     ;;; median to clear; the future-drift rule still applies to it. `now` is
     ;;; the validating node's clock in Unix seconds.
     ;;;
+    ;;; The optional `min-spacing` argument is the chain's spacing floor in
+    ;;; seconds; omitting it applies `coin-min-block-spacing`, the mainnet
+    ;;; floor. It is resolved before the guard because a bad floor is a node
+    ;;; misconfiguration, not a bad header, and must not be reported as one.
+    ;;;
     ;;; Rejection reasons are `malformed-header`, `bad-prev-hash`,
     ;;; `insufficient-spacing`, `time-too-old` and `time-too-far-ahead`. On
     ;;; success the value is the header.
@@ -117,36 +143,39 @@
     ;;; ```scheme
     ;;; (coin-result-reason (coin-validate-header-context '() header now))
     ;;; ; => #f, when the header is not from the future
+    ;;; (coin-ok? (coin-validate-header-context headers header now 1))
+    ;;; ; => #t, on a chain whose floor is one second
     ;;; ```
-    (define (coin-validate-header-context previous-headers header now)
-      (: any? any? any? -> coin-result?)
-      (guard (e (#t (coin-error 'malformed-header
-                                "header context check raised")))
-        (cond
-          ((not (block-header? header))
-           (coin-error 'malformed-header "expected a block header"))
-          ((not (list? previous-headers))
-           (coin-error 'malformed-header "expected a header list"))
-          ((not (and (number? now) (exact? now) (integer? now)))
-           (coin-error 'malformed-header "expected an integer clock"))
-          (else
-            (let ((time (block-header-time (validate-block-header header))))
-              (cond
-                ((> time (+ now coin-max-future-drift))
-                 (coin-error 'time-too-far-ahead
-                             "header time is too far in the future"))
-                ((null? previous-headers) (coin-ok header))
-                (else
-                  (let ((parent (last-of previous-headers)))
-                    (cond
-                      ((not (block-header-links? parent header))
-                       (coin-error 'bad-prev-hash
-                                   "header does not link to its parent"))
-                      ((< time (+ (block-header-time parent)
-                                  coin-min-block-spacing))
-                       (coin-error 'insufficient-spacing
-                                   "header is too close to its parent"))
-                      ((<= time (coin-median-time-past previous-headers))
-                       (coin-error 'time-too-old
-                                   "header time is at or below median time past"))
-                      (else (coin-ok header)))))))))))))
+    (define (coin-validate-header-context previous-headers header now
+                                          . maybe-min-spacing)
+      (: any? any? any? integer? ... -> coin-result?)
+      (let ((min-spacing (spacing-argument maybe-min-spacing)))
+        (guard (e (#t (coin-error 'malformed-header
+                                  "header context check raised")))
+          (cond
+            ((not (block-header? header))
+             (coin-error 'malformed-header "expected a block header"))
+            ((not (list? previous-headers))
+             (coin-error 'malformed-header "expected a header list"))
+            ((not (and (number? now) (exact? now) (integer? now)))
+             (coin-error 'malformed-header "expected an integer clock"))
+            (else
+              (let ((time (block-header-time (validate-block-header header))))
+                (cond
+                  ((> time (+ now coin-max-future-drift))
+                   (coin-error 'time-too-far-ahead
+                               "header time is too far in the future"))
+                  ((null? previous-headers) (coin-ok header))
+                  (else
+                    (let ((parent (last-of previous-headers)))
+                      (cond
+                        ((not (block-header-links? parent header))
+                         (coin-error 'bad-prev-hash
+                                     "header does not link to its parent"))
+                        ((< time (+ (block-header-time parent) min-spacing))
+                         (coin-error 'insufficient-spacing
+                                     "header is too close to its parent"))
+                        ((<= time (coin-median-time-past previous-headers))
+                         (coin-error 'time-too-old
+                                     "header time is at or below median time past"))
+                        (else (coin-ok header))))))))))))))

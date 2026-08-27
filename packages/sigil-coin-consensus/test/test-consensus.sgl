@@ -714,6 +714,74 @@
                        (header-at (block-header-hash dip) (+ median 1))
                        %far-future)))))
 
+  ;; The floor is chain policy: a chain config passes its own, and mainnet's
+  ;; is only the default.
+  (test "an explicit floor of the default changes nothing"
+    (assert-true (coin-ok? (coin-validate-header-context
+                             %chain
+                             (header-at (block-header-hash %tip) %next-time)
+                             %far-future
+                             coin-min-block-spacing)))
+    (assert-equal 'insufficient-spacing
+                  (coin-result-reason
+                    (coin-validate-header-context
+                      %chain
+                      (header-at (block-header-hash %tip) (- %next-time 1))
+                      %far-future
+                      coin-min-block-spacing))))
+
+  (test "a chain with a one-second floor accepts a fast child"
+    (let ((fast (header-at (block-header-hash %tip)
+                           (+ (block-header-time %tip) 1))))
+      (assert-true (coin-ok? (coin-validate-header-context %chain
+                                                           fast
+                                                           %far-future
+                                                           1)))
+      ;; The same header is far too fast under the mainnet floor.
+      (assert-equal 'insufficient-spacing
+                    (context-reason %chain fast %far-future))))
+
+  (test "a lower floor does not disable the other header rules"
+    ;; A lower floor only lowers the floor: a header must still link to its
+    ;; parent and stay out of the far future.
+    (assert-equal 'time-too-far-ahead
+                  (coin-result-reason
+                    (coin-validate-header-context
+                      %chain
+                      (header-at (block-header-hash %tip) %next-time)
+                      (- %next-time coin-max-future-drift 1)
+                      1)))
+    (assert-equal 'bad-prev-hash
+                  (coin-result-reason
+                    (coin-validate-header-context %chain
+                                                  (header-at %zero32
+                                                             %next-time)
+                                                  %far-future
+                                                  1))))
+
+  ;; A bad floor is the node's own misconfiguration, not a bad header, so it
+  ;; raises instead of being reported as a rejection.
+  (test "a nonsensical floor raises rather than rejecting the header"
+    (assert-error (coin-validate-header-context %chain
+                                                (header-at (block-header-hash
+                                                             %tip)
+                                                           %next-time)
+                                                %far-future
+                                                "soon"))
+    (assert-error (coin-validate-header-context %chain
+                                                (header-at (block-header-hash
+                                                             %tip)
+                                                           %next-time)
+                                                %far-future
+                                                -1))
+    (assert-error (coin-validate-header-context %chain
+                                                (header-at (block-header-hash
+                                                             %tip)
+                                                           %next-time)
+                                                %far-future
+                                                1
+                                                2)))
+
   (test "a malformed header is rejected rather than raising"
     (assert-equal 'malformed-header (context-reason %chain 42 %far-future))
     (assert-equal 'malformed-header

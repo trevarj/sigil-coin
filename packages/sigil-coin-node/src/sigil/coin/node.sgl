@@ -1,11 +1,74 @@
-;;; (sigil coin node) — SigilCoin node runtime scaffold
+;;; (sigil coin node) — SigilCoin chain configuration
+;;;
+;;; Facade over the modules that turn SigilCoin's consensus rules into
+;;; something `sigil-bitcoin-node` can run:
+;;;
+;;;   (sigil coin node rules)    header acceptance and fork choice
+;;;   (sigil coin node genesis)  the deterministic genesis builder
+;;;   (sigil coin node chain)    the mainnet and regtest chain configs
+;;;
+;;; A node opens a SigilCoin chain the same way it opens a Bitcoin one:
+;;;
+;;; ```scheme
+;;; (import (sigil bitcoin node) (sigil coin node))
+;;; (define n (node-open sigilcoin-regtest-chain "/tmp/sigilcoin"))
+;;; (header-rules? (chain-config-header-rules sigilcoin-regtest-chain)) ; => #t
+;;; ```
+;;;
+;;; The rules record lives in the config's `extensions`, so nothing in
+;;; `sigil-bitcoin` needs to know what a puzzle is.
 
 (define-library (sigil coin node)
-  (export node-package-version)
+  (import (sigil coin node rules)
+          (sigil coin node genesis)
+          (sigil coin node chain))
+  (export
+    ;; Package metadata
+    node-package-version
+
+    ;; Header rules
+    coin-header-version
+    coin-header-bits
+    coin-header-nonce
+    coin-rank-base
+    coin-solution-saving
+    coin-rank-encode
+    coin-rank-accumulated
+    coin-rank-tip-saving
+    coin-block-solution-length
+    coin-chain-work
+    coin-better-chain?
+    coin-accept-header?
+    coin-header-rules
+
+    ;; Genesis
+    coin-genesis-solution
+    coin-genesis-script-pubkey
+    coin-genesis-coinbase
+    coin-genesis-block
+    coin-genesis-header
+    coin-genesis-hash
+    coin-genesis-header-hex
+
+    ;; Chain configs
+    coin-target-block-spacing
+    coin-regtest-min-block-spacing
+    coin-irc-channel
+    coin-genesis-quote
+    coin-genesis-time
+    coin-regtest-genesis-quote
+    coin-regtest-genesis-time
+    coin-genesis-header-constant
+    coin-regtest-genesis-header-constant
+    coin-genesis-id-constant
+    coin-regtest-genesis-id-constant
+    sigilcoin-consensus-params
+    sigilcoin-main-chain
+    sigilcoin-regtest-chain)
+
   (begin
 
-    ;;; Version of the node package, used as a scaffold placeholder until the
-    ;;; chain config and node runtime land.
+    ;;; Version of the node package.
     ;;;
     ;;; Example:
     ;;;   (node-package-version) ;=> "0.1.0"

@@ -1,0 +1,357 @@
+;;; (sigil coin node rules) — SigilCoin header acceptance and fork choice
+;;;
+;;; This is the seam between SigilCoin's consensus package and
+;;; `sigil-bitcoin-node`. The library never interprets what a rule means: it
+;;; calls `accept?` to admit a header, `chain-work` to rank a chain, and
+;;; `better-chain?` to choose a tip. SigilCoin supplies all three here and
+;;; attaches the record to its chain config, so the node runs SigilCoin's
+;;; rules without the Bitcoin library learning anything about program golf.
+;;;
+;;; No hash proof-of-work is involved anywhere in this module. A header is
+;;; never hashed to compare against a target; the header hash is used only as
+;;; the tie-break of last resort, exactly as `coin-solution-compare` does.
+;;;
+;;; ============================================================
+;;; THE RANKING KEY
+;;; ============================================================
+;;;
+;;; `chain-work` must return a single integer, because that is what the
+;;; library persists and hands back in a `chain-candidate`. SigilCoin needs
+;;; two facts in it: how well the whole chain has been golfed, and how short
+;;; the TIP's own solution is. They are packed as two digits in base
+;;; `coin-rank-base`:
+;;;
+;;;   work = accumulated * coin-rank-base + tip-saving
+;;;
+;;; where `saving` for one block is
+;;;
+;;;   saving = (coin-max-solution-bytes + 1) - solution-length
+;;;
+;;; so a 1-byte solution scores 256, a 256-byte solution scores 1, and
+;;; shorter is always larger. `accumulated` is the sum of the savings of
+;;; every block from genesis to the tip; `tip-saving` is the last block's
+;;; saving alone. `coin-rank-base` is one more than the largest saving, so
+;;; the two digits never collide and both are recoverable:
+;;; `coin-rank-accumulated` and `coin-rank-tip-saving` read them back.
+;;;
+;;; A saving of 0 is reserved: it means "this chain's tip has no validated
+;;; body yet", which no real solution can produce, so an unsettled tip always
+;;; ranks below a settled sibling at the same height.
+;;;
+;;; HOW IT COMPOSES ACROSS HEIGHTS. No single accumulated number can make
+;;; "taller wins" and "shorter wins" compose by magnitude alone: one extra
+;;; block adds at most 256 to the sum, so a height-2 chain of long solutions
+;;; would lose to a height-1 chain of one very short one at any fixed
+;;; weighting. Height therefore outranks the packed number in
+;;; `better-chain?`, and the packed number only ever decides a comparison
+;;; BETWEEN SIBLINGS AT THE SAME HEIGHT — which is precisely the comparison
+;;; `coin-solution-compare` defines. What the packing still guarantees is
+;;; that the number orders chains sensibly on its own terms: it is strictly increasing along any
+;;; chain, because every block adds at least 1 to the high digit while the
+;;; low digit can never carry more than 256, which is less than one unit of
+;;; the high digit. A chain therefore never ranks below one of its own
+;;; ancestors, and the high digit stays a meaningful "total golf quality"
+;;; for status output.
+;;;
+;;; THE PROVISIONAL VALUE. During headers-first sync there is no body, so the
+;;; tip's solution length is unknown. The provisional value is the most
+;;; pessimistic one that is still monotone: the accumulated digit grows by 1,
+;;; the least any valid block can contribute, and the tip digit is 0, below
+;;; every real solution. It can therefore never overstate a chain — the
+;;; settled value is always at least the provisional one — so a header chain
+;;; cannot displace a sibling whose body has been validated by claiming a
+;;; solution nobody has seen.
+;;;
+;;; A provisional rank cannot strand the node on a wrong tip, for three
+;;; reasons that hold together:
+;;;
+;;;   1. `better-chain?` settles on height before it reads any rank. Its
+;;;      first two tests are on `extended?`, which the library defines as
+;;;      "a taller stored header exists", so anything below the tallest
+;;;      chain is out before its rank is looked at; the explicit height
+;;;      comparison then orders what is left. Both facts are carried by the
+;;;      headers themselves, so a pessimistic rank never stops the node from
+;;;      following the tallest header chain, which is what pulls bodies in.
+;;;   2. The library recomputes and re-persists the value when a body
+;;;      validates (`db-settle-header-work`), so every provisional value is
+;;;      replaced by the settled one for that block.
+;;;   3. Tip selection re-runs over the stored candidates every time, so a
+;;;      settled value takes effect at once; nothing is frozen at first sight.
+;;;
+;;; The one thing a stale provisional value could distort is the accumulated
+;;; digit of a descendant settled before its ancestor. That digit is
+;;; deliberately not consulted by `better-chain?` — only height, the tip
+;;; digit and the hash are — so a stale accumulator is bookkeeping drift in
+;;; status output, never a fork-choice decision.
+;;;
+;;; GENESIS NEVER SETTLES, AND STAYS PROVISIONAL FOREVER. The library seeds
+;;; its header table with `(chain-work genesis #f 0)` and only re-settles a
+;;; block whose BODY it downloaded and validated. Genesis has no body to
+;;; download — it is the starting state, not something a peer serves — so
+;;; nothing ever revisits it. Its stored value therefore stays
+;;; `(coin-rank-encode 1 0)`, i.e. exactly `coin-rank-base`, even though the
+;;; real genesis coinbase does carry a solution and would have scored
+;;; `(coin-solution-saving (bytevector-length coin-genesis-solution))` — the
+;;; generator's genesis solution is 49 bytes, so 208.
+;;;
+;;; The consequence is a constant understatement, by 208 - 1 = 207, of the
+;;; accumulated digit of every chain on the network. It is the same
+;;; constant for every candidate, it is confined to the digit fork choice
+;;; never reads, and the tip digit of genesis is 0 only while genesis IS the
+;;; tip — a state the first real block ends. So it is a status-output
+;;; cosmetic, not a ranking effect. `test-node.sgl` pins both the stored
+;;; provisional value and the settled value it would otherwise have had, so
+;;; neither can change silently.
+;;;
+;;; ============================================================
+;;; HEADER ACCEPTANCE
+;;; ============================================================
+;;;
+;;; `accept?` is `coin-validate-header-context` (linkage, spacing floor,
+;;; median time past, future drift) plus the three header fields SigilCoin
+;;; freezes because nothing reads them: `version`, `bits` and `nonce`. `bits`
+;;; is NOT difficulty here and is never retargeted; it is pinned to
+;;; `coin-header-bits` so no miner can vary it, and `nonce` is pinned to 0
+;;; because there is nothing to grind for. (Grinding is not eliminated: the
+;;; coinbase graffiti is 400 free bytes and the hash tie-break is grindable
+;;; through it. Pinning these two fields removes the free ones, not the game.)
+;;;
+;;; The spacing floor is chain policy, so the rules record is built per
+;;; chain: `(coin-header-rules min-block-spacing)`.
+
+(define-library (sigil coin node rules)
+  (import (sigil math)
+          (sigil time)
+          (sigil bitcoin consensus)
+          (sigil coin consensus))
+  (export
+    coin-header-version
+    coin-header-bits
+    coin-header-nonce
+    coin-rank-base
+    coin-solution-saving
+    coin-rank-encode
+    coin-rank-accumulated
+    coin-rank-tip-saving
+    coin-block-solution-length
+    coin-chain-work
+    coin-better-chain?
+    coin-accept-header?
+    coin-header-rules)
+
+  (begin
+
+    ;; ============================================================
+    ;; Frozen header fields
+    ;; ============================================================
+
+    ;;; The only block header version SigilCoin accepts.
+    (define coin-header-version 1)
+
+    ;;; The only `bits` value SigilCoin accepts.
+    ;;;
+    ;;; This is not a difficulty. It is the compact encoding of the largest
+    ;;; representable target, so any Bitcoin-derived helper that insists on
+    ;;; reading it computes "the whole hash space", i.e. no work at all.
+    (define coin-header-bits #x207fffff)
+
+    ;;; The only `nonce` value SigilCoin accepts. There is no hash to grind.
+    (define coin-header-nonce 0)
+
+    ;; ============================================================
+    ;; The ranking key
+    ;; ============================================================
+
+    ;;; Base of the two-digit ranking key: one more than the largest saving,
+    ;;; so the accumulated total and the tip saving never overlap.
+    (define coin-rank-base (+ coin-max-solution-bytes 2))
+
+    ;;; Score of a solution of `solution-length` bytes: shorter is larger.
+    ;;;
+    ;;; A length outside 1..`coin-max-solution-bytes` scores 0, the reserved
+    ;;; "unknown" value, because no such solution can appear in a valid
+    ;;; block.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-solution-saving 1)   ; => 256
+    ;;; (coin-solution-saving 256) ; => 1
+    ;;; (coin-solution-saving 0)   ; => 0
+    ;;; ```
+    (define (coin-solution-saving solution-length)
+      (: any? -> integer?)
+      (if (and (number? solution-length) (exact? solution-length)
+               (integer? solution-length)
+               (>= solution-length 1)
+               (<= solution-length coin-max-solution-bytes))
+          (- (+ coin-max-solution-bytes 1) solution-length)
+          0))
+
+    ;;; Pack an accumulated total and a tip saving into the ranking key.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-rank-encode 3 256) ; => 3 * coin-rank-base + 256
+    ;;; ```
+    (define (coin-rank-encode accumulated tip-saving)
+      (: integer? integer? -> integer?)
+      (+ (* accumulated coin-rank-base) tip-saving))
+
+    ;;; The accumulated golf total inside a ranking key.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-rank-accumulated (coin-rank-encode 3 256)) ; => 3
+    ;;; ```
+    (define (coin-rank-accumulated work)
+      (: integer? -> integer?)
+      (quotient work coin-rank-base))
+
+    ;;; The tip's own saving inside a ranking key, or 0 when its body has not
+    ;;; been validated yet.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-rank-tip-saving (coin-rank-encode 3 256)) ; => 256
+    ;;; ```
+    (define (coin-rank-tip-saving work)
+      (: integer? -> integer?)
+      (remainder work coin-rank-base))
+
+    ;;; Length of a block's claimed solution, or `#f` when the block has no
+    ;;; decodable SigilCoin coinbase payload.
+    ;;;
+    ;;; Total: a hostile or malformed body yields `#f` rather than a raise,
+    ;;; so ranking a block never has to be wrapped in a handler. Such a block
+    ;;; cannot pass solution verification either, so it never becomes a tip.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-block-solution-length 42) ; => #f
+    ;;; ```
+    (define (coin-block-solution-length b)
+      (: any? -> any?)
+      (let ((decoded (coin-block-coinbase-payload b)))
+        (and (coin-ok? decoded)
+             (bytevector-length
+               (coin-coinbase-payload-solution (coin-result-value decoded))))))
+
+    ;;; Accumulated ranking key of the chain ending at `header`.
+    ;;;
+    ;;; `b` is the validated block body, or `#f` during headers-first sync.
+    ;;; `previous-work` is the parent's key. With a body the tip digit is the
+    ;;; solution's saving; without one it is 0 and the accumulated digit
+    ;;; grows by 1, the least any valid block can add.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-rank-tip-saving (coin-chain-work header #f 0)) ; => 0
+    ;;; ```
+    (define (coin-chain-work header b previous-work)
+      (: any? any? integer? -> integer?)
+      (let* ((claimed (and b (coin-block-solution-length b)))
+             (saving (if claimed (coin-solution-saving claimed) 0))
+             (contribution (if (= 0 saving) 1 saving)))
+        (coin-rank-encode (+ (coin-rank-accumulated previous-work)
+                             contribution)
+                          saving)))
+
+    ;;; Whether `candidate` strictly outranks `incumbent` as the chain tip.
+    ;;;
+    ;;; The order is: a live candidate beats a settled one, a height a child
+    ;;; already extends being settled and never re-selectable over a live
+    ;;; tip; then the taller chain; then the shorter tip solution; then the
+    ;;; lower internal block hash. That is `coin-replaces-tip?` and
+    ;;; `coin-solution-compare` expressed over the candidates the library
+    ;;; hands out.
+    ;;;
+    ;;; "Strictly" is literal: this is a strict total order, so it is
+    ;;; irreflexive (a candidate never outranks itself, the hash tie-break
+    ;;; comparing equal) and antisymmetric (at most one direction is `#t`).
+    ;;; That is why settledness is compared as a RANK — live above settled —
+    ;;; rather than as an early `#f` on any extended candidate: two extended
+    ;;; candidates are equally settled, so they fall through to the ordinary
+    ;;; height/solution/hash comparison instead of both answering `#f`.
+    ;;; `best-row` never depends on that case today, because the tallest
+    ;;; stored height is never extended and so always ends as the incumbent,
+    ;;; but a contract that only holds for the inputs one caller happens to
+    ;;; produce is not a contract.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-better-chain? taller shorter-but-lower) ; => #t
+    ;;; ```
+    (define (coin-better-chain? candidate incumbent)
+      (: chain-candidate? chain-candidate? -> boolean?)
+      (let ((candidate-extended? (chain-candidate-extended? candidate))
+            (incumbent-extended? (chain-candidate-extended? incumbent))
+            (candidate-height (chain-candidate-height candidate))
+            (incumbent-height (chain-candidate-height incumbent)))
+        (cond
+          ;; Once a child builds on a height, that height is settled: no
+          ;; sibling replaces a live tip however short its solution.
+          ((and candidate-extended? (not incumbent-extended?)) #f)
+          ;; A settled incumbent is one the chain has already moved past, so
+          ;; any still-extendable candidate takes over. This is what walks
+          ;; the tip forward off genesis.
+          ((and incumbent-extended? (not candidate-extended?)) #t)
+          ;; Equally settled, so settledness decides nothing: rank them the
+          ;; ordinary way.
+          ((> candidate-height incumbent-height) #t)
+          ((< candidate-height incumbent-height) #f)
+          ;; Same height: the shorter solution wins. An unsettled tip scores
+          ;; 0 here, so it never displaces a settled sibling.
+          ((> (coin-rank-tip-saving (chain-candidate-work candidate))
+              (coin-rank-tip-saving (chain-candidate-work incumbent)))
+           #t)
+          ((< (coin-rank-tip-saving (chain-candidate-work candidate))
+              (coin-rank-tip-saving (chain-candidate-work incumbent)))
+           #f)
+          (else
+            (< (coin-hash-compare (chain-candidate-hash candidate)
+                                  (chain-candidate-hash incumbent))
+               0)))))
+
+    ;; ============================================================
+    ;; Header acceptance
+    ;; ============================================================
+
+    (define (current-unix-second)
+      (exact (floor (current-second))))
+
+    ;;; Whether `header` may extend `previous-headers` under `min-spacing`.
+    ;;;
+    ;;; `params` is accepted and ignored: SigilCoin has no difficulty to read
+    ;;; out of it, and the fields it does carry are activation heights the
+    ;;; header cannot violate. `previous-headers` runs oldest to newest and
+    ;;; is empty only for genesis.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-accept-header? params (list genesis) header 72000)
+    ;;; ```
+    (define (coin-accept-header? params previous-headers header min-spacing)
+      (: any? list? any? integer? -> boolean?)
+      (and (block-header? header)
+           (= coin-header-version (block-header-version header))
+           (= coin-header-bits (block-header-bits header))
+           (= coin-header-nonce (block-header-nonce header))
+           (coin-ok? (coin-validate-header-context previous-headers
+                                                   header
+                                                   (current-unix-second)
+                                                   min-spacing))))
+
+    ;;; Build the `header-rules` record for a chain with `min-spacing`.
+    ;;;
+    ;;; The spacing floor is the only chain-varying policy: mainnet passes
+    ;;; `coin-min-block-spacing`, a local test chain passes something a test
+    ;;; can wait out. Everything else is chain-independent consensus.
+    ;;;
+    ;;; ```scheme
+    ;;; (header-rules? (coin-header-rules coin-min-block-spacing)) ; => #t
+    ;;; ```
+    (define (coin-header-rules min-spacing)
+      (: integer? -> header-rules?)
+      (if (not (and (number? min-spacing) (exact? min-spacing)
+                    (integer? min-spacing) (>= min-spacing 0)))
+          (error "coin-header-rules: expected a spacing floor in seconds"))
+      (header-rules
+        accept?: (lambda (params previous-headers header)
+                   (coin-accept-header? params
+                                        previous-headers
+                                        header
+                                        min-spacing))
+        chain-work: coin-chain-work
+        better-chain?: coin-better-chain?))))
