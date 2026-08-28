@@ -1,0 +1,24 @@
+;;; A real `sigilcoin` process, for the two-node tests.
+;;;
+;;; `test-network.sgl` runs each node as its own operating-system process so
+;;; the two nodes are genuinely independent: separate VMs, separate data
+;;; directories, separate SQLite handles, talking over a loopback TCP socket
+;;; and nothing else. This file is what those processes run.
+;;;
+;;; It is the `sigilcoin` binary's own entry point and nothing more, so a
+;;; test that spawns it is running the same code an operator runs:
+;;;
+;;; ```sh
+;;; sigil -L <paths...> net-peer.sgl -- listen --regtest --data-dir DIR
+;;; ```
+;;;
+;;; `main` takes the words after `--`, which is how the toolchain separates
+;;; its own arguments from an application's, so the `-L` module paths the
+;;; test passes through never reach the CLI.
+;;;
+;;; This is not a test file: the runner collects `test-*.sgl` and
+;;; `*-test.sgl`, so it is never executed as one.
+
+(import (sigil coin cli))
+
+(main)

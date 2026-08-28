@@ -1,0 +1,887 @@
+;;; Two SigilCoin nodes, two processes, one socket.
+;;;
+;;; `test-chain.sgl` drives one node through the entry points a peer would
+;;; drive. This file puts the second node in its own OPERATING SYSTEM
+;;; PROCESS and makes the two talk over loopback TCP: separate VMs, separate
+;;; data directories, separate SQLite handles, no shared memory. That second
+;;; node is the real `sigilcoin` binary's entry point (`test/net-peer.sgl`),
+;;; so every command it runs is the one an operator runs, and every
+;;; assertion about it is read back out of its own database afterwards.
+;;;
+;;; WHAT IS REAL, AND THE ONE THING THAT IS NOT. Headers cross the wire
+;;; through the node's own code on both sides: the peer's
+;;; `node-sync-with-peer` asks, and this process's
+;;; `node-serve-inbound-transport` answers. Block BODIES cannot, because
+;;; `sigil-bitcoin` has no `getdata` responder anywhere:
+;;; `inbound-handle-envelope` answers `getheaders`, `getaddr` and the relay
+;;; commands and nothing else, and the fallback
+;;; `p2p-session-apply-envelope` answers only `version`, `ping` and `inv`.
+;;; A node ASKS for bodies — `node-download-blocks-for-peer` writes
+;;; `getdata` and reads `block` — but nothing in the library ever replies,
+;;; so two nodes of this codebase alone can sync headers and never bodies.
+;;;
+;;; So the serving side wraps its transport: a `getdata` is answered out of
+;;; the serving node's own `blocks` table as the `block` message a Bitcoin
+;;; peer would send, and every other envelope is handed to the node
+;;; untouched. `serve-getdata-blocks` is the whole of what a test had to
+;;; supply. Nothing on the receiving side is simulated: the peer process
+;;; requests, parses, stores, validates, reorganises and rejects with its
+;;; own code, over the socket.
+;;;
+;;; Every wait is bounded — the accept, every envelope read, and each peer
+;;; process's own connect and read timeouts — so a peer that stops talking
+;;; fails a test with a message instead of hanging the suite.
+
+(import (sigil test)
+        (sigil fs)
+        (sigil io)
+        (sigil math)
+        (sigil process)
+        (sigil socket)
+        (sigil sqlite)
+        (sigil string)
+        (sigil bitcoin utils)
+        (sigil bitcoin primitives)
+        (sigil bitcoin encoding)
+        (sigil bitcoin keys)
+        (sigil bitcoin script)
+        (sigil bitcoin tx)
+        (sigil bitcoin consensus)
+        (sigil bitcoin p2p)
+        (sigil bitcoin node)
+        (sigil coin puzzle generator)
+        (sigil coin consensus)
+        (sigil coin node))
+
+;; ============================================================
+;; Bounds
+;; ============================================================
+;;
+;; Ceilings, never delays: nothing here sleeps, and nothing waits without
+;; one of these.
+
+;; Longest wait for a peer process to open a connection.
+(define %accept-timeout 30000)
+
+;; Longest wait for a message from a connected peer. Generous on purpose: a
+;; peer goes quiet for as long as it takes to ingest the headers it was just
+;; sent, which is seconds for a hundred of them, and hanging up on it would
+;; cost it the whole block-download half of the pass.
+(define %read-timeout 60000)
+
+;; Envelopes the serving node handles on one connection. A whole sync round
+;; is a handful; block messages are answered inside the transport and do not
+;; count against it.
+(define %serve-steps 512)
+
+;; Transaction announcements accepted in one relay message.
+(define %serve-max-tx 32)
+
+;; Blocks a peer asks for at once, and the read budget it spends on the
+;; replies. Kept equal: a peer that asked for more than it will read would
+;; leave block messages unread in the socket.
+(define %sync-batch "64")
+
+;; ============================================================
+;; Scripts and keys
+;; ============================================================
+
+;; `OP_RETURN "sg"`: unspendable, so blocks mined only for their height stay
+;; out of every balance. The script `test-chain.sgl` mines to.
+(define %elsewhere #u8(#x6a #x02 #x73 #x67))
+
+;; `OP_TRUE`: a coinbase anyone can spend with an empty scriptSig.
+;;
+;; The spend test needs a mature output it can move WITHOUT a signature,
+;; because secp256k1 is a native module and a workspace-wide run has none
+;; bound — the same reason `sigil-coin-cli`'s suite gates its key tests. The
+;; money still lands on a real `sgl1` P2WPKH address whose key the receiving
+;; node holds on disk; only the input side of the transfer is keyless.
+(define %anyone #u8(#x51))
+
+;; The key the receiving node holds, and the address it pays out to. Fixed
+;; so the address is checked in rather than derived at run time, which needs
+;; secp256k1; `assert-address-matches-key` ties the two together whenever
+;; the runtime does have it.
+(define %peer-wallet-key
+  "0101010101010101010101010101010101010101010101010101010101010101")
+(define %peer-address "sgl1q0xcqpzrky6eff2g52qdye53xkk9jxkvrcgu8pc")
+
+;; Whether this runtime has the secp256k1 native module bound. Probed by
+;; use, because referencing an unbound native raises.
+(define %native-secp256k1?
+  (guard (err (#t #f))
+    (and (public-key? (private-key->public-key (make-bytevector 32 1))) #t)))
+
+;; ============================================================
+;; The peer process
+;; ============================================================
+
+;; `net-peer.sgl` runs the `sigilcoin` entry point. Found relative to the
+;; working directory, which is the workspace root for a whole-repo run and
+;; the package root for a single-file one.
+(define %peer-script
+  (let loop ((candidates (list "packages/sigil-coin-node/test/net-peer.sgl"
+                               "test/net-peer.sgl"
+                               "../test/net-peer.sgl")))
+    (cond ((null? candidates)
+           (error "test-network: cannot find test/net-peer.sgl"))
+          ((file-exists? (car candidates)) (car candidates))
+          (else (loop (cdr candidates))))))
+
+;; The module search paths this process resolved its own imports through,
+;; handed to the peer as `-L` so it loads the same code from the same
+;; checkouts. `--` separates them from the words the CLI reads.
+(define %peer-command
+  (let loop ((paths (library-paths)) (out '()))
+    (if (null? paths)
+        (append (reverse out) (list %peer-script "--"))
+        (loop (cdr paths) (cons (car paths) (cons "-L" out))))))
+
+;;; Spawn a `sigilcoin` command as its own process, without waiting.
+;;;
+;;; ```scheme
+;;; (spawn-peer '("status" "--regtest" "--data-dir" "/tmp/b"))
+;;; ```
+(define (spawn-peer args)
+  (let ((p (apply process-spawn
+                  "sigil"
+                  die-with-parent: #t
+                  (append %peer-command args))))
+    (unless p
+      (error "test-network: could not spawn the peer process"))
+    p))
+
+;;; Everything a peer process printed, as a list of lines.
+(define (peer-output p)
+  (let loop ((lines '()))
+    (let ((line (read-line (process-stdout p))))
+      (if (eof-object? line)
+          (reverse lines)
+          (loop (cons line lines))))))
+
+;;; Value a peer LAST printed for a `key: value` line, or `#f`.
+;;;
+;;; The sync commands print a status block per iteration and one more at the
+;;; end, so the last occurrence is the state the peer finished in. The
+;;; earlier ones are a pass in progress: a first pass that spends its whole
+;;; budget on headers reports no blocks yet and is not a failure.
+;;;
+;;; ```scheme
+;;; (peer-field lines "best-height") ; => "4"
+;;; ```
+(define (peer-field lines key)
+  (let ((prefix (string-append key ": ")))
+    (let loop ((xs lines) (found #f))
+      (cond ((null? xs) found)
+            ((string-starts-with? (car xs) prefix)
+             (loop (cdr xs)
+                   (string-trim (substring (car xs)
+                                           (string-length prefix)
+                                           (string-length (car xs))))))
+            (else (loop (cdr xs) found))))))
+
+;; The last line a failed peer printed is its `sigilcoin: <reason>`.
+(define (peer-failure-reason lines)
+  (if (null? lines)
+      "no output"
+      (car (reverse lines))))
+
+;; ============================================================
+;; The listening side
+;; ============================================================
+
+;; Loopback only, on a port this process binds the moment it picks it and
+;; holds until the phase is over: nothing can take it in between, so a
+;; second run of the suite, or a busy machine, cannot collide.
+(define %port-base 19500)
+(define %port-span 300)
+
+;;; Bind a free loopback port, returning `(port . listener)`.
+(define (open-endpoint)
+  (let loop ((port (+ %port-base (modulo (process-id) %port-span)))
+             (tries 0))
+    (if (> tries 128)
+        (error "test-network: no free loopback port in the test range")
+        (let ((listener (guard (err (else #f))
+                          (tcp-listen port 8 "127.0.0.1"))))
+          (if listener
+              (cons port listener)
+              (loop (+ %port-base
+                       (modulo (+ 1 (- port %port-base)) %port-span))
+                    (+ tries 1)))))))
+
+(define (endpoint-text port)
+  (string-append "127.0.0.1:" (number->string port)))
+
+;; SQLite rows come back keyed by column name; take either a string or a
+;; symbol key, as `test-chain.sgl` does.
+(define (row-value row key)
+  (let ((entry (assoc key row)))
+    (if entry
+        (cdr entry)
+        (let ((sym (assoc (string->symbol key) row)))
+          (and sym (cdr sym))))))
+
+;; The serving node's own copy of a block, as the bytes it stored.
+(define (stored-block-payload n hash-bytes)
+  (let ((rows (sqlite-query
+                (node-db n)
+                "SELECT block_hex FROM blocks WHERE hash = ? AND block_hex IS NOT NULL"
+                (hex-encode hash-bytes))))
+    (and (pair? rows) (hex-decode (row-value (car rows) "block_hex")))))
+
+(define (block-inventory? item)
+  (or (= inv-block (inventory-vector-type item))
+      (= inv-witness-block (inventory-vector-type item))))
+
+;; Answer one `getdata`: a `block` message for every block this node has,
+;; and one `notfound` naming the rest. The responder `sigil-bitcoin` does
+;; not have; see the file header.
+(define (serve-getdata-blocks n sock envelope)
+  (let ((magic (chain-config-magic (node-config n))))
+    (let loop ((items (inventory-message-parse
+                        (p2p-envelope-payload envelope)))
+               (missing '()))
+      (if (null? items)
+          (unless (null? missing)
+            (p2p-socket-write-envelope
+              sock
+              (p2p-envelope magic: magic
+                            command: "notfound"
+                            payload: (notfound-message (reverse missing)))))
+          (let* ((item (car items))
+                 (payload (and (block-inventory? item)
+                               (stored-block-payload
+                                 n
+                                 (inventory-vector-hash item)))))
+            (if payload
+                (begin
+                  (p2p-socket-write-envelope
+                    sock
+                    (p2p-envelope magic: magic
+                                  command: "block"
+                                  payload: payload))
+                  (loop (cdr items) missing))
+                (loop (cdr items) (cons item missing))))))))
+
+;;; Serve one accepted peer with the node's own inbound handler.
+;;;
+;;; The read callback is where the block responder lives: a `getdata` is
+;;; answered there and never reaches the node, which has no case for it.
+(define (serve-peer n sock)
+  ;; The peer hanging up is how every one of these connections ends — it
+  ;; finishes its pass and closes, and the node's reader raises.
+  (guard (err (else #f))
+    (node-serve-inbound-transport
+      n
+      "127.0.0.1"
+      0
+      (lambda ()
+        (let loop ()
+          (let ((envelope (p2p-socket-read-envelope-timeout sock
+                                                            %read-timeout)))
+            (if (string=? "getdata" (p2p-envelope-command envelope))
+                (begin (serve-getdata-blocks n sock envelope) (loop))
+                envelope))))
+      (lambda (envelope) (p2p-socket-write-envelope sock envelope))
+      (lambda () (socket-close sock))
+      %serve-steps
+      %serve-max-tx))
+  (guard (err (else #f))
+    (socket-close sock))
+  #t)
+
+;;; Serve `count` inbound connections and return how many were served.
+;;;
+;;; An accept that times out returns early with a smaller count, which every
+;;; caller asserts on: it means the peer process never arrived.
+(define (serve-connections n listener count)
+  (let loop ((served 0))
+    (if (>= served count)
+        served
+        (if (socket-ready? listener %accept-timeout)
+            (let ((sock (tcp-accept listener)))
+              (if sock
+                  (begin (serve-peer n sock) (loop (+ served 1)))
+                  (loop served)))
+            served))))
+
+;;; Sync a peer process against a node this process serves.
+;;;
+;;; The listener is bound before the peer is spawned, so there is no window
+;;; in which the peer can find the port closed. Returns the peer's printed
+;;; lines; a non-zero exit or a missed connection raises with the peer's own
+;;; reason.
+;;;
+;;; ```scheme
+;;; (sync-peer server listener port dir 2)
+;;; ```
+(define (sync-peer server listener port dir iterations)
+  (let* ((child (spawn-peer (list "sync"
+                                  "--regtest"
+                                  "--data-dir" dir
+                                  "--peer" (endpoint-text port)
+                                  "--max-steps" %sync-batch
+                                  "--max-blocks" %sync-batch
+                                  "--iterations" (number->string iterations)
+                                  "--connect-timeout" "5000"
+                                  "--read-timeout" "30000")))
+         (served (serve-connections server listener iterations))
+         ;; Read after serving, not during: a sync prints a status block per
+         ;; iteration, tens of lines, which the pipe holds comfortably.
+         (lines (peer-output child))
+         (status (process-wait child)))
+    (unless (= iterations served)
+      (error (string-append "test-network: the peer opened "
+                            (number->string served)
+                            " of "
+                            (number->string iterations)
+                            " connections")))
+    (cons status lines)))
+
+;; A sync that has to succeed.
+(define (sync-peer-ok server listener port dir iterations)
+  (let ((result (sync-peer server listener port dir iterations)))
+    (unless (= 0 (car result))
+      (error (string-append "test-network: `sigilcoin sync` failed: "
+                            (peer-failure-reason (cdr result)))))
+    (cdr result)))
+
+;; ============================================================
+;; Data directories
+;; ============================================================
+
+(define (fresh-dir)
+  (let ((dir (make-temp-directory)))
+    (unless dir
+      (error "test-network: could not create a temp directory"))
+    dir))
+
+;; `(sigil fs)` deletes one empty directory at a time, and a node directory
+;; holds a database, its journals and a wallet key.
+(define (remove-tree dir)
+  (process-run "rm" "-rf" dir))
+
+;; The wallet key a peer's data directory holds, planted rather than
+;; generated so the address it pays to can be checked in.
+(define (plant-wallet-key dir)
+  (let ((path (string-append dir "/wallet.key")))
+    (write-file-string path (string-append %peer-wallet-key "\n"))
+    (process-run "chmod" "0600" path)
+    path))
+
+;; The scriptPubKey an `sgl1` address pays to. Bech32 only: deriving this
+;; from an address needs no key, which is why the payment side of the spend
+;; test works on a runtime with no secp256k1.
+(define (address->script address)
+  (let ((decoded (segwit-decode address)))
+    (unless (and decoded (string=? "sgl" (car decoded)) (= 0 (cadr decoded)))
+      (error "test-network: not a SigilCoin v0 address"))
+    (script-p2wpkh (caddr decoded))))
+
+;; The address `%peer-wallet-key` really produces, on a runtime that can
+;; derive one. Nothing else in this file needs a key, so everywhere else is
+;; native-free.
+(define (assert-address-matches-key)
+  (when %native-secp256k1?
+    (assert-equal %peer-address
+                  (segwit-encode
+                    "sgl"
+                    0
+                    (hash160 (private-key->public-key
+                               (hex-decode %peer-wallet-key)))))))
+
+;; ============================================================
+;; Nodes
+;; ============================================================
+
+(define (open-node dir)
+  (node-open sigilcoin-regtest-chain dir))
+
+(define (block-hash b)
+  (block-header-hash (block-header-field b)))
+
+(define (height-of n)
+  (node-status-snapshot-best-height (node-status n)))
+
+(define (validated-count n)
+  (node-status-snapshot-validated-block-count (node-status n)))
+
+(define (best-block-height n)
+  (node-status-snapshot-best-block-height (node-status n)))
+
+(define (best-block-hash n)
+  (node-status-snapshot-best-block-hash (node-status n)))
+
+(define (last-error n)
+  (node-status-snapshot-sync-last-error (node-status n)))
+
+(define (tip-is? n b)
+  (string=? (hex-encode (block-hash b)) (best-block-hash n)))
+
+;; Ingest, store, validate: the peer-driven path with the network taken out,
+;; which is how this side of the wire produces blocks to serve.
+(define (submit n b)
+  (node-ingest-headers n (list (block-header-field b)))
+  (node-store-block n b)
+  (node-validate-blocks n))
+
+(define (mine-blocks n count payout)
+  (let loop ((i 0) (blocks '()))
+    (if (>= i count)
+        (reverse blocks)
+        (let ((b (coin-mine-block n #f "two-node" payout)))
+          (unless (= 1 (submit n b))
+            (error (string-append "test-network: a block did not validate: "
+                                  (last-error n))))
+          (loop (+ i 1) (cons b blocks))))))
+
+;;; A second node holding the same blocks, built by submitting them again.
+;;;
+;;; Copying a data directory would be quicker and would not be a snapshot:
+;;; the database is open. Replaying the same block objects gives a node that
+;;; validated every one of them itself.
+(define (node-with-blocks dir blocks)
+  (let ((n (open-node dir)))
+    (for-each
+      (lambda (b)
+        (unless (= 1 (submit n b))
+          (error (string-append "test-network: replaying a block failed: "
+                                (last-error n)))))
+      blocks)
+    n))
+
+(define (active-utxos n)
+  (sqlite-query
+    (node-db n)
+    "SELECT height, value, coinbase, script_pubkey, created_by FROM utxos WHERE active = 1 ORDER BY height ASC"))
+
+(define (utxo-total n)
+  (let loop ((rows (active-utxos n)) (total 0))
+    (if (null? rows)
+        total
+        (loop (cdr rows) (+ total (row-value (car rows) "value"))))))
+
+(define (utxos-paying n script)
+  (let loop ((rows (active-utxos n)) (out '()))
+    (cond ((null? rows) (reverse out))
+          ((string=? (hex-encode script) (row-value (car rows) "script_pubkey"))
+           (loop (cdr rows) (cons (car rows) out)))
+          (else (loop (cdr rows) out)))))
+
+;; Three legal solutions to one puzzle, longest first. The shortest is the
+;; generator's own; the others are the same program behind one and two
+;; spaces, which the reader skips — a worse block by SigilCoin's only
+;; measure, and legal by every other rule. Ranking blocks needs a ladder of
+;; lengths for a fixed puzzle, and the generator publishes at most two.
+(define (solution-ladder parent-hash height)
+  (let ((best (puzzle-spec-solution (coin-puzzle-for parent-hash height))))
+    (list (string-append "  " best) (string-append " " best) best)))
+
+(define (build-at parent height solution graffiti payout)
+  (coin-build-block parent
+                    height
+                    solution
+                    graffiti
+                    payout
+                    (coin-next-block-time parent
+                                          coin-regtest-min-block-spacing)))
+
+;; ============================================================
+;; Fresh sync from genesis
+;; ============================================================
+
+(test-group "sigilcoin two-node sync"
+  (test "an empty peer process syncs a mined chain from genesis"
+    (let* ((dir-a (fresh-dir))
+           (dir-b (fresh-dir))
+           (a (open-node dir-a))
+           (blocks (mine-blocks a 4 %elsewhere))
+           (endpoint (open-endpoint))
+           (port (car endpoint))
+           (listener (cdr endpoint)))
+      (assert-equal 4 (height-of a))
+      (assert-equal 4 (validated-count a))
+      ;; The peer starts with nothing but the address of this node.
+      (let ((lines (sync-peer-ok a listener port dir-b 2)))
+        ;; What the peer itself reported, before anything is read back out
+        ;; of its database.
+        (assert-equal "4" (peer-field lines "best-height"))
+        (assert-equal "4" (peer-field lines "validated-blocks"))
+        (assert-equal (hex-encode (block-hash (list-ref blocks 3)))
+                      (peer-field lines "best-block-hash"))
+        (assert-equal "" (peer-field lines "sync-last-error")))
+      (socket-close listener)
+      (node-close a)
+      ;; And the same chain read out of the peer's own database.
+      (let ((b (open-node dir-b)))
+        (assert-equal 4 (height-of b))
+        (assert-equal 4 (best-block-height b))
+        (assert-equal (hex-encode (block-hash (list-ref blocks 3)))
+                      (best-block-hash b))
+        ;; Bodies, not just headers: four blocks validated, and four
+        ;; coinbase outputs in the peer's own UTXO set, worth exactly what
+        ;; SigilCoin's schedule issues.
+        (assert-equal 4 (validated-count b))
+        (assert-equal 4 (length (active-utxos b)))
+        (assert-equal (coin-cumulative-supply 4) (utxo-total b))
+        (assert-equal '(1 1 1 1)
+                      (map (lambda (r) (row-value r "coinbase"))
+                           (active-utxos b)))
+        (assert-equal "" (last-error b))
+        (node-close b))
+      (remove-tree dir-a)
+      (remove-tree dir-b))))
+
+;; ============================================================
+;; Propagating a newly mined block
+;; ============================================================
+
+(test-group "sigilcoin block propagation"
+  (test "a block mined after the peer caught up reaches it too"
+    (let* ((dir-a (fresh-dir))
+           (dir-b (fresh-dir))
+           (a (open-node dir-a))
+           (blocks (mine-blocks a 2 %elsewhere))
+           (endpoint (open-endpoint))
+           (port (car endpoint))
+           (listener (cdr endpoint)))
+      ;; Both nodes on the same tip.
+      (sync-peer-ok a listener port dir-b 1)
+      (let ((b (open-node dir-b)))
+        (assert-equal 2 (best-block-height b))
+        (assert-true (tip-is? b (list-ref blocks 1)))
+        (node-close b))
+      ;; A new block is mined while the peer is idle, and reaches it on the
+      ;; next ordinary sync — no headers, blocks or hashes handed over.
+      (let ((next (car (mine-blocks a 1 %elsewhere))))
+        (assert-equal 3 (best-block-height a))
+        (let ((lines (sync-peer-ok a listener port dir-b 1)))
+          (assert-equal "3" (peer-field lines "best-block-height"))
+          (assert-equal (hex-encode (block-hash next))
+                        (peer-field lines "best-block-hash")))
+        (socket-close listener)
+        (node-close a)
+        (let ((b (open-node dir-b)))
+          (assert-equal 3 (best-block-height b))
+          (assert-true (tip-is? b next))
+          (assert-equal 3 (validated-count b))
+          (assert-equal (coin-cumulative-supply 3) (utxo-total b))
+          (node-close b)))
+      (remove-tree dir-a)
+      (remove-tree dir-b))))
+
+;; ============================================================
+;; Spending across nodes
+;; ============================================================
+;;
+;; A coinbase has to age `coinbase-maturity` blocks before anything can
+;; spend it, so this is the one expensive test in the file: the chain really
+;; is mined to height 101 on one node and really is validated block by block
+;; on the other.
+
+(test-group "sigilcoin spend across nodes"
+  (test "coins mined by one node land in the other node's own UTXO set"
+    (let* ((dir-a (fresh-dir))
+           (dir-b (fresh-dir))
+           (a (open-node dir-a))
+           ;; Every reward is spendable without a signature; see `%anyone`.
+           (blocks (mine-blocks a 100 %anyone))
+           (funding (car (block-transactions (car blocks))))
+           (to-script (address->script %peer-address))
+           (parent (node-best-header a))
+           ;; The whole of the first reward, moved to the peer's address.
+           (transfer (transaction
+                       version: 2
+                       inputs: (list
+                                 (txin previous-output:
+                                         (outpoint txid: (transaction-txid
+                                                           funding)
+                                                   index: 0)
+                                       script-sig: #u8()
+                                       sequence: #xffffffff
+                                       witness: '()))
+                       outputs: (list (txout value: (coin-block-reward 1)
+                                             script-pubkey: to-script))
+                       lock-time: 0))
+           (payment (coin-build-block parent
+                                      101
+                                      (puzzle-spec-solution
+                                        (coin-puzzle-for
+                                          (block-header-hash parent)
+                                          101))
+                                      "payment"
+                                      %anyone
+                                      (coin-next-block-time
+                                        parent
+                                        coin-regtest-min-block-spacing)
+                                      (list transfer)
+                                      0)))
+      (assert-equal 100 (height-of a))
+      ;; The maturity window is why the chain is this long: Bitcoin's
+      ;; connector refuses a coinbase spent sooner, so height 101 is the
+      ;; first block that may move the reward minted at height 1, and this
+      ;; block validating is that rule being satisfied rather than skipped.
+      (assert-equal 1 (submit a payment))
+      (assert-equal 101 (best-block-height a))
+      (assert-equal 2 (length (block-transactions payment)))
+      ;; The peer holds the key to the address being paid.
+      (plant-wallet-key dir-b)
+      (assert-address-matches-key)
+      (let* ((endpoint (open-endpoint))
+             (port (car endpoint))
+             (listener (cdr endpoint)))
+        (let ((lines (sync-peer-ok a listener port dir-b 2)))
+          (assert-equal "101" (peer-field lines "best-block-height"))
+          (assert-equal "101" (peer-field lines "validated-blocks")))
+        (socket-close listener))
+      (node-close a)
+      ;; The money moved on the peer's own view of the chain: its UTXO set
+      ;; holds one non-coinbase output paying its address, and the coinbase
+      ;; that funded it is gone.
+      (let ((b (open-node dir-b)))
+        (assert-equal 101 (best-block-height b))
+        (assert-true (tip-is? b payment))
+        (assert-equal 101 (validated-count b))
+        (let ((paid (utxos-paying b to-script)))
+          (assert-equal 1 (length paid))
+          (assert-equal (coin-block-reward 1) (row-value (car paid) "value"))
+          (assert-equal 0 (row-value (car paid) "coinbase"))
+          (assert-equal 101 (row-value (car paid) "height")))
+        ;; 101 outputs, not 102: the spent coinbase left the set, and no
+        ;; value was created or destroyed on the way.
+        (assert-equal 101 (length (active-utxos b)))
+        (assert-equal (coin-cumulative-supply 101) (utxo-total b))
+        (assert-equal "" (last-error b))
+        (node-close b))
+      (remove-tree dir-a)
+      (remove-tree dir-b))))
+
+;; ============================================================
+;; Reorganising onto a shorter solution
+;; ============================================================
+
+(test-group "sigilcoin reorganisation between nodes"
+  (test "a shorter solution takes the tip on both nodes, and a late one does not"
+    ;; WHERE THE SIBLING HAS TO COME FROM. A node answers `getheaders` by
+    ;; looking up the height of the first locator hash it has SEEN, on any
+    ;; branch, and then sending its own best chain above that height
+    ;; (`db-best-chain-header-rows-after`). A node that saw the loser
+    ;; therefore tells a peer sitting on the loser that it has nothing —
+    ;; same height, nothing above it — and if it later extends, the child
+    ;; does not connect for that peer. So the better sibling is offered by a
+    ;; node that never saw the worse one, which is also the honest picture:
+    ;; two miners solved the same puzzle, and neither has the other's block.
+    (let* ((dir-a (fresh-dir))
+           (dir-b (fresh-dir))
+           (dir-c (fresh-dir))
+           (dir-d (fresh-dir))
+           (a (open-node dir-a))
+           (blocks (mine-blocks a 2 %elsewhere))
+           (parent (block-header-field (list-ref blocks 1)))
+           (ladder (solution-ladder (block-header-hash parent) 3))
+           (long (build-at parent 3 (car ladder) "par" %elsewhere))
+           (shorter (build-at parent 3 (cadr ladder) "golfed" %elsewhere))
+           (shortest (build-at parent 3 (caddr ladder) "late" %elsewhere)))
+      ;; Three legal blocks at one height, strictly ordered by the only
+      ;; thing SigilCoin ranks by.
+      (assert-true (> (coin-block-solution-length long)
+                      (coin-block-solution-length shorter)))
+      (assert-true (> (coin-block-solution-length shorter)
+                      (coin-block-solution-length shortest)))
+      (assert-equal 1 (submit a long))
+      (assert-true (tip-is? a long))
+      ;; The peer takes the longer solution from the node that mined it.
+      (let* ((endpoint (open-endpoint))
+             (port (car endpoint))
+             (listener (cdr endpoint)))
+        (sync-peer-ok a listener port dir-b 1)
+        (socket-close listener))
+      (node-close a)
+      (let ((b (open-node dir-b)))
+        (assert-equal 3 (best-block-height b))
+        (assert-true (tip-is? b long))
+        (node-close b))
+      ;; The competing miner: the same first two blocks, and a shorter
+      ;; solution at height 3.
+      (let ((c (node-with-blocks dir-c blocks)))
+        (assert-equal 1 (submit c shorter))
+        (assert-true (tip-is? c shorter))
+        (let* ((endpoint (open-endpoint))
+               (port (car endpoint))
+               (listener (cdr endpoint)))
+          ;; The peer, sitting on the longer solution, reorganises onto the
+          ;; shorter one over the wire.
+          (let ((lines (sync-peer-ok c listener port dir-b 1)))
+            (assert-equal "3" (peer-field lines "best-block-height"))
+            (assert-equal (hex-encode (block-hash shorter))
+                          (peer-field lines "best-block-hash")))
+          (let ((b (open-node dir-b)))
+            (assert-true (tip-is? b shorter))
+            (assert-equal 3 (best-block-height b))
+            ;; Both nodes agree on the tip, and it is a reorganisation
+            ;; rather than a second chain: the displaced block's coinbase is
+            ;; gone from the peer's own UTXO set.
+            (assert-equal (best-block-hash c) (best-block-hash b))
+            (assert-equal 3 (length (active-utxos b)))
+            (assert-equal (list (hex-encode (block-hash (list-ref blocks 0)))
+                                (hex-encode (block-hash (list-ref blocks 1)))
+                                (hex-encode (block-hash shorter)))
+                          (map (lambda (r) (row-value r "created_by"))
+                               (active-utxos b)))
+            (node-close b))
+          ;; A child settles height 3 on both nodes.
+          (let ((child (car (mine-blocks c 1 %elsewhere))))
+            (assert-equal 4 (best-block-height c))
+            (let ((lines (sync-peer-ok c listener port dir-b 1)))
+              (assert-equal "4" (peer-field lines "best-block-height"))
+              (assert-equal (hex-encode (block-hash child))
+                            (peer-field lines "best-block-hash")))
+            (socket-close listener)
+            ;; The best solution of the three, arriving after the height was
+            ;; settled. The node that has the child refuses it outright.
+            (assert-equal 0 (submit c shortest))
+            (assert-equal 4 (best-block-height c))
+            (assert-true (tip-is? c child))
+            (node-close c)
+            ;; And the peer refuses it over the wire, offered by a third
+            ;; node whose own tip it is.
+            (let ((d (node-with-blocks dir-d blocks)))
+              (assert-equal 1 (submit d shortest))
+              (assert-true (tip-is? d shortest))
+              (let* ((endpoint-d (open-endpoint))
+                     (port-d (car endpoint-d))
+                     (listener-d (cdr endpoint-d)))
+                (let ((lines (sync-peer-ok d listener-d port-d dir-b 1)))
+                  ;; The header may become the best one the peer has — that
+                  ;; is what committing the solution length to the header
+                  ;; buys — but the validated chain does not move.
+                  (assert-equal "4" (peer-field lines "best-block-height"))
+                  (assert-equal (hex-encode (block-hash child))
+                                (peer-field lines "best-block-hash")))
+                (socket-close listener-d))
+              (node-close d))
+            (let ((b (open-node dir-b)))
+              (assert-equal 4 (best-block-height b))
+              (assert-true (tip-is? b child))
+              (assert-equal 4 (validated-count b))
+              (assert-equal 4 (length (active-utxos b)))
+              (node-close b)))))
+      (remove-tree dir-a)
+      (remove-tree dir-b)
+      (remove-tree dir-c)
+      (remove-tree dir-d))))
+
+;; ============================================================
+;; An invalid block from a peer
+;; ============================================================
+
+(test-group "sigilcoin invalid block from a peer"
+  (test "a block that lies about its solution is refused and does not stick"
+    (let* ((dir-a (fresh-dir))
+           (dir-b (fresh-dir))
+           (dir-bad (fresh-dir))
+           (a (open-node dir-a))
+           (blocks (mine-blocks a 3 %elsewhere))
+           (honest-tip (list-ref blocks 2))
+           (parent (block-header-field honest-tip))
+           (honest (build-at parent
+                             4
+                             (puzzle-spec-solution
+                               (coin-puzzle-for (block-header-hash parent) 4))
+                             "lie"
+                             %elsewhere))
+           (header (block-header-field honest))
+           ;; The same block under the best claim a header can make: one
+           ;; byte of solution, which outranks every honest sibling. The
+           ;; coinbase says otherwise, so it is a claim the body cannot
+           ;; back.
+           (liar (block header-field:
+                          (block-header version: (block-header-version header)
+                                        previous-block:
+                                          (block-header-previous-block header)
+                                        merkle-root:
+                                          (block-header-merkle-root header)
+                                        time: (block-header-time header)
+                                        bits: (block-header-bits header)
+                                        nonce: 1)
+                        transactions: (block-transactions honest))))
+      (assert-true (> (coin-block-solution-length liar)
+                      (coin-header-solution-length
+                        (block-header-field liar))))
+      ;; The peer starts on the honest chain.
+      (let* ((endpoint (open-endpoint))
+             (port (car endpoint))
+             (listener (cdr endpoint)))
+        (sync-peer-ok a listener port dir-b 1)
+        (socket-close listener))
+      (node-close a)
+      ;; The dishonest node holds the same honest chain and one block more.
+      ;; It never validates that block itself — the header is legal on its
+      ;; own, which is all it takes to offer it, and checking the body is
+      ;; the receiving node's job.
+      (let ((bad (node-with-blocks dir-bad blocks)))
+        (assert-equal 1 (node-ingest-headers bad
+                                             (list (block-header-field liar))))
+        (node-store-block bad liar)
+        (assert-true (tip-is? bad honest-tip))
+        (let* ((endpoint (open-endpoint))
+               (port (car endpoint))
+               (listener (cdr endpoint))
+               (result (sync-peer bad listener port dir-b 1)))
+          ;; The peer does not call that pass a success, and does not move:
+          ;; the block came down and it still has three.
+          (assert-true (not (= 0 (car result))))
+          (assert-equal "3" (peer-field (cdr result) "best-block-height"))
+          (assert-equal "3" (peer-field (cdr result) "validated-blocks"))
+          (socket-close listener))
+        (node-close bad))
+      ;; The honest chain the peer already had is untouched: same tip, same
+      ;; count, same coins.
+      (let ((b (open-node dir-b)))
+        (assert-equal 3 (best-block-height b))
+        (assert-true (tip-is? b honest-tip))
+        (assert-equal 3 (validated-count b))
+        (assert-equal 3 (length (active-utxos b)))
+        (assert-equal (coin-cumulative-supply 3) (utxo-total b))
+        ;; And the peer's own record of the refusal names the rule that
+        ;; fired, on the block it downloaded and then threw away.
+        (let ((row (car (sqlite-query
+                          (node-db b)
+                          "SELECT status, validated, last_error FROM blocks WHERE hash = ?"
+                          (hex-encode (block-hash liar))))))
+          (assert-equal "invalid" (row-value row "status"))
+          (assert-equal 0 (row-value row "validated"))
+          (assert-true (string-contains? (row-value row "last_error")
+                                         "solution-length-mismatch")))
+        ;; The lie is permanent: the header is marked invalid, so the branch
+        ;; cannot be retried into the peer.
+        (assert-equal 0
+                      (row-value (car (sqlite-query
+                                        (node-db b)
+                                        "SELECT valid FROM headers WHERE hash = ?"
+                                        (hex-encode (block-hash liar))))
+                                 "valid"))
+        (node-close b))
+      ;; Not poisoned for later either: the next honest block still lands.
+      (let* ((a (open-node dir-a))
+             (next (car (mine-blocks a 1 %elsewhere)))
+             (endpoint (open-endpoint))
+             (port (car endpoint))
+             (listener (cdr endpoint)))
+        (let ((lines (sync-peer-ok a listener port dir-b 1)))
+          (assert-equal "4" (peer-field lines "best-block-height"))
+          (assert-equal (hex-encode (block-hash next))
+                        (peer-field lines "best-block-hash")))
+        (socket-close listener)
+        (node-close a))
+      (let ((b (open-node dir-b)))
+        (assert-equal 4 (best-block-height b))
+        (assert-equal 4 (validated-count b))
+        (node-close b))
+      (remove-tree dir-a)
+      (remove-tree dir-b)
+      (remove-tree dir-bad))))
+
+(run-tests)
