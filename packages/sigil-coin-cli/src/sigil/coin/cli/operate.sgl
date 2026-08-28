@@ -28,6 +28,7 @@
           (sigil string)
           (sigil time)
           (sigil socket)
+          (sigil sqlite)
           (sigil bitcoin utils)
           (sigil bitcoin p2p)
           (sigil bitcoin node)
@@ -488,7 +489,134 @@
                                   (cli-number args "--max-blocks" "16")
                                   "run")))))
 
+    ;; ============================================================
+    ;; Listening
+    ;; ============================================================
+
+    ;; Everything the node records about one inbound connection, undone.
+    ;;
+    ;; `node-serve-inbound-transport` books EVERY way an inbound connection
+    ;; can end — a peer hanging up, sending garbage, or going quiet — as
+    ;; both a peer failure and a node-level sync failure, then re-raises.
+    ;; On a public port those are the ordinary case, so leaving them in
+    ;; place means `sync-stage` is permanently `failed`, `sync-last-error`
+    ;; permanently quotes the last stranger, and `peer-failures` counts
+    ;; strangers rather than faults. Nothing an operator can alert on
+    ;; survives that.
+    ;;
+    ;; The metadata rows are written directly because `sigil-bitcoin`
+    ;; exports no way to clear a sync failure; the stage is only cleared
+    ;; when the failure on record is the `inbound` one this drop caused, so
+    ;; a real fault from another stage is never erased.
+    (define (forget-inbound-drop n port)
+      (node-remove-peer n "inbound" port)
+      (when (string=? "inbound"
+                      (node-status-snapshot-sync-failed-stage (node-status n)))
+        (let ((db (node-db n)))
+          (for-each
+            (lambda (row)
+              (sqlite-run
+                db
+                "INSERT OR REPLACE INTO metadata(key, value) VALUES (?, ?)"
+                (car row)
+                (cdr row)))
+            (list (cons "sync-stage" "idle")
+                  (cons "sync-failed-stage" "")
+                  (cons "sync-last-error" ""))))))
+
+    ;; Serve one accepted connection to completion.
+    ;;
+    ;; Returns `(answered . reason)`: `answered` is how many messages this
+    ;; node wrote back, and `reason` is why the connection ended, or `#f`
+    ;; when it ran to its step budget.
+    ;;
+    ;; The write callback is counted rather than the return value, because
+    ;; ending in an error says NOTHING about whether the peer was served: a
+    ;; peer that finishes its business and hangs up is the ordinary case,
+    ;; and the transport reports that hangup exactly the way it reports a
+    ;; stranger who connected and sent nothing. What separates the two is
+    ;; whether this node ever had something to answer with — a `version`
+    ;; back is already one message more than a bare `nc` gets.
+    ;;
+    ;; `node-serve-inbound-socket` is not used because it builds its own
+    ;; callbacks; this is the same transport with the write side observed.
+    ;;
+    ;; Anything raised while UNDOING a drop is a fault in the node's own
+    ;; database rather than in the peer, and is left to propagate: that is
+    ;; the only condition under which a listener should stop.
+    (define (serve-one-inbound n client port read-timeout max-steps max-tx)
+      (let ((requested 0)
+            (answered 0)
+            (reason #f))
+        (guard (err
+                (else
+                 (set! reason (cli-error-message err "connection closed"))))
+          (node-serve-inbound-transport
+            n
+            "inbound"
+            port
+            ;; Counted on the READ side on purpose. The transport writes this
+            ;; node's handshake before any peer message arrives, so counting
+            ;; writes would score a bare connect-and-hangup as a served peer.
+            ;; A connection is only served once the peer got a whole envelope
+            ;; in: a hangup, garbage, or a silent client never reaches this.
+            (lambda ()
+              (let ((envelope (p2p-socket-read-envelope-timeout client read-timeout)))
+                (when envelope
+                  (set! requested (+ requested 1)))
+                envelope))
+            (lambda (envelope)
+              (set! answered (+ answered 1))
+              (p2p-socket-write-envelope client envelope))
+            (lambda () (socket-close client))
+            max-steps
+            max-tx))
+        (when reason
+          ;; The transport closes the socket on its own error path; this
+          ;; covers a raise from before it took ownership, and closing an
+          ;; already-closed socket is a no-op.
+          (guard (err (else #f)) (socket-close client))
+          (forget-inbound-drop n port))
+        (list requested answered reason)))
+
     ;;; Serve inbound peers on a TCP port.
+    ;;;
+    ;;; ## One connection at a time, one failure at a time
+    ;;;
+    ;;; Each accepted connection is served inside its OWN guard. A peer that
+    ;;; connects and hangs up, sends bytes that are not this chain's wire
+    ;;; protocol, stalls past `--read-timeout` or dies mid-message is logged
+    ;;; as `peer-dropped: <reason>` and forgotten; the listener goes straight
+    ;;; back to accepting. Only two things stop it: `--bind`/`--port` that
+    ;;; cannot be bound, and the operator's own limits
+    ;;; (`--max-connections`, or `--accept-timeout` with a positive
+    ;;; `--max-connections`).
+    ;;;
+    ;;; ## What the status fields mean afterwards
+    ;;;
+    ;;; A connection that ended in an error is not a node failure. Its
+    ;;; synthetic peer row is removed and its sync failure cleared, so:
+    ;;;
+    ;;;   * `sync-stage: idle` and an empty `sync-last-error` mean the node
+    ;;;     is healthy — anything else is a real fault worth paging on.
+    ;;;   * `peer-failures` counts peers that are still known and last
+    ;;;     failed, never the strangers a public port collects.
+    ;;;   * `connections-served` counts connections that got at least one
+    ;;;     whole envelope IN, and `connections-dropped` the ones that never
+    ;;;     did. The count is taken on the read side deliberately: this node
+    ;;;     writes its handshake before a peer has said anything, so scoring
+    ;;;     writes would count a bare connect-and-hangup as a served peer.
+    ;;;     The two are disjoint and sum to `connections-accepted`. Served
+    ;;;     climbing is a working seed; dropped climbing on its own is noise
+    ;;;     or an attack, and costs the node nothing.
+    ;;;
+    ;;; ## `--max-connections 0`
+    ;;;
+    ;;; Zero means serve indefinitely: the accept timeout becomes a poll
+    ;;; interval and the command never returns on its own, which is what a
+    ;;; seed node under a supervisor wants. A positive value serves at most
+    ;;; that many connections and also exits when `--accept-timeout` passes
+    ;;; with nothing waiting, which is what a probe or a test wants.
     ;;;
     ;;; ```scheme
     ;;; (run-listen '("--regtest" "--port" "19445" "--max-connections" "1"))
@@ -516,39 +644,61 @@
                        (peer-endpoint bind port)
                        ". Another process may already hold that port.")))
             (println "listening: ~a" (peer-endpoint bind port))
-            (let* ((failure #f)
+            (let* ((accepted 0)
+                   (served 0)
+                   (dropped 0)
+                   (last-drop "")
+                   (fatal #f)
                    (result
-                     (guard (err (else (set! failure err) #f))
-                       (let loop ((completed 0) (last #f))
-                         (if (and (> max-connections 0)
-                                  (>= completed max-connections))
-                             last
-                             (if (socket-ready? listener accept-timeout)
-                                 (let ((client (tcp-accept listener)))
-                                   (if client
-                                       (loop
-                                         (+ completed 1)
-                                         (node-serve-inbound-socket
-                                           n
-                                           "inbound"
-                                           (+ completed 1)
-                                           client
-                                           read-timeout
-                                           max-steps
-                                           max-tx))
-                                       (loop completed last)))
-                                 last))))))
+                     ;; This guard sees only what `serve-one-inbound` chose
+                     ;; NOT to absorb: a fault in the node itself. Peer
+                     ;; errors never reach it, which is the whole point.
+                     (guard (err (else (set! fatal err) #f))
+                       (let loop ((last #f))
+                         (cond
+                           ((and (> max-connections 0)
+                                 (>= accepted max-connections))
+                            last)
+                           ((socket-ready? listener accept-timeout)
+                            (let ((client (tcp-accept listener)))
+                              (if client
+                                  (let* ((outcome
+                                           (serve-one-inbound n
+                                                              client
+                                                              port
+                                                              read-timeout
+                                                              max-steps
+                                                              max-tx))
+                                         (requested (car outcome))
+                                         (answered (cadr outcome))
+                                         (reason (caddr outcome)))
+                                    (set! accepted (+ accepted 1))
+                                    (if (> requested 0)
+                                        (begin
+                                          (set! served (+ served 1))
+                                          (println "peer-served: ~a answered=~a ended=~a"
+                                                   accepted
+                                                   answered
+                                                   (or reason "step budget"))
+                                          (loop (node-status n)))
+                                        (begin
+                                          (set! dropped (+ dropped 1))
+                                          (set! last-drop
+                                            (or reason "nothing to answer"))
+                                          (println "peer-dropped: ~a" last-drop)
+                                          (loop last))))
+                                  (loop last))))
+                           ;; Nothing waiting. Zero means serve forever, so
+                           ;; the timeout is only a poll interval there.
+                           ((= max-connections 0) (loop last))
+                           (else last))))))
               (socket-close listener)
-              ;; A peer hanging up mid-conversation is how most inbound
-              ;; connections end, and the node's transport reports it the
-              ;; same way it reports a real fault. Say what happened and
-              ;; still print the status rather than exiting non-zero on a
-              ;; normal disconnect.
-              ;; ponytail: one bucket for every transport outcome. The node
-              ;; would have to distinguish "peer closed" from "peer sent
-              ;; garbage" before this can, and it does not today.
-              (when failure
-                (println "peer-disconnected: ~a"
-                         (cli-error-message failure "connection closed")))
+              (println "connections-accepted: ~a" accepted)
+              (println "connections-served: ~a" served)
+              (println "connections-dropped: ~a" dropped)
+              (println "listen-last-drop: ~a" last-drop)
+              ;; Re-raised outside the guard handler: a raise from inside one
+              ;; escapes every enclosing guard, including `main`'s.
+              (when fatal (raise fatal))
               (coin-print-status (node-status n))
               result)))))))

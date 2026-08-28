@@ -1,0 +1,22 @@
+;;; A real `sigilcoin-explorer` process, for the front-door tests.
+;;;
+;;; `test-explorer.sgl` cannot both run the accept loop and connect to it:
+;;; the loop owns the process it runs in, and the whole point of the
+;;; slow-client tests is that a second client arrives while a first one is
+;;; still being waited on. So the server goes in its own operating-system
+;;; process and this file is what that process runs.
+;;;
+;;; It is the binary's own entry point and nothing more, so `--help`,
+;;; `--version` and the timeouts a test measures are the ones an operator
+;;; gets:
+;;;
+;;; ```sh
+;;; sigil -L <paths...> explorer-peer.sgl -- --regtest --data-dir DIR --port N
+;;; ```
+;;;
+;;; This is not a test file: the runner collects `test-*.sgl` and
+;;; `*-test.sgl`, so it is never executed as one.
+
+(import (sigil coin explorer))
+
+(explorer-main)

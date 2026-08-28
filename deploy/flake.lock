@@ -1,0 +1,329 @@
+{
+  "nodes": {
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1785828668,
+        "narHash": "sha256-8fsyqeO+mJqvIzeO4xIpgJe/f7MTbbVTEC6RT6WSXNs=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "e72e4f299401a3689d4b3d5fc6496b11db7064eb",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "e72e4f299401a3689d4b3d5fc6496b11db7064eb",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "nixpkgs": "nixpkgs",
+        "sigil": "sigil",
+        "sigil-ansi": "sigil-ansi",
+        "sigil-bitcoin": "sigil-bitcoin",
+        "sigil-crypto": "sigil-crypto",
+        "sigil-docs": "sigil-docs",
+        "sigil-ffi": "sigil-ffi",
+        "sigil-http": "sigil-http",
+        "sigil-json": "sigil-json",
+        "sigil-log": "sigil-log",
+        "sigil-lsp": "sigil-lsp",
+        "sigil-mcp": "sigil-mcp",
+        "sigil-nrepl": "sigil-nrepl",
+        "sigil-socket": "sigil-socket",
+        "sigil-sqlite": "sigil-sqlite",
+        "sigil-tls": "sigil-tls",
+        "sigil-version": "sigil-version"
+      }
+    },
+    "sigil": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1787773481,
+        "narHash": "sha256-hQsBNn2AuUPriwOgsB2H/pXyBCcdfyO91eaQ8lwAxbg=",
+        "ref": "refs/heads/master",
+        "rev": "7e5a6c21cf46a326cfb937c23270a408bb10278f",
+        "revCount": 3361,
+        "type": "git",
+        "url": "file:///home/trev/Workspace/sigil/sigil"
+      },
+      "original": {
+        "rev": "7e5a6c21cf46a326cfb937c23270a408bb10278f",
+        "type": "git",
+        "url": "file:///home/trev/Workspace/sigil/sigil"
+      }
+    },
+    "sigil-ansi": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1778062183,
+        "narHash": "sha256-9jdbvq0RVSEz8rcF5Mpw9FTiDVrEsfMs9O6w6c+noyg=",
+        "ref": "master",
+        "rev": "1e14b6f9d034ca8ef9f404e2ded316d0780ad7cf",
+        "revCount": 32,
+        "type": "git",
+        "url": "https://codeberg.org/sigil/sigil-ansi"
+      },
+      "original": {
+        "ref": "master",
+        "rev": "1e14b6f9d034ca8ef9f404e2ded316d0780ad7cf",
+        "type": "git",
+        "url": "https://codeberg.org/sigil/sigil-ansi"
+      }
+    },
+    "sigil-bitcoin": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1787888188,
+        "narHash": "sha256-SCC4CULYklWWdX/t20haB+aWWy1XRkuJ/tI7U1sP2d4=",
+        "ref": "refs/heads/master",
+        "rev": "5362a808d295f7435f3c37d0897a8707016dcc0b",
+        "revCount": 106,
+        "type": "git",
+        "url": "file:///home/trev/Workspace/sigil/sigil-bitcoin"
+      },
+      "original": {
+        "rev": "5362a808d295f7435f3c37d0897a8707016dcc0b",
+        "type": "git",
+        "url": "file:///home/trev/Workspace/sigil/sigil-bitcoin"
+      }
+    },
+    "sigil-crypto": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1787584295,
+        "narHash": "sha256-+yyqYkFkpN4DSIZKmBef5/h/CEBnKgT/uMnK1eAZgA0=",
+        "ref": "master",
+        "rev": "debba4462b7ff4de143db9e0792b8606fdc455bc",
+        "revCount": 41,
+        "type": "git",
+        "url": "https://codeberg.org/sigil/sigil-crypto"
+      },
+      "original": {
+        "ref": "master",
+        "rev": "debba4462b7ff4de143db9e0792b8606fdc455bc",
+        "type": "git",
+        "url": "https://codeberg.org/sigil/sigil-crypto"
+      }
+    },
+    "sigil-docs": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1782651142,
+        "narHash": "sha256-ghwSwKlipxmhcfOZNAQHpnAucFHaRJo/G+ZYgtImi90=",
+        "ref": "master",
+        "rev": "105327cf559c31945fa3239b770460ca323ea8ed",
+        "revCount": 95,
+        "type": "git",
+        "url": "https://codeberg.org/sigil/sigil-docs"
+      },
+      "original": {
+        "ref": "master",
+        "rev": "105327cf559c31945fa3239b770460ca323ea8ed",
+        "type": "git",
+        "url": "https://codeberg.org/sigil/sigil-docs"
+      }
+    },
+    "sigil-ffi": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1784132365,
+        "narHash": "sha256-FDCSlzN0GRG/bKBckBGvKUrW/fr39GK0JolQdECqsXI=",
+        "ref": "master",
+        "rev": "43283237fae5abdba324769ad4a7a2baf694e660",
+        "revCount": 25,
+        "type": "git",
+        "url": "https://codeberg.org/sigil/sigil-ffi"
+      },
+      "original": {
+        "ref": "master",
+        "rev": "43283237fae5abdba324769ad4a7a2baf694e660",
+        "type": "git",
+        "url": "https://codeberg.org/sigil/sigil-ffi"
+      }
+    },
+    "sigil-http": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1783417994,
+        "narHash": "sha256-2n17iWyl76ZTB7FHZRhicViskraBTIgH7sapuWsfzOY=",
+        "ref": "master",
+        "rev": "c24a14cabdb5ceed6273d7a6c1004baee07d69a0",
+        "revCount": 91,
+        "type": "git",
+        "url": "https://codeberg.org/sigil/sigil-http"
+      },
+      "original": {
+        "ref": "master",
+        "rev": "c24a14cabdb5ceed6273d7a6c1004baee07d69a0",
+        "type": "git",
+        "url": "https://codeberg.org/sigil/sigil-http"
+      }
+    },
+    "sigil-json": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1778062027,
+        "narHash": "sha256-aJpMttKYMTHfFsBZ8PqMuW2zvADGDIl6A2+Y04JdCvU=",
+        "ref": "master",
+        "rev": "55c9e74712b5f79b45d41c65cfe0aef2c8f7e155",
+        "revCount": 38,
+        "type": "git",
+        "url": "https://codeberg.org/sigil/sigil-json"
+      },
+      "original": {
+        "ref": "master",
+        "rev": "55c9e74712b5f79b45d41c65cfe0aef2c8f7e155",
+        "type": "git",
+        "url": "https://codeberg.org/sigil/sigil-json"
+      }
+    },
+    "sigil-log": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1778062117,
+        "narHash": "sha256-bKSG1BBRkMis7f6/ENI6dCkH1KWbkevqZo5LzOOJumo=",
+        "ref": "master",
+        "rev": "56e4fc5a52dc370c037ef14502bb8d6d2876dc53",
+        "revCount": 21,
+        "type": "git",
+        "url": "https://codeberg.org/sigil/sigil-log"
+      },
+      "original": {
+        "ref": "master",
+        "rev": "56e4fc5a52dc370c037ef14502bb8d6d2876dc53",
+        "type": "git",
+        "url": "https://codeberg.org/sigil/sigil-log"
+      }
+    },
+    "sigil-lsp": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1782651286,
+        "narHash": "sha256-mDfoP3+ZHpOgNZiimwCNgI1jU776HbFVcD23y91xh3M=",
+        "ref": "master",
+        "rev": "98d35fe94e05e315ea9871899d686297e4e056b1",
+        "revCount": 25,
+        "type": "git",
+        "url": "https://codeberg.org/sigil/sigil-lsp"
+      },
+      "original": {
+        "ref": "master",
+        "rev": "98d35fe94e05e315ea9871899d686297e4e056b1",
+        "type": "git",
+        "url": "https://codeberg.org/sigil/sigil-lsp"
+      }
+    },
+    "sigil-mcp": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1784891204,
+        "narHash": "sha256-/TVbjydKAsoomZyO6CNKmScQMuZSiI77PihOWC6P3+4=",
+        "ref": "master",
+        "rev": "52d7e90e6d718b72a886dfb74e774e6cf0845fd7",
+        "revCount": 69,
+        "type": "git",
+        "url": "https://codeberg.org/sigil/sigil-mcp"
+      },
+      "original": {
+        "ref": "master",
+        "rev": "52d7e90e6d718b72a886dfb74e774e6cf0845fd7",
+        "type": "git",
+        "url": "https://codeberg.org/sigil/sigil-mcp"
+      }
+    },
+    "sigil-nrepl": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1783600357,
+        "narHash": "sha256-M63PR/Czf8dVdh6/UWAmfTeE5VWeZ72LKplXVQXy08k=",
+        "ref": "master",
+        "rev": "e5618482fb4adb2ed3851bef980bef91d3ad2ff7",
+        "revCount": 49,
+        "type": "git",
+        "url": "https://codeberg.org/sigil/sigil-nrepl"
+      },
+      "original": {
+        "ref": "master",
+        "rev": "e5618482fb4adb2ed3851bef980bef91d3ad2ff7",
+        "type": "git",
+        "url": "https://codeberg.org/sigil/sigil-nrepl"
+      }
+    },
+    "sigil-socket": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1778062025,
+        "narHash": "sha256-pgF60Ann2fxPDsdLGs2gs1c4gDB9DGoWa3LM6/eT9f0=",
+        "ref": "master",
+        "rev": "6b9e36eb4d4a944b463e5f6826bd711186ba6710",
+        "revCount": 40,
+        "type": "git",
+        "url": "https://codeberg.org/sigil/sigil-socket"
+      },
+      "original": {
+        "ref": "master",
+        "rev": "6b9e36eb4d4a944b463e5f6826bd711186ba6710",
+        "type": "git",
+        "url": "https://codeberg.org/sigil/sigil-socket"
+      }
+    },
+    "sigil-sqlite": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1784049668,
+        "narHash": "sha256-OW2XtK5TkjHic7AYutvbD060DD2YDUVoXqAW7CeDxkw=",
+        "ref": "master",
+        "rev": "3d441fb32a216aaf99d0e2732bef5877e91d5d48",
+        "revCount": 29,
+        "type": "git",
+        "url": "https://codeberg.org/sigil/sigil-sqlite"
+      },
+      "original": {
+        "ref": "master",
+        "rev": "3d441fb32a216aaf99d0e2732bef5877e91d5d48",
+        "type": "git",
+        "url": "https://codeberg.org/sigil/sigil-sqlite"
+      }
+    },
+    "sigil-tls": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1785835297,
+        "narHash": "sha256-JIZ2gxgUzssQwv8IzXpaneZr5HJv15kFakNoX72bi4Y=",
+        "ref": "master",
+        "rev": "fe4b756f2f46eacf5e3a4eb5d17f2681d88c5ee8",
+        "revCount": 35,
+        "type": "git",
+        "url": "https://codeberg.org/sigil/sigil-tls"
+      },
+      "original": {
+        "ref": "master",
+        "rev": "fe4b756f2f46eacf5e3a4eb5d17f2681d88c5ee8",
+        "type": "git",
+        "url": "https://codeberg.org/sigil/sigil-tls"
+      }
+    },
+    "sigil-version": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1778062024,
+        "narHash": "sha256-dvmsW0dRUwJdUyfJvqqHsgCv4Ba+VPQglWeB257NV88=",
+        "ref": "master",
+        "rev": "2d2c9ef9c2694466f65abc14cddf9bfb9cada4a4",
+        "revCount": 19,
+        "type": "git",
+        "url": "https://codeberg.org/sigil/sigil-version"
+      },
+      "original": {
+        "ref": "master",
+        "rev": "2d2c9ef9c2694466f65abc14cddf9bfb9cada4a4",
+        "type": "git",
+        "url": "https://codeberg.org/sigil/sigil-version"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}

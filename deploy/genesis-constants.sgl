@@ -1,0 +1,42 @@
+;;; Print the genesis constants for a quote and timestamp.
+;;;
+;;; Launch-day tool. `packages/sigil-coin-node/src/sigil/coin/node/chain.sgl`
+;;; carries four checked-in values per chain — the quote, the timestamp, the
+;;; serialized header hex and the display id — and all four have to move
+;;; together, because the quote IS the genesis coinbase and changing it
+;;; changes the hash. This prints what the new values must be.
+;;;
+;;; Run from the repository root:
+;;;
+;;;   nix develop /home/trev/Workspace/sigil -c \
+;;;     sigil deploy/genesis-constants.sgl --redirects ./dev-redirects.sgl
+;;;
+;;; Edit QUOTE and TIME below, run it, then paste the two hex strings into
+;;; `coin-genesis-header-constant` and `coin-genesis-id-constant` and the
+;;; quote and time into `coin-genesis-quote` and `coin-genesis-time`.
+;;; `test-node.sgl` rebuilds genesis from the quote and asserts the
+;;; constants, so a mismatch fails the suite rather than shipping.
+
+(import (sigil io)
+        (sigil bitcoin encoding)
+        (sigil bitcoin utils)
+        (sigil coin node genesis))
+
+;; ---- edit these two ----------------------------------------------------
+(define QUOTE "PLACEHOLDER: the launch-day #systemcrafters quote goes here")
+(define TIME 1785542400) ;; seconds since the Unix epoch, UTC
+;; ------------------------------------------------------------------------
+
+(println "quote: ~a" QUOTE)
+;; BYTES, not characters. The quote becomes coinbase graffiti verbatim via
+;; `string->utf8`, and the graffiti cap (400 B) and the block cap (8192 B)
+;; are byte limits. `string-length` would under-count any non-ASCII quote and
+;; report a quote as legal that the consensus rules reject.
+(println "quote-bytes: ~a" (bytevector-length (string->utf8 QUOTE)))
+(println "time: ~a" TIME)
+(println "header-hex: ~a" (coin-genesis-header-hex QUOTE TIME))
+(println "hash: ~a" (hex-encode (coin-genesis-hash QUOTE TIME)))
+;; The display id is the hash written the other way round, which is the form
+;; humans quote and the form `coin-genesis-id-constant` stores.
+(println "id: ~a"
+         (hex-encode (reverse-bytevector (coin-genesis-hash QUOTE TIME))))

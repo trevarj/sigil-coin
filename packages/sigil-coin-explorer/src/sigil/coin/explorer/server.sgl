@@ -45,6 +45,7 @@
   (import (sigil math)
           (sigil io)
           (sigil string)
+          (sigil time)
           (sigil socket)
           (sigil process)
           (sigil bitcoin node)
@@ -61,8 +62,13 @@
     explorer-response-content-type
     explorer-response-body
     explorer-http-response
+    explorer-default-read-timeout
+    explorer-default-max-pending
+    explorer-request-head
+    explorer-answer-head
     explorer-serve-connection
     explorer-serve
+    explorer-usage
     explorer-main)
 
   (begin
@@ -229,9 +235,15 @@
                  (respond 404 %json
                           (explorer-error-json "not-found"
                                                "not a SigilCoin address")))))
+          ;; A path nobody claimed still gets an answer in the media type
+          ;; its caller asked for: a bot polling `/api/...` should not have
+          ;; to parse HTML to learn it mistyped an endpoint.
           (else
-           (respond 404 %html
-                    (explorer-missing-page "No such page."))))))
+           (if (json-path? path)
+               (respond 404 %json
+                        (explorer-error-json "not-found" "no such endpoint"))
+               (respond 404 %html
+                        (explorer-missing-page "No such page.")))))))
 
     ;; True when a path is one the JSON side owns, so a failure before any
     ;; route ran still answers in the media type the caller asked for.
@@ -294,6 +306,7 @@
             ((= status 400) "400 Bad Request")
             ((= status 404) "404 Not Found")
             ((= status 405) "405 Method Not Allowed")
+            ((= status 408) "408 Request Timeout")
             ((= status 500) "500 Internal Server Error")
             ((= status 503) "503 Service Unavailable")
             (else (string-append (number->string status) " Unknown"))))
@@ -304,17 +317,21 @@
     ;;; quote with one non-ASCII character would otherwise under-report
     ;;; `Content-Length` and truncate the page in the client.
     ;;;
+    ;;; `body:` is `#f` for a `HEAD`, which RFC 9110 says carries the
+    ;;; headers a `GET` would and no body — including the `Content-Length`
+    ;;; the `GET` would have had, which is the whole point of asking.
+    ;;;
     ;;; ```scheme
     ;;; (explorer-http-response (list 200 "text/plain" "hi"))
     ;;; ```
-    (define (explorer-http-response response)
-      (: list? -> string?)
-      (let ((body (explorer-response-body response)))
+    (define (explorer-http-response response (keys: (body #t)))
+      (: list? (body: any?) -> string?)
+      (let ((text (explorer-response-body response)))
         (string-append
           "HTTP/1.1 " (status-text (explorer-response-status response)) "\r\n"
           "Content-Type: " (explorer-response-content-type response) "\r\n"
           "Content-Length: "
-          (number->string (bytevector-length (string->utf8 body))) "\r\n"
+          (number->string (bytevector-length (string->utf8 text))) "\r\n"
           ;; A read-only view of a chain that changes once a day is still a
           ;; live view; nothing here may be cached as if it were final.
           "Cache-Control: no-store\r\n"
@@ -324,22 +341,96 @@
           "Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'\r\n"
           "Connection: close\r\n"
           "\r\n"
-          body)))
+          (if body text ""))))
 
-    ;; Read the request line, then drain headers until the blank line. The
-    ;; body is never read: no route accepts one.
-    (define (read-request conn)
-      (let ((line (socket-read-line conn)))
-        (and (string? line)
-             (begin
-               (let drain ((header (socket-read-line conn)) (seen 0))
-                 ;; A client that never sends the blank line cannot hold the
-                 ;; loop open forever.
-                 (when (and (string? header)
-                            (> (string-length (trim-line header)) 0)
-                            (< seen 100))
-                   (drain (socket-read-line conn) (+ seen 1))))
-               (trim-line line)))))
+    ;; ============================================================
+    ;; Reading a request without trusting the client
+    ;; ============================================================
+
+    ;;; Milliseconds a client gets to send its whole request head.
+    ;;;
+    ;;; ```scheme
+    ;;; explorer-default-read-timeout ; => 5000
+    ;;; ```
+    (define explorer-default-read-timeout 5000)
+
+    ;;; Connections held part-read at once before the oldest is dropped.
+    ;;;
+    ;;; ```scheme
+    ;;; explorer-default-max-pending ; => 64
+    ;;; ```
+    (define explorer-default-max-pending 64)
+
+    ;; A request head longer than this is not a request. Bounds what one
+    ;; client can make the server hold before it has said anything useful.
+    (define %max-head-bytes 8192)
+
+    (define (now-ms)
+      (exact (floor (/ (* 1000 (current-jiffy)) (jiffies-per-second)))))
+
+    ;; Whether the blank line that ends the request head has arrived.
+    (define (head-complete? buffer)
+      (let ((n (string-length buffer)))
+        (let loop ((i 0))
+          (cond ((>= i n) #f)
+                ((not (char=? (string-ref buffer i) #\newline)) (loop (+ i 1)))
+                ((and (< (+ i 1) n)
+                      (char=? (string-ref buffer (+ i 1)) #\newline))
+                 #t)
+                ((and (< (+ i 2) n)
+                      (char=? (string-ref buffer (+ i 1)) #\return)
+                      (char=? (string-ref buffer (+ i 2)) #\newline))
+                 #t)
+                (else (loop (+ i 1)))))))
+
+    (define (first-line buffer)
+      (let ((n (string-length buffer)))
+        (let loop ((i 0))
+          (cond ((>= i n) buffer)
+                ((char=? (string-ref buffer i) #\newline)
+                 (substring buffer 0 i))
+                (else (loop (+ i 1)))))))
+
+    ;;; The request line in `buffer`, once the head is complete.
+    ;;;
+    ;;; Returns `#f` while the head is still arriving, so a caller reading
+    ;;; incrementally knows to wait for more without blocking on the socket.
+    ;;;
+    ;;; ```scheme
+    ;;; (explorer-request-head "GET / HTTP/1.1\r\n\r\n") ; => "GET / HTTP/1.1"
+    ;;; ```
+    (define (explorer-request-head buffer)
+      (: string? -> any?)
+      (and (head-complete? buffer) (trim-line (first-line buffer))))
+
+    ;; Read the request head with a deadline. `socket-read-line` is not used
+    ;; anywhere on this path: it blocks per BYTE with no timeout, so one
+    ;; client that opens a connection and says nothing holds the server for
+    ;; as long as it likes.
+    ;;
+    ;; Returns the request line, or `#f` when the client timed out, sent an
+    ;; over-long head, or closed without one.
+    (define (read-head conn timeout-ms)
+      (let ((deadline (+ (now-ms) timeout-ms)))
+        (let loop ((buffer ""))
+          (let ((head (explorer-request-head buffer)))
+            (cond
+              (head head)
+              ((> (string-length buffer) %max-head-bytes) #f)
+              (else
+               (let ((remaining (- deadline (now-ms))))
+                 (and (> remaining 0)
+                      (socket-ready? conn remaining)
+                      (let ((chunk (guard (e (#t #f)) (socket-read conn))))
+                        (cond
+                          ;; Closed without a blank line. A request line on
+                          ;; its own is still a request; nothing is not.
+                          ((eof-object? chunk)
+                           (and (> (string-length buffer) 0)
+                                (trim-line (first-line buffer))))
+                          ((and (string? chunk) (> (string-length chunk) 0))
+                           (loop (string-append buffer chunk)))
+                          (else #f)))))))))))
 
     (define (trim-line line)
       (let loop ((n (string-length line)))
@@ -358,65 +449,209 @@
         (and (>= (length parts) 2)
              (cons (car parts) (car (cdr parts))))))
 
+    ;;; Answer an already-read request head on `conn`, then close it.
+    ;;;
+    ;;; `head` is the request line, or `#f` when the client never sent a
+    ;;; usable one. Returns the path served, or `#f`.
+    ;;;
+    ;;; Split from the reading half so the same answering code serves a
+    ;;; connection read all at once and one read a chunk at a time by the
+    ;;; accept loop.
+    ;;;
+    ;;; ```scheme
+    ;;; (explorer-answer-head chain "/tmp/n" conn "GET / HTTP/1.1")
+    ;;; ```
+    (define (explorer-answer-head chain data-dir conn head)
+      (: chain-config? string? any? any? -> any?)
+      (let* ((request (and (string? head) (parse-request-line head)))
+             (method (and request (car request)))
+             (path (and request (explorer-request-path (cdr request))))
+             (response
+               (cond
+                 ((not (string? head))
+                  (respond 408 %html
+                           (explorer-missing-page "Request timed out.")))
+                 ((not request)
+                  (respond 400 %html
+                           (explorer-missing-page "Malformed request.")))
+                 ((not (or (string=? method "GET") (string=? method "HEAD")))
+                  (respond 405 %html
+                           (explorer-missing-page
+                             "This explorer only answers GET.")))
+                 (else
+                  (explorer-respond chain data-dir path)))))
+        (guard (e (#t #f))
+          (socket-send-all conn
+                           (explorer-http-response
+                             response
+                             ;; RFC 9110: a HEAD response has no content.
+                             body: (not (equal? method "HEAD")))))
+        (guard (e (#t #f)) (socket-close conn))
+        path))
+
     ;;; Serve exactly one request on an accepted connection, then close it.
     ;;;
-    ;;; Returns the path served, or `#f` when the request was unusable.
+    ;;; Returns the path served, or `#f` when the request was unusable. The
+    ;;; read is bounded by `timeout:` milliseconds, so a client that opens
+    ;;; the connection and says nothing costs that much and no more.
     ;;;
     ;;; ```scheme
     ;;; (explorer-serve-connection sigilcoin-regtest-chain "/tmp/n" conn)
     ;;; ```
-    (define (explorer-serve-connection chain data-dir conn)
-      (: chain-config? string? any? -> any?)
-      (let* ((line (read-request conn))
-             (request (and line (parse-request-line line))))
-        (let ((response
-                (cond
-                  ((not request)
-                   (respond 400 %html
-                            (explorer-missing-page "Malformed request.")))
-                  ((not (or (string=? (car request) "GET")
-                            (string=? (car request) "HEAD")))
-                   (respond 405 %html
-                            (explorer-missing-page
-                              "This explorer only answers GET.")))
-                  (else
-                   (explorer-respond chain
-                                     data-dir
-                                     (explorer-request-path (cdr request)))))))
-          (socket-send-all conn (explorer-http-response response))
-          (socket-close conn)
-          (and request (explorer-request-path (cdr request))))))
+    (define (explorer-serve-connection
+              chain data-dir conn
+              (keys: (timeout explorer-default-read-timeout)))
+      (: chain-config? string? any? (timeout: integer?) -> any?)
+      (explorer-answer-head chain data-dir conn (read-head conn timeout)))
+
+    ;; ============================================================
+    ;; The accept loop
+    ;; ============================================================
+
+    (define (close-quietly conn)
+      (guard (e (#t #f)) (socket-close conn)))
+
+    ;; A connection whose head has not finished arriving: `(conn buffer
+    ;; deadline)`.
+    (define (pending conn buffer deadline) (list conn buffer deadline))
+    (define (pending-conn p) (car p))
+    (define (pending-buffer p) (car (cdr p)))
+    (define (pending-deadline p) (car (cdr (cdr p))))
+
+    (define (pending-sockets xs) (map pending-conn xs))
+
+    ;; Milliseconds until the nearest deadline, floored so a select always
+    ;; makes progress and capped so an idle server still wakes up.
+    (define (poll-interval xs now)
+      (let loop ((rest xs) (best 1000))
+        (if (null? rest)
+            (if (< best 10) 10 best)
+            (let ((left (- (pending-deadline (car rest)) now)))
+              (loop (cdr rest) (if (< left best) left best))))))
 
     ;;; Listen and serve.
     ;;;
-    ;;; `requests:` bounds how many connections are served before the
-    ;;; listener closes, which is what lets a test drive the real socket
-    ;;; path; the default is unbounded.
+    ;;; Request heads are read INCREMENTALLY, many at a time, through one
+    ;;; `socket-select`. A client that connects and then says nothing sits
+    ;;; in the pending list costing one file descriptor until `timeout:`
+    ;;; expires; it never delays another client's request, because the
+    ;;; server is never blocked on it. That is the difference between a
+    ;;; toy on localhost and something that can hold a public port: the
+    ;;; slowloris attack against the serial version was one connection.
+    ;;;
+    ;;; `max-pending:` bounds the descriptors an attacker can hold open at
+    ;;; once; past it the oldest half-read connection is dropped, so the
+    ;;; server degrades to "slowest clients lose" rather than "nobody is
+    ;;; served".
+    ;;;
+    ;;; `requests:` bounds how many connections are retired — answered,
+    ;;; timed out or dropped — before the listener closes, which is what
+    ;;; lets a test drive the real socket path; the default is unbounded.
+    ;;;
+    ;;; ponytail: single-threaded, one request per connection, no keep-alive
+    ;;; and responses written with a blocking send. A client that stalls
+    ;;; mid-RESPONSE can still hold the loop; give the writes their own
+    ;;; pending state if that ever shows up in a log.
     ;;;
     ;;; ```scheme
     ;;; (explorer-serve sigilcoin-regtest-chain "/tmp/n" port: 8080)
     ;;; ```
-    (define (explorer-serve chain data-dir (keys: (port 8080)
-                                                  (host "127.0.0.1")
-                                                  (requests #f)))
+    (define (explorer-serve chain data-dir
+                            (keys: (port 8080)
+                                   (host "127.0.0.1")
+                                   (requests #f)
+                                   (timeout explorer-default-read-timeout)
+                                   (max-pending explorer-default-max-pending)))
       (: chain-config? string? (port: integer?) (host: string?)
-         (requests: any?) -> boolean?)
+         (requests: any?) (timeout: integer?) (max-pending: integer?)
+         -> boolean?)
       (let ((listener (tcp-listen port host: host)))
         (unless listener
           (error (string-append "explorer-serve: could not listen on "
                                 host ":" (number->string port))))
-        (let loop ((served 0))
+        ;; Retire one connection: answer it if it said something, drop it
+        ;; otherwise. Errors from a single connection never leave here.
+        (define (retire p head)
+          (guard (e (#t (close-quietly (pending-conn p))))
+            (explorer-answer-head chain data-dir (pending-conn p) head))
+          #t)
+        ;; Advance every readable connection, and expire the late ones.
+        ;; Returns `(still-pending . retired-count)`.
+        (define (step xs readable now)
+          (let loop ((rest xs) (keep '()) (retired 0))
+            (if (null? rest)
+                (cons (reverse keep) retired)
+                (let* ((p (car rest))
+                       (conn (pending-conn p)))
+                  (cond
+                    ((memq conn readable)
+                     (let ((chunk (guard (e (#t #f)) (socket-read conn))))
+                       (if (or (not chunk) (eof-object? chunk))
+                           ;; Closed. Answer a head that arrived without its
+                           ;; blank line; drop a connection that said nothing.
+                           (let ((buffer (pending-buffer p)))
+                             (if (> (string-length buffer) 0)
+                                 (retire p (trim-line (first-line buffer)))
+                                 (close-quietly conn))
+                             (loop (cdr rest) keep (+ retired 1)))
+                           (let* ((buffer (string-append (pending-buffer p)
+                                                         chunk))
+                                  (head (explorer-request-head buffer)))
+                             (cond
+                               (head
+                                (retire p head)
+                                (loop (cdr rest) keep (+ retired 1)))
+                               ((> (string-length buffer) %max-head-bytes)
+                                (retire p #f)
+                                (loop (cdr rest) keep (+ retired 1)))
+                               (else
+                                (loop (cdr rest)
+                                      (cons (pending conn
+                                                     buffer
+                                                     (pending-deadline p))
+                                            keep)
+                                      retired)))))))
+                    ((>= now (pending-deadline p))
+                     (retire p #f)
+                     (loop (cdr rest) keep (+ retired 1)))
+                    (else (loop (cdr rest) (cons p keep) retired)))))))
+        (let loop ((served 0) (waiting '()))
           (if (and (number? requests) (>= served requests))
-              (begin (socket-close listener) #t)
-              (let ((conn (tcp-accept listener)))
-                (if (not conn)
-                    (begin (socket-close listener) #t)
-                    (begin
-                      ;; One bad connection must not stop the server.
-                      (guard (e (#t (guard (inner (#t #f))
-                                      (socket-close conn))))
-                        (explorer-serve-connection chain data-dir conn))
-                      (loop (+ served 1)))))))))
+              (begin
+                (for-each close-quietly (pending-sockets waiting))
+                (socket-close listener)
+                #t)
+              (let* ((now (now-ms))
+                     (ready (socket-select (cons listener
+                                                 (pending-sockets waiting))
+                                           '()
+                                           (poll-interval waiting now)))
+                     (readable (if (pair? ready) (car ready) '()))
+                     (advanced (step waiting readable (now-ms)))
+                     (rest (car advanced))
+                     (retired (cdr advanced)))
+                (if (memq listener readable)
+                    (let ((conn (tcp-accept listener)))
+                      (if (not conn)
+                          (begin
+                            (for-each close-quietly (pending-sockets rest))
+                            (socket-close listener)
+                            #t)
+                          ;; Full: the oldest half-read client loses its
+                          ;; place rather than the new one being refused.
+                          (let ((room (if (>= (length rest) max-pending)
+                                          (begin
+                                            (close-quietly
+                                              (pending-conn (car rest)))
+                                            (cdr rest))
+                                          rest)))
+                            (loop (+ served retired)
+                                  (append room
+                                          (list (pending
+                                                  conn
+                                                  ""
+                                                  (+ (now-ms) timeout))))))))
+                    (loop (+ served retired) rest)))))))
 
     ;; ============================================================
     ;; Entry point
@@ -444,23 +679,68 @@
                (car (cdr xs)))
               (else (loop (cdr xs))))))
 
+    ;; Kept here rather than read from `explorer-package-version`, which
+    ;; lives in the facade that imports THIS module: asking for it would be
+    ;; a cycle. Must match `package.sgl`.
+    (define %version "0.1.0")
+
+    ;;; The flags `sigilcoin-explorer` accepts, as one block of text.
+    ;;;
+    ;;; ```scheme
+    ;;; (display (explorer-usage))
+    ;;; ```
+    (define (explorer-usage)
+      (: -> string?)
+      (string-append
+        "sigilcoin-explorer — read-only web explorer for SigilCoin\n"
+        "\n"
+        "usage:\n"
+        "  sigilcoin-explorer [--regtest] [--data-dir DIR] [--host HOST] [--port N]\n"
+        "\n"
+        "options:\n"
+        "  --regtest         serve sigilcoin-regtest instead of sigilcoin-main\n"
+        "  --data-dir DIR    node data directory to read (default: .)\n"
+        "  --host HOST       address to bind (default: 127.0.0.1)\n"
+        "  --port N          port to bind (default: 8080)\n"
+        "  -h, --help        print this and exit\n"
+        "  --version         print the package version and exit\n"
+        "\n"
+        "The explorer never writes: it opens the node's database read-only,\n"
+        "answers one request per connection, and closes.\n"))
+
     ;;; `sigil-coin-explorer`'s entry point.
+    ;;;
+    ;;; `--help` and `--version` answer and exit BEFORE anything binds a
+    ;;; port. Without them the binary fell through to `explorer-serve` and
+    ;;; an operator asking what the flags were got a server instead of an
+    ;;; answer, with nothing on stdout to say so.
     ;;;
     ;;; ```sh
     ;;; sigil-coin-explorer --regtest --data-dir /tmp/n --port 8080
     ;;; ```
     (define (explorer-main)
       (: -> void?)
-      (let* ((args (application-args (cdr (command-line))))
-             (chain (if (flag? args "--regtest")
-                        sigilcoin-regtest-chain
-                        sigilcoin-main-chain))
-             (data-dir (option args "--data-dir" "."))
-             (host (option args "--host" "127.0.0.1"))
-             (port (or (string->number (option args "--port" "8080")) 8080)))
-        (display (string-append "explorer: " (chain-config-name chain)
-                                " at " (explorer-db-path chain data-dir)
-                                "\nexplorer: http://" host ":"
-                                (number->string port) "/\n"))
-        (flush-output-port (current-output-port))
-        (explorer-serve chain data-dir port: port host: host)))))
+      (let ((args (application-args (cdr (command-line)))))
+        (cond
+          ((or (flag? args "--help") (flag? args "-h"))
+           (display (explorer-usage))
+           (flush-output-port (current-output-port))
+           (exit 0))
+          ((flag? args "--version")
+           (display (string-append "sigilcoin-explorer " %version "\n"))
+           (flush-output-port (current-output-port))
+           (exit 0))
+          (else
+           (let* ((chain (if (flag? args "--regtest")
+                             sigilcoin-regtest-chain
+                             sigilcoin-main-chain))
+                  (data-dir (option args "--data-dir" "."))
+                  (host (option args "--host" "127.0.0.1"))
+                  (port (or (string->number (option args "--port" "8080"))
+                            8080)))
+             (display (string-append "explorer: " (chain-config-name chain)
+                                     " at " (explorer-db-path chain data-dir)
+                                     "\nexplorer: http://" host ":"
+                                     (number->string port) "/\n"))
+             (flush-output-port (current-output-port))
+             (explorer-serve chain data-dir port: port host: host))))))))

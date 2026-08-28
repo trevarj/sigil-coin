@@ -18,6 +18,7 @@
         (sigil fs)
         (sigil io)
         (sigil math)
+        (sigil time)
         (sigil error)
         (sigil string)
         (sigil process)
@@ -1192,6 +1193,157 @@
       (assert-true (string-contains? (run-text (cons "run" args))
                                      "validated-blocks: 1"))
       (assert-equal 1 (tip-height args)))))
+
+;; ============================================================
+;; The listener under attack
+;; ============================================================
+;;
+;; A test cannot both run `sigilcoin listen` and connect to it: the accept
+;; loop owns the process it runs in, and the hostile connections have to
+;; arrive while it is accepting. So the listener runs as its own operating-
+;; system process — `test/listen-peer.sgl`, which is the binary's real entry
+;; point — and this process is the attacker.
+
+;; Found relative to the working directory, which is the workspace root for
+;; a whole-repo run and the package root for a single-file one.
+(define %listen-script
+  (let loop ((candidates (list "packages/sigil-coin-cli/test/listen-peer.sgl"
+                               "test/listen-peer.sgl"
+                               "../test/listen-peer.sgl")))
+    (cond ((null? candidates)
+           (error "test-cli: cannot find test/listen-peer.sgl"))
+          ((file-exists? (car candidates)) (car candidates))
+          (else (loop (cdr candidates))))))
+
+;; The module search paths this process resolved its own imports through,
+;; handed to the child as `-L` so it loads the same code from the same
+;; checkouts. `--` separates them from the words the CLI reads.
+(define %listen-command
+  (let loop ((paths (library-paths)) (out '()))
+    (if (null? paths)
+        (append (reverse out) (list %listen-script "--"))
+        (loop (cdr paths) (cons (car paths) (cons "-L" out))))))
+
+(define (spawn-listener args)
+  (let ((p (apply process-spawn
+                  "sigil"
+                  die-with-parent: #t
+                  (append %listen-command args))))
+    (unless p
+      (error "test-cli: could not spawn the listener process"))
+    p))
+
+(define (listener-lines p)
+  (let loop ((lines '()))
+    (let ((line (read-line (process-stdout p))))
+      (if (eof-object? line)
+          (reverse lines)
+          (loop (cons line lines))))))
+
+(define (printed? lines text)
+  (let loop ((xs lines))
+    (cond ((null? xs) #f)
+          ((string-contains? (car xs) text) #t)
+          (else (loop (cdr xs))))))
+
+;; Loopback ports derived from this process's id, so a second run of the
+;; suite on the same machine cannot collide.
+(define (listen-port offset)
+  (+ 19600 offset (* 2 (modulo (process-id) 150))))
+
+;; Connect, retrying while the child is still binding. A connect succeeds
+;; as soon as the child has called listen(), so the first success also
+;; proves the port is open.
+(define (connect-listener port)
+  (let loop ((tries 0))
+    (let ((sock (guard (err (else #f)) (tcp-connect "127.0.0.1" port))))
+      (cond (sock sock)
+            ;; `sleep` counts SECONDS: 200 tries is twenty of them.
+            ((> tries 200) #f)
+            (else (sleep 0.1) (loop (+ tries 1)))))))
+
+(test-group "sigilcoin listen under hostile connections"
+  (test "a hangup, garbage and a silent client drop only themselves"
+    ;; Each of the three is a connection an attacker makes for free with
+    ;; one line of `nc`. All three must be dropped, and the fourth — a real
+    ;; peer — must still be served by the same listener.
+    (let* ((args (fresh-args))
+           (port (listen-port 0)))
+      (fast-forward args 2)
+      (let ((child (spawn-listener
+                     (append (list "listen"
+                                   "--port" (number->string port)
+                                   "--max-connections" "4"
+                                   "--accept-timeout" "20000"
+                                   "--read-timeout" "500"
+                                   "--max-steps" "16")
+                             args))))
+        ;; 1. connect and hang up
+        (let ((hangup (connect-listener port)))
+          (assert-true (socket? hangup))
+          (socket-close hangup))
+        ;; 2. bytes that are not this chain's wire protocol
+        (let ((garbage (connect-listener port)))
+          (assert-true (socket? garbage))
+          (socket-send-all garbage "GET / HTTP/1.1\r\n\r\nnot an envelope")
+          (socket-close garbage))
+        ;; 3. open, say nothing, and let --read-timeout expire
+        (let ((silent (connect-listener port)))
+          (assert-true (socket? silent))
+          (sleep 0.9)
+          (socket-close silent))
+        ;; 4. a real peer. Headers only: `sigil-bitcoin` has no `getdata`
+        ;; responder, so asking for bodies would time out for a reason that
+        ;; has nothing to do with this test.
+        (let* ((client (fresh-args))
+               (status
+                 (quietly
+                   (lambda ()
+                     (cli-with-node client
+                       (lambda (n)
+                         (node-sync-configured-peer
+                           n
+                           "127.0.0.1"
+                           port
+                           (coin-peer-connector '("--read-timeout" "20000"))
+                           16
+                           0)))))))
+          (assert-equal 2 (node-status-snapshot-best-height status))
+          (assert-true (not (string=? "failed"
+                                      (node-status-snapshot-sync-stage
+                                        status)))))
+        (let ((lines (listener-lines child))
+              (exit-code (process-wait child)))
+          (assert-equal 0 exit-code)
+          ;; The listener survived all three and served the fourth.
+          (assert-true (printed? lines "connections-accepted: 4"))
+          (assert-true (printed? lines "connections-served: 1"))
+          (assert-true (printed? lines "connections-dropped: 3"))
+          ;; And none of the noise reads as a node fault.
+          (assert-true (printed? lines "sync-stage: idle"))
+          (assert-true (printed? lines "peer-failures: 0"))))))
+
+  (test "--max-connections 0 keeps serving past the accept timeout"
+    (let* ((args (fresh-args))
+           (port (listen-port 1))
+           (child (spawn-listener
+                    (append (list "listen"
+                                  "--port" (number->string port)
+                                  "--max-connections" "0"
+                                  "--accept-timeout" "200"
+                                  "--read-timeout" "500")
+                            args))))
+      (let ((hangup (connect-listener port)))
+        (assert-true (socket? hangup))
+        (socket-close hangup))
+      ;; Several accept timeouts later, with no peer in between, the port
+      ;; must still be open: zero means serve indefinitely.
+      (sleep 1.5)
+      (let ((again (guard (err (else #f)) (tcp-connect "127.0.0.1" port))))
+        (assert-true (socket? again))
+        (socket-close again))
+      (process-kill! child)
+      (assert-true #t))))
 
 ;; ============================================================
 ;; Everything that needs a private key

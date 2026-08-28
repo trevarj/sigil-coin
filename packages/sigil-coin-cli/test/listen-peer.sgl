@@ -1,0 +1,24 @@
+;;; A real `sigilcoin` process, for the listener tests.
+;;;
+;;; `test-cli.sgl` cannot both run `sigilcoin listen` and attack it: the
+;;; accept loop owns the process it runs in, and the hostile connections
+;;; have to arrive while it is accepting. So the listener goes in its own
+;;; operating-system process and this file is what that process runs.
+;;;
+;;; It is the `sigilcoin` binary's own entry point and nothing more, so the
+;;; listener under attack is the one an operator deploys:
+;;;
+;;; ```sh
+;;; sigil -L <paths...> listen-peer.sgl -- listen --regtest --data-dir DIR
+;;; ```
+;;;
+;;; `main` takes the words after `--`, which is how the toolchain separates
+;;; its own arguments from an application's, so the `-L` module paths the
+;;; test passes through never reach the CLI.
+;;;
+;;; This is not a test file: the runner collects `test-*.sgl` and
+;;; `*-test.sgl`, so it is never executed as one.
+
+(import (sigil coin cli))
+
+(main)

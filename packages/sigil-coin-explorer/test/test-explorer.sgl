@@ -21,8 +21,10 @@
         (sigil fs)
         (sigil io)
         (sigil math)
+        (sigil time)
         (sigil array)
         (sigil string)
+        (sigil process)
         (sigil socket)
         (sigil sqlite)
         (sigil json)
@@ -126,6 +128,10 @@
 
 (define (has? haystack needle)
   (string-contains? haystack needle))
+
+;; Wall-clock seconds, for the assertions that are about a request NOT
+;; having waited on another client.
+(define (seconds-now) (current-second))
 
 ;; Every route the explorer serves, for the sweeps that must hold across
 ;; all of them.
@@ -935,6 +941,172 @@
         (let ((response (socket-read-all client)))
           (socket-close client)
           (socket-close listener)
-          (assert-true (has? response "400 Bad Request")))))))
+          (assert-true (has? response "400 Bad Request"))))))
+
+  (test "HEAD gets the headers a GET would and no body"
+    ;; RFC 9110: a HEAD response carries the Content-Length the GET would
+    ;; have had, and nothing after the blank line.
+    (let ((listener (tcp-listen 0 host: "127.0.0.1")))
+      (let* ((port (car (cdr (socket-local-address listener))))
+             (client (tcp-connect "127.0.0.1" port)))
+        (socket-send-all client "HEAD / HTTP/1.1\r\nHost: x\r\n\r\n")
+        (explorer-serve-connection sigilcoin-regtest-chain %dir
+                                   (tcp-accept listener))
+        (let ((response (socket-read-all client)))
+          (socket-close client)
+          (socket-close listener)
+          (assert-true (has? response "HTTP/1.1 200 OK"))
+          ;; The length is the GET's, so a client can still use it.
+          (assert-true (has? response "Content-Length: "))
+          (assert-true (not (has? response "<html")))
+          (assert-true (not (has? response "sigilcoin-regtest")))
+          ;; Nothing at all after the blank line that ends the head.
+          (assert-true (string-ends-with? response "\r\n\r\n"))))))
+
+  (test "an unknown /api path answers in JSON"
+    (let ((response (explorer-respond sigilcoin-regtest-chain %dir
+                                      "/api/nope")))
+      (assert-equal 404 (explorer-response-status response))
+      (assert-equal "application/json; charset=utf-8"
+                    (explorer-response-content-type response))
+      (assert-true (has? (explorer-response-body response) "not-found"))))
+
+  (test "a client that opens and says nothing is dropped, not waited on"
+    ;; The serial version blocked in `socket-read-line` for as long as the
+    ;; client cared to stay quiet. Now the read is bounded, so this returns.
+    (let ((listener (tcp-listen 0 host: "127.0.0.1")))
+      (let* ((port (car (cdr (socket-local-address listener))))
+             (client (tcp-connect "127.0.0.1" port))
+             (started (seconds-now)))
+        (explorer-serve-connection sigilcoin-regtest-chain %dir
+                                   (tcp-accept listener)
+                                   timeout: 300)
+        (let ((elapsed (- (seconds-now) started)))
+          (socket-close client)
+          (socket-close listener)
+          (assert-true (< elapsed 3)))))))
+
+;; ============================================================
+;; The front door, in its own process
+;; ============================================================
+;;
+;; A test cannot both run the accept loop and connect to it. These put the
+;; real binary's entry point in its own operating-system process
+;; (`test/explorer-peer.sgl`) so a slow client and a normal one can be in
+;; flight at the same time, which is the only way to prove the slow one is
+;; not holding the server.
+
+(define %explorer-script
+  (let loop ((candidates
+               (list "packages/sigil-coin-explorer/test/explorer-peer.sgl"
+                     "test/explorer-peer.sgl"
+                     "../test/explorer-peer.sgl")))
+    (cond ((null? candidates)
+           (error "test-explorer: cannot find test/explorer-peer.sgl"))
+          ((file-exists? (car candidates)) (car candidates))
+          (else (loop (cdr candidates))))))
+
+(define %explorer-command
+  (let loop ((paths (library-paths)) (out '()))
+    (if (null? paths)
+        (append (reverse out) (list %explorer-script "--"))
+        (loop (cdr paths) (cons (car paths) (cons "-L" out))))))
+
+(define (spawn-explorer args)
+  (let ((p (apply process-spawn
+                  "sigil"
+                  die-with-parent: #t
+                  (append %explorer-command args))))
+    (unless p
+      (error "test-explorer: could not spawn the explorer process"))
+    p))
+
+(define (explorer-lines p)
+  (let loop ((lines '()))
+    (let ((line (read-line (process-stdout p))))
+      (if (eof-object? line)
+          (reverse lines)
+          (loop (cons line lines))))))
+
+(define (printed? lines text)
+  (let loop ((xs lines))
+    (cond ((null? xs) #f)
+          ((string-contains? (car xs) text) #t)
+          (else (loop (cdr xs))))))
+
+(define (explorer-port offset)
+  (+ 18700 offset (* 2 (modulo (process-id) 150))))
+
+;; Connect, retrying while the child is still binding.
+(define (connect-explorer port)
+  (let loop ((tries 0))
+    (let ((sock (guard (err (else #f)) (tcp-connect "127.0.0.1" port))))
+      (cond (sock sock)
+            ((> tries 200) #f)
+            (else (sleep 0.1) (loop (+ tries 1)))))))
+
+(define (http-get port target)
+  (let ((sock (connect-explorer port)))
+    (and sock
+         (begin
+           (socket-send-all sock
+                            (string-append "GET " target " HTTP/1.1\r\n"
+                                           "Host: 127.0.0.1\r\n\r\n"))
+           (let ((response (socket-read-all sock)))
+             (socket-close sock)
+             response)))))
+
+(test-group "the explorer binary"
+  (test "--help prints usage and exits, rather than serving"
+    (let* ((child (spawn-explorer (list "--help")))
+           (lines (explorer-lines child))
+           (code (process-wait child)))
+      (assert-equal 0 code)
+      (assert-true (printed? lines "usage:"))
+      (assert-true (printed? lines "--data-dir"))
+      (assert-true (printed? lines "--regtest"))
+      (assert-true (printed? lines "--host"))
+      (assert-true (printed? lines "--port"))
+      ;; It must not have started a server on the way past.
+      (assert-true (not (printed? lines "http://")))))
+
+  (test "--version prints a version and exits"
+    (let* ((child (spawn-explorer (list "--version")))
+           (lines (explorer-lines child))
+           (code (process-wait child)))
+      (assert-equal 0 code)
+      (assert-true (printed? lines "sigilcoin-explorer 0.1.0"))))
+
+  (test "a silent client does not delay anybody else"
+    ;; One connection that opens and sends nothing is the whole slowloris.
+    ;; Against the serial server it stopped every other request until it
+    ;; disconnected; here the good request has to come back at once.
+    (let* ((port (explorer-port 0))
+           (child (spawn-explorer (list "--regtest"
+                                        "--data-dir" %dir
+                                        "--port" (number->string port)))))
+      ;; Wait for the port, then hold a connection open saying nothing.
+      (let ((silent (connect-explorer port)))
+        (assert-true (socket? silent))
+        (let* ((started (seconds-now))
+               (response (http-get port "/api/summary"))
+               (elapsed (- (seconds-now) started)))
+          (assert-true (string? response))
+          (assert-true (has? response "HTTP/1.1 200 OK"))
+          (assert-true (has? response "\"tip_height\":5"))
+          ;; The silent client's own budget is the 5 s default; the good
+          ;; request must not have waited on any part of it.
+          (assert-true (< elapsed 3)))
+        ;; And a second one, still with the slow client attached.
+        (let ((again (http-get port "/blocks")))
+          (assert-true (string? again))
+          (assert-true (has? again "HTTP/1.1 200 OK")))
+        ;; The silent client is eventually dropped on its own timeout.
+        (let ((verdict (socket-read-all silent)))
+          (socket-close silent)
+          (assert-true (or (not (string? verdict))
+                           (has? verdict "408 Request Timeout"))))
+        (process-kill! child)
+        (assert-true #t)))))
 
 (run-tests)
