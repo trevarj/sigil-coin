@@ -7,9 +7,35 @@
   description: "SigilCoin command-line interface"
   url: "https://github.com/trevarj/sigil-coin"
   license: "BSD-3-Clause"
+  ;; `sigilcoin` is the binary a miner runs; the package name is not.
+  entry: '(sigil coin cli)
+  bundle-name: "sigilcoin"
 
   dependencies: (list
-    (from-workspace name: "sigil-coin-node"))
+    (from-workspace name: "sigil-coin-puzzle")
+    (from-workspace name: "sigil-coin-consensus")
+    (from-workspace name: "sigil-coin-node")
+    ;; The wallet reads the node's own UTXO table rather than keeping a
+    ;; second copy of it.
+    (from-git url: "codeberg:sigil/sigil-sqlite" version: "^0.16.0")
+    (from-git url: "github:trevarj/sigil-bitcoin"
+              package: "sigil-secp256k1" version: "^0.1")
+    (from-git url: "github:trevarj/sigil-bitcoin"
+              package: "sigil-bitcoin-primitives" version: "^0.1")
+    (from-git url: "github:trevarj/sigil-bitcoin"
+              package: "sigil-bitcoin-utils" version: "^0.1")
+    (from-git url: "github:trevarj/sigil-bitcoin"
+              package: "sigil-bitcoin-encoding" version: "^0.1")
+    (from-git url: "github:trevarj/sigil-bitcoin"
+              package: "sigil-bitcoin-keys" version: "^0.1")
+    (from-git url: "github:trevarj/sigil-bitcoin"
+              package: "sigil-bitcoin-script" version: "^0.1")
+    (from-git url: "github:trevarj/sigil-bitcoin"
+              package: "sigil-bitcoin-tx" version: "^0.1")
+    (from-git url: "github:trevarj/sigil-bitcoin"
+              package: "sigil-bitcoin-p2p" version: "^0.1")
+    (from-git url: "github:trevarj/sigil-bitcoin"
+              package: "sigil-bitcoin-node" version: "^0.1"))
 
   dev-dependencies: (list
     (from-git url: "codeberg:sigil/sigil"

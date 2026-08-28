@@ -1,0 +1,701 @@
+;;; (sigil coin cli wallet) — keys, addresses, balance, and spending
+;;;
+;;; The smallest wallet that lets someone mine a block and then move the
+;;; coins: ONE key, one P2WPKH address, and the node's own UTXO table as the
+;;; only source of truth about what that address owns. There is no second
+;;; index to fall out of step with the chain, and no address book.
+;;;
+;;; ## Addresses
+;;;
+;;; A SigilCoin address is a native SegWit v0 address under the human
+;;; readable part `sgl`, so it reads as `sgl1...` and cannot be pasted into
+;;; a Bitcoin wallet by accident.
+;;;
+;;; `sigil-bitcoin` does NOT hard-code `bc`: `segwit-encode` and
+;;; `bitcoin-network` both take the HRP as data, and `segwit-decode` hands
+;;; the HRP back to the caller. So nothing in `sigil-bitcoin` needs changing
+;;; — the HRP is simply passed in, and `coin-address->script-pubkey` checks
+;;; the one it gets back. The `bitcoin-network` record is deliberately NOT
+;;; used: its other five fields are Base58 and BIP32 version bytes that
+;;; SigilCoin does not define, and inventing constants nothing consumes is
+;;; how a wallet ends up emitting an address format no one agreed on.
+;;;
+;;; ## Key storage
+;;;
+;;; One 32-byte secret in `<data-dir>/wallet.key`, hex, mode 0600, created
+;;; on first use from `/dev/urandom` — the kernel CSPRNG, never
+;;; `(sigil random)`, whose Xorshift128 stream is fine for dice and fatal
+;;; for keys. The file is refused if its mode is readable by group or other,
+;;; because a key another account can read is not a key. Nothing here ever
+;;; prints, logs, or exports the secret; the only things that leave this
+;;; module are public keys, addresses, and signatures.
+;;;
+;;; THE DIRECTORY IS THE LOCK, NOT THE FILE. `(sigil fs)` has no umask and
+;;; no mode-carrying open, so the key file is necessarily created under the
+;;; process umask and chmodded to 0600 a moment later. The secret is only
+;;; written after that chmod, so it never lands under a permissive mode —
+;;; but the empty file does exist at 0644 for an instant, and a descriptor
+;;; opened in that instant keeps reading after the mode changes, because
+;;; permissions are checked at open. So the data directory is created and
+;;; chmodded to 0700 BEFORE the key file is created: another account cannot
+;;; traverse into it to get that descriptor in the first place.
+;;;
+;;; ```scheme
+;;; (coin-address (wallet-public-key (wallet-key "/tmp/node"))) ; => "sgl1..."
+;;; ```
+
+(define-library (sigil coin cli wallet)
+  (import (sigil fs)
+          (sigil io)
+          (sigil math)
+          (sigil path)
+          (sigil process)
+          (sigil string)
+          (sigil sqlite)
+          (sigil secp256k1)
+          (sigil bitcoin utils)
+          (sigil bitcoin primitives)
+          (sigil bitcoin encoding)
+          (sigil bitcoin keys)
+          (sigil bitcoin script)
+          (sigil bitcoin tx)
+          (sigil bitcoin node)
+          (sigil coin cli args))
+  (export
+    coin-address-hrp
+    coin-coinbase-maturity
+    coin-address
+    coin-address->script-pubkey
+    wallet-key-file
+    wallet-key
+    wallet-public-key
+    wallet-script-pubkey
+    wallet-utxos
+    wallet-utxo-value
+    wallet-utxo-outpoint
+    wallet-utxo-mature?
+    wallet-balance
+    wallet-outpoint=?
+    wallet-outpoint-member?
+    wallet-mempool-transactions
+    wallet-mempool-spent-outpoints
+    wallet-select-inputs
+    wallet-build-transfer
+    coin-dust-threshold
+    coin-default-fee
+    run-address
+    run-balance
+    run-send)
+
+  (begin
+
+    ;;; Human readable part of every SigilCoin address.
+    ;;;
+    ;;; ```scheme
+    ;;; coin-address-hrp ; => "sgl"
+    ;;; ```
+    (define coin-address-hrp "sgl")
+
+    ;; Bitcoin Core's relay floor for a P2WPKH output. Change below this is
+    ;; not worth an input to spend later, so it is dropped into the fee.
+    ;;; Smallest change output the wallet will create, in daviwils.
+    (define coin-dust-threshold 294)
+
+    ;; `sigil-bitcoin` keeps its maturity window private, so it is restated
+    ;; here and pinned by a test that spends at exactly the boundary. A
+    ;; wallet that disagreed would build transactions the node refuses.
+    ;;; Blocks a coinbase output must age before the wallet will spend it.
+    ;;;
+    ;;; ```scheme
+    ;;; coin-coinbase-maturity ; => 100
+    ;;; ```
+    (define coin-coinbase-maturity 100)
+
+    ;;; Fee `send` pays when `--fee` is not given, in daviwils.
+    ;;;
+    ;;; There is no fee market on a chain that mines one block a day by
+    ;;; writing programs, so this is a token amount rather than an estimate.
+    ;;;
+    ;;; ```scheme
+    ;;; coin-default-fee ; => 1000
+    ;;; ```
+    (define coin-default-fee 1000)
+
+    ;; ============================================================
+    ;; Addresses
+    ;; ============================================================
+
+    ;;; Derive the `sgl1...` address of a serialized public key.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-address (private-key->public-key (make-bytevector 32 1)))
+    ;;; ; => "sgl1..."
+    ;;; ```
+    (define (coin-address public-key)
+      (: bytevector? -> string?)
+      (unless (public-key? public-key)
+        (error "coin-address: expected a serialized secp256k1 public key"))
+      (segwit-encode coin-address-hrp 0 (hash160 public-key)))
+
+    ;;; Decode a SigilCoin address into the scriptPubKey that pays it.
+    ;;;
+    ;;; Every rejection says which part is wrong, because the usual mistake
+    ;;; is a pasted Bitcoin address and "invalid address" does not tell
+    ;;; anyone that.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-address->script-pubkey "--to" (coin-address pubkey))
+    ;;; ; => the P2WPKH script
+    ;;; ```
+    (define (coin-address->script-pubkey who address)
+      (: string? any? -> bytevector?)
+      (unless (string? address)
+        (error (string-append who ": expected an sgl1... address")))
+      (let ((decoded (segwit-decode address)))
+        (unless decoded
+          (error (string-append
+                   who
+                   ": \""
+                   address
+                   "\" is not a valid bech32 address.")))
+        (let ((hrp (car decoded))
+              (version (cadr decoded))
+              (program (caddr decoded)))
+          (unless (string=? hrp coin-address-hrp)
+            (error (string-append
+                     who
+                     ": \""
+                     address
+                     "\" is a \""
+                     hrp
+                     "\" address, not a SigilCoin one. SigilCoin addresses"
+                     " start with \""
+                     coin-address-hrp
+                     "1\".")))
+          (unless (= version 0)
+            (error (string-append
+                     who
+                     ": witness version "
+                     (number->string version)
+                     " is not spendable by this wallet; use a v0 "
+                     coin-address-hrp
+                     "1 address.")))
+          (unless (= 20 (bytevector-length program))
+            (error (string-append
+                     who
+                     ": only 20-byte (single key) v0 addresses are"
+                     " supported.")))
+          (script-p2wpkh program))))
+
+    ;; ============================================================
+    ;; Key storage
+    ;; ============================================================
+
+    (define %key-bytes 32)
+    (define %entropy-source "/dev/urandom")
+
+    ;;; Path of the key file inside a node's data directory.
+    ;;;
+    ;;; ```scheme
+    ;;; (wallet-key-file "/tmp/node") ; => "/tmp/node/wallet.key"
+    ;;; ```
+    (define (wallet-key-file data-dir)
+      (: string? -> string?)
+      (path-join data-dir "wallet.key"))
+
+    ;; 32 bytes straight from the kernel CSPRNG. A short read is an error,
+    ;; never padded and never retried with anything weaker.
+    (define (kernel-entropy count)
+      (let ((port (guard (err (else #f))
+                    (open-binary-input-file %entropy-source))))
+        (unless port
+          (error (string-append
+                   "wallet: cannot read "
+                   %entropy-source
+                   ". Refusing to generate a key without a kernel entropy"
+                   " source.")))
+        (let ((bytes (guard (err (else #f))
+                       (read-bytevector count port))))
+          (close-port port)
+          (unless (and (bytevector? bytes)
+                       (= count (bytevector-length bytes)))
+            (error (string-append "wallet: short read from "
+                                  %entropy-source
+                                  ".")))
+          bytes)))
+
+    ;; secp256k1 rejects zero and anything at or above the group order, so a
+    ;; draw can legitimately fail. Re-draw rather than clamping: clamping
+    ;; biases the key.
+    (define (fresh-private-key)
+      (let loop ((attempts 0))
+        (when (> attempts 8)
+          (error "wallet: could not draw a valid secp256k1 key"))
+        (let ((candidate (kernel-entropy %key-bytes)))
+          (if (secp256k1-seckey-verify? candidate)
+              candidate
+              (loop (+ attempts 1))))))
+
+    (define (restrict-permissions mode path)
+      ;; `(sigil fs)` has no chmod, so this is the same `process-run` call
+      ;; the toolchain itself uses for file modes.
+      (unless (= 0 (process-run "chmod" mode path))
+        (error (string-append "wallet: could not restrict permissions on "
+                              path))))
+
+    ;; The key's containing directory, owner-only, before the key file
+    ;; exists. See the module header: this is what closes the window the
+    ;; file's own create-then-chmod leaves open.
+    (define (ensure-private-directory dir)
+      (ensure-directory dir)
+      (restrict-permissions "0700" dir)
+      (let ((stat (file-stat dir)))
+        (unless stat
+          (error (string-append "wallet: cannot stat " dir)))
+        (unless (= 0 (bitwise-and (stat-mode stat) #o077))
+          (error (string-append
+                   "wallet: "
+                   dir
+                   " is reachable by other accounts. Run: chmod 0700 "
+                   dir)))))
+
+    (define (require-private-permissions path)
+      (let ((stat (file-stat path)))
+        (unless stat
+          (error (string-append "wallet: cannot stat " path)))
+        (let ((mode (stat-mode stat)))
+          (unless (= 0 (bitwise-and mode #o077))
+            (error (string-append
+                     "wallet: "
+                     path
+                     " is readable by other accounts. Run: chmod 0600 "
+                     path))))))
+
+    (define (write-key-file path key)
+      ;; Owner-only directory first, so nothing else can reach the file
+      ;; during the moment it exists empty under the umask's mode.
+      (ensure-private-directory (path-dirname path))
+      ;; Create the file empty and lock it down BEFORE the secret is in it,
+      ;; so the key is never on disk under a permissive mode.
+      (write-file-string path "")
+      (restrict-permissions "0600" path)
+      (write-file-string path (string-append (hex-encode key) "\n"))
+      (require-private-permissions path))
+
+    (define (read-key-file path)
+      (require-private-permissions path)
+      (let* ((text (string-trim (read-file-string path)))
+             (key (guard (err (else #f))
+                    (hex-decode text))))
+        (unless (bytevector? key)
+          (error (string-append
+                   "wallet: "
+                   path
+                   " is not a hex private key. Move it aside to start a"
+                   " new wallet.")))
+        (unless (= %key-bytes (bytevector-length key))
+          (error (string-append "wallet: "
+                                path
+                                " is not a 32-byte private key.")))
+        (unless (secp256k1-seckey-verify? key)
+          (error (string-append "wallet: "
+                                path
+                                " is not a valid secp256k1 private key.")))
+        key))
+
+    ;;; Load the wallet key for a data directory, creating it if absent.
+    ;;;
+    ;;; The returned bytes are secret: they are used to sign and to derive a
+    ;;; public key, and are never printed by any command.
+    ;;;
+    ;;; ```scheme
+    ;;; (bytevector-length (wallet-key "/tmp/node")) ; => 32
+    ;;; ```
+    (define (wallet-key data-dir)
+      (: string? -> bytevector?)
+      (let ((path (wallet-key-file data-dir)))
+        (if (file-exists? path)
+            (read-key-file path)
+            (let ((key (fresh-private-key)))
+              (write-key-file path key)
+              key))))
+
+    ;;; Public key of a wallet secret.
+    ;;;
+    ;;; ```scheme
+    ;;; (public-key? (wallet-public-key (wallet-key "/tmp/node"))) ; => #t
+    ;;; ```
+    (define (wallet-public-key private-key)
+      (: bytevector? -> bytevector?)
+      (private-key->public-key private-key))
+
+    ;;; scriptPubKey the wallet's own address pays to.
+    ;;;
+    ;;; ```scheme
+    ;;; (wallet-script-pubkey (wallet-key "/tmp/node"))
+    ;;; ```
+    (define (wallet-script-pubkey private-key)
+      (: bytevector? -> bytevector?)
+      (script-p2wpkh (hash160 (wallet-public-key private-key))))
+
+    ;; ============================================================
+    ;; Reading the node's UTXO set
+    ;; ============================================================
+
+    (define (row-ref row key)
+      (let ((pair (assoc key row)))
+        (if pair
+            (cdr pair)
+            (let ((sym (assoc (string->symbol key) row)))
+              (and sym (cdr sym))))))
+
+    ;;; Active UTXO rows the node holds for one scriptPubKey.
+    ;;;
+    ;;; Read straight out of the node's database, so the wallet cannot
+    ;;; disagree with the chain the node validated.
+    ;;;
+    ;;; ```scheme
+    ;;; (length (wallet-utxos n (wallet-script-pubkey key)))
+    ;;; ```
+    (define (wallet-utxos n script-pubkey)
+      (: node? bytevector? -> list?)
+      (sqlite-query
+        (node-db n)
+        "SELECT txid, output_index, value, coinbase, height FROM utxos WHERE active = 1 AND script_pubkey = ? ORDER BY height ASC, txid ASC, output_index ASC"
+        (hex-encode script-pubkey)))
+
+    ;;; Value of a UTXO row, in daviwils.
+    ;;;
+    ;;; ```scheme
+    ;;; (wallet-utxo-value row) ; => 100000000
+    ;;; ```
+    (define (wallet-utxo-value row)
+      (: list? -> integer?)
+      (row-ref row "value"))
+
+    ;;; Outpoint a UTXO row refers to.
+    ;;;
+    ;;; ```scheme
+    ;;; (outpoint-index (wallet-utxo-outpoint row)) ; => 0
+    ;;; ```
+    (define (wallet-utxo-outpoint row)
+      (: list? -> outpoint?)
+      (outpoint txid: (hex-decode (row-ref row "txid"))
+                index: (row-ref row "output_index")))
+
+    ;;; Whether a UTXO row can be spent in the block after `tip-height`.
+    ;;;
+    ;;; Only coinbase outputs are ever held back, and the maturity window is
+    ;;; the node's own: a wallet that disagreed would build transactions the
+    ;;; node then refuses.
+    ;;;
+    ;;; ```scheme
+    ;;; (wallet-utxo-mature? row 101) ; => #t
+    ;;; ```
+    (define (wallet-utxo-mature? row tip-height)
+      (: list? integer? -> boolean?)
+      (or (not (= 1 (row-ref row "coinbase")))
+          (>= (- (+ tip-height 1) (row-ref row "height"))
+              coin-coinbase-maturity)))
+
+    ;;; Total and spendable balance for a scriptPubKey, in daviwils.
+    ;;;
+    ;;; Returns `(total . spendable)`; they differ only while coinbase
+    ;;; rewards are still maturing.
+    ;;;
+    ;;; ```scheme
+    ;;; (wallet-balance n script) ; => (300000000 . 0)
+    ;;; ```
+    (define (wallet-balance n script-pubkey)
+      (: node? bytevector? -> pair?)
+      (let ((tip (node-status-snapshot-best-block-height (node-status n))))
+        (let loop ((rows (wallet-utxos n script-pubkey))
+                   (total 0)
+                   (spendable 0))
+          (if (null? rows)
+              (cons total spendable)
+              (let ((value (wallet-utxo-value (car rows))))
+                (loop (cdr rows)
+                      (+ total value)
+                      (if (wallet-utxo-mature? (car rows) tip)
+                          (+ spendable value)
+                          spendable)))))))
+
+    ;; ============================================================
+    ;; The mempool's claim on the wallet's coins
+    ;; ============================================================
+    ;;
+    ;; A UTXO row stays `active` until a BLOCK spends it, so the node's UTXO
+    ;; table alone cannot tell a wallet that a coin is already committed to
+    ;; an unconfirmed transaction. Selecting such a coin again builds a
+    ;; conflicting spend, which the node's own mempool policy then refuses
+    ;; with `mempool-conflict`. Oldest-first selection makes that permanent
+    ;; rather than occasional: the same coin is re-picked every time, so one
+    ;; unconfirmed transaction would block every later one.
+
+    ;;; Whether two outpoints name the same output.
+    ;;;
+    ;;; ```scheme
+    ;;; (wallet-outpoint=? op op) ; => #t
+    ;;; ```
+    (define (wallet-outpoint=? left right)
+      (: outpoint? outpoint? -> boolean?)
+      (and (= (outpoint-index left) (outpoint-index right))
+           (equal? (outpoint-txid left) (outpoint-txid right))))
+
+    ;;; Whether `op` is one of the outpoints in `ops`.
+    ;;;
+    ;;; ```scheme
+    ;;; (wallet-outpoint-member? op (list op)) ; => #t
+    ;;; ```
+    (define (wallet-outpoint-member? op ops)
+      (: outpoint? list? -> boolean?)
+      (cond ((null? ops) #f)
+            ((wallet-outpoint=? op (car ops)) #t)
+            (else (wallet-outpoint-member? op (cdr ops)))))
+
+    ;;; Transactions the node's mempool holds and would relay, in the order
+    ;;; the node itself lists them.
+    ;;;
+    ;;; `node-mempool` hands back entries without their bytes, so the rows
+    ;;; are read here. The ordering is the node's own — first seen, then
+    ;;; txid — so two callers agree on it.
+    ;;;
+    ;;; ```scheme
+    ;;; (length (wallet-mempool-transactions n)) ; => 1
+    ;;; ```
+    (define (wallet-mempool-transactions n)
+      (: node? -> list?)
+      (map (lambda (row)
+             (transaction-parse (hex-decode (row-ref row "tx_hex"))))
+           (sqlite-query
+             (node-db n)
+             "SELECT txid, tx_hex FROM mempool WHERE tx_hex IS NOT NULL AND status = 'available' ORDER BY updated_at ASC, txid ASC")))
+
+    ;;; Outpoints the node's mempool is already spending.
+    ;;;
+    ;;; ```scheme
+    ;;; (length (wallet-mempool-spent-outpoints n)) ; => 1
+    ;;; ```
+    (define (wallet-mempool-spent-outpoints n)
+      (: node? -> list?)
+      (let loop ((txs (wallet-mempool-transactions n)) (out '()))
+        (if (null? txs)
+            out
+            (loop (cdr txs)
+                  (append (map txin-previous-output
+                               (transaction-inputs (car txs)))
+                          out)))))
+
+    ;; ============================================================
+    ;; Spending
+    ;; ============================================================
+
+    ;;; Pick mature, unpinned rows covering `needed` daviwils, oldest first.
+    ;;;
+    ;;; A row an unconfirmed mempool transaction already spends is skipped:
+    ;;; picking it again would build a conflicting transaction the node
+    ;;; refuses, and with oldest-first ordering it would be picked again
+    ;;; forever.
+    ;;;
+    ;;; Returns `(rows . input-value)`, or raises naming the shortfall and
+    ;;; whether maturity or an unconfirmed spend is holding the coins back.
+    ;;;
+    ;;; ```scheme
+    ;;; (wallet-select-inputs n script 100001000)
+    ;;; ```
+    (define (wallet-select-inputs n script-pubkey needed)
+      (: node? bytevector? integer? -> pair?)
+      (let* ((tip (node-status-snapshot-best-block-height (node-status n)))
+             (rows (wallet-utxos n script-pubkey))
+             (pinned (wallet-mempool-spent-outpoints n)))
+        (let loop ((xs rows) (chosen '()) (value 0) (held 0))
+          (cond
+            ((>= value needed)
+             (cons (reverse chosen) value))
+            ((null? xs)
+             (let ((balance (wallet-balance n script-pubkey)))
+               (error (string-append
+                        "send: balance is too low. Need "
+                        (cli-daviwils->sgl needed)
+                        " SGL, have "
+                        (cli-daviwils->sgl (- (cdr balance) held))
+                        " SGL spendable"
+                        (if (> (car balance) (cdr balance))
+                            (string-append
+                              " ("
+                              (cli-daviwils->sgl (- (car balance)
+                                                    (cdr balance)))
+                              " SGL still maturing; a mined reward is"
+                              " spendable "
+                              (number->string coin-coinbase-maturity)
+                              " blocks later)")
+                            "")
+                        (if (> held 0)
+                            (string-append
+                              " ("
+                              (cli-daviwils->sgl held)
+                              " SGL is committed to a transaction that has"
+                              " not confirmed yet; mine a block to free"
+                              " it)")
+                            "")
+                        "."))))
+            ((wallet-outpoint-member? (wallet-utxo-outpoint (car xs)) pinned)
+             (loop (cdr xs)
+                   chosen
+                   value
+                   (+ held (wallet-utxo-value (car xs)))))
+            ((wallet-utxo-mature? (car xs) tip)
+             (loop (cdr xs)
+                   (cons (car xs) chosen)
+                   (+ value (wallet-utxo-value (car xs)))
+                   held))
+            (else
+             (loop (cdr xs) chosen value held))))))
+
+    ;;; Build and sign a transfer of `amount` daviwils to `script-pubkey`.
+    ;;;
+    ;;; Change goes back to the wallet's own address unless it would be
+    ;;; dust, in which case it is left to the fee rather than creating an
+    ;;; output that costs more to spend than it holds. Every input is a
+    ;;; P2WPKH the wallet controls, so one signing pass covers them all.
+    ;;;
+    ;;; ```scheme
+    ;;; (wallet-build-transfer n key to-script 100000000 1000)
+    ;;; ```
+    (define (wallet-build-transfer n private-key to-script amount fee)
+      (: node? bytevector? bytevector? integer? integer? -> transaction?)
+      (when (<= amount 0)
+        (error "send: --amount must be greater than zero."))
+      (when (< fee 0)
+        (error "send: --fee cannot be negative."))
+      (let* ((own-script (wallet-script-pubkey private-key))
+             (selected (wallet-select-inputs n own-script (+ amount fee)))
+             (rows (car selected))
+             (input-value (cdr selected))
+             (change (- input-value amount fee))
+             (outputs (if (>= change coin-dust-threshold)
+                          (list (txout value: amount
+                                       script-pubkey: to-script)
+                                (txout value: change
+                                       script-pubkey: own-script))
+                          (list (txout value: amount
+                                       script-pubkey: to-script))))
+             (unsigned (transaction
+                         version: 2
+                         inputs: (map (lambda (row)
+                                        (txin previous-output:
+                                                (wallet-utxo-outpoint row)
+                                              script-sig: #u8()
+                                              sequence: #xffffffff
+                                              witness: '()))
+                                      rows)
+                         outputs: outputs
+                         lock-time: 0)))
+        ;; Signed last input first is irrelevant here: P2WPKH sighashes
+        ;; commit to the unsigned inputs, so the order does not matter.
+        (let loop ((index 0) (tx unsigned))
+          (if (>= index (length rows))
+              tx
+              (loop (+ index 1)
+                    (transaction-sign-p2wpkh-input
+                      tx
+                      index
+                      (wallet-utxo-value (list-ref rows index))
+                      private-key))))))
+
+    ;; ============================================================
+    ;; Commands
+    ;; ============================================================
+
+    ;;; Print the wallet's address, creating the key on first use.
+    ;;;
+    ;;; ```scheme
+    ;;; (run-address '("--regtest" "--data-dir" "/tmp/node"))
+    ;;; ```
+    (define (run-address args)
+      (: list? -> any?)
+      (cli-chain args)
+      (let* ((data-dir (cli-data-dir args))
+             (key (wallet-key data-dir)))
+        (println "address: ~a" (coin-address (wallet-public-key key)))
+        (println "chain: ~a" (cli-chain-name args))
+        (println "key-file: ~a" (wallet-key-file data-dir))))
+
+    ;;; Print what the node's UTXO set says the wallet owns.
+    ;;;
+    ;;; ```scheme
+    ;;; (run-balance '("--regtest" "--data-dir" "/tmp/node"))
+    ;;; ```
+    (define (run-balance args)
+      (: list? -> any?)
+      ;; Chain and flags first: a mistyped command should not create a key.
+      (cli-chain args)
+      (let* ((key (wallet-key (cli-data-dir args)))
+             (script (wallet-script-pubkey key)))
+        (cli-with-node args
+          (lambda (n)
+            (let ((balance (wallet-balance n script))
+                  (rows (wallet-utxos n script)))
+              (println "address: ~a" (coin-address (wallet-public-key key)))
+              (println "chain: ~a" (cli-chain-name args))
+              (println "outputs: ~a" (length rows))
+              (println "balance: ~a SGL" (cli-daviwils->sgl (car balance)))
+              (println "spendable: ~a SGL" (cli-daviwils->sgl (cdr balance)))
+              (println "immature: ~a SGL"
+                       (cli-daviwils->sgl (- (car balance) (cdr balance))))
+              balance)))))
+
+    ;;; Build, sign and submit a transfer to another SigilCoin address.
+    ;;;
+    ;;; The transaction is handed to the node's own mempool policy, so a
+    ;;; refusal here is the refusal a peer would give.
+    ;;;
+    ;;; What is printed says where the coins ARE, not where they are going.
+    ;;; `available` is the node's word for "in the mempool", and on its own
+    ;;; it reads like a completed payment; it is reported alongside
+    ;;; `confirmations: 0` and the block that has to be mined, because until
+    ;;; a block includes it nothing has moved.
+    ;;;
+    ;;; ```scheme
+    ;;; (run-send '("--to" "sgl1..." "--amount" "1" "--regtest"))
+    ;;; ```
+    (define (run-send args)
+      (: list? -> any?)
+      (cli-chain args)
+      (let* ((to (cli-required args "--to" "send" "a sgl1... address"))
+             (to-script (coin-address->script-pubkey "--to" to))
+             (amount (cli-sgl->daviwils
+                       "--amount"
+                       (cli-required args "--amount" "send" "an amount in SGL")))
+             (fee (cli-sgl->daviwils
+                    "--fee"
+                    (cli-arg args
+                             "--fee"
+                             (cli-daviwils->sgl coin-default-fee))))
+             ;; Last, so no key file is created for a command that was
+             ;; going to be rejected on its arguments anyway.
+             (key (wallet-key (cli-data-dir args))))
+        (cli-with-node args
+          (lambda (n)
+            (let* ((tx (wallet-build-transfer n key to-script amount fee))
+                   (entry (node-store-transaction n tx "wallet")))
+              (unless (string=? "available"
+                                (node-mempool-entry-status entry))
+                (error (string-append
+                         "send: the node refused the transaction ("
+                         (node-mempool-entry-last-error entry)
+                         "). Nothing was spent.")))
+              (println "txid: ~a"
+                       (hex-encode (reverse-bytevector
+                                     (transaction-txid tx))))
+              (println "to: ~a" to)
+              (println "amount: ~a SGL" (cli-daviwils->sgl amount))
+              (println "fee: ~a SGL" (cli-daviwils->sgl fee))
+              (println "inputs: ~a" (length (transaction-inputs tx)))
+              (println "outputs: ~a" (length (transaction-outputs tx)))
+              (println "status: ~a (unconfirmed)"
+                       (node-mempool-entry-status entry))
+              (println "confirmations: 0")
+              (println "next: nothing has moved until a block includes this transaction; mine one with `sigilcoin mine`")
+              entry)))))))

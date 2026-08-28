@@ -1,0 +1,299 @@
+;;; (sigil coin cli args) — flags, chain selection, and amounts
+;;;
+;;; Everything every `sigilcoin` subcommand shares. The flag grammar is the
+;;; one `sigil-bitcoin`'s node CLI already uses, because an operator running
+;;; both should not have to learn two: `--name value` pairs anywhere after
+;;; the subcommand, repeated `--peer` flags accumulating, and bare
+;;; positional words first.
+;;;
+;;; Two things are SigilCoin's own:
+;;;
+;;;   * `chain-config-by-name` in `sigil-bitcoin` cannot name a SigilCoin
+;;;     chain — it resolves `"sigilcoin"` to that repo's placeholder config,
+;;;     which carries Bitcoin's rules and regtest's genesis. `cli-chain`
+;;;     resolves against the real configs this repo owns instead.
+;;;   * amounts are printed and parsed in SGL, never in floating point. A
+;;;     money path that rounds is a money path that loses coins, so
+;;;     `cli-sgl->daviwils` is an exact decimal-digit parser.
+;;;
+;;; ```scheme
+;;; (chain-config-name (cli-chain '("--regtest"))) ; => "sigilcoin-regtest"
+;;; (cli-sgl->daviwils "send --amount" "1.5")      ; => 150000000
+;;; ```
+
+(define-library (sigil coin cli args)
+  (import (sigil math)
+          (sigil string)
+          (sigil bitcoin node)
+          (sigil coin consensus)
+          (sigil coin node))
+  (export
+    cli-default-data-dir
+    cli-arg
+    cli-arg-list
+    cli-flag?
+    cli-number
+    cli-required
+    cli-chain-name
+    cli-chain
+    cli-data-dir
+    cli-with-node
+    cli-daviwils->sgl
+    cli-sgl->daviwils
+    cli-error-message)
+
+  (begin
+
+    ;;; Data directory used when `--data-dir` is not given.
+    ;;;
+    ;;; ```scheme
+    ;;; cli-default-data-dir ; => ".sigilcoin"
+    ;;; ```
+    (define cli-default-data-dir ".sigilcoin")
+
+    ;;; Value of the `--name value` flag in `args`, or `default`.
+    ;;;
+    ;;; The last occurrence does not win: the first does, matching
+    ;;; `sigil-bitcoin`'s parser so a flag repeated by a wrapper script
+    ;;; behaves the same in both CLIs.
+    ;;;
+    ;;; ```scheme
+    ;;; (cli-arg '("--data-dir" "/tmp/x") "--data-dir" #f) ; => "/tmp/x"
+    ;;; ```
+    (define (cli-arg args name default)
+      (: list? string? any? -> any?)
+      (cond ((null? args) default)
+            ((and (string=? (car args) name) (not (null? (cdr args))))
+             (cadr args))
+            (else
+             (cli-arg (cdr args) name default))))
+
+    ;;; Every value given for a repeatable `--name value` flag, in order.
+    ;;;
+    ;;; ```scheme
+    ;;; (cli-arg-list '("--peer" "a" "--peer" "b") "--peer") ; => ("a" "b")
+    ;;; ```
+    (define (cli-arg-list args name)
+      (: list? string? -> list?)
+      (let loop ((xs args) (out '()))
+        (cond ((null? xs) (reverse out))
+              ((and (string=? (car xs) name) (not (null? (cdr xs))))
+               (loop (cddr xs) (cons (cadr xs) out)))
+              (else
+               (loop (cdr xs) out)))))
+
+    ;;; Whether a valueless flag such as `--regtest` is present.
+    ;;;
+    ;;; ```scheme
+    ;;; (cli-flag? '("--regtest") "--regtest") ; => #t
+    ;;; ```
+    (define (cli-flag? args name)
+      (: list? string? -> boolean?)
+      (cond ((null? args) #f)
+            ((string=? (car args) name) #t)
+            (else (cli-flag? (cdr args) name))))
+
+    ;;; Numeric value of a `--name value` flag, or the parsed `default`.
+    ;;;
+    ;;; Raises naming the flag rather than the value, because an operator who
+    ;;; mistyped a number needs to know which of a dozen flags to look at.
+    ;;;
+    ;;; ```scheme
+    ;;; (cli-number '("--max-steps" "8") "--max-steps" "64") ; => 8
+    ;;; ```
+    (define (cli-number args name default)
+      (: list? string? string? -> integer?)
+      (let* ((text (cli-arg args name default))
+             (value (string->number text)))
+        (unless (and value (exact? value) (integer? value))
+          (error (string-append name
+                                ": expected a whole number, got \""
+                                text
+                                "\"")))
+        value))
+
+    ;;; Value of a mandatory flag, or an error naming what to pass.
+    ;;;
+    ;;; ```scheme
+    ;;; (cli-required '("--to" "sgl1...") "--to" "send" "a payout address")
+    ;;; ```
+    (define (cli-required args name command what)
+      (: list? string? string? string? -> string?)
+      (let ((value (cli-arg args name #f)))
+        (unless value
+          (error (string-append command
+                                ": missing "
+                                name
+                                ". Pass "
+                                name
+                                " with "
+                                what
+                                ".")))
+        value))
+
+    ;;; Chain name selected by `--chain` or `--regtest`.
+    ;;;
+    ;;; ```scheme
+    ;;; (cli-chain-name '())            ; => "sigilcoin-main"
+    ;;; (cli-chain-name '("--regtest")) ; => "sigilcoin-regtest"
+    ;;; ```
+    (define (cli-chain-name args)
+      (: list? -> string?)
+      (cli-arg args
+               "--chain"
+               (if (cli-flag? args "--regtest")
+                   "sigilcoin-regtest"
+                   "sigilcoin-main")))
+
+    ;;; Resolve the chain config a command runs against.
+    ;;;
+    ;;; Only SigilCoin's own chains are reachable. Naming a Bitcoin chain is
+    ;;; refused outright rather than quietly opening a database this binary
+    ;;; cannot mine on.
+    ;;;
+    ;;; ```scheme
+    ;;; (chain-config-name (cli-chain '())) ; => "sigilcoin-main"
+    ;;; ```
+    (define (cli-chain args)
+      (: list? -> chain-config?)
+      (let ((name (cli-chain-name args)))
+        (cond ((or (string=? name "sigilcoin-main")
+                   (string=? name "sigilcoin")
+                   (string=? name "main"))
+               sigilcoin-main-chain)
+              ((or (string=? name "sigilcoin-regtest")
+                   (string=? name "regtest"))
+               sigilcoin-regtest-chain)
+              (else
+               (error (string-append
+                        "--chain: unknown chain \""
+                        name
+                        "\". Use sigilcoin-main or sigilcoin-regtest."))))))
+
+    ;;; Data directory a command opens its node in.
+    ;;;
+    ;;; ```scheme
+    ;;; (cli-data-dir '("--data-dir" "/tmp/x")) ; => "/tmp/x"
+    ;;; ```
+    (define (cli-data-dir args)
+      (: list? -> string?)
+      (cli-arg args "--data-dir" cli-default-data-dir))
+
+    ;;; Message carried by an exception, or `fallback`.
+    ;;;
+    ;;; ```scheme
+    ;;; (cli-error-message err "command failed")
+    ;;; ```
+    (define (cli-error-message err fallback)
+      (: any? string? -> string?)
+      (let ((message (exception-message err)))
+        (if (string? message) message fallback)))
+
+    ;;; Open the node for `args`, run `proc` on it, and always close it.
+    ;;;
+    ;;; The original message survives rather than being replaced by
+    ;;; "command failed": an operator needs to read which rule or peer
+    ;;; actually refused. The failure is re-signalled AFTER the guard has
+    ;;; returned, because a `raise` from inside a guard handler escapes
+    ;;; every enclosing guard, including the one `main` reports through.
+    ;;;
+    ;;; ```scheme
+    ;;; (cli-with-node '("--regtest") node-status)
+    ;;; ```
+    (define (cli-with-node args proc)
+      (: list? procedure? -> any?)
+      (let* ((n (node-open (cli-chain args) (cli-data-dir args)))
+             (failure #f)
+             (result (guard (err
+                             (else
+                              (set! failure err)
+                              #f))
+                       (proc n))))
+        (node-close n)
+        (when failure
+          (error (cli-error-message failure "the command failed")))
+        result))
+
+    ;; ============================================================
+    ;; Amounts
+    ;; ============================================================
+
+    (define %fraction-digits 8)
+
+    ;;; Render an amount of daviwils as fixed-point SGL.
+    ;;;
+    ;;; Always eight fraction digits, so two amounts printed side by side
+    ;;; line up and no amount can be misread as a different magnitude.
+    ;;;
+    ;;; ```scheme
+    ;;; (cli-daviwils->sgl 100000000) ; => "1.00000000"
+    ;;; (cli-daviwils->sgl 1)         ; => "0.00000001"
+    ;;; ```
+    (define (cli-daviwils->sgl amount)
+      (: integer? -> string?)
+      (let* ((magnitude (abs amount))
+             (whole (quotient magnitude coin-daviwils-per-sigil))
+             (fraction (remainder magnitude coin-daviwils-per-sigil)))
+        (string-append (if (< amount 0) "-" "")
+                       (number->string whole)
+                       "."
+                       (string-pad (number->string fraction)
+                                   %fraction-digits
+                                   #\0))))
+
+    (define (digits->number who text)
+      (let ((len (string-length text)))
+        (when (= len 0)
+          (error (string-append who ": expected digits")))
+        (let loop ((i 0) (total 0))
+          (if (>= i len)
+              total
+              (let ((digit (- (char->integer (string-ref text i)) 48)))
+                (unless (<= 0 digit 9)
+                  (error (string-append who
+                                        ": \""
+                                        text
+                                        "\" is not a decimal amount")))
+                (loop (+ i 1) (+ (* total 10) digit)))))))
+
+    ;;; Parse a decimal SGL amount into daviwils, exactly.
+    ;;;
+    ;;; Digits only: no exponent, no thousands separator, no floating point
+    ;;; anywhere on the path. More than eight fraction digits is refused
+    ;;; rather than rounded, because rounding a payment is losing coins.
+    ;;;
+    ;;; ```scheme
+    ;;; (cli-sgl->daviwils "--amount" "1")          ; => 100000000
+    ;;; (cli-sgl->daviwils "--amount" "0.00000001") ; => 1
+    ;;; ```
+    (define (cli-sgl->daviwils who text)
+      (: string? string? -> integer?)
+      (unless (string? text)
+        (error (string-append who ": expected an amount in SGL")))
+      (let ((parts (string-split text ".")))
+        (cond
+          ((= 1 (length parts))
+           (* coin-daviwils-per-sigil (digits->number who (car parts))))
+          ((= 2 (length parts))
+           (let ((fraction (cadr parts)))
+             (when (> (string-length fraction) %fraction-digits)
+               (error (string-append
+                        who
+                        ": \""
+                        text
+                        "\" has more than 8 decimal places; one daviwil is"
+                        " 0.00000001 SGL")))
+             (when (= 0 (string-length fraction))
+               (error (string-append who
+                                     ": \""
+                                     text
+                                     "\" ends in a decimal point")))
+             (+ (* coin-daviwils-per-sigil (digits->number who (car parts)))
+                (* (digits->number who fraction)
+                   (expt 10 (- %fraction-digits
+                               (string-length fraction)))))))
+          (else
+           (error (string-append who
+                                 ": \""
+                                 text
+                                 "\" is not a decimal amount"))))))))

@@ -1,0 +1,554 @@
+;;; (sigil coin cli operate) — the node operator commands
+;;;
+;;; `status`, `peers`, `header-sync`, `block-sync`, `sync`, `run` and
+;;; `listen`, with the same flag names `sigil-bitcoin`'s node CLI uses so an
+;;; operator running both does not have to learn two vocabularies.
+;;;
+;;; Nothing here re-implements sync, validation or the wire protocol. Every
+;;; command is a thin shell over the chain-generic primitives in
+;;; `(sigil bitcoin node)` — `node-sync-with-peers`, `node-validate-blocks`,
+;;; `node-serve-inbound-socket` and friends — plus the node-taking helpers
+;;; `(sigil bitcoin node main)` exports.
+;;;
+;;; What could NOT be reused is that CLI's own `run-status`, `run-sync` and
+;;; so on: each one resolves its chain through `chain-config-by-name`, which
+;;; has no way to name a SigilCoin chain. `"sigilcoin"` there is a
+;;; placeholder carrying Bitcoin's header and block rules and regtest's
+;;; genesis, so driving those entry points would run a SigilCoin data
+;;; directory under Bitcoin's consensus. The wrappers below open the node
+;;; with this repo's real configs instead.
+;;;
+;;; ```scheme
+;;; (run-status '("--regtest" "--data-dir" "/tmp/node"))
+;;; ```
+
+(define-library (sigil coin cli operate)
+  (import (sigil io)
+          (sigil math)
+          (sigil string)
+          (sigil time)
+          (sigil socket)
+          (sigil bitcoin utils)
+          (sigil bitcoin p2p)
+          (sigil bitcoin node)
+          (sigil bitcoin node main)
+          (sigil coin consensus)
+          (sigil coin node)
+          (sigil coin cli args))
+  (export
+    coin-parse-peer
+    coin-print-status
+    coin-peer-connector
+    run-status
+    run-peers
+    run-header-sync
+    run-block-sync
+    run-sync
+    run-node
+    run-listen)
+
+  (begin
+
+    ;; ============================================================
+    ;; Peer endpoints
+    ;; ============================================================
+
+    (define (parse-port text)
+      (let ((port (string->number text)))
+        (unless (and port (exact? port) (integer? port) (< 0 port 65536))
+          (error (string-append "peer: \""
+                                text
+                                "\" is not a TCP port number.")))
+        port))
+
+    (define (find-char text ch start)
+      (let loop ((i start))
+        (cond ((>= i (string-length text)) #f)
+              ((char=? ch (string-ref text i)) i)
+              (else (loop (+ i 1))))))
+
+    (define (parse-bracketed text default-port)
+      (let ((close (find-char text #\] 1)))
+        (unless close
+          (error "peer: an IPv6 peer must be written [ADDRESS] or [ADDRESS]:PORT."))
+        (let ((host (substring text 1 close))
+              (rest (substring text (+ close 1) (string-length text))))
+          (cond ((string=? rest "") (cons host default-port))
+                ((string-starts-with? rest ":")
+                 (cons host
+                       (parse-port (substring rest
+                                              1
+                                              (string-length rest)))))
+                (else
+                 (error "peer: an IPv6 peer must be written [ADDRESS] or [ADDRESS]:PORT."))))))
+
+    ;;; Parse `HOST`, `HOST:PORT` or `[IPv6]:PORT` into `(host . port)`.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-parse-peer "127.0.0.1" 19445) ; => ("127.0.0.1" . 19445)
+    ;;; ```
+    (define (coin-parse-peer text default-port)
+      (: string? integer? -> pair?)
+      (if (string-starts-with? text "[")
+          (parse-bracketed text default-port)
+          (let ((parts (string-split text ":")))
+            (cond ((= 1 (length parts)) (cons (car parts) default-port))
+                  ((= 2 (length parts))
+                   (cons (car parts) (parse-port (cadr parts))))
+                  (else
+                   (error "peer: an IPv6 peer must be written [ADDRESS] or [ADDRESS]:PORT."))))))
+
+    ;; ============================================================
+    ;; Transport
+    ;; ============================================================
+
+    (define (fd-ready? fd ready)
+      (and ready
+           (let loop ((xs (car ready)))
+             (cond ((null? xs) #f)
+                   ((= fd (car xs)) #t)
+                   (else (loop (cdr xs)))))))
+
+    ;; The same bounded, non-blocking resolve `sigil-bitcoin`'s node CLI
+    ;; uses, so a dead DNS server cannot hang a command.
+    (define (resolve-host host timeout-ms)
+      (let ((fd (%resolve-start host)))
+        (unless fd
+          (error "peers: the DNS resolver is unavailable."))
+        (if (fd-ready? fd (fd-select (list fd) '() timeout-ms))
+            (or (%resolve-take fd) '())
+            (begin
+              (%resolve-cancel fd)
+              (error (string-append "peers: DNS lookup for "
+                                    host
+                                    " timed out."))))))
+
+    (define (connect-socket host port resolve-timeout connect-timeout)
+      (let loop ((addresses (resolve-host host resolve-timeout))
+                 (last "no address resolved"))
+        (if (null? addresses)
+            (error (string-append "peers: could not connect to "
+                                  host
+                                  " ("
+                                  last
+                                  ")."))
+            (let ((result (guard (err
+                                  (else
+                                   (cli-error-message err
+                                                      "transport failed")))
+                            (p2p-socket-connect-timeout (car addresses)
+                                                        port
+                                                        connect-timeout))))
+              (if (string? result)
+                  (loop (cdr addresses) result)
+                  result)))))
+
+    (define (peer-timeouts args)
+      (list (cli-number args "--resolve-timeout" "2000")
+            (cli-number args "--connect-timeout" "5000")
+            (cli-number args "--read-timeout" "5000")))
+
+    ;;; Build the connector the node's sync entry points drive peers with.
+    ;;;
+    ;;; ```scheme
+    ;;; (node-sync-with-peers n (coin-peer-connector '()) 8 0 64 16)
+    ;;; ```
+    (define (coin-peer-connector args)
+      (: list? -> procedure?)
+      (let* ((timeouts (peer-timeouts args))
+             (resolve-timeout (car timeouts))
+             (connect-timeout (cadr timeouts))
+             (read-timeout (caddr timeouts)))
+        (lambda (peer)
+          (let ((sock (connect-socket (node-peer-address peer)
+                                      (node-peer-port peer)
+                                      resolve-timeout
+                                      connect-timeout)))
+            (list
+              (lambda () (p2p-socket-read-envelope-timeout sock read-timeout))
+              (lambda (envelope) (p2p-socket-write-envelope sock envelope))
+              (lambda () (socket-close sock)))))))
+
+    ;; ============================================================
+    ;; Status
+    ;; ============================================================
+
+    (define (peer-endpoint address port)
+      (string-append (if (string-contains? address ":")
+                         (string-append "[" address "]")
+                         address)
+                     ":"
+                     (number->string port)))
+
+    (define (print-peer peer)
+      (println "~a source=~a score=~a failures=~a last-result=~a last-error=~a"
+               (peer-endpoint (node-peer-address peer)
+                              (node-peer-port peer))
+               (node-peer-source peer)
+               (node-peer-score peer)
+               (node-peer-failures peer)
+               (node-peer-last-result peer)
+               (node-peer-last-error peer)))
+
+    ;;; Print a node status snapshot, with SigilCoin's own numbers appended.
+    ;;;
+    ;;; The Bitcoin fields are reported under the names `sigil-bitcoin` uses
+    ;;; so existing tooling can read them; the mining lines below them are
+    ;;; what a SigilCoin operator actually watches.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-print-status (node-status n))
+    ;;; ```
+    (define (coin-print-status status)
+      (: node-status-snapshot? -> any?)
+      (println "chain: ~a" (node-status-snapshot-chain-name status))
+      (println "best-height: ~a" (node-status-snapshot-best-height status))
+      (println "best-hash: ~a" (node-status-snapshot-best-hash status))
+      (println "best-work: ~a" (node-status-snapshot-best-work status))
+      (println "best-header-time: ~a"
+               (node-status-snapshot-best-header-time status))
+      (println "headers: ~a" (node-status-snapshot-header-count status))
+      (println "blocks: ~a" (node-status-snapshot-block-count status))
+      (println "validated-blocks: ~a"
+               (node-status-snapshot-validated-block-count status))
+      (println "best-block-height: ~a"
+               (node-status-snapshot-best-block-height status))
+      (println "best-block-hash: ~a"
+               (node-status-snapshot-best-block-hash status))
+      (println "mempool: ~a" (node-status-snapshot-mempool-count status))
+      (println "peers: ~a" (node-status-snapshot-peer-count status))
+      (println "peer-successes: ~a"
+               (node-status-snapshot-peer-success-count status))
+      (println "peer-failures: ~a"
+               (node-status-snapshot-peer-failure-count status))
+      (println "pending-blocks: ~a"
+               (node-status-snapshot-pending-block-count status))
+      (println "sync-stage: ~a" (node-status-snapshot-sync-stage status))
+      (println "sync-last-error: ~a"
+               (node-status-snapshot-sync-last-error status))
+      ;; SigilCoin's own view: what the next block is worth and how much of
+      ;; the supply the chain has issued so far.
+      (let* ((height (node-status-snapshot-best-block-height status))
+             (next (+ height 1)))
+        (println "tip-solution-bytes: ~a"
+                 (coin-solution-bytes-of
+                   (node-status-snapshot-best-work status)))
+        (println "next-height: ~a" next)
+        (println "next-reward: ~a SGL"
+                 (cli-daviwils->sgl (coin-block-reward next)))
+        (println "issued-supply: ~a SGL"
+                 (cli-daviwils->sgl (coin-cumulative-supply height)))
+        (println "max-supply: ~a SGL" (cli-daviwils->sgl coin-max-supply)))
+      status)
+
+    ;; The stored work encodes the tip's solution length as a saving, so the
+    ;; length itself is recoverable for display.
+    (define (coin-solution-bytes-of work)
+      (let ((saving (coin-rank-tip-saving work)))
+        (if (<= saving 0)
+            0
+            (+ 1 (- coin-max-solution-bytes saving)))))
+
+    ;;; Print the node's view of the chain.
+    ;;;
+    ;;; ```scheme
+    ;;; (run-status '("--regtest" "--data-dir" "/tmp/node"))
+    ;;; ```
+    (define (run-status args)
+      (: list? -> any?)
+      (cli-with-node args
+        (lambda (n)
+          (coin-print-status (node-status n)))))
+
+    ;;; Run a `peers` subcommand: `add`, `list`, `remove` or `test`.
+    ;;;
+    ;;; ```scheme
+    ;;; (run-peers '("add" "127.0.0.1:19445" "--regtest"))
+    ;;; ```
+    (define (run-peers args)
+      (: list? -> any?)
+      (when (null? args)
+        (error "peers: missing subcommand. Use add, list, remove or test."))
+      (let ((subcommand (car args))
+            (rest (cdr args)))
+        (cli-with-node rest
+          (lambda (n)
+            (let ((default-port (chain-config-default-port (node-config n))))
+              (cond
+                ((string=? subcommand "add")
+                 (let ((peer (coin-parse-peer
+                               (peer-argument rest "peers add")
+                               default-port)))
+                   (print-peer (node-add-peer n (car peer) (cdr peer)))))
+                ((string=? subcommand "list")
+                 (let ((peers (node-peers n)))
+                   (if (null? peers)
+                       (println "no peers configured; add one with `sigilcoin peers add HOST:PORT`")
+                       (for-each print-peer peers))
+                   peers))
+                ((string=? subcommand "remove")
+                 (let ((peer (coin-parse-peer
+                               (peer-argument rest "peers remove")
+                               default-port)))
+                   (node-remove-peer n (car peer) (cdr peer))
+                   (println "removed ~a"
+                            (peer-endpoint (car peer) (cdr peer)))))
+                ((string=? subcommand "test")
+                 (let ((peer (coin-parse-peer
+                               (peer-argument rest "peers test")
+                               default-port)))
+                   (print-peer (node-test-peer n
+                                               (car peer)
+                                               (cdr peer)
+                                               (coin-peer-connector rest)))))
+                (else
+                 (error (string-append
+                          "peers: unknown subcommand \""
+                          subcommand
+                          "\". Use add, list, remove or test.")))))))))
+
+    (define (peer-argument args command)
+      (when (or (null? args) (string-starts-with? (car args) "--"))
+        (error (string-append command
+                              ": missing HOST[:PORT]. Example: `"
+                              command
+                              " 127.0.0.1:19445`.")))
+      (car args))
+
+    ;; ============================================================
+    ;; Sync
+    ;; ============================================================
+
+    (define (sync-listed-peers n texts connect max-steps max-blocks command)
+      (let loop ((xs texts) (last-error ""))
+        (if (null? xs)
+            (error (string-append command
+                                  ": every --peer failed"
+                                  (if (string=? last-error "")
+                                      "."
+                                      (string-append " (" last-error ")."))))
+            (let* ((peer (coin-parse-peer
+                           (car xs)
+                           (chain-config-default-port (node-config n))))
+                   (status (node-sync-configured-peer n
+                                                      (car peer)
+                                                      (cdr peer)
+                                                      connect
+                                                      max-steps
+                                                      max-blocks)))
+              (if (string=? "failed"
+                            (node-status-snapshot-sync-stage status))
+                  (loop (cdr xs)
+                        (node-status-snapshot-sync-last-error status))
+                  status)))))
+
+    (define (sync-once n args max-blocks command)
+      (let ((texts (cli-arg-list args "--peer"))
+            (connect (coin-peer-connector args))
+            (max-steps (cli-number args "--max-steps" "64")))
+        (if (null? texts)
+            (begin
+              (maybe-bootstrap-sync-peers n args)
+              (when (= 0 (node-status-snapshot-peer-count (node-status n)))
+                (error (string-append
+                         command
+                         ": no peers are configured and none could be"
+                         " discovered. Add one with `sigilcoin peers add"
+                         " HOST:PORT` or pass --peer HOST:PORT.")))
+              (node-sync-with-peers n
+                                    connect
+                                    (cli-number args "--max-peers" "8")
+                                    (cli-number args "--max-retries" "0")
+                                    max-steps
+                                    max-blocks))
+            (sync-listed-peers n texts connect max-steps max-blocks
+                               command))))
+
+    ;; One bounded pass, repeated `--iterations` times (0 means forever),
+    ;; retrying a failed pass up to `--max-retries` times. `attempt` is what
+    ;; differs between `header-sync`, `block-sync`, `sync` and `run`.
+    (define (sync-loop args command attempt)
+      (cli-with-node args
+        (lambda (n)
+          (let ((iterations (cli-number args "--iterations" "1"))
+                (max-retries (cli-number args "--max-retries" "0"))
+                (retry-delay (cli-number args "--retry-delay" "0")))
+            (let loop ((completed 0) (retries 0) (last-error ""))
+              (if (and (> iterations 0) (>= completed iterations))
+                  (let ((status (node-mark-sync-idle n)))
+                    (coin-print-status status)
+                    status)
+                  (let* ((before (run-progress-snapshot (node-status n)))
+                         (failure #f)
+                         (status (guard (err
+                                         (else
+                                          (set! failure
+                                            (cli-error-message err
+                                                               "failed"))
+                                          (node-record-run-failure n failure)
+                                          #f))
+                                   (attempt n))))
+                    (cond
+                      ((and status
+                            (not (string=? "failed"
+                                           (node-status-snapshot-sync-stage
+                                             status))))
+                       (coin-print-status status)
+                       (when (and (= iterations 0)
+                                  (> retry-delay 0)
+                                  (not (run-progress-made? before status)))
+                         (sleep retry-delay))
+                       (loop (+ completed 1) 0 ""))
+                      (else
+                       ;; Keep the reason the attempt actually gave. The
+                       ;; status row only records the last transport-level
+                       ;; failure, which is empty when the command never got
+                       ;; as far as a peer.
+                       (let ((reason (or failure
+                                         (node-status-snapshot-sync-last-error
+                                           status)
+                                         last-error)))
+                         (coin-print-status (node-status n))
+                         (when (> retry-delay 0) (sleep retry-delay))
+                         (if (and (>= retries max-retries)
+                                  (> iterations 0))
+                             (error (string-append
+                                      command
+                                      ": gave up after "
+                                      (number->string (+ retries 1))
+                                      " attempt(s). Last error: "
+                                      reason))
+                             (loop completed (+ retries 1) reason))))))))))))
+
+    ;;; Walk the header chain from peers without downloading bodies.
+    ;;;
+    ;;; ```scheme
+    ;;; (run-header-sync '("--regtest" "--peer" "127.0.0.1:19445"))
+    ;;; ```
+    (define (run-header-sync args)
+      (: list? -> any?)
+      (sync-loop args
+                 "header-sync"
+                 (lambda (n) (sync-once n args 0 "header-sync"))))
+
+    ;;; Download and validate bodies for headers the node already has.
+    ;;;
+    ;;; ```scheme
+    ;;; (run-block-sync '("--regtest" "--peer" "127.0.0.1:19445"))
+    ;;; ```
+    (define (run-block-sync args)
+      (: list? -> any?)
+      (sync-loop args
+                 "block-sync"
+                 (lambda (n)
+                   (fetch-blocks-node-once n
+                                           args
+                                           "block-sync"
+                                           (coin-peer-connector args)
+                                           #f))))
+
+    ;;; Sync headers and bodies in one pass.
+    ;;;
+    ;;; ```scheme
+    ;;; (run-sync '("--regtest" "--peer" "127.0.0.1:19445"))
+    ;;; ```
+    (define (run-sync args)
+      (: list? -> any?)
+      (sync-loop args
+                 "sync"
+                 (lambda (n)
+                   (sync-once n
+                              args
+                              (cli-number args "--max-blocks" "16")
+                              "sync"))))
+
+    ;;; Keep syncing and validating until the iteration budget runs out.
+    ;;;
+    ;;; With `--iterations 0` this is the long-running node. Each pass either
+    ;;; drains the validation backlog or takes another sync step, which is
+    ;;; the same choice `sigil-bitcoin`'s own `run` makes.
+    ;;;
+    ;;; ```scheme
+    ;;; (run-node '("--regtest" "--iterations" "0" "--retry-delay" "1000"))
+    ;;; ```
+    (define (run-node args)
+      (: list? -> any?)
+      (sync-loop args
+                 "run"
+                 (lambda (n)
+                   (if (string=? "validation"
+                                 (run-loop-attempt-mode n args -1))
+                       (begin
+                         (node-validate-blocks
+                           n
+                           (cli-number args "--validation-blocks" "128"))
+                         (node-status n))
+                       (sync-once n
+                                  args
+                                  (cli-number args "--max-blocks" "16")
+                                  "run")))))
+
+    ;;; Serve inbound peers on a TCP port.
+    ;;;
+    ;;; ```scheme
+    ;;; (run-listen '("--regtest" "--port" "19445" "--max-connections" "1"))
+    ;;; ```
+    (define (run-listen args)
+      (: list? -> any?)
+      (cli-with-node args
+        (lambda (n)
+          (let* ((bind (cli-arg args "--bind" "127.0.0.1"))
+                 (port (cli-number
+                         args
+                         "--port"
+                         (number->string
+                           (chain-config-default-port (node-config n)))))
+                 (backlog (cli-number args "--backlog" "8"))
+                 (max-connections (cli-number args "--max-connections" "1"))
+                 (accept-timeout (cli-number args "--accept-timeout" "5000"))
+                 (read-timeout (cli-number args "--read-timeout" "5000"))
+                 (max-steps (cli-number args "--max-steps" "8"))
+                 (max-tx (cli-number args "--max-tx" "64"))
+                 (listener (tcp-listen port backlog bind)))
+            (unless listener
+              (error (string-append
+                       "listen: could not bind "
+                       (peer-endpoint bind port)
+                       ". Another process may already hold that port.")))
+            (println "listening: ~a" (peer-endpoint bind port))
+            (let* ((failure #f)
+                   (result
+                     (guard (err (else (set! failure err) #f))
+                       (let loop ((completed 0) (last #f))
+                         (if (and (> max-connections 0)
+                                  (>= completed max-connections))
+                             last
+                             (if (socket-ready? listener accept-timeout)
+                                 (let ((client (tcp-accept listener)))
+                                   (if client
+                                       (loop
+                                         (+ completed 1)
+                                         (node-serve-inbound-socket
+                                           n
+                                           "inbound"
+                                           (+ completed 1)
+                                           client
+                                           read-timeout
+                                           max-steps
+                                           max-tx))
+                                       (loop completed last)))
+                                 last))))))
+              (socket-close listener)
+              ;; A peer hanging up mid-conversation is how most inbound
+              ;; connections end, and the node's transport reports it the
+              ;; same way it reports a real fault. Say what happened and
+              ;; still print the status rather than exiting non-zero on a
+              ;; normal disconnect.
+              ;; ponytail: one bucket for every transport outcome. The node
+              ;; would have to distinguish "peer closed" from "peer sent
+              ;; garbage" before this can, and it does not today.
+              (when failure
+                (println "peer-disconnected: ~a"
+                         (cli-error-message failure "connection closed")))
+              (coin-print-status (node-status n))
+              result)))))))

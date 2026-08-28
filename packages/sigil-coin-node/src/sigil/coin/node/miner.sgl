@@ -34,12 +34,20 @@
 ;;; (coin-mine-block n "(list (iota 11) 694)" "hi there" payout-script)
 ;;; ```
 ;;;
-;;; ONE TRANSACTION PER BLOCK. The builder assembles a coinbase-only block.
-;;; Nothing about the format prevents more, but a block with fee-paying
-;;; transactions needs a fee total to size the coinbase claim, and that is
-;;; mempool selection rather than block assembly.
-;;; ponytail: coinbase-only; take a transaction list and add the fees to the
-;;; coinbase claim when there is a mempool to select from.
+;;; TRANSACTIONS ARE OPTIONAL, NOT ABSENT. `coin-build-block` takes the
+;;; transactions to include after the coinbase and the fee total they pay.
+;;; Both default to "none", so a caller with no mempool still gets the
+;;; coinbase-only block it used to get, and a caller with one gets a block
+;;; whose coinbase claims `coin-block-reward` PLUS those fees — which is
+;;; what Bitcoin's connector allows and what makes the fees collectable.
+;;;
+;;; The fee total is an argument rather than something computed here because
+;;; a fee is `inputs - outputs`, and the input values live in the node's UTXO
+;;; set, which block assembly has no handle on. Selecting the transactions
+;;; and totalling their fees is one job, done by the caller that can see the
+;;; UTXO set; assembling them into a block is this one. Over-claiming is not
+;;; a way to steal: the connector recomputes the fees from the UTXO set and
+;;; rejects a coinbase claiming more than subsidy plus fees.
 
 (define-library (sigil coin node miner)
   (import (sigil math)
@@ -103,40 +111,63 @@
       (string->utf8 (puzzle-spec-solution
                       (coin-puzzle-for previous-hash height))))
 
+    ;; A fee total has to be a non-negative exact integer. Anything else is a
+    ;; caller bug that would otherwise surface as a block the node refuses
+    ;; with a message about the subsidy, which names the wrong mistake.
+    (define (require-fees who fees)
+      (unless (and (number? fees) (exact? fees) (integer? fees) (>= fees 0))
+        (error (string-append who
+                              ": expected a non-negative total of the fees"
+                              " the block's transactions pay")))
+      fees)
+
+    (define (optional-argument rest index default)
+      (let loop ((xs rest) (i index))
+        (cond ((null? xs) default)
+              ((= 0 i) (car xs))
+              (else (loop (cdr xs) (- i 1))))))
+
     ;;; Build the coinbase transaction for a SigilCoin block.
     ;;;
-    ;;; The claim is exactly `coin-block-reward` for the height: there are no
-    ;;; fees in a coinbase-only block, and claiming less would burn coins for
-    ;;; nothing.
+    ;;; The claim is `coin-block-reward` for the height plus the optional
+    ;;; `fees` the block's other transactions pay, which defaults to zero for
+    ;;; a coinbase-only block. Claiming less would burn coins for nothing;
+    ;;; claiming more is a block the connector rejects.
     ;;;
     ;;; ```scheme
     ;;; (txout-value (car (transaction-outputs
     ;;;                     (coin-mining-coinbase 1 "'()" "" #u8(#x6a)))))
     ;;; ; => 100000000
+    ;;; (txout-value (car (transaction-outputs
+    ;;;                     (coin-mining-coinbase 1 "'()" "" #u8(#x6a) 1000))))
+    ;;; ; => 100001000
     ;;; ```
-    (define (coin-mining-coinbase height solution graffiti script-pubkey)
-      (: integer? any? any? bytevector? -> transaction?)
+    (define (coin-mining-coinbase height solution graffiti script-pubkey
+                                  . maybe-fees)
+      (: integer? any? any? bytevector? integer? ... -> transaction?)
       (if (not (bytevector? script-pubkey))
           (error "coin-mining-coinbase: expected a payout scriptPubKey"))
-      (transaction
-        version: 1
-        inputs: (list
-                  (txin previous-output: (outpoint txid: %zero32
-                                                   index: %coinbase-index)
-                        script-sig: (coin-coinbase-payload-encode
-                                      (coin-coinbase-payload
-                                        height: height
-                                        solution: (coin-mining-bytes
-                                                    "coin-mining-coinbase solution"
-                                                    solution)
-                                        graffiti: (coin-mining-bytes
-                                                    "coin-mining-coinbase graffiti"
-                                                    graffiti)))
-                        sequence: %sequence-final
-                        witness: '()))
-        outputs: (list (txout value: (coin-block-reward height)
-                              script-pubkey: script-pubkey))
-        lock-time: 0))
+      (let ((fees (require-fees "coin-mining-coinbase"
+                                (optional-argument maybe-fees 0 0))))
+        (transaction
+          version: 1
+          inputs: (list
+                    (txin previous-output: (outpoint txid: %zero32
+                                                     index: %coinbase-index)
+                          script-sig: (coin-coinbase-payload-encode
+                                        (coin-coinbase-payload
+                                          height: height
+                                          solution: (coin-mining-bytes
+                                                      "coin-mining-coinbase solution"
+                                                      solution)
+                                          graffiti: (coin-mining-bytes
+                                                      "coin-mining-coinbase graffiti"
+                                                      graffiti)))
+                          sequence: %sequence-final
+                          witness: '()))
+          outputs: (list (txout value: (+ (coin-block-reward height) fees)
+                                script-pubkey: script-pubkey))
+          lock-time: 0)))
 
     ;;; Build a block extending `parent-header` at `height`.
     ;;;
@@ -146,22 +177,39 @@
     ;;; `height` that is not the parent's plus one, builds a block the node
     ;;; will reject — which is what makes this usable for negative tests.
     ;;;
+    ;;; `transactions` and `fees` are optional and default to none: the
+    ;;; transactions to include after the coinbase, and the total fee they
+    ;;; pay, which the coinbase claims on top of the subsidy. The merkle root
+    ;;; commits to every transaction in the block, coinbase first.
+    ;;;
     ;;; ```scheme
     ;;; (block? (coin-build-block parent 1 "'()" "" #u8(#x6a) 1767225601))
     ;;; ; => #t
+    ;;; (length (block-transactions
+    ;;;           (coin-build-block parent 1 "'()" "" #u8(#x6a) 1767225601
+    ;;;                             (list tx) 1000)))
+    ;;; ; => 2
     ;;; ```
     (define (coin-build-block parent-header height solution graffiti
-                              script-pubkey time)
-      (: block-header? integer? any? any? bytevector? integer? -> block?)
+                              script-pubkey time . maybe-transactions)
+      (: block-header? integer? any? any? bytevector? integer? list?
+         integer? ... -> block?)
       (if (not (block-header? parent-header))
           (error "coin-build-block: expected a parent block header"))
-      (let* ((solution-bytes (coin-mining-bytes "coin-build-block solution"
+      (if (not (list? (optional-argument maybe-transactions 0 '())))
+          (error "coin-build-block: expected a list of transactions"))
+      (let* ((txs (optional-argument maybe-transactions 0 '()))
+             (fees (require-fees "coin-build-block"
+                                 (optional-argument maybe-transactions 1 0)))
+             (solution-bytes (coin-mining-bytes "coin-build-block solution"
                                                 solution))
              (coinbase (coin-mining-coinbase height
                                              solution-bytes
                                              graffiti
-                                             script-pubkey))
-             (root (merkle-root (list (transaction-txid coinbase)))))
+                                             script-pubkey
+                                             fees))
+             (transactions (cons coinbase txs))
+             (root (merkle-root (map transaction-txid transactions))))
         (block header-field:
                  (block-header version: coin-header-version
                                previous-block: (block-header-hash
@@ -172,7 +220,7 @@
                                ;; The solution-length commitment fork choice
                                ;; ranks by, taken from the solution itself.
                                nonce: (bytevector-length solution-bytes))
-               transactions: (list coinbase))))
+               transactions: transactions)))
 
     ;;; The earliest timestamp a child of `parent-header` may carry.
     ;;;

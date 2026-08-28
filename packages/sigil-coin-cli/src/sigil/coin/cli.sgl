@@ -1,14 +1,212 @@
-;;; (sigil coin cli) — `sigilcoin` CLI scaffold
+;;; (sigil coin cli) — the `sigilcoin` binary
+;;;
+;;; Facade over the command modules and the entry point the bundle runs:
+;;;
+;;;   (sigil coin cli args)     flags, chain selection, SGL amounts
+;;;   (sigil coin cli wallet)   keys, `sgl1` addresses, balance, spending
+;;;   (sigil coin cli mine)     `puzzle` and `mine`
+;;;   (sigil coin cli operate)  status, peers, sync, run, listen
+;;;
+;;; Every command prints `key: value` lines, one per line, so the output is
+;;; readable in a terminal and greppable in a script without a formatter.
+;;;
+;;; The one thing worth knowing before running anything: SigilCoin is mined
+;;; by writing programs, not by burning electricity. `sigilcoin puzzle`
+;;; prints the puzzle for the next block and the always-legal baseline
+;;; solution; anything shorter than that baseline is a better block.
+;;;
+;;; ```scheme
+;;; (cli-run '("puzzle" "--regtest"))
+;;; ```
 
 (define-library (sigil coin cli)
-  (export cli-package-version)
+  (import (sigil process)
+          (sigil string)
+          (sigil coin cli args)
+          (sigil coin cli wallet)
+          (sigil coin cli mine)
+          (sigil coin cli operate))
+  (export
+    ;; Package metadata
+    cli-package-version
+
+    ;; Entry points
+    cli-usage
+    cli-run
+    main
+
+    ;; Shared argument handling
+    cli-default-data-dir
+    cli-arg
+    cli-arg-list
+    cli-flag?
+    cli-number
+    cli-required
+    cli-chain-name
+    cli-chain
+    cli-data-dir
+    cli-with-node
+    cli-daviwils->sgl
+    cli-sgl->daviwils
+    cli-error-message
+
+    ;; Wallet
+    coin-address-hrp
+    coin-coinbase-maturity
+    coin-address
+    coin-address->script-pubkey
+    coin-dust-threshold
+    coin-default-fee
+    wallet-key-file
+    wallet-key
+    wallet-public-key
+    wallet-script-pubkey
+    wallet-utxos
+    wallet-utxo-value
+    wallet-utxo-outpoint
+    wallet-utxo-mature?
+    wallet-balance
+    wallet-outpoint=?
+    wallet-outpoint-member?
+    wallet-mempool-transactions
+    wallet-mempool-spent-outpoints
+    wallet-select-inputs
+    wallet-build-transfer
+    run-address
+    run-balance
+    run-send
+
+    ;; Mining
+    coin-solution-advice
+    coin-validated-tip-height
+    coin-validated-tip-header
+    coin-header-at-height
+    coin-puzzle-report
+    coin-print-puzzle
+    coin-block-transaction-fee
+    coin-select-block-transactions
+    run-puzzle
+    run-mine
+
+    ;; Node operation
+    coin-parse-peer
+    coin-print-status
+    coin-peer-connector
+    run-status
+    run-peers
+    run-header-sync
+    run-block-sync
+    run-sync
+    run-node
+    run-listen)
+
   (begin
 
-    ;;; Version of the CLI package, used as a scaffold placeholder until the
-    ;;; `sigilcoin` binary and its commands land.
+    ;;; Version of the CLI package.
     ;;;
-    ;;; Example:
-    ;;;   (cli-package-version) ;=> "0.1.0"
+    ;;; ```scheme
+    ;;; (cli-package-version) ; => "0.1.0"
+    ;;; ```
     (define (cli-package-version)
       (: -> string?)
-      "0.1.0")))
+      "0.1.0")
+
+    ;;; Print the command surface.
+    ;;;
+    ;;; ```scheme
+    ;;; (cli-usage)
+    ;;; ```
+    (define (cli-usage)
+      (: -> any?)
+      (println "sigilcoin — mine a blockchain by writing the shortest program")
+      (println "")
+      (println "mining:")
+      (println "  sigilcoin puzzle [--height N] [CHAIN] [--data-dir DIR]")
+      (println "  sigilcoin mine [--solution EXPR] [--graffiti TEXT] [--address ADDR] [CHAIN] [--data-dir DIR]")
+      (println "")
+      (println "wallet:")
+      (println "  sigilcoin address [CHAIN] [--data-dir DIR]")
+      (println "  sigilcoin balance [CHAIN] [--data-dir DIR]")
+      (println "  sigilcoin send --to ADDR --amount SGL [--fee SGL] [CHAIN] [--data-dir DIR]")
+      (println "")
+      (println "node:")
+      (println "  sigilcoin status [CHAIN] [--data-dir DIR]")
+      (println "  sigilcoin peers add|list|remove|test [HOST[:PORT]] [CHAIN] [--data-dir DIR]")
+      (println "  sigilcoin header-sync [--peer HOST[:PORT]] [--max-steps N] [--iterations N|0] [--max-peers N] [--max-retries N] [--retry-delay N] [CHAIN] [--data-dir DIR]")
+      (println "  sigilcoin block-sync [--peer HOST[:PORT]] [--max-steps N] [--max-blocks N] [--iterations N|0] [--max-retries N] [--retry-delay N] [CHAIN] [--data-dir DIR]")
+      (println "  sigilcoin sync [--peer HOST[:PORT]] [--max-steps N] [--max-blocks N] [--iterations N|0] [--max-peers N] [--max-retries N] [--retry-delay N] [CHAIN] [--data-dir DIR]")
+      (println "  sigilcoin run [--iterations N|0] [--retry-delay N] [--validation-blocks N] [--max-blocks N] [CHAIN] [--data-dir DIR]")
+      (println "  sigilcoin listen [--bind HOST] [--port N] [--backlog N] [--max-connections N|0] [--accept-timeout N] [--read-timeout N] [--max-steps N] [--max-tx N] [CHAIN] [--data-dir DIR]")
+      (println "")
+      (println "CHAIN is --regtest, or --chain sigilcoin-main|sigilcoin-regtest.")
+      (println "Default chain: sigilcoin-main. Default data dir: ~a."
+               cli-default-data-dir)
+      (println "Amounts are SGL: 1 SGL = 100000000 daviwils.")
+      (println "Timeouts: --resolve-timeout, --connect-timeout, --read-timeout, in ms."))
+
+    ;;; Dispatch one already-parsed argument list.
+    ;;;
+    ;;; Separated from `main` so tests can drive the real command surface
+    ;;; without a subprocess.
+    ;;;
+    ;;; ```scheme
+    ;;; (cli-run '("puzzle" "--regtest" "--data-dir" "/tmp/node"))
+    ;;; ```
+    (define (cli-run args)
+      (: list? -> any?)
+      (if (null? args)
+          (cli-usage)
+          (let ((command (car args))
+                (rest (cdr args)))
+            (cond ((or (string=? command "help")
+                       (string=? command "--help")
+                       (string=? command "-h"))
+                   (cli-usage))
+                  ((string=? command "version")
+                   (println "sigilcoin ~a" (cli-package-version)))
+                  ((string=? command "puzzle") (run-puzzle rest))
+                  ((string=? command "mine") (run-mine rest))
+                  ((string=? command "address") (run-address rest))
+                  ((string=? command "balance") (run-balance rest))
+                  ((string=? command "send") (run-send rest))
+                  ((string=? command "status") (run-status rest))
+                  ((string=? command "peers") (run-peers rest))
+                  ((string=? command "header-sync") (run-header-sync rest))
+                  ((string=? command "block-sync") (run-block-sync rest))
+                  ((string=? command "sync") (run-sync rest))
+                  ((string=? command "run") (run-node rest))
+                  ((string=? command "listen") (run-listen rest))
+                  (else
+                   (cli-usage)
+                   (error (string-append "unknown command \""
+                                         command
+                                         "\". Run `sigilcoin help`.")))))))
+
+    ;; `sigil run <pkg> -- args` leaves the toolchain's own words in front of
+    ;; a bare `--`. Strip through the separator when there is one, and
+    ;; otherwise pass everything through: `sigilcoin run` is itself a
+    ;; subcommand, so keying the strip on the word `run` would make the
+    ;; long-running node unreachable from the installed binary.
+    (define (application-args raw)
+      (let loop ((xs raw))
+        (cond ((null? xs) raw)
+              ((string=? (car xs) "--") (cdr xs))
+              (else (loop (cdr xs))))))
+
+    ;;; Entry point of the `sigilcoin` binary.
+    ;;;
+    ;;; A failed command prints one `sigilcoin: <message>` line and exits
+    ;;; non-zero, so a shell script can branch on it and a human gets a
+    ;;; sentence rather than a stack trace.
+    ;;;
+    ;;; ```scheme
+    ;;; (main)
+    ;;; ```
+    (define (main)
+      (: -> void?)
+      (guard (err
+              (else
+               (println "sigilcoin: ~a"
+                        (cli-error-message err "the command failed"))
+               (exit 1)))
+        (cli-run (application-args (cdr (command-line))))))))

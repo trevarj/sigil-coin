@@ -1,0 +1,525 @@
+;;; (sigil coin cli mine) — the `puzzle` and `mine` commands
+;;;
+;;; The two commands the game is actually played with.
+;;;
+;;; `puzzle` publishes everything a miner needs before they open a REPL: the
+;;; target in canonical form, the seed it came from, par, and the
+;;; always-legal quoted-literal solution. That last line is the baseline —
+;;; mining it is legal and wins nothing, and every byte shaved off it is the
+;;; whole competition.
+;;;
+;;; `mine` goes the other way. The solution is checked against the
+;;; regenerated puzzle BEFORE a block exists, because the failures worth
+;;; reporting — wrong value, a closure, over the byte cap, a parse error —
+;;; are all knowable without touching the chain, and reporting them as "the
+;;; node rejected your block" would tell a miner nothing about which byte to
+;;; change.
+;;;
+;;; `mine` also fills the block. A block is not the coinbase alone: the
+;;; node's mempool is where transactions wait, and a chain that never moves
+;;; them from there is a chain nobody can spend on. `mine` selects what fits
+;;; — see `coin-select-block-transactions` — and the coinbase claims the
+;;; subsidy plus the fees of what it selected.
+;;;
+;;; ```scheme
+;;; (run-puzzle '("--regtest"))
+;;; (run-mine '("--regtest" "--solution" "(iota 11)"))
+;;; ```
+
+(define-library (sigil coin cli mine)
+  (import (sigil io)
+          (sigil math)
+          (sigil string)
+          (sigil time)
+          (sigil sqlite)
+          (sigil bitcoin utils)
+          (sigil bitcoin encoding)
+          (sigil bitcoin primitives)
+          (sigil bitcoin tx)
+          (sigil bitcoin consensus)
+          (sigil bitcoin node)
+          (sigil coin puzzle)
+          (sigil coin puzzle generator)
+          (sigil coin consensus)
+          (sigil coin node)
+          (sigil coin cli args)
+          (sigil coin cli wallet))
+  (export
+    coin-solution-advice
+    coin-validated-tip-height
+    coin-validated-tip-header
+    coin-header-at-height
+    coin-puzzle-report
+    coin-print-puzzle
+    coin-block-transaction-fee
+    coin-select-block-transactions
+    run-puzzle
+    run-mine)
+
+  (begin
+
+    ;; The tip a command works from is the best VALIDATED block, never the
+    ;; best header. On this chain a header costs nothing and one whose body
+    ;; nobody has can hold the best-header slot for a while; mining onto it
+    ;; would build a block whose parent can never connect.
+    ;;; Height of the last block the node validated.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-validated-tip-height n) ; => 3
+    ;;; ```
+    (define (coin-validated-tip-height n)
+      (: node? -> integer?)
+      (node-status-snapshot-best-block-height (node-status n)))
+
+    ;; The node exposes only its best HEADER, so the validated tip's header
+    ;; is read out of the table the node persists it in.
+    ;; A sqlite row is an alist whose keys may be strings or symbols
+    ;; depending on the driver build, so look both up rather than assuming.
+    (define (row-ref row key)
+      (let ((pair (assoc key row)))
+        (if pair
+            (cdr pair)
+            (let ((sym (assoc (string->symbol key) row)))
+              (and sym (cdr sym))))))
+
+    (define (header-row->header row)
+      (block-header-parse (hex-decode (row-ref row "header_hex"))))
+
+    (define (header-row-at n column value)
+      (let ((rows (sqlite-query
+                    (node-db n)
+                    (string-append
+                      "SELECT header_hex FROM headers WHERE "
+                      column
+                      " = ? AND valid = 1 ORDER BY height ASC LIMIT 1")
+                    value)))
+        (if (null? rows) #f (header-row->header (car rows)))))
+
+    ;;; Header of the last block the node validated.
+    ;;;
+    ;;; Falls back to the chain's genesis on a node that has validated
+    ;;; nothing yet, which is what height 1 is mined on.
+    ;;;
+    ;;; ```scheme
+    ;;; (block-header? (coin-validated-tip-header n)) ; => #t
+    ;;; ```
+    (define (coin-validated-tip-header n)
+      (: node? -> block-header?)
+      (let ((hash (node-status-snapshot-best-block-hash (node-status n))))
+        (if (string=? "" hash)
+            (chain-config-genesis-header (node-config n))
+            (or (header-row-at n "hash" hash)
+                (error "the node's validated tip has no stored header")))))
+
+    ;;; Header the node holds at `height` on its validated chain.
+    ;;;
+    ;;; ```scheme
+    ;;; (block-header-time (coin-header-at-height n 1))
+    ;;; ```
+    (define (coin-header-at-height n height)
+      (: node? integer? -> block-header?)
+      (let loop ((header (coin-validated-tip-header n))
+                 (current (coin-validated-tip-height n)))
+        (cond ((= current height) header)
+              ((<= current 0)
+               (error (string-append "no header stored at height "
+                                     (number->string height))))
+              (else
+               (let ((parent (header-row-at
+                               n
+                               "hash"
+                               (hex-encode (block-header-previous-block
+                                             header)))))
+                 (unless parent
+                   (error (string-append
+                            "the chain is missing the header at height "
+                            (number->string (- current 1)))))
+                 (loop parent (- current 1)))))))
+
+    ;;; Turn a solution-check failure into a sentence naming the next move.
+    ;;;
+    ;;; The consensus layer answers in reason symbols, which are exactly
+    ;;; right for a validator and useless to someone golfing at 2am.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-solution-advice 'solution-mismatch "")
+    ;;; ; => "it evaluates to something other than the puzzle's target. ..."
+    ;;; ```
+    (define (coin-solution-advice reason detail)
+      (: any? any? -> string?)
+      (let ((extra (if (and (string? detail) (not (string=? "" detail)))
+                       (string-append " (" detail ")")
+                       "")))
+        (cond
+          ((eq? reason 'solution-mismatch)
+           "it evaluates to something other than the puzzle's target. Run `sigilcoin puzzle` and compare your value against `target`.")
+          ((eq? reason 'solution-not-a-value)
+           "it evaluates to a procedure, not data. A solution has to produce the target value itself, so wrap the body in a call rather than handing back a lambda.")
+          ((eq? reason 'solution-oversize)
+           (string-append "it is longer than the "
+                          (number->string coin-max-solution-bytes)
+                          "-byte cap. Shorten it; the cap is consensus, not policy."))
+          ((eq? reason 'solution-malformed)
+           "it is empty or not text. Pass the program source with --solution.")
+          ((eq? reason 'solution-parse-failed)
+           (string-append "it does not parse as puzzle-lang v1"
+                          extra
+                          ". Check the parentheses and that every name is in `puzzle-builtin-names`."))
+          ((eq? reason 'solution-eval-failed)
+           (string-append "it did not finish inside the v1 limits"
+                          extra
+                          ". Fuel, allocations and depth are all capped; an unbounded loop or a huge intermediate list will hit one of them."))
+          (else
+           (string-append "the check failed with "
+                          (if (symbol? reason) (symbol->string reason) "an error")
+                          extra
+                          ".")))))
+
+    ;;; Everything `puzzle` reports about one height, as an alist.
+    ;;;
+    ;;; Separated from the printing so a test can assert on the values
+    ;;; rather than on a rendered block of text.
+    ;;;
+    ;;; ```scheme
+    ;;; (cdr (assq 'par (coin-puzzle-report parent-hash 1)))
+    ;;; ```
+    (define (coin-puzzle-report previous-hash height)
+      (: bytevector? integer? -> list?)
+      (let ((spec (coin-puzzle-for previous-hash height)))
+        (list (cons 'height height)
+              (cons 'parent (hex-encode (reverse-bytevector previous-hash)))
+              (cons 'seed (hex-encode (coin-puzzle-seed previous-hash height)))
+              (cons 'target (puzzle-print-value (puzzle-spec-target spec)))
+              (cons 'par (puzzle-spec-par spec))
+              (cons 'solution (puzzle-spec-solution spec))
+              (cons 'solution-length
+                    (string-length (puzzle-spec-solution spec)))
+              (cons 'reward (coin-block-reward height)))))
+
+    (define (report-ref report key)
+      (cdr (assq key report)))
+
+    ;;; Print a puzzle report in the CLI's `key: value` form.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-print-puzzle (coin-puzzle-report parent-hash 1))
+    ;;; ```
+    (define (coin-print-puzzle report)
+      (: list? -> any?)
+      (println "height: ~a" (report-ref report 'height))
+      (println "parent: ~a" (report-ref report 'parent))
+      (println "seed: ~a" (report-ref report 'seed))
+      (println "target: ~a" (report-ref report 'target))
+      (println "par: ~a" (report-ref report 'par))
+      (println "reward: ~a SGL"
+               (cli-daviwils->sgl (report-ref report 'reward)))
+      (println "max-solution-bytes: ~a" coin-max-solution-bytes)
+      (println "baseline-length: ~a" (report-ref report 'solution-length))
+      (println "baseline: ~a" (report-ref report 'solution))
+      report)
+
+    ;;; Show the puzzle for the next block, or for `--height`.
+    ;;;
+    ;;; A height other than the tip's successor is answered from the header
+    ;;; the node has at that height, so `--height` can be used to look back
+    ;;; at a puzzle someone already solved.
+    ;;;
+    ;;; ```scheme
+    ;;; (run-puzzle '("--regtest" "--height" "1"))
+    ;;; ```
+    (define (run-puzzle args)
+      (: list? -> any?)
+      (cli-with-node args
+        (lambda (n)
+          (let* ((tip (coin-validated-tip-height n))
+                 (height (cli-number args
+                                     "--height"
+                                     (number->string (+ tip 1)))))
+            (when (< height 1)
+              (error "--height: genesis has no puzzle to mine; the lowest minable height is 1."))
+            (when (> height (+ tip 1))
+              (error (string-append
+                       "--height: "
+                       (number->string height)
+                       " is beyond the tip. The next block is height "
+                       (number->string (+ tip 1))
+                       "; sync further before asking about later ones.")))
+            (let ((parent (if (= height (+ tip 1))
+                              (coin-validated-tip-header n)
+                              (coin-header-at-height n (- height 1)))))
+              (coin-print-puzzle
+                (coin-puzzle-report (block-header-hash parent) height)))))))
+
+    ;; ============================================================
+    ;; Filling the block from the mempool
+    ;; ============================================================
+    ;;
+    ;; The node's mempool policy is not the block's rules. It checks that a
+    ;; transaction's inputs exist, are mature, are not double-spent and are
+    ;; worth at least the outputs; it does NOT run the input scripts, and it
+    ;; judged all of that against the height when the transaction arrived.
+    ;; So a transaction sitting in the mempool is a CANDIDATE, and a block
+    ;; that includes one the connector then rejects is a block the node marks
+    ;; invalid — taking the miner's reward with it.
+    ;;
+    ;; Selection therefore re-checks every rule the connector applies to a
+    ;; transaction, at THIS height, against the validated UTXO set, and skips
+    ;; anything that does not pass rather than risking the block.
+
+    ;; Bit 31 of a sequence number turns the relative-timelock rules off.
+    (define %sequence-locktime-disable #x80000000)
+
+    ;; The active UTXO row backing an outpoint, or #f when the validated
+    ;; chain has no such unspent output. A mempool transaction spending
+    ;; another mempool transaction's output lands here as #f, which is what
+    ;; keeps unconfirmed chains out of the block.
+    ;; ponytail: no in-block chaining; index the block's own new outputs if
+    ;; chained spends ever need to confirm together.
+    (define (active-utxo-row n op)
+      (let ((rows (sqlite-query
+                    (node-db n)
+                    "SELECT value, script_pubkey, coinbase, height FROM utxos WHERE txid = ? AND output_index = ? AND active = 1"
+                    (hex-encode (outpoint-txid op))
+                    (outpoint-index op))))
+        (if (null? rows) #f (car rows))))
+
+    (define (utxo-row->txout row)
+      (txout value: (row-ref row "value")
+             script-pubkey: (hex-decode (row-ref row "script_pubkey"))))
+
+    ;; The connector's coinbase maturity rule, read at the height the block
+    ;; would occupy rather than the height the transaction arrived at.
+    (define (utxo-row-spendable-at? row height)
+      (or (not (= 1 (row-ref row "coinbase")))
+          (>= (- height (row-ref row "height")) coin-coinbase-maturity)))
+
+    ;; Whether an input opts into BIP68 relative timelocks, which SigilCoin
+    ;; activates at height 0 and which this selection does not evaluate.
+    (define (relative-timelock? tx input)
+      (and (>= (transaction-version tx) 2)
+           (= 0 (bitwise-and (txin-sequence input)
+                             %sequence-locktime-disable))))
+
+    ;; Every input's script, against the outputs it claims to spend. This is
+    ;; the check the mempool never made, and the one a forged signature would
+    ;; otherwise sail through into an invalid block.
+    (define (input-scripts-valid? tx prevouts)
+      (let loop ((xs prevouts) (index 0))
+        (cond ((null? xs) #t)
+              ((standard-input-script-valid? tx index (car xs) prevouts)
+               (loop (cdr xs) (+ index 1)))
+              (else #f))))
+
+    ;;; The fee `tx` pays in the block at `height`, or `#f` when that block
+    ;;; cannot include it.
+    ;;;
+    ;;; `spent` is the outpoints the block already spends, so a transaction
+    ;;; conflicting with one already selected is refused here rather than
+    ;;; making the whole block invalid. Duplicate inputs inside `tx` itself
+    ;;; are caught by the same list.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-block-transaction-fee n 102 tx '()) ; => 1000
+    ;;; ```
+    (define (coin-block-transaction-fee n height tx spent)
+      (: node? integer? transaction? list? -> any?)
+      (and (transaction? tx)
+           (not (coinbase-transaction? tx))
+           ;; A lock-time of zero is final at every height and time, so no
+           ;; absolute timelock can turn this transaction invalid between
+           ;; the mempool and the block.
+           ;; ponytail: skips timelocked transactions rather than evaluating
+           ;; the lock; evaluate it when something on this chain writes one.
+           (= 0 (transaction-lock-time tx))
+           (let loop ((inputs (transaction-inputs tx))
+                      (seen spent)
+                      (prevouts '())
+                      (input-value 0))
+             (if (null? inputs)
+                 (let ((ordered (reverse prevouts))
+                       (fee (- input-value (transaction-output-value tx))))
+                   (and (>= fee 0)
+                        (input-scripts-valid? tx ordered)
+                        fee))
+                 (let* ((input (car inputs))
+                        (op (txin-previous-output input))
+                        (row (and (not (wallet-outpoint-member? op seen))
+                                  (not (relative-timelock? tx input))
+                                  (active-utxo-row n op))))
+                   (and row
+                        (utxo-row-spendable-at? row height)
+                        (loop (cdr inputs)
+                              (cons op seen)
+                              (cons (utxo-row->txout row) prevouts)
+                              (+ input-value (row-ref row "value")))))))))
+
+    ;;; The mempool transactions the next block can carry, with their fees.
+    ;;;
+    ;;; Returns `(transactions . fees)`, ready for `coin-build-block`.
+    ;;;
+    ;;; `build` is called as `(build transactions fees)` and returns the
+    ;;; block those arguments produce. Handing selection the real builder is
+    ;;; what makes the size cap exact: the candidate block is serialized as
+    ;;; it would be mined, coinbase, solution, graffiti and transaction count
+    ;;; included, so nothing here has to model the encoding and then drift
+    ;;; from it.
+    ;;;
+    ;;; DETERMINISTIC. The candidates arrive in the node's own mempool order
+    ;;; and are taken greedily first-fit; a transaction that does not fit is
+    ;;; skipped and smaller later ones are still considered, so the result is
+    ;;; a function of the mempool and the UTXO set alone.
+    ;;;
+    ;;; ```scheme
+    ;;; (car (coin-select-block-transactions n 102 build)) ; => (tx ...)
+    ;;; ```
+    (define (coin-select-block-transactions n height build)
+      (: node? integer? procedure? -> pair?)
+      (let loop ((candidates (wallet-mempool-transactions n))
+                 (chosen '())
+                 (spent '())
+                 (fees 0))
+        (if (null? candidates)
+            (cons (reverse chosen) fees)
+            (let* ((tx (car candidates))
+                   (fee (coin-block-transaction-fee n height tx spent)))
+              (if (not fee)
+                  (loop (cdr candidates) chosen spent fees)
+                  ;; ponytail: re-serializes the whole candidate block per
+                  ;; transaction, so selection is O(n^2) in mempool size;
+                  ;; track the size incrementally if a mempool ever grows
+                  ;; enough for that to show up.
+                  (let ((size (coin-block-size
+                                (build (reverse (cons tx chosen))
+                                       (+ fees fee)))))
+                    (if (or (not size) (> size coin-max-block-bytes))
+                        (loop (cdr candidates) chosen spent fees)
+                        (loop (cdr candidates)
+                              (cons tx chosen)
+                              (append (map txin-previous-output
+                                           (transaction-inputs tx))
+                                      spent)
+                              (+ fees fee)))))))))
+
+    ;;; Mine one block on the tip and submit it to the local node.
+    ;;;
+    ;;; The solution is validated against the regenerated puzzle first, the
+    ;;; block is assembled by the node package's miner primitive, and it then
+    ;;; goes in through the same path a peer's block takes, so what is
+    ;;; reported is what the node actually accepted.
+    ;;;
+    ;;; ```scheme
+    ;;; (run-mine '("--regtest" "--graffiti" "hello from #systemcrafters"))
+    ;;; ```
+    (define (run-mine args)
+      (: list? -> any?)
+      ;; Resolve the chain before anything else, so a mistyped `--chain`
+      ;; cannot leave a freshly created wallet key behind in a directory
+      ;; the command then never opens.
+      (cli-chain args)
+      (let* ((data-dir (cli-data-dir args))
+             (address (cli-arg args "--address" #f))
+             (graffiti (cli-arg args "--graffiti" ""))
+             (solution (cli-arg args "--solution" #f))
+             (payout (if address
+                         (coin-address->script-pubkey "--address" address)
+                         (wallet-script-pubkey (wallet-key data-dir))))
+             (payout-address (or address
+                                 (coin-address
+                                   (wallet-public-key
+                                     (wallet-key data-dir))))))
+        (when (> (string-length graffiti) coin-max-graffiti-bytes)
+          (error (string-append
+                   "--graffiti: "
+                   (number->string (string-length graffiti))
+                   " bytes is over the "
+                   (number->string coin-max-graffiti-bytes)
+                   "-byte cap.")))
+        (cli-with-node args
+          (lambda (n)
+            (let* ((parent (coin-validated-tip-header n))
+                   (parent-hash (block-header-hash parent))
+                   (height (+ 1 (coin-validated-tip-height n)))
+                   (spec (coin-puzzle-for parent-hash height))
+                   (mined (or solution (puzzle-spec-solution spec))))
+              ;; Check before building: a miner needs to know which byte is
+              ;; wrong, not that a block was rejected.
+              (let ((checked (coin-check-solution spec mined)))
+                (when (coin-failed? checked)
+                  (error (string-append
+                           "mine: that solution does not solve height "
+                           (number->string height)
+                           " — "
+                           (coin-solution-advice
+                             (coin-result-reason checked)
+                             (coin-result-detail checked))))))
+              ;; `coin-mine-block` builds on the node's best HEADER, which
+              ;; is not always the validated tip on this chain, so the
+              ;; builder is called directly with the parent checked above.
+              (let* ((spacing (coin-chain-min-block-spacing (node-config n)))
+                     (time (require-spacing parent spacing))
+                     ;; The builder, partially applied: selection measures
+                     ;; candidate blocks with it, and the block that is
+                     ;; actually mined comes out of the same call.
+                     (build (lambda (txs fees)
+                              (coin-build-block parent height mined graffiti
+                                                payout time txs fees)))
+                     (selected (coin-select-block-transactions n
+                                                               height
+                                                               build))
+                     (txs (car selected))
+                     (fees (cdr selected))
+                     (b (build txs fees))
+                     (header (block-header-field b)))
+                (node-ingest-headers n (list header))
+                (node-store-block n b)
+                (let ((validated (node-validate-blocks n)))
+                  (when (= 0 validated)
+                    (error (string-append
+                             "mine: the node refused the block — "
+                             (node-status-snapshot-sync-last-error
+                               (node-status n))))))
+                (println "height: ~a" height)
+                (println "block: ~a" (block-header-id header))
+                (println "solution-length: ~a"
+                         (coin-block-solution-length b))
+                (println "par: ~a" (puzzle-spec-par spec))
+                (println "beats-par: ~a"
+                         (if (< (coin-block-solution-length b)
+                                (puzzle-spec-par spec))
+                             "yes"
+                             "no"))
+                (println "graffiti: ~a" graffiti)
+                (println "transactions: ~a" (length txs))
+                (println "reward: ~a SGL"
+                         (cli-daviwils->sgl (coin-block-reward height)))
+                (println "fees: ~a SGL" (cli-daviwils->sgl fees))
+                (println "claimed: ~a SGL"
+                         (cli-daviwils->sgl
+                           (+ (coin-block-reward height) fees)))
+                (println "size: ~a bytes" (coin-block-size b))
+                (println "payout: ~a" payout-address)
+                b))))))
+
+    ;; Two header rules bracket the timestamp: it must clear the parent's
+    ;; time by the chain's spacing floor, and it must not sit further ahead
+    ;; of the clock than the future-drift allowance. Between them the
+    ;; earliest legal stamp is the floor, so mine at the later of the floor
+    ;; and now, and refuse only when the floor is past the drift limit —
+    ;; which is the case a miner reads as "the next block is not due yet".
+    ;; Refusing here rather than at ingest is the difference between a
+    ;; sentence about the block schedule and one about header acceptance.
+    (define (require-spacing parent spacing)
+      (let ((earliest (coin-next-block-time parent spacing))
+            (now (exact (floor (current-second)))))
+        (when (> earliest (+ now coin-max-future-drift))
+          (error (string-append
+                   "mine: too early. This chain mines a block every "
+                   (number->string spacing)
+                   " seconds, so the next one cannot be timestamped before "
+                   (number->string earliest)
+                   " — "
+                   (number->string (- earliest now))
+                   " seconds away, further ahead than the "
+                   (number->string coin-max-future-drift)
+                   "-second future-drift limit allows.")))
+        (max earliest now)))))
