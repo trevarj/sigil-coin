@@ -1,0 +1,706 @@
+;;; (sigil coin explorer render) — HTML and JSON for chain data
+;;;
+;;; ## Everything from a block is hostile until it is escaped
+;;;
+;;; Graffiti is 400 bytes a miner chose, and a solution is 256 bytes a miner
+;;; chose. Both reach this module as raw `bytevector`s, and both are printed
+;;; on a page other people read. So there is exactly ONE way text from a
+;;; block becomes markup, and it is two stages that always run in order:
+;;;
+;;;   1. SANITIZE — `explorer-safe-text` decodes bytes as STRICT UTF-8. Any
+;;;      byte that is not part of a well-formed, shortest-form, non-surrogate
+;;;      sequence is replaced by U+FFFD and the decoder resyncs at the next
+;;;      byte. `utf8->string` is deliberately not used: it passes an invalid
+;;;      byte through as a lone code point, which is exactly the shape that
+;;;      later turns into a mismatched escape. Control code points (C0,
+;;;      DEL, C1) are replaced too, so a raw `0x00` or `0x1b` can neither
+;;;      truncate the page nor start a terminal escape in `curl` output.
+;;;   2. ESCAPE — `explorer-escape` replaces `&`, `<`, `>`, `"` and `'` with
+;;;      their entities. `&` goes first, so an entity this stage introduces
+;;;      is never re-escaped. Quoting both quote characters means the same
+;;;      procedure is correct in element text and inside an attribute value,
+;;;      which removes the "which escaper did I need here" mistake entirely.
+;;;
+;;; `explorer-text` is the two stages composed, and it is what every page
+;;; calls. Nothing here interpolates block data into a `<script>` or a
+;;; `style` attribute, so HTML escaping is sufficient: there is no
+;;; JavaScript context on any page and no client-side framework to feed.
+;;;
+;;; ```scheme
+;;; (explorer-text (string->utf8 "<script>alert(1)</script>"))
+;;; ; => "&lt;script&gt;alert(1)&lt;/script&gt;"
+;;; ```
+;;;
+;;; ## JSON
+;;;
+;;; The JSON endpoints serve `application/json`, are built from ordered
+;;; alists so key order is stable for anyone diffing responses, and carry
+;;; sanitized strings — `sigil-json` escapes quotes, backslashes and control
+;;; characters, and a client that renders a value into a page is responsible
+;;; for its own escaping, exactly as with any other API.
+
+(define-library (sigil coin explorer render)
+  (import (sigil math)
+          (sigil string)
+          (sigil time)
+          (sigil json)
+          (sigil bitcoin encoding)
+          (sigil coin consensus)
+          (sigil coin explorer store))
+  (export
+    ;; Escaping
+    explorer-replacement-char
+    explorer-safe-text
+    explorer-escape
+    explorer-text
+
+    ;; Formatting
+    explorer-sigil-amount
+    explorer-format-time
+    explorer-under-par-text
+
+    ;; Pages
+    explorer-page
+    explorer-summary-page
+    explorer-blocks-page
+    explorer-block-page
+    explorer-address-page
+    explorer-missing-page
+    explorer-no-database-page
+
+    ;; JSON
+    explorer-summary-json
+    explorer-blocks-json
+    explorer-block-json
+    explorer-address-json
+    explorer-error-json)
+
+  (begin
+
+    ;;; The code point every ill-formed byte and every control character is
+    ;;; replaced by: U+FFFD REPLACEMENT CHARACTER.
+    (define explorer-replacement-char #xfffd)
+
+    ;; ============================================================
+    ;; Stage 1: bytes to a safe string
+    ;; ============================================================
+
+    ;; A code point is safe to display when it is not a C0 control, not DEL,
+    ;; and not a C1 control. Tabs and newlines are excluded as well: block
+    ;; text is shown inside table cells and `<pre>`, where a stray newline
+    ;; is noise rather than layout the miner is entitled to.
+    (define (displayable? cp)
+      (and (>= cp #x20)
+           (not (= cp #x7f))
+           (not (and (>= cp #x80) (<= cp #x9f)))))
+
+    (define (continuation? b)
+      (and (>= b #x80) (<= b #xbf)))
+
+    ;; Decode the UTF-8 sequence starting at `i`. Returns (code-point . next).
+    ;; Rejects, by returning U+FFFD and a single-byte step:
+    ;;   * a continuation byte or #xc0/#xc1/#xf5+ in leading position
+    ;;   * a truncated sequence
+    ;;   * a non-continuation byte where one is required
+    ;;   * an overlong encoding, a UTF-16 surrogate, or a value above
+    ;;     U+10FFFF
+    (define (decode-at bytes n i)
+      (let ((b (bytevector-u8-ref bytes i)))
+        (cond
+          ((< b #x80) (cons b (+ i 1)))
+          ((and (>= b #xc2) (<= b #xdf))
+           (if (and (< (+ i 1) n)
+                    (continuation? (bytevector-u8-ref bytes (+ i 1))))
+               (cons (+ (* (- b #xc0) 64)
+                        (- (bytevector-u8-ref bytes (+ i 1)) #x80))
+                     (+ i 2))
+               (cons explorer-replacement-char (+ i 1))))
+          ((and (>= b #xe0) (<= b #xef))
+           (if (and (< (+ i 2) n)
+                    (continuation? (bytevector-u8-ref bytes (+ i 1)))
+                    (continuation? (bytevector-u8-ref bytes (+ i 2))))
+               (let ((cp (+ (* (- b #xe0) 4096)
+                            (* (- (bytevector-u8-ref bytes (+ i 1)) #x80) 64)
+                            (- (bytevector-u8-ref bytes (+ i 2)) #x80))))
+                 ;; Below U+0800 is overlong; U+D800..U+DFFF is a surrogate.
+                 (if (or (< cp #x800) (and (>= cp #xd800) (<= cp #xdfff)))
+                     (cons explorer-replacement-char (+ i 1))
+                     (cons cp (+ i 3))))
+               (cons explorer-replacement-char (+ i 1))))
+          ((and (>= b #xf0) (<= b #xf4))
+           (if (and (< (+ i 3) n)
+                    (continuation? (bytevector-u8-ref bytes (+ i 1)))
+                    (continuation? (bytevector-u8-ref bytes (+ i 2)))
+                    (continuation? (bytevector-u8-ref bytes (+ i 3))))
+               (let ((cp (+ (* (- b #xf0) 262144)
+                            (* (- (bytevector-u8-ref bytes (+ i 1)) #x80) 4096)
+                            (* (- (bytevector-u8-ref bytes (+ i 2)) #x80) 64)
+                            (- (bytevector-u8-ref bytes (+ i 3)) #x80))))
+                 (if (or (< cp #x10000) (> cp #x10ffff))
+                     (cons explorer-replacement-char (+ i 1))
+                     (cons cp (+ i 4))))
+               (cons explorer-replacement-char (+ i 1))))
+          (else (cons explorer-replacement-char (+ i 1))))))
+
+    ;;; Decode attacker-supplied bytes into a string that is safe to display.
+    ;;;
+    ;;; Strict UTF-8: every ill-formed byte and every control character
+    ;;; becomes U+FFFD. A string argument is passed through the same control
+    ;;; filter, so a canonically printed solution carrying a literal `0x01`
+    ;;; is cleaned as well.
+    ;;;
+    ;;; ```scheme
+    ;;; (explorer-safe-text #u8(104 105))          ; => "hi"
+    ;;; (explorer-safe-text #u8(104 #xff 105))     ; => "h\xFFFD;i"
+    ;;; ```
+    (define (explorer-safe-text value)
+      (: any? -> string?)
+      (cond
+        ((string? value)
+         (list->string
+           (map (lambda (c)
+                  (if (displayable? (char->integer c))
+                      c
+                      (integer->char explorer-replacement-char)))
+                (string->list value))))
+        ((bytevector? value)
+         (let ((n (bytevector-length value)))
+           (let loop ((i 0) (acc '()))
+             (if (>= i n)
+                 (list->string (reverse acc))
+                 (let* ((step (decode-at value n i))
+                        (cp (car step)))
+                   (loop (cdr step)
+                         (cons (integer->char
+                                 (if (displayable? cp)
+                                     cp
+                                     explorer-replacement-char))
+                               acc)))))))
+        (else "")))
+
+    ;; ============================================================
+    ;; Stage 2: a safe string to markup
+    ;; ============================================================
+
+    ;;; Escape a string for HTML, in element text and in attribute values
+    ;;; alike.
+    ;;;
+    ;;; `&` is replaced first, so the entities this introduces are not
+    ;;; escaped a second time.
+    ;;;
+    ;;; ```scheme
+    ;;; (explorer-escape "<a href='x'>&") ; => "&lt;a href=&#39;x&#39;&gt;&amp;"
+    ;;; ```
+    (define (explorer-escape text)
+      (: any? -> string?)
+      (if (not (string? text))
+          ""
+          (let ((n (string-length text)))
+            (let loop ((i 0) (acc '()))
+              (if (>= i n)
+                  (apply string-append (reverse acc))
+                  (let ((c (string-ref text i)))
+                    (loop (+ i 1)
+                          (cons (cond ((char=? c #\&) "&amp;")
+                                      ((char=? c #\<) "&lt;")
+                                      ((char=? c #\>) "&gt;")
+                                      ((char=? c #\") "&quot;")
+                                      ((char=? c #\') "&#39;")
+                                      (else (string c)))
+                                acc))))))))
+
+    ;;; Sanitize then escape: the only way block data becomes markup.
+    ;;;
+    ;;; ```scheme
+    ;;; (explorer-text (string->utf8 "<b>")) ; => "&lt;b&gt;"
+    ;;; ```
+    (define (explorer-text value)
+      (: any? -> string?)
+      (explorer-escape (explorer-safe-text value)))
+
+    ;; ============================================================
+    ;; Formatting
+    ;; ============================================================
+
+    ;;; Render daviwils as a decimal SGL amount with all eight places.
+    ;;;
+    ;;; ```scheme
+    ;;; (explorer-sigil-amount 10000000000) ; => "100.00000000"
+    ;;; ```
+    (define (explorer-sigil-amount daviwils)
+      (: any? -> string?)
+      (if (not (and (number? daviwils) (exact? daviwils)
+                    (integer? daviwils) (>= daviwils 0)))
+          "0.00000000"
+          (let* ((whole (quotient daviwils coin-daviwils-per-sigil))
+                 (part (number->string (remainder daviwils
+                                                  coin-daviwils-per-sigil)))
+                 (pad (make-string (- 8 (string-length part)) #\0)))
+            (string-append (number->string whole) "." pad part))))
+
+    ;;; Render a block timestamp as UTC.
+    ;;;
+    ;;; ```scheme
+    ;;; (explorer-format-time 1767225600) ; => "2026-01-01 00:00:00 UTC"
+    ;;; ```
+    (define (explorer-format-time seconds)
+      (: any? -> string?)
+      (if (not (number? seconds))
+          "unknown"
+          (guard (e (#t (number->string seconds)))
+            (string-append (format-datetime seconds #t) " UTC"))))
+
+    ;;; How a block's margin against par reads.
+    ;;;
+    ;;; ```scheme
+    ;;; (explorer-under-par-text 3)  ; => "3 under"
+    ;;; (explorer-under-par-text 0)  ; => "at par"
+    ;;; (explorer-under-par-text -2) ; => "2 over"
+    ;;; ```
+    (define (explorer-under-par-text delta)
+      (: any? -> string?)
+      (cond ((not (number? delta)) "unknown")
+            ((> delta 0) (string-append (number->string delta) " under"))
+            ((= delta 0) "at par")
+            (else (string-append (number->string (- delta)) " over"))))
+
+    ;; ============================================================
+    ;; HTML scaffolding
+    ;; ============================================================
+
+    (define %style
+      (string-append
+        "body{font-family:monospace;margin:2rem auto;max-width:60rem;"
+        "color:#1b1b1b;background:#fbfbf8}"
+        "h1,h2{font-weight:normal}"
+        "table{border-collapse:collapse;width:100%}"
+        "th,td{border-bottom:1px solid #ddd;padding:.35rem .5rem;"
+        "text-align:left;vertical-align:top}"
+        "th{background:#f0efe8}"
+        "pre{white-space:pre-wrap;word-break:break-all;background:#f0efe8;"
+        "padding:.5rem;margin:0}"
+        "nav a{margin-right:1rem}"
+        ".q{color:#444}"))
+
+    (define (join parts)
+      (apply string-append parts))
+
+    (define (rows cells)
+      (join (map (lambda (cell) (string-append "<td>" cell "</td>")) cells)))
+
+    (define (headings names)
+      (join (map (lambda (name) (string-append "<th>" name "</th>")) names)))
+
+    (define (field label value)
+      (string-append "<tr><th>" label "</th><td>" value "</td></tr>"))
+
+    ;;; Wrap a page body in the shared shell.
+    ;;;
+    ;;; `title` is escaped here, so callers pass plain text.
+    ;;;
+    ;;; ```scheme
+    ;;; (explorer-page "SigilCoin" "<p>hi</p>")
+    ;;; ```
+    (define (explorer-page title body)
+      (: string? string? -> string?)
+      (join (list
+              "<!DOCTYPE html>\n<html lang=\"en\"><head>"
+              "<meta charset=\"utf-8\">"
+              "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+              "<title>" (explorer-escape title) "</title>"
+              "<style>" %style "</style>"
+              "</head><body>"
+              "<nav><a href=\"/\">summary</a>"
+              "<a href=\"/blocks\">blocks</a>"
+              "<a href=\"/api/summary\">api</a></nav>"
+              body
+              "</body></html>\n")))
+
+    (define (block-link b)
+      (string-append "<a href=\"/block/"
+                     (explorer-escape (number->string
+                                        (explorer-block-height b)))
+                     "\">"
+                     (explorer-escape (number->string
+                                        (explorer-block-height b)))
+                     "</a>"))
+
+    (define (address-cell b)
+      (let ((address (explorer-block-payout-address b)))
+        (if (string? address)
+            (string-append "<a href=\"/address/" (explorer-escape address)
+                           "\">" (explorer-escape address) "</a>")
+            "<span class=\"q\">unrecognised script</span>")))
+
+    (define (optional-number value)
+      (if (number? value) (number->string value) "&mdash;"))
+
+    (define (graffiti-cell b)
+      (let ((graffiti (explorer-block-graffiti b)))
+        (if (and (bytevector? graffiti)
+                 (> (bytevector-length graffiti) 0))
+            (string-append "<span class=\"q\">" (explorer-text graffiti)
+                           "</span>")
+            "<span class=\"q\">&mdash;</span>")))
+
+    ;; The solution as consensus prints it, falling back to the raw bytes
+    ;; when the miner published something that does not parse. Both are
+    ;; sanitized and escaped; neither is trusted.
+    (define (solution-text b)
+      (let ((source (explorer-block-solution-source b))
+            (raw (explorer-block-solution b)))
+        (cond ((string? source) (explorer-text source))
+              ((bytevector? raw) (explorer-text raw))
+              (else "&mdash;"))))
+
+    (define (block-rows blocks)
+      (join (map (lambda (b)
+                   (string-append
+                     "<tr>"
+                     (rows (list
+                             (block-link b)
+                             (explorer-escape
+                               (explorer-format-time
+                                 (explorer-block-time b)))
+                             (address-cell b)
+                             (optional-number
+                               (explorer-block-solution-length b))
+                             (optional-number (explorer-block-par b))
+                             (explorer-escape
+                               (explorer-under-par-text
+                                 (explorer-block-under-par b)))
+                             (explorer-escape
+                               (explorer-sigil-amount
+                                 (explorer-block-reward b)))
+                             (graffiti-cell b)))
+                     "</tr>"))
+                 blocks)))
+
+    (define %block-headings
+      '("height" "time" "miner" "bytes" "par" "margin" "reward" "quote"))
+
+    (define (block-table blocks)
+      (if (null? blocks)
+          "<p>No blocks yet.</p>"
+          (string-append "<table><tr>" (headings %block-headings) "</tr>"
+                         (block-rows blocks) "</table>")))
+
+    ;; ============================================================
+    ;; Pages
+    ;; ============================================================
+
+    ;;; The summary page: where the chain is, what it has paid out, and the
+    ;;; puzzle the next block has to solve.
+    ;;;
+    ;;; ```scheme
+    ;;; (explorer-summary-page (explorer-chain-summary s) blocks)
+    ;;; ```
+    (define (explorer-summary-page summary blocks)
+      (: explorer-summary? list? -> string?)
+      (explorer-page
+        (string-append (explorer-summary-chain-name summary) " explorer")
+        (join (list
+                "<h1>" (explorer-escape
+                         (explorer-summary-chain-name summary)) "</h1>"
+                (if (explorer-summary-empty summary)
+                    "<p>This node has no chain data yet.</p>"
+                    "")
+                "<table>"
+                (field "tip height"
+                       (number->string
+                         (explorer-summary-tip-height summary)))
+                (field "tip block"
+                       (explorer-escape (explorer-summary-tip-id summary)))
+                (field "tip time"
+                       (explorer-escape
+                         (explorer-format-time
+                           (explorer-summary-tip-time summary))))
+                (field "headers"
+                       (string-append
+                         (number->string
+                           (explorer-summary-header-count summary))
+                         " (to height "
+                         (number->string
+                           (explorer-summary-header-height summary))
+                         ")"))
+                (field "validated blocks"
+                       (number->string
+                         (explorer-summary-block-count summary)))
+                (field "supply issued"
+                       (string-append
+                         (explorer-sigil-amount
+                           (explorer-summary-supply summary))
+                         " of "
+                         (explorer-sigil-amount
+                           (explorer-summary-max-supply summary))
+                         " SGL"))
+                (field "current reward"
+                       (string-append
+                         (explorer-sigil-amount
+                           (explorer-summary-next-reward summary))
+                         " SGL"))
+                (field "next halving"
+                       (let ((height (explorer-summary-next-halving-height
+                                       summary)))
+                         (if (number? height)
+                             (string-append "height " (number->string height))
+                             "never (reward has decayed to zero)")))
+                "</table>"
+                "<h2>Puzzle for height "
+                (number->string (explorer-summary-next-height summary))
+                "</h2>"
+                "<table>"
+                (field "par"
+                       (optional-number
+                         (explorer-summary-puzzle-par summary)))
+                (field "seed"
+                       (let ((seed (explorer-summary-puzzle-seed summary)))
+                         (if (string? seed) (explorer-escape seed) "&mdash;")))
+                "</table>"
+                "<pre>"
+                (let ((target (explorer-summary-puzzle-target summary)))
+                  (if (string? target) (explorer-text target) "&mdash;"))
+                "</pre>"
+                "<h2>Recent blocks</h2>"
+                (block-table blocks)))))
+
+    ;;; The block list page.
+    ;;;
+    ;;; ```scheme
+    ;;; (explorer-blocks-page summary blocks)
+    ;;; ```
+    (define (explorer-blocks-page summary blocks)
+      (: explorer-summary? list? -> string?)
+      (explorer-page
+        (string-append (explorer-summary-chain-name summary) " blocks")
+        (join (list "<h1>Blocks</h1>" (block-table blocks)))))
+
+    ;;; The block detail page.
+    ;;;
+    ;;; ```scheme
+    ;;; (explorer-block-page b)
+    ;;; ```
+    (define (explorer-block-page b)
+      (: explorer-block? -> string?)
+      (explorer-page
+        (string-append "Block " (number->string (explorer-block-height b)))
+        (join (list
+                "<h1>Block " (number->string (explorer-block-height b))
+                "</h1>"
+                "<table>"
+                (field "id" (explorer-escape (explorer-block-id b)))
+                (field "time"
+                       (explorer-escape
+                         (explorer-format-time (explorer-block-time b))))
+                (field "parent"
+                       (let ((parent (explorer-block-parent-id b))
+                             (height (explorer-block-height b)))
+                         (if (and (string? parent) (> height 0))
+                             (string-append "<a href=\"/block/"
+                                            (explorer-escape
+                                              (number->string (- height 1)))
+                                            "\">"
+                                            (explorer-escape parent)
+                                            "</a>")
+                             "<span class=\"q\">none (genesis)</span>")))
+                (field "miner" (address-cell b))
+                (field "reward"
+                       (string-append
+                         (explorer-sigil-amount (explorer-block-reward b))
+                         " SGL"))
+                (field "solution bytes"
+                       (optional-number (explorer-block-solution-length b)))
+                (field "par" (optional-number (explorer-block-par b)))
+                (field "margin"
+                       (explorer-escape
+                         (explorer-under-par-text
+                           (explorer-block-under-par b))))
+                (field "transactions"
+                       (optional-number
+                         (explorer-block-transaction-count b)))
+                (field "size"
+                       (let ((size (explorer-block-size b)))
+                         (if (number? size)
+                             (string-append (number->string size) " bytes")
+                             "&mdash;")))
+                (field "puzzle seed"
+                       (let ((seed (explorer-block-seed b)))
+                         (if (string? seed) (explorer-escape seed) "&mdash;")))
+                (let ((problem (explorer-block-problem b)))
+                  (if problem
+                      (field "problem"
+                             (explorer-escape (symbol->string problem)))
+                      ""))
+                "</table>"
+                "<h2>Solution</h2><pre>" (solution-text b) "</pre>"
+                "<h2>Target</h2><pre>"
+                (let ((target (explorer-block-target b)))
+                  (if (string? target) (explorer-text target) "&mdash;"))
+                "</pre>"
+                "<h2>Quote</h2><pre>"
+                (let ((graffiti (explorer-block-graffiti b)))
+                  (if (and (bytevector? graffiti)
+                           (> (bytevector-length graffiti) 0))
+                      (explorer-text graffiti)
+                      "&mdash;"))
+                "</pre>"))))
+
+    ;;; The address page: what it mined and what it currently holds.
+    ;;;
+    ;;; ```scheme
+    ;;; (explorer-address-page "sgl1..." 10000000000 blocks)
+    ;;; ```
+    (define (explorer-address-page address balance blocks)
+      (: string? integer? list? -> string?)
+      (explorer-page
+        (string-append "Address " address)
+        (join (list
+                "<h1>Address</h1>"
+                "<table>"
+                (field "address" (explorer-text address))
+                (field "balance"
+                       (string-append (explorer-sigil-amount balance)
+                                      " SGL"))
+                (field "blocks mined"
+                       (number->string (length blocks)))
+                "</table>"
+                "<h2>Blocks mined</h2>"
+                (block-table blocks)))))
+
+    ;;; The page for a path that names nothing.
+    ;;;
+    ;;; ```scheme
+    ;;; (explorer-missing-page "no such block")
+    ;;; ```
+    (define (explorer-missing-page reason)
+      (: string? -> string?)
+      (explorer-page "Not found"
+                     (string-append "<h1>Not found</h1><p>"
+                                    (explorer-text reason)
+                                    "</p>")))
+
+    ;;; The page shown when there is no node database to read.
+    ;;;
+    ;;; ```scheme
+    ;;; (explorer-no-database-page "/tmp/n/sigilcoin-main.sqlite")
+    ;;; ```
+    (define (explorer-no-database-page path)
+      (: string? -> string?)
+      (explorer-page "No chain data"
+                     (join (list
+                             "<h1>No chain data</h1>"
+                             "<p>No node database at <code>"
+                             (explorer-text path)
+                             "</code>. Start a node there, or point the"
+                             " explorer at the directory that has one.</p>"))))
+
+    ;; ============================================================
+    ;; JSON
+    ;; ============================================================
+
+    ;; JSON carries strings, so a code point the HTML side would escape is
+    ;; harmless here; the SANITIZE stage still runs, because an ill-formed
+    ;; byte would otherwise reach a client as broken UTF-8.
+    (define (json-text value)
+      (if (or (string? value) (bytevector? value))
+          (explorer-safe-text value)
+          'null))
+
+    (define (json-number value)
+      (if (number? value) value 'null))
+
+    (define (block-alist b)
+      (list
+        (cons "height" (explorer-block-height b))
+        (cons "id" (explorer-block-id b))
+        (cons "time" (explorer-block-time b))
+        (cons "parent_id" (or (explorer-block-parent-id b) 'null))
+        (cons "miner" (or (explorer-block-payout-address b) 'null))
+        (cons "reward" (explorer-block-reward b))
+        (cons "solution" (json-text (or (explorer-block-solution-source b)
+                                        (explorer-block-solution b))))
+        (cons "solution_bytes"
+              (json-number (explorer-block-solution-length b)))
+        (cons "par" (json-number (explorer-block-par b)))
+        (cons "under_par" (json-number (explorer-block-under-par b)))
+        (cons "target" (json-text (explorer-block-target b)))
+        (cons "seed" (json-text (explorer-block-seed b)))
+        (cons "graffiti" (json-text (explorer-block-graffiti b)))
+        (cons "transactions"
+              (json-number (explorer-block-transaction-count b)))
+        (cons "size" (json-number (explorer-block-size b)))
+        (cons "problem"
+              (let ((problem (explorer-block-problem b)))
+                (if problem (symbol->string problem) 'null)))))
+
+    (define (summary-alist summary)
+      (list
+        (cons "chain" (explorer-summary-chain-name summary))
+        (cons "tip_height" (explorer-summary-tip-height summary))
+        (cons "tip_id" (explorer-summary-tip-id summary))
+        (cons "tip_time" (explorer-summary-tip-time summary))
+        (cons "header_height" (explorer-summary-header-height summary))
+        (cons "header_count" (explorer-summary-header-count summary))
+        (cons "block_count" (explorer-summary-block-count summary))
+        (cons "supply" (explorer-summary-supply summary))
+        (cons "max_supply" (explorer-summary-max-supply summary))
+        (cons "next_height" (explorer-summary-next-height summary))
+        (cons "next_reward" (explorer-summary-next-reward summary))
+        (cons "next_halving_height"
+              (json-number (explorer-summary-next-halving-height summary)))
+        (cons "puzzle"
+              (list
+                (cons "par" (json-number (explorer-summary-puzzle-par summary)))
+                (cons "target" (json-text (explorer-summary-puzzle-target summary)))
+                (cons "seed" (json-text (explorer-summary-puzzle-seed summary)))))
+        (cons "empty" (explorer-summary-empty summary))))
+
+    ;;; The summary endpoint's body, with the recent blocks alongside it.
+    ;;;
+    ;;; ```scheme
+    ;;; (explorer-summary-json summary blocks)
+    ;;; ```
+    (define (explorer-summary-json summary blocks)
+      (: explorer-summary? list? -> string?)
+      (json-encode (append (summary-alist summary)
+                           (list (cons "blocks" (map block-alist blocks))))))
+
+    ;;; The block-list endpoint's body.
+    ;;;
+    ;;; ```scheme
+    ;;; (explorer-blocks-json blocks)
+    ;;; ```
+    (define (explorer-blocks-json blocks)
+      (: list? -> string?)
+      (json-encode (list (cons "blocks" (map block-alist blocks)))))
+
+    ;;; One block's endpoint body.
+    ;;;
+    ;;; ```scheme
+    ;;; (explorer-block-json b)
+    ;;; ```
+    (define (explorer-block-json b)
+      (: explorer-block? -> string?)
+      (json-encode (block-alist b)))
+
+    ;;; An address endpoint body.
+    ;;;
+    ;;; ```scheme
+    ;;; (explorer-address-json "sgl1..." 0 '())
+    ;;; ```
+    (define (explorer-address-json address balance blocks)
+      (: string? integer? list? -> string?)
+      (json-encode (list (cons "address" (explorer-safe-text address))
+                         (cons "balance" balance)
+                         (cons "blocks_mined" (length blocks))
+                         (cons "blocks" (map block-alist blocks)))))
+
+    ;;; An error body, for the endpoints that have no data to return.
+    ;;;
+    ;;; ```scheme
+    ;;; (explorer-error-json "not-found" "no such block")
+    ;;; ```
+    (define (explorer-error-json code detail)
+      (: string? string? -> string?)
+      (json-encode (list (cons "error" code)
+                         (cons "detail" (explorer-safe-text detail)))))))

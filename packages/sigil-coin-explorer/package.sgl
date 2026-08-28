@@ -7,9 +7,29 @@
   description: "Read-only web explorer for SigilCoin chain data"
   url: "https://github.com/trevarj/sigil-coin"
   license: "BSD-3-Clause"
+  entry: '(sigil coin explorer)
+  bundle-name: "sigilcoin-explorer"
 
   dependencies: (list
-    (from-workspace name: "sigil-coin-node"))
+    (from-workspace name: "sigil-coin-puzzle")
+    (from-workspace name: "sigil-coin-consensus")
+    (from-workspace name: "sigil-coin-node")
+    ;; The explorer reads the node's own tables; it never keeps a second
+    ;; copy of the chain.
+    (from-git url: "codeberg:sigil/sigil-sqlite" version: "^0.16.0")
+    (from-git url: "codeberg:sigil/sigil-json" version: "^0.16.0")
+    (from-git url: "github:trevarj/sigil-bitcoin"
+              package: "sigil-bitcoin-utils" version: "^0.1")
+    (from-git url: "github:trevarj/sigil-bitcoin"
+              package: "sigil-bitcoin-encoding" version: "^0.1")
+    (from-git url: "github:trevarj/sigil-bitcoin"
+              package: "sigil-bitcoin-script" version: "^0.1")
+    (from-git url: "github:trevarj/sigil-bitcoin"
+              package: "sigil-bitcoin-tx" version: "^0.1")
+    (from-git url: "github:trevarj/sigil-bitcoin"
+              package: "sigil-bitcoin-consensus" version: "^0.1")
+    (from-git url: "github:trevarj/sigil-bitcoin"
+              package: "sigil-bitcoin-node" version: "^0.1"))
 
   dev-dependencies: (list
     (from-git url: "codeberg:sigil/sigil"

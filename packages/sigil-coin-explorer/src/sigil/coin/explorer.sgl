@@ -1,14 +1,166 @@
-;;; (sigil coin explorer) — SigilCoin web explorer scaffold
+;;; (sigil coin explorer) — the read-only SigilCoin chain explorer
+;;;
+;;; Facade over the three modules the explorer is made of:
+;;;
+;;;   (sigil coin explorer store)   read-only reads from a node's database
+;;;   (sigil coin explorer render)  escaping, HTML pages, JSON bodies
+;;;   (sigil coin explorer server)  routing and the HTTP/1.1 front door
+;;;
+;;; SigilCoin is mined by writing the shortest program that solves the day's
+;;; puzzle, so the explorer's job is social rather than financial: who won
+;;; today, how many bytes did it take them, and what did they quote from
+;;; `#systemcrafters` while doing it.
+;;;
+;;; Two rules shape the whole package:
+;;;
+;;;   * IT NEVER WRITES. The database belongs to the node. See
+;;;     `(sigil coin explorer store)` for the two locks and what they do
+;;;     not cover.
+;;;   * IT NEVER TRUSTS A BLOCK. Graffiti and solutions are bytes a miner
+;;;     chose. See `(sigil coin explorer render)` for the sanitize-then-
+;;;     escape path every one of them takes.
+;;;
+;;; ```scheme
+;;; (import (sigil coin explorer) (sigil coin node))
+;;; (explorer-serve sigilcoin-regtest-chain "/tmp/sigilcoin" port: 8080)
+;;; ```
+;;;
+;;; ```sh
+;;; sigil-coin-explorer --regtest --data-dir /tmp/sigilcoin --port 8080
+;;; ```
 
 (define-library (sigil coin explorer)
-  (export explorer-package-version)
+  (import (sigil coin explorer store)
+          (sigil coin explorer render)
+          (sigil coin explorer server))
+  (export
+    ;; Package metadata
+    explorer-package-version
+
+    ;; Store: addresses
+    explorer-address-hrp
+    explorer-script->address
+    explorer-address->script
+
+    ;; Store: opening
+    explorer-db-path
+    explorer-open
+    explorer-close
+    explorer-store
+    explorer-store?
+    explorer-store-db
+    explorer-store-config
+
+    ;; Store: blocks
+    explorer-block
+    explorer-block?
+    explorer-block-height
+    explorer-block-id
+    explorer-block-hash-text
+    explorer-block-time
+    explorer-block-parent-id
+    explorer-block-solution
+    explorer-block-solution-source
+    explorer-block-solution-length
+    explorer-block-graffiti
+    explorer-block-par
+    explorer-block-target
+    explorer-block-seed
+    explorer-block-reward
+    explorer-block-payout-script
+    explorer-block-payout-address
+    explorer-block-transaction-count
+    explorer-block-size
+    explorer-block-problem
+    explorer-block-under-par
+
+    ;; Store: chain summary
+    explorer-summary
+    explorer-summary?
+    explorer-summary-chain-name
+    explorer-summary-tip-height
+    explorer-summary-tip-id
+    explorer-summary-tip-time
+    explorer-summary-header-height
+    explorer-summary-header-count
+    explorer-summary-block-count
+    explorer-summary-supply
+    explorer-summary-max-supply
+    explorer-summary-next-height
+    explorer-summary-next-reward
+    explorer-summary-next-halving-height
+    explorer-summary-puzzle-target
+    explorer-summary-puzzle-par
+    explorer-summary-puzzle-seed
+    explorer-summary-empty
+
+    ;; Store: queries
+    explorer-default-page-size
+    explorer-chain-summary
+    explorer-recent-blocks
+    explorer-block-by-height
+    explorer-block-by-id
+    explorer-address-blocks
+    explorer-address-balance
+    explorer-next-halving-height
+
+    ;; Render: escaping
+    explorer-replacement-char
+    explorer-safe-text
+    explorer-escape
+    explorer-text
+
+    ;; Render: formatting
+    explorer-sigil-amount
+    explorer-format-time
+    explorer-under-par-text
+
+    ;; Render: pages
+    explorer-page
+    explorer-summary-page
+    explorer-blocks-page
+    explorer-block-page
+    explorer-address-page
+    explorer-missing-page
+    explorer-no-database-page
+
+    ;; Render: JSON
+    explorer-summary-json
+    explorer-blocks-json
+    explorer-block-json
+    explorer-address-json
+    explorer-error-json
+
+    ;; Server
+    explorer-request-path
+    explorer-path-segments
+    explorer-route
+    explorer-handle
+    explorer-respond
+    explorer-response-status
+    explorer-response-content-type
+    explorer-response-body
+    explorer-http-response
+    explorer-serve-connection
+    explorer-serve
+    explorer-main
+    main)
+
   (begin
 
-    ;;; Version of the explorer package, used as a scaffold placeholder until
-    ;;; the read-only web explorer lands.
+    ;;; Version of the explorer package.
     ;;;
     ;;; Example:
     ;;;   (explorer-package-version) ;=> "0.1.0"
     (define (explorer-package-version)
       (: -> string?)
-      "0.1.0")))
+      "0.1.0")
+
+    ;;; The binary's entry point.
+    ;;;
+    ;;; ```sh
+    ;;; sigil-coin-explorer --regtest --data-dir /tmp/sigilcoin
+    ;;; ```
+    (define (main)
+      (: -> void?)
+      (explorer-main))))

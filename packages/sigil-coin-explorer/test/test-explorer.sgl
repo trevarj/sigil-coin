@@ -1,8 +1,940 @@
+;;; The read-only SigilCoin explorer, driven against a real chain.
+;;;
+;;; Nothing here is mocked. A regtest node is opened on a real SQLite
+;;; database in a temp directory, blocks are mined into it with the node
+;;; package's own miner, and every assertion is about what the explorer read
+;;; back out and what it rendered.
+;;;
+;;; Two of those blocks are hostile on purpose:
+;;;
+;;;   * one carries graffiti containing `<script>alert(1)</script>`, a raw
+;;;     NUL, an ESC and an ill-formed UTF-8 byte
+;;;   * one carries a solution that is still a VALID solution — it
+;;;     evaluates to the puzzle's target, so the node accepts the block —
+;;;     but smuggles `<script>` in through a dead string literal
+;;;
+;;; Both are mined, validated and stored by the real node before the
+;;; explorer ever sees them, which is the only way to prove the escaping
+;;; sits on the path attacker bytes actually take.
+
 (import (sigil test)
+        (sigil fs)
+        (sigil io)
+        (sigil math)
+        (sigil array)
+        (sigil string)
+        (sigil socket)
+        (sigil sqlite)
+        (sigil json)
+        (sigil bitcoin utils)
+        (sigil bitcoin encoding)
+        (sigil bitcoin script)
+        (sigil bitcoin tx)
+        (sigil bitcoin consensus)
+        (sigil bitcoin node)
+        (sigil coin puzzle)
+        (sigil coin puzzle generator)
+        (sigil coin consensus)
+        (sigil coin node)
         (sigil coin explorer))
 
-(test-group "sigil-coin-explorer scaffold"
-  (test "reports the package version"
-    (assert-equal "0.1.0" (explorer-package-version))))
+;; ============================================================
+;; Helpers
+;; ============================================================
+
+(define (fresh-dir)
+  (let ((dir (make-temp-directory)))
+    (unless dir (error "fresh-dir: could not create a temp directory"))
+    dir))
+
+;; Two literal `sgl1` addresses, so no key material is needed. Their
+;; checksums are asserted below rather than assumed.
+(define %miner-a "sgl1q70nakelv6wvuk2e63ah8lg68kq3nx7q2g3taul")
+(define %miner-b "sgl1qw508d6qejxtdg4y5r3zarvary0c5xw7kr43pwr")
+
+(define %script-a (explorer-address->script %miner-a))
+(define %script-b (explorer-address->script %miner-b))
+
+;; `<script>alert(1)</script>`, then a NUL, an ESC, an ill-formed lead byte
+;; and a lone continuation byte. Everything after the ASCII is what a naive
+;; `utf8->string` would let through unchanged.
+(define %hostile-graffiti
+  (bytevector-append
+    (string->utf8 "<script>alert(1)</script> & \"quoted\" 'single'")
+    #u8(#x00 #x1b #xff #x80)))
+
+;; Mine one block onto `n` and store it the way the node does.
+(define (mine n solution graffiti script)
+  (let ((b (coin-mine-block n solution graffiti script)))
+    (node-ingest-headers n (list (block-header-field b)))
+    (node-store-block n b)
+    (unless (= 1 (node-validate-blocks n))
+      (error (string-append "mine: block did not validate: "
+                            (node-status-snapshot-sync-last-error
+                              (node-status n)))))
+    b))
+
+;; A solution that is legal for the puzzle at `height` and contains hostile
+;; text: `(if #f "<script>..." <generator solution>)` evaluates to exactly
+;; the generator's own answer, so the node accepts it, while the source a
+;; page prints carries markup.
+(define (hostile-solution parent-hash height)
+  (let ((baseline (utf8->string (coin-generator-solution parent-hash height))))
+    (string-append "(if #f \"<script>x</script>\" " baseline ")")))
+
+;; The chain every read-side group works against: five blocks, alternating
+;; payout addresses, with the hostile pair at heights 4 and 5.
+(define %dir (fresh-dir))
+
+(define %chain-blocks
+  (let ((n (node-open sigilcoin-regtest-chain %dir)))
+    (let* ((b1 (mine n #f "block one" %script-a))
+           (b2 (mine n #f "hello from #systemcrafters" %script-b))
+           (b3 (mine n #f "third" %script-a))
+           (b4 (mine n #f %hostile-graffiti %script-a))
+           (parent (block-header-hash (block-header-field b4)))
+           (b5 (mine n (hostile-solution parent 5) "fifth" %script-b)))
+      (node-close n)
+      (list b1 b2 b3 b4 b5))))
+
+(define (open-store) (explorer-open sigilcoin-regtest-chain %dir))
+
+(define (with-store proc)
+  (let* ((store (open-store))
+         (value (proc store)))
+    (explorer-close store)
+    value))
+
+(define (body-of path)
+  (explorer-response-body
+    (explorer-respond sigilcoin-regtest-chain %dir path)))
+
+(define (status-of path)
+  (explorer-response-status
+    (explorer-respond sigilcoin-regtest-chain %dir path)))
+
+(define (json-of path)
+  (json-decode (body-of path)))
+
+;; `json-decode` keys objects by keyword and decodes arrays into Sigil
+;; arrays, so these two adapters keep the assertions in plain Scheme.
+(define (dict-get value key)
+  (dict-ref value (string->keyword key)))
+
+(define (json-list value)
+  (if (list? value) value (array->list value)))
+
+(define (has? haystack needle)
+  (string-contains? haystack needle))
+
+;; Every route the explorer serves, for the sweeps that must hold across
+;; all of them.
+(define %all-paths
+  (list "/" "/blocks" "/block/0" "/block/3" "/block/nope"
+        "/address/sgl1q70nakelv6wvuk2e63ah8lg68kq3nx7q2g3taul"
+        "/address/notanaddress"
+        "/api/summary" "/api/blocks" "/api/block/2" "/api/block/nope"
+        "/api/address/sgl1q70nakelv6wvuk2e63ah8lg68kq3nx7q2g3taul"
+        "/nothing/here"))
+
+;; ============================================================
+;; Fixtures
+;; ============================================================
+
+(test-group "explorer test chain"
+  (test "the literal payout addresses decode"
+    (assert-true (bytevector? %script-a))
+    (assert-true (bytevector? %script-b))
+    (assert-true (not (equal? %script-a %script-b))))
+
+  (test "five blocks were mined and validated"
+    (assert-equal 5 (length %chain-blocks)))
+
+  (test "the hostile graffiti really reached the chain"
+    (let* ((b4 (list-ref %chain-blocks 3))
+           (payload (coin-block-coinbase-payload b4)))
+      (assert-true (coin-ok? payload))
+      (assert-equal %hostile-graffiti
+                    (coin-coinbase-payload-graffiti
+                      (coin-result-value payload)))))
+
+  (test "the hostile solution is a solution the node accepted"
+    (let* ((b5 (list-ref %chain-blocks 4))
+           (payload (coin-block-coinbase-payload b5)))
+      (assert-true (coin-ok? payload))
+      (assert-true
+        (has? (utf8->string (coin-coinbase-payload-solution
+                              (coin-result-value payload)))
+              "<script>")))))
+
+;; ============================================================
+;; Read-only
+;; ============================================================
+
+(test-group "the explorer cannot write"
+  (test "a missing database is not created"
+    (let ((dir (fresh-dir)))
+      (assert-equal #f (explorer-open sigilcoin-regtest-chain dir))
+      (assert-true (not (file-exists?
+                          (explorer-db-path sigilcoin-regtest-chain dir))))))
+
+  (test "the explorer's own path matches the node's"
+    (let* ((dir (fresh-dir))
+           (n (node-open sigilcoin-regtest-chain dir))
+           (path (node-db-path n)))
+      (node-close n)
+      (assert-equal path (explorer-db-path sigilcoin-regtest-chain dir))))
+
+  (test "every write through an explorer handle is refused"
+    (with-store
+      (lambda (store)
+        (let ((db (explorer-store-db store)))
+          ;; sigil-sqlite reports a refused write as #f, not a raise.
+          (assert-equal #f
+                        (sqlite-run db
+                                    "INSERT INTO metadata(key, value) VALUES (?, ?)"
+                                    "explorer" "was here"))
+          (assert-equal "attempt to write a readonly database"
+                        (sqlite-errmsg db))
+          (assert-equal #f (sqlite-exec db "DELETE FROM headers"))
+          (assert-equal #f
+                        (sqlite-exec db "CREATE TABLE t (a INTEGER)"))
+          (assert-equal #f (sqlite-exec db "DROP TABLE headers"))))))
+
+  (test "query_only is on for every handle"
+    (with-store
+      (lambda (store)
+        (let ((rows (sqlite-query (explorer-store-db store)
+                                  "PRAGMA query_only")))
+          (assert-equal 1 (cdr (car (car rows))))))))
+
+  (test "serving every route leaves the database byte for byte identical"
+    (let* ((path (explorer-db-path sigilcoin-regtest-chain %dir))
+           (before (read-file-bytes path)))
+      (for-each (lambda (route) (body-of route)) %all-paths)
+      (assert-equal before (read-file-bytes path))))
+
+  (test "the node still sees the same tip after the explorer ran"
+    (let* ((n (node-open sigilcoin-regtest-chain %dir))
+           (height (node-status-snapshot-best-block-height (node-status n))))
+      (node-close n)
+      (assert-equal 5 height))))
+
+;; ============================================================
+;; Summary
+;; ============================================================
+
+(test-group "chain summary"
+  (test "the numbers match the chain"
+    (with-store
+      (lambda (store)
+        (let ((s (explorer-chain-summary store)))
+          (assert-equal "sigilcoin-regtest" (explorer-summary-chain-name s))
+          (assert-equal 5 (explorer-summary-tip-height s))
+          (assert-equal (block-header-id
+                          (block-header-field (list-ref %chain-blocks 4)))
+                        (explorer-summary-tip-id s))
+          ;; Six headers: genesis plus five mined blocks. Five validated
+          ;; BODIES: a node stores the genesis header and no genesis body.
+          (assert-equal 6 (explorer-summary-header-count s))
+          (assert-equal 5 (explorer-summary-header-height s))
+          (assert-equal 5 (explorer-summary-block-count s))
+          (assert-equal #f (explorer-summary-empty s))))))
+
+  (test "supply is the emission schedule at the tip"
+    (with-store
+      (lambda (store)
+        (let ((s (explorer-chain-summary store)))
+          (assert-equal (coin-cumulative-supply 5)
+                        (explorer-summary-supply s))
+          (assert-equal coin-max-supply (explorer-summary-max-supply s))
+          (assert-equal 6 (explorer-summary-next-height s))
+          (assert-equal (coin-block-reward 6)
+                        (explorer-summary-next-reward s))))))
+
+  (test "supply is the sum of the rewards actually paid"
+    (with-store
+      (lambda (store)
+        (let ((paid (let loop ((blocks (explorer-recent-blocks store 100))
+                               (total 0))
+                      (if (null? blocks)
+                          total
+                          (loop (cdr blocks)
+                                (+ total (explorer-block-reward
+                                           (car blocks))))))))
+          (assert-equal paid (explorer-summary-supply
+                               (explorer-chain-summary store)))))))
+
+  (test "the next halving is the first height of the next epoch"
+    (assert-equal 731 (explorer-next-halving-height 0))
+    (assert-equal 731 (explorer-next-halving-height 1))
+    (assert-equal 731 (explorer-next-halving-height 730))
+    (assert-equal 1461 (explorer-next-halving-height 731))
+    (assert-equal #f (explorer-next-halving-height coin-final-reward-height))
+    (with-store
+      (lambda (store)
+        (assert-equal 731 (explorer-summary-next-halving-height
+                            (explorer-chain-summary store))))))
+
+  (test "the published puzzle is the one the next block must solve"
+    (with-store
+      (lambda (store)
+        (let* ((s (explorer-chain-summary store))
+               (tip (block-header-hash
+                      (block-header-field (list-ref %chain-blocks 4))))
+               (spec (coin-puzzle-for tip 6)))
+          (assert-equal (puzzle-spec-par spec)
+                        (explorer-summary-puzzle-par s))
+          (assert-equal (puzzle-print-value (puzzle-spec-target spec))
+                        (explorer-summary-puzzle-target s))
+          (assert-equal (hex-encode (coin-puzzle-seed tip 6))
+                        (explorer-summary-puzzle-seed s)))))))
+
+;; ============================================================
+;; Blocks
+;; ============================================================
+
+(test-group "block list"
+  (test "the walk is newest first, down the parent links"
+    (with-store
+      (lambda (store)
+        (assert-equal '(5 4 3 2 1)
+                      (map explorer-block-height
+                           (explorer-recent-blocks store 5))))))
+
+  (test "the page size is honoured"
+    (with-store
+      (lambda (store)
+        (assert-equal '(5 4) (map explorer-block-height
+                                  (explorer-recent-blocks store 2)))
+        (assert-equal '() (explorer-recent-blocks store 0)))))
+
+  (test "the walk reaches genesis and stops"
+    (with-store
+      (lambda (store)
+        (assert-equal '(5 4 3 2 1 0)
+                      (map explorer-block-height
+                           (explorer-recent-blocks store 50))))))
+
+  (test "each row carries the miner, the length, par and the margin"
+    (with-store
+      (lambda (store)
+        (let* ((b (explorer-block-by-height store 3))
+               (spec (coin-puzzle-for
+                       (block-header-hash
+                         (block-header-field (list-ref %chain-blocks 1)))
+                       3)))
+          (assert-equal %miner-a (explorer-block-payout-address b))
+          (assert-equal %script-a (explorer-block-payout-script b))
+          (assert-equal (coin-block-reward 3) (explorer-block-reward b))
+          (assert-equal (puzzle-spec-par spec) (explorer-block-par b))
+          (assert-equal (string-length (puzzle-spec-solution spec))
+                        (explorer-block-solution-length b))
+          (assert-equal (- (explorer-block-par b)
+                           (explorer-block-solution-length b))
+                        (explorer-block-under-par b))))))
+
+  (test "a longer-than-par solution reads as over par"
+    (with-store
+      (lambda (store)
+        (let ((b (explorer-block-by-height store 5)))
+          (assert-true (< (explorer-block-under-par b) 0))
+          (assert-true (has? (explorer-under-par-text
+                               (explorer-block-under-par b))
+                             "over"))))))
+
+  (test "genesis has no puzzle and no margin"
+    (with-store
+      (lambda (store)
+        (let ((b (explorer-block-by-height store 0)))
+          (assert-equal 0 (explorer-block-height b))
+          (assert-equal #f (explorer-block-par b))
+          (assert-equal #f (explorer-block-target b))
+          (assert-equal #f (explorer-block-under-par b))
+          (assert-equal 0 (explorer-block-reward b))
+          ;; Genesis is body-less forever, and says so in those words.
+          (assert-equal 'genesis (explorer-block-problem b))))))
+
+  (test "a block is findable by height and by display id"
+    (with-store
+      (lambda (store)
+        (let* ((header (block-header-field (list-ref %chain-blocks 2)))
+               (id (block-header-id header))
+               (by-height (explorer-block-by-height store 3))
+               (by-id (explorer-block-by-id store id)))
+          (assert-equal id (explorer-block-id by-height))
+          (assert-equal 3 (explorer-block-height by-id))))))
+
+  (test "a name that matches nothing is #f, not a raise"
+    (with-store
+      (lambda (store)
+        (assert-equal #f (explorer-block-by-height store 99))
+        (assert-equal #f (explorer-block-by-height store -1))
+        (assert-equal #f (explorer-block-by-height store "three"))
+        (assert-equal #f (explorer-block-by-id store "nope"))
+        (assert-equal #f (explorer-block-by-id store (make-string 64 #\z))))))
+
+  (test "the detail fields match the block on the chain"
+    (with-store
+      (lambda (store)
+        (let* ((raw (list-ref %chain-blocks 1))
+               (b (explorer-block-by-height store 2)))
+          (assert-equal (length (block-transactions raw))
+                        (explorer-block-transaction-count b))
+          (assert-equal (coin-block-size raw) (explorer-block-size b))
+          (assert-equal (block-header-id
+                          (block-header-field (list-ref %chain-blocks 0)))
+                        (explorer-block-parent-id b))
+          (assert-equal #f (explorer-block-problem b))))))
+
+  (test "the solution is shown as consensus prints it"
+    (with-store
+      (lambda (store)
+        (let* ((b (explorer-block-by-height store 3))
+               (parsed (puzzle-parse (explorer-block-solution b))))
+          (assert-true (puzzle-ok? parsed))
+          (assert-equal (puzzle-print-expression (puzzle-result-value parsed))
+                        (explorer-block-solution-source b)))))))
+
+;; ============================================================
+;; Addresses
+;; ============================================================
+
+(test-group "address view"
+  (test "an address maps to its script and back"
+    (assert-equal %miner-a (explorer-script->address %script-a))
+    (assert-equal #f (explorer-address->script "not-an-address"))
+    (assert-equal #f (explorer-address->script
+                       "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"))
+    (assert-equal #f (explorer-address->script 42))
+    (assert-equal #f (explorer-script->address #u8(#x6a))))
+
+  (test "blocks mined by an address are the ones it was paid"
+    (with-store
+      (lambda (store)
+        (assert-equal '(4 3 1)
+                      (map explorer-block-height
+                           (explorer-address-blocks store %script-a 10)))
+        (assert-equal '(5 2)
+                      (map explorer-block-height
+                           (explorer-address-blocks store %script-b 10))))))
+
+  (test "the block limit is honoured"
+    (with-store
+      (lambda (store)
+        (assert-equal '(4 3)
+                      (map explorer-block-height
+                           (explorer-address-blocks store %script-a 2))))))
+
+  (test "the balance sums the address's unspent coinbase outputs"
+    (with-store
+      (lambda (store)
+        (assert-equal (+ (coin-block-reward 1)
+                         (coin-block-reward 3)
+                         (coin-block-reward 4))
+                      (explorer-address-balance store %script-a))
+        (assert-equal (+ (coin-block-reward 2) (coin-block-reward 5))
+                      (explorer-address-balance store %script-b)))))
+
+  (test "an address with no coins has a zero balance and no blocks"
+    (with-store
+      (lambda (store)
+        (let ((stranger (script-p2wpkh (make-bytevector 20 7))))
+          (assert-equal 0 (explorer-address-balance store stranger))
+          (assert-equal '() (explorer-address-blocks store stranger 10))
+          (assert-equal 0 (explorer-address-balance store "not a script")))))))
+
+;; ============================================================
+;; Escaping
+;; ============================================================
+
+(test-group "sanitizing attacker bytes"
+  (test "well-formed UTF-8 survives"
+    (assert-equal "hi" (explorer-safe-text #u8(104 105)))
+    (assert-equal "héllo" (explorer-safe-text (string->utf8 "héllo")))
+    (assert-equal "→" (explorer-safe-text (string->utf8 "→")))
+    (assert-equal "𝄞" (explorer-safe-text (string->utf8 "𝄞"))))
+
+  (test "ill-formed bytes become the replacement character"
+    (let ((replacement (string (integer->char explorer-replacement-char))))
+      ;; A lone continuation byte, an invalid lead byte, a truncated
+      ;; sequence, an overlong encoding and a surrogate.
+      (assert-equal replacement (explorer-safe-text #u8(#x80)))
+      (assert-equal replacement (explorer-safe-text #u8(#xff)))
+      (assert-equal replacement (explorer-safe-text #u8(#xc2)))
+      (assert-equal (string-append replacement replacement)
+                    (explorer-safe-text #u8(#xc0 #xaf)))
+      (assert-equal (string-append replacement replacement replacement)
+                    (explorer-safe-text #u8(#xed #xa0 #x80)))
+      (assert-equal (string-append "a" replacement "b")
+                    (explorer-safe-text #u8(97 #xff 98)))))
+
+  (test "control characters never survive"
+    (let ((replacement (string (integer->char explorer-replacement-char))))
+      (assert-equal replacement (explorer-safe-text #u8(#x00)))
+      (assert-equal replacement (explorer-safe-text #u8(#x1b)))
+      (assert-equal replacement (explorer-safe-text #u8(#x0a)))
+      (assert-equal replacement (explorer-safe-text #u8(#x7f)))
+      ;; U+009B, a C1 control, reachable only as a two-byte sequence.
+      (assert-equal replacement (explorer-safe-text #u8(#xc2 #x9b)))
+      ;; The same filter applies to a string argument.
+      (assert-equal (string-append "a" replacement)
+                    (explorer-safe-text (string #\a (integer->char 1))))))
+
+  (test "markup characters become entities"
+    (assert-equal "&lt;script&gt;" (explorer-escape "<script>"))
+    (assert-equal "&amp;lt;" (explorer-escape "&lt;"))
+    (assert-equal "&quot;x&quot;" (explorer-escape "\"x\""))
+    (assert-equal "&#39;x&#39;" (explorer-escape "'x'"))
+    (assert-equal "" (explorer-escape 42)))
+
+  (test "the composed path neutralises a hostile string"
+    (assert-equal "&lt;script&gt;alert(1)&lt;/script&gt;"
+                  (explorer-text (string->utf8 "<script>alert(1)</script>")))
+    (assert-equal "&lt;img src=x onerror=&quot;y&quot;&gt;"
+                  (explorer-text (string->utf8 "<img src=x onerror=\"y\">")))))
+
+(test-group "hostile blocks render inert"
+  (test "the hostile graffiti is escaped on the block page"
+    (let ((page (body-of "/block/4")))
+      (assert-true (has? page "&lt;script&gt;alert(1)&lt;/script&gt;"))
+      (assert-true (not (has? page "<script>")))
+      (assert-true (not (has? page "</script>")))
+      (assert-true (has? page "&quot;quoted&quot;"))
+      (assert-true (has? page "&#39;single&#39;"))))
+
+  (test "the hostile graffiti's raw bytes never reach the page"
+    (let ((bytes (string->utf8 (body-of "/block/4"))))
+      (let loop ((i 0))
+        (when (< i (bytevector-length bytes))
+          (let ((b (bytevector-u8-ref bytes i)))
+            (assert-true (or (>= b #x20) (= b #x0a)))
+            (loop (+ i 1)))))
+      (assert-true #t)))
+
+  (test "the hostile graffiti is escaped in the block list too"
+    (let ((page (body-of "/")))
+      (assert-true (has? page "&lt;script&gt;alert(1)&lt;/script&gt;"))
+      (assert-true (not (has? page "<script>")))))
+
+  (test "the hostile solution is escaped on its block page"
+    (let ((page (body-of "/block/5")))
+      (assert-true (has? page "&lt;script&gt;x&lt;/script&gt;"))
+      (assert-true (not (has? page "<script>")))))
+
+  (test "a hostile path is escaped on the 404 page"
+    (let ((page (body-of "/address/<script>alert(1)</script>")))
+      (assert-equal 404 (status-of "/address/<script>alert(1)</script>"))
+      (assert-true (not (has? page "<script>")))))
+
+  (test "no HTML page anywhere contains an unescaped script tag"
+    ;; Scoped to HTML on purpose. The JSON endpoints serve
+    ;; `application/json` and MUST return the graffiti's own characters;
+    ;; HTML-escaping an API payload would corrupt it for every client.
+    (for-each
+      (lambda (route)
+        (let ((response (explorer-respond sigilcoin-regtest-chain %dir route)))
+          (when (has? (explorer-response-content-type response) "text/html")
+            (assert-true (not (has? (explorer-response-body response)
+                                    "<script"))))))
+      %all-paths)
+    (assert-true #t))
+
+  (test "the JSON endpoints keep the bytes and change the media type"
+    (let ((response (explorer-respond sigilcoin-regtest-chain %dir
+                                      "/api/blocks")))
+      (assert-true (has? (explorer-response-content-type response)
+                         "application/json"))
+      (assert-true (has? (explorer-response-body response)
+                         "<script>alert(1)</script>")))))
+
+;; ============================================================
+;; Pages
+;; ============================================================
+
+(test-group "rendered pages"
+  (test "the summary page shows the chain's real numbers"
+    (let ((page (body-of "/")))
+      (assert-equal 200 (status-of "/"))
+      (assert-true (has? page "sigilcoin-regtest"))
+      (assert-true (has? page (block-header-id
+                                (block-header-field
+                                  (list-ref %chain-blocks 4)))))
+      (assert-true (has? page (explorer-sigil-amount
+                                (coin-cumulative-supply 5))))
+      (assert-true (has? page (explorer-sigil-amount coin-max-supply)))
+      (assert-true (has? page "Puzzle for height 6"))
+      (assert-true (has? page "height 731"))
+      (assert-true (has? page %miner-a))
+      (assert-true (has? page "hello from #systemcrafters"))))
+
+  (test "the block list page lists every recent block"
+    (let ((page (body-of "/blocks")))
+      (assert-equal 200 (status-of "/blocks"))
+      (for-each (lambda (height)
+                  (assert-true (has? page (string-append "/block/"
+                                                         (number->string
+                                                           height)))))
+                '(0 1 2 3 4 5))))
+
+  (test "the block detail page shows the solution, target and parent"
+    (with-store
+      (lambda (store)
+        (let* ((b (explorer-block-by-height store 3))
+               (page (body-of "/block/3")))
+          (assert-equal 200 (status-of "/block/3"))
+          (assert-true (has? page (explorer-escape
+                                    (explorer-block-solution-source b))))
+          (assert-true (has? page (explorer-escape
+                                    (explorer-block-target b))))
+          (assert-true (has? page (explorer-block-seed b)))
+          (assert-true (has? page (explorer-block-parent-id b)))
+          (assert-true (has? page "/block/2"))
+          (assert-true (has? page (number->string
+                                    (explorer-block-size b))))))))
+
+  (test "genesis says it has no parent"
+    (let ((page (body-of "/block/0")))
+      (assert-equal 200 (status-of "/block/0"))
+      (assert-true (has? page "none (genesis)"))))
+
+  (test "a block found by display id renders too"
+    (let ((id (block-header-id (block-header-field
+                                 (list-ref %chain-blocks 2)))))
+      (assert-equal 200 (status-of (string-append "/block/" id)))
+      (assert-true (has? (body-of (string-append "/block/" id))
+                         "Block 3"))))
+
+  (test "the address page shows the balance and the blocks mined"
+    (let ((page (body-of (string-append "/address/" %miner-a))))
+      (assert-equal 200 (status-of (string-append "/address/" %miner-a)))
+      (assert-true (has? page %miner-a))
+      (assert-true (has? page (explorer-sigil-amount
+                                (+ (coin-block-reward 1)
+                                   (coin-block-reward 3)
+                                   (coin-block-reward 4)))))
+      (assert-true (has? page "/block/4"))
+      (assert-true (not (has? page "/block/2")))))
+
+  (test "an unknown name is a 404 page, not a crash"
+    (assert-equal 404 (status-of "/block/12345"))
+    (assert-equal 404 (status-of "/address/nope"))
+    (assert-equal 404 (status-of "/no/such/page"))
+    (assert-true (has? (body-of "/block/12345") "Not found")))
+
+  (test "amounts and times render as chosen"
+    (assert-equal "100.00000000" (explorer-sigil-amount 10000000000))
+    (assert-equal "1.00000000" (explorer-sigil-amount 100000000))
+    (assert-equal "0.00000001" (explorer-sigil-amount 1))
+    (assert-equal "0.00000000" (explorer-sigil-amount 0))
+    (assert-equal "0.00000000" (explorer-sigil-amount #f))
+    (assert-equal "2026-01-01 00:00:00 UTC"
+                  (explorer-format-time coin-regtest-genesis-time))
+    (assert-equal "3 under" (explorer-under-par-text 3))
+    (assert-equal "at par" (explorer-under-par-text 0))
+    (assert-equal "2 over" (explorer-under-par-text -2))
+    (assert-equal "unknown" (explorer-under-par-text #f))))
+
+;; ============================================================
+;; JSON
+;; ============================================================
+
+(test-group "the JSON endpoint"
+  (test "the summary's shape is stable"
+    (let ((value (json-of "/api/summary")))
+      (assert-equal "sigilcoin-regtest" (dict-get value "chain"))
+      (assert-equal 5 (dict-get value "tip_height"))
+      (assert-equal (block-header-id
+                      (block-header-field (list-ref %chain-blocks 4)))
+                    (dict-get value "tip_id"))
+      (assert-equal 6 (dict-get value "header_count"))
+      (assert-equal 5 (dict-get value "header_height"))
+      (assert-equal (coin-cumulative-supply 5) (dict-get value "supply"))
+      (assert-equal coin-max-supply (dict-get value "max_supply"))
+      (assert-equal 6 (dict-get value "next_height"))
+      (assert-equal (coin-block-reward 6) (dict-get value "next_reward"))
+      (assert-equal 731 (dict-get value "next_halving_height"))
+      (assert-equal 5 (dict-get value "block_count"))
+      (assert-equal #f (dict-get value "empty"))
+      (assert-equal 6 (length (json-list (dict-get value "blocks"))))))
+
+  (test "the summary carries the next puzzle"
+    (let* ((value (json-of "/api/summary"))
+           (puzzle (dict-get value "puzzle"))
+           (tip (block-header-hash
+                  (block-header-field (list-ref %chain-blocks 4))))
+           (spec (coin-puzzle-for tip 6)))
+      (assert-equal (puzzle-spec-par spec) (dict-get puzzle "par"))
+      (assert-equal (puzzle-print-value (puzzle-spec-target spec))
+                    (dict-get puzzle "target"))
+      (assert-equal (hex-encode (coin-puzzle-seed tip 6))
+                    (dict-get puzzle "seed"))))
+
+  (test "a block's shape is stable"
+    (with-store
+      (lambda (store)
+        (let ((value (json-of "/api/block/3"))
+              (b (explorer-block-by-height store 3)))
+          (assert-equal 3 (dict-get value "height"))
+          (assert-equal (explorer-block-id b) (dict-get value "id"))
+          (assert-equal (explorer-block-time b) (dict-get value "time"))
+          (assert-equal (explorer-block-parent-id b)
+                        (dict-get value "parent_id"))
+          (assert-equal %miner-a (dict-get value "miner"))
+          (assert-equal (coin-block-reward 3) (dict-get value "reward"))
+          (assert-equal (explorer-block-solution-source b)
+                        (dict-get value "solution"))
+          (assert-equal (explorer-block-solution-length b)
+                        (dict-get value "solution_bytes"))
+          (assert-equal (explorer-block-par b) (dict-get value "par"))
+          (assert-equal (explorer-block-under-par b)
+                        (dict-get value "under_par"))
+          (assert-equal (explorer-block-target b) (dict-get value "target"))
+          (assert-equal (explorer-block-seed b) (dict-get value "seed"))
+          (assert-equal (explorer-block-transaction-count b)
+                        (dict-get value "transactions"))
+          (assert-equal (explorer-block-size b) (dict-get value "size"))
+          (assert-equal 'null (dict-get value "problem"))))))
+
+  (test "genesis reports its missing fields as null"
+    (let ((value (json-of "/api/block/0")))
+      (assert-equal 0 (dict-get value "height"))
+      (assert-equal 'null (dict-get value "par"))
+      (assert-equal 'null (dict-get value "target"))
+      (assert-equal 'null (dict-get value "under_par"))
+      (assert-equal "genesis" (dict-get value "problem"))))
+
+  (test "the block list is an array, newest first"
+    (let ((blocks (json-list (dict-get (json-of "/api/blocks") "blocks"))))
+      (assert-equal 6 (length blocks))
+      (assert-equal '(5 4 3 2 1 0)
+                    (map (lambda (b) (dict-get b "height")) blocks))))
+
+  (test "the address endpoint carries the balance and the blocks"
+    (let ((value (json-of (string-append "/api/address/" %miner-a))))
+      (assert-equal %miner-a (dict-get value "address"))
+      (assert-equal (+ (coin-block-reward 1)
+                       (coin-block-reward 3)
+                       (coin-block-reward 4))
+                    (dict-get value "balance"))
+      (assert-equal 3 (dict-get value "blocks_mined"))
+      (assert-equal '(4 3 1)
+                    (map (lambda (b) (dict-get b "height"))
+                         (json-list (dict-get value "blocks"))))))
+
+  (test "hostile bytes come back as valid, inert JSON"
+    (let* ((blocks (json-list (dict-get (json-of "/api/blocks") "blocks")))
+           (fourth (car (cdr blocks)))
+           (graffiti (dict-get fourth "graffiti"))
+           (replacement (string (integer->char explorer-replacement-char))))
+      (assert-equal 4 (dict-get fourth "height"))
+      (assert-true (has? graffiti "<script>alert(1)</script>"))
+      ;; The NUL, the ESC and the two ill-formed bytes are all gone.
+      (assert-true (has? graffiti replacement))
+      (let ((bytes (string->utf8 graffiti)))
+        (let loop ((i 0))
+          (when (< i (bytevector-length bytes))
+            (assert-true (not (= #x00 (bytevector-u8-ref bytes i))))
+            (assert-true (not (= #x1b (bytevector-u8-ref bytes i))))
+            (loop (+ i 1)))))
+      (assert-true #t)))
+
+  (test "a JSON miss answers in JSON"
+    (assert-equal 404 (status-of "/api/block/999"))
+    (assert-equal "not-found" (dict-get (json-of "/api/block/999") "error"))
+    (assert-equal 404 (status-of "/api/address/nope"))
+    (assert-equal "not-found"
+                  (dict-get (json-of "/api/address/nope") "error"))))
+
+;; ============================================================
+;; Empty and broken databases
+;; ============================================================
+
+(test-group "an empty or missing database is an honest empty state"
+  (test "no database at all is a 503 page that says where it looked"
+    (let* ((dir (fresh-dir))
+           (path (explorer-db-path sigilcoin-regtest-chain dir))
+           (response (explorer-respond sigilcoin-regtest-chain dir "/")))
+      (assert-equal 503 (explorer-response-status response))
+      (assert-true (has? (explorer-response-body response) "No chain data"))
+      (assert-true (has? (explorer-response-body response) path))
+      (assert-true (not (file-exists? path)))))
+
+  (test "no database at all is a 503 JSON body for the API"
+    (let* ((dir (fresh-dir))
+           (response (explorer-respond sigilcoin-regtest-chain
+                                       dir
+                                       "/api/summary")))
+      (assert-equal 503 (explorer-response-status response))
+      (assert-equal "no-database"
+                    (dict-get (json-decode (explorer-response-body response))
+                              "error"))))
+
+  (test "a database with a schema and no blocks renders the genesis state"
+    (let ((dir (fresh-dir)))
+      (node-close (node-open sigilcoin-regtest-chain dir))
+      (let ((store (explorer-open sigilcoin-regtest-chain dir)))
+        (let ((s (explorer-chain-summary store)))
+          (assert-equal 0 (explorer-summary-tip-height s))
+          (assert-equal 1 (explorer-summary-header-count s))
+          (assert-equal #f (explorer-summary-empty s))
+          (assert-equal coin-regtest-genesis-id-constant
+                        (explorer-summary-tip-id s)))
+        (explorer-close store))
+      (assert-equal 200 (explorer-response-status
+                          (explorer-respond sigilcoin-regtest-chain dir "/")))))
+
+  (test "a database with no schema at all renders empty rather than raising"
+    (let* ((dir (fresh-dir))
+           (path (explorer-db-path sigilcoin-regtest-chain dir))
+           (db (sqlite-open path)))
+      (sqlite-close db)
+      (let ((store (explorer-open sigilcoin-regtest-chain dir)))
+        (let ((s (explorer-chain-summary store)))
+          (assert-equal 0 (explorer-summary-tip-height s))
+          (assert-equal 0 (explorer-summary-header-count s))
+          (assert-equal 0 (explorer-summary-block-count s))
+          (assert-true (explorer-summary-empty s)))
+        (assert-equal '() (explorer-recent-blocks store 10))
+        (assert-equal #f (explorer-block-by-height store 0))
+        (assert-equal 0 (explorer-address-balance store %script-a))
+        (explorer-close store))
+      (let ((page (explorer-response-body
+                    (explorer-respond sigilcoin-regtest-chain dir "/"))))
+        (assert-true (has? page "This node has no chain data yet."))
+        (assert-true (has? page "No blocks yet.")))
+      (assert-equal #t (dict-get (json-decode
+                                   (explorer-response-body
+                                     (explorer-respond sigilcoin-regtest-chain
+                                                       dir
+                                                       "/api/summary")))
+                                 "empty"))))
+
+  (test "headers ahead of bodies render as a gap, not a failure"
+    ;; A node mid-sync: the header is stored and the body is not. The
+    ;; explorer must still place the block.
+    (let* ((dir (fresh-dir))
+           (n (node-open sigilcoin-regtest-chain dir))
+           (b (coin-mine-block n #f "mid-sync" %script-a)))
+      (node-ingest-headers n (list (block-header-field b)))
+      (node-close n)
+      (let ((store (explorer-open sigilcoin-regtest-chain dir)))
+        ;; The active tip is still genesis: no body has been validated.
+        (assert-equal 0 (explorer-summary-tip-height
+                          (explorer-chain-summary store)))
+        (assert-equal 2 (explorer-summary-header-count
+                          (explorer-chain-summary store)))
+        (assert-equal 1 (explorer-summary-header-height
+                          (explorer-chain-summary store)))
+        (let ((pending (explorer-block-by-id
+                         store
+                         (block-header-id (block-header-field b)))))
+          (assert-equal 1 (explorer-block-height pending))
+          (assert-equal 'body-not-downloaded (explorer-block-problem pending))
+          (assert-equal #f (explorer-block-solution pending))
+          (assert-equal #f (explorer-block-solution-source pending))
+          (assert-equal #f (explorer-block-payout-address pending))
+          (assert-equal #f (explorer-block-size pending)))
+        (explorer-close store))
+      (assert-equal 200
+                    (explorer-response-status
+                      (explorer-respond
+                        sigilcoin-regtest-chain
+                        dir
+                        (string-append "/block/"
+                                       (block-header-id
+                                         (block-header-field b)))))))))
+
+;; ============================================================
+;; HTTP
+;; ============================================================
+
+(test-group "the HTTP front door"
+  (test "a request target's path is what routes"
+    (assert-equal "/blocks" (explorer-request-path "/blocks?page=2"))
+    (assert-equal "/blocks" (explorer-request-path "/blocks#top"))
+    (assert-equal "/" (explorer-request-path "/"))
+    (assert-equal "/" (explorer-request-path 42)))
+
+  (test "path segments drop the empties"
+    (assert-equal '() (explorer-path-segments "/"))
+    (assert-equal '("block" "7") (explorer-path-segments "/block/7/"))
+    (assert-equal '("a" "b") (explorer-path-segments "//a//b")))
+
+  (test "the response declares a byte-accurate length"
+    (let* ((response (explorer-respond sigilcoin-regtest-chain %dir
+                                       "/block/4"))
+           (text (explorer-http-response response))
+           (body (explorer-response-body response)))
+      (assert-true (has? text "HTTP/1.1 200 OK"))
+      (assert-true (has? text "Content-Type: text/html; charset=utf-8"))
+      (assert-true (has? text "Content-Security-Policy: default-src 'none'"))
+      (assert-true (has? text (string-append
+                                "Content-Length: "
+                                (number->string
+                                  (bytevector-length (string->utf8 body))))))
+      ;; The hostile block's page is not pure ASCII, so a character count
+      ;; would have been wrong here.
+      (assert-true (> (bytevector-length (string->utf8 body))
+                      (string-length body)))))
+
+  (test "a real socket round-trip serves the summary and the API"
+    ;; Single-threaded on purpose: the client connects first, the kernel
+    ;; completes the handshake into the listen backlog, and `tcp-accept`
+    ;; then returns without blocking.
+    (let ((listener (tcp-listen 0 host: "127.0.0.1")))
+      (assert-true (socket? listener))
+      ;; `socket-local-address` hands back a two-element LIST, not the
+      ;; `(host . port)` pair its docstring shows.
+      (let ((port (car (cdr (socket-local-address listener)))))
+        (define (fetch target)
+          (let ((client (tcp-connect "127.0.0.1" port)))
+            (assert-true (socket? client))
+            (socket-send-all client
+                             (string-append "GET " target " HTTP/1.1\r\n"
+                                            "Host: 127.0.0.1\r\n"
+                                            "\r\n"))
+            (explorer-serve-connection sigilcoin-regtest-chain %dir
+                                       (tcp-accept listener))
+            (let ((response (socket-read-all client)))
+              (socket-close client)
+              response)))
+        (let ((summary (fetch "/"))
+              (api (fetch "/api/summary"))
+              (missing (fetch "/block/999"))
+              (posted (fetch "/")))
+          (assert-true (has? summary "HTTP/1.1 200 OK"))
+          (assert-true (has? summary "sigilcoin-regtest"))
+          (assert-true (has? summary "&lt;script&gt;alert(1)&lt;/script&gt;"))
+          (assert-true (not (has? summary "<script>")))
+          (assert-true (has? api "Content-Type: application/json"))
+          (assert-true (has? api "\"tip_height\":5"))
+          (assert-true (has? missing "HTTP/1.1 404 Not Found"))
+          (assert-true (has? posted "HTTP/1.1 200 OK")))
+        (socket-close listener))))
+
+  (test "a method other than GET is refused"
+    (let ((listener (tcp-listen 0 host: "127.0.0.1")))
+      (let* ((port (car (cdr (socket-local-address listener))))
+             (client (tcp-connect "127.0.0.1" port)))
+        (socket-send-all client "POST / HTTP/1.1\r\nHost: x\r\n\r\n")
+        (explorer-serve-connection sigilcoin-regtest-chain %dir
+                                   (tcp-accept listener))
+        (let ((response (socket-read-all client)))
+          (socket-close client)
+          (socket-close listener)
+          (assert-true (has? response "405 Method Not Allowed"))))))
+
+  (test "a malformed request line is refused"
+    (let ((listener (tcp-listen 0 host: "127.0.0.1")))
+      (let* ((port (car (cdr (socket-local-address listener))))
+             (client (tcp-connect "127.0.0.1" port)))
+        (socket-send-all client "GARBAGE\r\n\r\n")
+        (explorer-serve-connection sigilcoin-regtest-chain %dir
+                                   (tcp-accept listener))
+        (let ((response (socket-read-all client)))
+          (socket-close client)
+          (socket-close listener)
+          (assert-true (has? response "400 Bad Request")))))))
 
 (run-tests)

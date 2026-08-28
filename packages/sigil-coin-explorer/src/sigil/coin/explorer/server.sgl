@@ -1,0 +1,466 @@
+;;; (sigil coin explorer server) — routing and the HTTP/1.1 front door
+;;;
+;;; A read-only site with six routes and no client-side code needs one thing
+;;; from a web server: parse a request line, hand back a response, close.
+;;; That is what this is. It is built on `(sigil socket)`, which ships in
+;;; `sigil-stdlib`, rather than on `sigil-http`: the published `sigil-http`
+;;; is part of the 0.9 `sigil` workspace and pulls that workspace's
+;;; `sigil-stdlib`, `sigil-socket`, `sigil-tls` and `sigil-crypto` in behind
+;;; it. Installing it here re-pointed the shared `sigil-crypto` from 0.16.5
+;;; to 0.9.2 for EVERY package in this workspace, which is a change to
+;;; `sigil-bitcoin`'s hashing, made silently, from a package that only wants
+;;; to print a table. That is reported rather than worked around; when a
+;;; 0.20-compatible `sigil-http` is published, `explorer-serve-connection`
+;;; is the only procedure that has to change.
+;;;
+;;; ## Routes
+;;;
+;;;   GET /                    chain summary and recent blocks
+;;;   GET /blocks              the recent block list
+;;;   GET /block/<height|id>   one block in full
+;;;   GET /address/<sgl1...>   blocks mined by an address, and its balance
+;;;   GET /api/summary         summary and recent blocks, as JSON
+;;;   GET /api/blocks          the block list, as JSON
+;;;   GET /api/block/<h|id>    one block, as JSON
+;;;   GET /api/address/<a>     one address, as JSON
+;;;
+;;; ## One handle per request
+;;;
+;;; `explorer-respond` opens the database, answers, and closes. A node is a
+;;; live writer: it may not have created the file when the explorer starts,
+;;; and it may be restarted under it. Opening per request means "the node
+;;; was not running yet" heals by itself instead of pinning a stale `#f`,
+;;; and it holds no handle open across requests for a writer to contend
+;;; with.
+;;;
+;;; ponytail: one open per request, no pooling. A chain that mines one block
+;;; a day does not have a connection-rate problem; add a cached handle with
+;;; an invalidation check if the explorer ever serves real traffic.
+;;;
+;;; ```scheme
+;;; (explorer-serve sigilcoin-regtest-chain "/tmp/sigilcoin" port: 8080)
+;;; ```
+
+(define-library (sigil coin explorer server)
+  (import (sigil math)
+          (sigil io)
+          (sigil string)
+          (sigil socket)
+          (sigil process)
+          (sigil bitcoin node)
+          (sigil coin node)
+          (sigil coin explorer store)
+          (sigil coin explorer render))
+  (export
+    explorer-request-path
+    explorer-path-segments
+    explorer-route
+    explorer-handle
+    explorer-respond
+    explorer-response-status
+    explorer-response-content-type
+    explorer-response-body
+    explorer-http-response
+    explorer-serve-connection
+    explorer-serve
+    explorer-main)
+
+  (begin
+
+    ;; ============================================================
+    ;; Request paths
+    ;; ============================================================
+
+    ;;; The path part of a request target, with any query string dropped.
+    ;;;
+    ;;; ```scheme
+    ;;; (explorer-request-path "/blocks?x=1") ; => "/blocks"
+    ;;; ```
+    (define (explorer-request-path target)
+      (: any? -> string?)
+      (if (not (string? target))
+          "/"
+          (let ((n (string-length target)))
+            (let loop ((i 0))
+              (cond ((>= i n) target)
+                    ((or (char=? (string-ref target i) #\?)
+                         (char=? (string-ref target i) #\#))
+                     (substring target 0 i))
+                    (else (loop (+ i 1))))))))
+
+    ;;; The non-empty segments of a path.
+    ;;;
+    ;;; ```scheme
+    ;;; (explorer-path-segments "/block/7/") ; => ("block" "7")
+    ;;; ```
+    (define (explorer-path-segments path)
+      (: any? -> list?)
+      (if (not (string? path))
+          '()
+          (let loop ((parts (string-split path "/")) (out '()))
+            (cond ((null? parts) (reverse out))
+                  ((string=? (car parts) "") (loop (cdr parts) out))
+                  (else (loop (cdr parts) (cons (car parts) out)))))))
+
+    ;; ============================================================
+    ;; Responses
+    ;; ============================================================
+
+    (define %html "text/html; charset=utf-8")
+    (define %json "application/json; charset=utf-8")
+
+    ;;; Status code of a handler result.
+    (define (explorer-response-status response)
+      (: list? -> integer?)
+      (car response))
+
+    ;;; Content type of a handler result.
+    (define (explorer-response-content-type response)
+      (: list? -> string?)
+      (car (cdr response)))
+
+    ;;; Body of a handler result.
+    (define (explorer-response-body response)
+      (: list? -> string?)
+      (car (cdr (cdr response))))
+
+    (define (respond status content-type body)
+      (list status content-type body))
+
+    ;; ============================================================
+    ;; Routing
+    ;; ============================================================
+
+    ;; A block named either by height or by its 64-character display id.
+    (define (lookup-block store token)
+      (let ((height (string->number token)))
+        (if (and (number? height) (exact? height) (integer? height))
+            (explorer-block-by-height store height)
+            (explorer-block-by-id store token))))
+
+    (define (address-view store token)
+      (let ((script (explorer-address->script token)))
+        (and script
+             (cons (explorer-address-balance store script)
+                   (explorer-address-blocks store
+                                            script
+                                            explorer-default-page-size)))))
+
+    ;;; Route a path against an open store.
+    ;;;
+    ;;; Returns `(status content-type body)`. Every route that can be handed
+    ;;; a name that matches nothing answers 404 with a page, not a raise:
+    ;;; the name came off the wire.
+    ;;;
+    ;;; ```scheme
+    ;;; (explorer-response-status (explorer-route store "/")) ; => 200
+    ;;; ```
+    (define (explorer-route store path)
+      (: explorer-store? string? -> list?)
+      (let ((segments (explorer-path-segments path)))
+        (cond
+          ;; Summary
+          ((null? segments)
+           (respond 200 %html
+                    (explorer-summary-page
+                      (explorer-chain-summary store)
+                      (explorer-recent-blocks store
+                                              explorer-default-page-size))))
+          ;; Block list
+          ((equal? segments '("blocks"))
+           (respond 200 %html
+                    (explorer-blocks-page
+                      (explorer-chain-summary store)
+                      (explorer-recent-blocks store
+                                              explorer-default-page-size))))
+          ;; Block detail
+          ((and (= 2 (length segments)) (string=? (car segments) "block"))
+           (let ((b (lookup-block store (car (cdr segments)))))
+             (if b
+                 (respond 200 %html (explorer-block-page b))
+                 (respond 404 %html
+                          (explorer-missing-page
+                            "No block by that height or id.")))))
+          ;; Address
+          ((and (= 2 (length segments)) (string=? (car segments) "address"))
+           (let* ((token (car (cdr segments)))
+                  (view (address-view store token)))
+             (if view
+                 (respond 200 %html
+                          (explorer-address-page token (car view) (cdr view)))
+                 (respond 404 %html
+                          (explorer-missing-page
+                            "Not a SigilCoin address.")))))
+          ;; JSON: summary
+          ((equal? segments '("api" "summary"))
+           (respond 200 %json
+                    (explorer-summary-json
+                      (explorer-chain-summary store)
+                      (explorer-recent-blocks store
+                                              explorer-default-page-size))))
+          ;; JSON: block list
+          ((equal? segments '("api" "blocks"))
+           (respond 200 %json
+                    (explorer-blocks-json
+                      (explorer-recent-blocks store
+                                              explorer-default-page-size))))
+          ;; JSON: one block
+          ((and (= 3 (length segments))
+                (string=? (car segments) "api")
+                (string=? (car (cdr segments)) "block"))
+           (let ((b (lookup-block store (car (cdr (cdr segments))))))
+             (if b
+                 (respond 200 %json (explorer-block-json b))
+                 (respond 404 %json
+                          (explorer-error-json
+                            "not-found"
+                            "no block by that height or id")))))
+          ;; JSON: one address
+          ((and (= 3 (length segments))
+                (string=? (car segments) "api")
+                (string=? (car (cdr segments)) "address"))
+           (let* ((token (car (cdr (cdr segments))))
+                  (view (address-view store token)))
+             (if view
+                 (respond 200 %json
+                          (explorer-address-json token
+                                                 (car view)
+                                                 (cdr view)))
+                 (respond 404 %json
+                          (explorer-error-json "not-found"
+                                               "not a SigilCoin address")))))
+          (else
+           (respond 404 %html
+                    (explorer-missing-page "No such page."))))))
+
+    ;; True when a path is one the JSON side owns, so a failure before any
+    ;; route ran still answers in the media type the caller asked for.
+    (define (json-path? path)
+      (let ((segments (explorer-path-segments path)))
+        (and (pair? segments) (string=? (car segments) "api"))))
+
+    ;;; Answer `path` against an open store, or against no store at all.
+    ;;;
+    ;;; `store` is `#f` when there is no database to read; `db-path` is only
+    ;;; used to say where the explorer looked.
+    ;;;
+    ;;; ```scheme
+    ;;; (explorer-response-status (explorer-handle #f "/" "/tmp/x.sqlite"))
+    ;;; ; => 503
+    ;;; ```
+    (define (explorer-handle store path db-path)
+      (: any? string? string? -> list?)
+      (if (explorer-store? store)
+          (explorer-route store path)
+          ;; 503, not 404: the page exists, the data source does not, and a
+          ;; bot polling the API should back off rather than give up.
+          (respond 503
+                   (if (json-path? path) %json %html)
+                   (if (json-path? path)
+                       (explorer-error-json "no-database" db-path)
+                       (explorer-no-database-page db-path)))))
+
+    ;;; Open the database, answer one request, close.
+    ;;;
+    ;;; ```scheme
+    ;;; (explorer-respond sigilcoin-regtest-chain "/tmp/n" "/api/summary")
+    ;;; ```
+    (define (explorer-respond chain data-dir path)
+      (: chain-config? string? string? -> list?)
+      (let ((store (explorer-open chain data-dir)))
+        (if (not store)
+            (explorer-handle #f path (explorer-db-path chain data-dir))
+            (let ((response
+                    (guard (e (#t (respond
+                                    500
+                                    (if (json-path? path) %json %html)
+                                    (if (json-path? path)
+                                        (explorer-error-json
+                                          "internal-error"
+                                          "the explorer could not read that")
+                                        (explorer-missing-page
+                                          "The explorer could not read that.")))))
+                      (explorer-handle store path
+                                       (explorer-db-path chain data-dir)))))
+              (explorer-close store)
+              response))))
+
+    ;; ============================================================
+    ;; HTTP/1.1
+    ;; ============================================================
+
+    (define (status-text status)
+      (cond ((= status 200) "200 OK")
+            ((= status 400) "400 Bad Request")
+            ((= status 404) "404 Not Found")
+            ((= status 405) "405 Method Not Allowed")
+            ((= status 500) "500 Internal Server Error")
+            ((= status 503) "503 Service Unavailable")
+            (else (string-append (number->string status) " Unknown"))))
+
+    ;;; Serialize a handler result as an HTTP/1.1 response.
+    ;;;
+    ;;; The body length is measured in BYTES, not characters: a graffiti
+    ;;; quote with one non-ASCII character would otherwise under-report
+    ;;; `Content-Length` and truncate the page in the client.
+    ;;;
+    ;;; ```scheme
+    ;;; (explorer-http-response (list 200 "text/plain" "hi"))
+    ;;; ```
+    (define (explorer-http-response response)
+      (: list? -> string?)
+      (let ((body (explorer-response-body response)))
+        (string-append
+          "HTTP/1.1 " (status-text (explorer-response-status response)) "\r\n"
+          "Content-Type: " (explorer-response-content-type response) "\r\n"
+          "Content-Length: "
+          (number->string (bytevector-length (string->utf8 body))) "\r\n"
+          ;; A read-only view of a chain that changes once a day is still a
+          ;; live view; nothing here may be cached as if it were final.
+          "Cache-Control: no-store\r\n"
+          "X-Content-Type-Options: nosniff\r\n"
+          ;; No page loads a script, a style sheet or an image, so the
+          ;; strictest policy that still renders is the correct one.
+          "Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'\r\n"
+          "Connection: close\r\n"
+          "\r\n"
+          body)))
+
+    ;; Read the request line, then drain headers until the blank line. The
+    ;; body is never read: no route accepts one.
+    (define (read-request conn)
+      (let ((line (socket-read-line conn)))
+        (and (string? line)
+             (begin
+               (let drain ((header (socket-read-line conn)) (seen 0))
+                 ;; A client that never sends the blank line cannot hold the
+                 ;; loop open forever.
+                 (when (and (string? header)
+                            (> (string-length (trim-line header)) 0)
+                            (< seen 100))
+                   (drain (socket-read-line conn) (+ seen 1))))
+               (trim-line line)))))
+
+    (define (trim-line line)
+      (let loop ((n (string-length line)))
+        (if (and (> n 0)
+                 (let ((c (string-ref line (- n 1))))
+                   (or (char=? c #\return) (char=? c #\newline))))
+            (loop (- n 1))
+            (substring line 0 n))))
+
+    ;; "GET /path HTTP/1.1" -> ("GET" "/path")
+    (define (parse-request-line line)
+      (let ((parts (let collect ((xs (string-split line " ")) (out '()))
+                     (cond ((null? xs) (reverse out))
+                           ((string=? (car xs) "") (collect (cdr xs) out))
+                           (else (collect (cdr xs) (cons (car xs) out)))))))
+        (and (>= (length parts) 2)
+             (cons (car parts) (car (cdr parts))))))
+
+    ;;; Serve exactly one request on an accepted connection, then close it.
+    ;;;
+    ;;; Returns the path served, or `#f` when the request was unusable.
+    ;;;
+    ;;; ```scheme
+    ;;; (explorer-serve-connection sigilcoin-regtest-chain "/tmp/n" conn)
+    ;;; ```
+    (define (explorer-serve-connection chain data-dir conn)
+      (: chain-config? string? any? -> any?)
+      (let* ((line (read-request conn))
+             (request (and line (parse-request-line line))))
+        (let ((response
+                (cond
+                  ((not request)
+                   (respond 400 %html
+                            (explorer-missing-page "Malformed request.")))
+                  ((not (or (string=? (car request) "GET")
+                            (string=? (car request) "HEAD")))
+                   (respond 405 %html
+                            (explorer-missing-page
+                              "This explorer only answers GET.")))
+                  (else
+                   (explorer-respond chain
+                                     data-dir
+                                     (explorer-request-path (cdr request)))))))
+          (socket-send-all conn (explorer-http-response response))
+          (socket-close conn)
+          (and request (explorer-request-path (cdr request))))))
+
+    ;;; Listen and serve.
+    ;;;
+    ;;; `requests:` bounds how many connections are served before the
+    ;;; listener closes, which is what lets a test drive the real socket
+    ;;; path; the default is unbounded.
+    ;;;
+    ;;; ```scheme
+    ;;; (explorer-serve sigilcoin-regtest-chain "/tmp/n" port: 8080)
+    ;;; ```
+    (define (explorer-serve chain data-dir (keys: (port 8080)
+                                                  (host "127.0.0.1")
+                                                  (requests #f)))
+      (: chain-config? string? (port: integer?) (host: string?)
+         (requests: any?) -> boolean?)
+      (let ((listener (tcp-listen port host: host)))
+        (unless listener
+          (error (string-append "explorer-serve: could not listen on "
+                                host ":" (number->string port))))
+        (let loop ((served 0))
+          (if (and (number? requests) (>= served requests))
+              (begin (socket-close listener) #t)
+              (let ((conn (tcp-accept listener)))
+                (if (not conn)
+                    (begin (socket-close listener) #t)
+                    (begin
+                      ;; One bad connection must not stop the server.
+                      (guard (e (#t (guard (inner (#t #f))
+                                      (socket-close conn))))
+                        (explorer-serve-connection chain data-dir conn))
+                      (loop (+ served 1)))))))))
+
+    ;; ============================================================
+    ;; Entry point
+    ;; ============================================================
+
+    ;; `sigil run <pkg> -- args` leaves the toolchain's own words in front
+    ;; of a bare `--`. Strip through the separator when there is one, and
+    ;; otherwise take everything.
+    (define (application-args raw)
+      (let loop ((xs raw))
+        (cond ((null? xs) raw)
+              ((string=? (car xs) "--") (cdr xs))
+              (else (loop (cdr xs))))))
+
+    (define (flag? args name)
+      (let loop ((xs args))
+        (cond ((null? xs) #f)
+              ((string=? (car xs) name) #t)
+              (else (loop (cdr xs))))))
+
+    (define (option args name fallback)
+      (let loop ((xs args))
+        (cond ((null? xs) fallback)
+              ((and (string=? (car xs) name) (pair? (cdr xs)))
+               (car (cdr xs)))
+              (else (loop (cdr xs))))))
+
+    ;;; `sigil-coin-explorer`'s entry point.
+    ;;;
+    ;;; ```sh
+    ;;; sigil-coin-explorer --regtest --data-dir /tmp/n --port 8080
+    ;;; ```
+    (define (explorer-main)
+      (: -> void?)
+      (let* ((args (application-args (cdr (command-line))))
+             (chain (if (flag? args "--regtest")
+                        sigilcoin-regtest-chain
+                        sigilcoin-main-chain))
+             (data-dir (option args "--data-dir" "."))
+             (host (option args "--host" "127.0.0.1"))
+             (port (or (string->number (option args "--port" "8080")) 8080)))
+        (display (string-append "explorer: " (chain-config-name chain)
+                                " at " (explorer-db-path chain data-dir)
+                                "\nexplorer: http://" host ":"
+                                (number->string port) "/\n"))
+        (flush-output-port (current-output-port))
+        (explorer-serve chain data-dir port: port host: host)))))

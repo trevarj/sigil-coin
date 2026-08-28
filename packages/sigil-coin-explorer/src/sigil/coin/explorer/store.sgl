@@ -1,0 +1,658 @@
+;;; (sigil coin explorer store) — read-only reads from a node's database
+;;;
+;;; The explorer is a READER. It opens the same SQLite file a live node is
+;;; writing and must never change a byte of it, so the handle is locked shut
+;;; in two independent ways:
+;;;
+;;;   1. A database file that does not exist is NOT opened. `sqlite-open`
+;;;      carries SQLite's `CREATE` flag, so opening a missing path would
+;;;      create an empty database — a write, and a confusing one, because a
+;;;      typo in `--data-dir` would then render an honest-looking empty
+;;;      chain forever. `explorer-open` returns `#f` instead and the caller
+;;;      renders the "no database" state.
+;;;   2. Every handle that IS opened runs `PRAGMA query_only = ON` before
+;;;      any other statement. From that point the connection refuses
+;;;      `INSERT`, `UPDATE`, `DELETE`, `CREATE` and `DROP` with SQLite's
+;;;      "attempt to write a readonly database". `sigil-sqlite` exposes only
+;;;      `sqlite3_open()`, which has no `SQLITE_OPEN_READONLY` flag and no
+;;;      URI filenames, so the pragma is the strongest lock expressible
+;;;      here; `test-explorer.sgl` proves it by trying to write through an
+;;;      explorer handle and by hashing the file before and after a full
+;;;      sweep of every route.
+;;;
+;;; What the pragma does not cover: SQLite may still roll back a hot journal
+;;; or checkpoint a WAL left by a crashed writer, because that is recovery
+;;; performed by the file format, not a statement this module issues. No
+;;; explorer code path asks for it.
+;;;
+;;; ## Reading a chain that is being written
+;;;
+;;; The node publishes its validated tip in `metadata` as
+;;; `active-chain-tip-hash` / `active-chain-tip-height`, and the explorer
+;;; walks backwards from there through `headers.prev_hash`. Walking the
+;;; parent links rather than selecting by height is what keeps a fork
+;;; sibling at the same height out of the answer.
+;;;
+;;; A node mid-sync has headers whose bodies have not arrived. Those still
+;;; produce a block record — height, time, id, parent — with the body-derived
+;;; fields left `#f`, so the list renders the gap instead of failing.
+;;;
+;;; ```scheme
+;;; (define s (explorer-open sigilcoin-regtest-chain "/tmp/sigilcoin"))
+;;; (explorer-summary-tip-height (explorer-chain-summary s))
+;;; ```
+
+(define-library (sigil coin explorer store)
+  (import (sigil struct)
+          (sigil fs)
+          (sigil math)
+          (sigil sqlite)
+          (sigil bitcoin utils)
+          (sigil bitcoin encoding)
+          (sigil bitcoin script)
+          (sigil bitcoin tx)
+          (sigil bitcoin consensus)
+          (sigil bitcoin node)
+          (sigil coin puzzle)
+          (sigil coin puzzle generator)
+          (sigil coin consensus)
+          (sigil coin node))
+  (export
+    ;; Addresses
+    explorer-address-hrp
+    explorer-script->address
+    explorer-address->script
+
+    ;; Opening
+    explorer-db-path
+    explorer-open
+    explorer-close
+    explorer-store
+    explorer-store?
+    explorer-store-db
+    explorer-store-config
+
+    ;; Blocks
+    explorer-block
+    explorer-block?
+    explorer-block-height
+    explorer-block-id
+    explorer-block-hash-text
+    explorer-block-time
+    explorer-block-parent-id
+    explorer-block-solution
+    explorer-block-solution-source
+    explorer-block-solution-length
+    explorer-block-graffiti
+    explorer-block-par
+    explorer-block-target
+    explorer-block-seed
+    explorer-block-reward
+    explorer-block-payout-script
+    explorer-block-payout-address
+    explorer-block-transaction-count
+    explorer-block-size
+    explorer-block-problem
+    explorer-block-under-par
+
+    ;; Chain summary
+    explorer-summary
+    explorer-summary?
+    explorer-summary-chain-name
+    explorer-summary-tip-height
+    explorer-summary-tip-id
+    explorer-summary-tip-time
+    explorer-summary-header-height
+    explorer-summary-header-count
+    explorer-summary-block-count
+    explorer-summary-supply
+    explorer-summary-max-supply
+    explorer-summary-next-height
+    explorer-summary-next-reward
+    explorer-summary-next-halving-height
+    explorer-summary-puzzle-target
+    explorer-summary-puzzle-par
+    explorer-summary-puzzle-seed
+    explorer-summary-empty
+
+    ;; Queries
+    explorer-default-page-size
+    explorer-chain-summary
+    explorer-recent-blocks
+    explorer-block-by-height
+    explorer-block-by-id
+    explorer-address-blocks
+    explorer-address-balance
+    explorer-next-halving-height)
+
+  (begin
+
+    ;;; Human readable part of every SigilCoin address. Restated here rather
+    ;;; than imported: `sigil-coin-cli` owns the wallet, and the explorer
+    ;;; must not depend on a binary package to name an address.
+    ;;;
+    ;;; ```scheme
+    ;;; explorer-address-hrp ; => "sgl"
+    ;;; ```
+    (define explorer-address-hrp "sgl")
+
+    ;;; How many blocks a list page shows by default.
+    (define explorer-default-page-size 25)
+
+    ;; The most blocks any single walk of the chain will visit. An address
+    ;; view has to scan the chain to find the blocks it mined, and this is
+    ;; the ceiling on that scan.
+    ;;
+    ;; ponytail: linear scan per address view, capped. SigilCoin mines one
+    ;; block a day, so 100k blocks is ~270 years of chain; add a
+    ;; payout-address index (built by the explorer in its OWN database, not
+    ;; the node's) if the scan ever becomes the slow part.
+    (define %max-walk 100000)
+
+    ;; ============================================================
+    ;; Addresses
+    ;; ============================================================
+
+    ;;; Render a scriptPubKey as an `sgl1` address, or `#f` when it is not a
+    ;;; witness program this chain has an address form for.
+    ;;;
+    ;;; Total: junk bytes yield `#f` rather than a raise, because the script
+    ;;; comes out of a block and blocks are attacker-supplied.
+    ;;;
+    ;;; ```scheme
+    ;;; (explorer-script->address (script-p2wpkh (make-bytevector 20 0)))
+    ;;; ; => "sgl1q..."
+    ;;; ```
+    (define (explorer-script->address script)
+      (: any? -> any?)
+      (guard (e (#t #f))
+        (and (bytevector? script)
+             (let ((witness (script-witness-program-decode script)))
+               (and witness
+                    (segwit-encode explorer-address-hrp
+                                   (car witness)
+                                   (cadr witness)))))))
+
+    ;;; Decode an `sgl1` address into the scriptPubKey that pays it, or `#f`.
+    ;;;
+    ;;; Total, and deliberately strict: the address arrives in a URL, so a
+    ;;; `bc1` address, a bad checksum or a truncated program must all be a
+    ;;; quiet `#f` that renders "unknown address", never a raise.
+    ;;;
+    ;;; ```scheme
+    ;;; (explorer-address->script "sgl1qw508d6qejxtdg4y5r3zarvary0c5xw7kr43pwr")
+    ;;; ; => the P2WPKH script
+    ;;; (explorer-address->script "nonsense") ; => #f
+    ;;; ```
+    (define (explorer-address->script address)
+      (: any? -> any?)
+      (guard (e (#t #f))
+        (and (string? address)
+             (let ((decoded (segwit-decode address)))
+               (and decoded
+                    (string=? (car decoded) explorer-address-hrp)
+                    (script-witness-program (cadr decoded)
+                                            (caddr decoded)))))))
+
+    ;; ============================================================
+    ;; Opening
+    ;; ============================================================
+
+    ;;; An open, read-only handle on a node's database.
+    ;;;
+    ;;; The chain config is carried under `config` rather than `chain`
+    ;;; because a one-element `(chain)` field spec collides with the core
+    ;;; `chain` threading macro during expansion.
+    (define-struct explorer-store
+      (db)
+      (config))
+
+    ;;; Where a node keeps the database for `chain` under `data-dir`.
+    ;;;
+    ;;; Mirrors `sigil-bitcoin-node`'s own layout, which keeps the file name
+    ;;; private. A test pins the two together.
+    ;;;
+    ;;; ```scheme
+    ;;; (explorer-db-path sigilcoin-regtest-chain "/tmp/n")
+    ;;; ; => "/tmp/n/sigilcoin-regtest.sqlite"
+    ;;; ```
+    (define (explorer-db-path chain data-dir)
+      (: chain-config? string? -> string?)
+      (string-append data-dir "/" (chain-config-name chain) ".sqlite"))
+
+    ;;; Open the node database for `chain` under `data-dir`, read-only.
+    ;;;
+    ;;; Returns `#f` when there is no database there: `sqlite-open` would
+    ;;; CREATE one, and creating a file is a write the explorer must not do.
+    ;;;
+    ;;; ```scheme
+    ;;; (explorer-open sigilcoin-regtest-chain "/nowhere") ; => #f
+    ;;; ```
+    (define (explorer-open chain data-dir)
+      (: chain-config? string? -> any?)
+      (let ((path (explorer-db-path chain data-dir)))
+        (and (file-exists? path)
+             (let ((db (sqlite-open path)))
+               (and db
+                    (begin
+                      ;; Before any other statement, and never turned off.
+                      (sqlite-exec db "PRAGMA query_only = ON")
+                      (explorer-store db: db config: chain)))))))
+
+    ;;; Close a store's handle.
+    ;;;
+    ;;; ```scheme
+    ;;; (explorer-close s) ; => #t
+    ;;; ```
+    (define (explorer-close store)
+      (: explorer-store? -> boolean?)
+      (sqlite-close (explorer-store-db store))
+      #t)
+
+    ;; ============================================================
+    ;; Query helpers
+    ;; ============================================================
+
+    ;; Rows come back as alists keyed by symbol.
+    (define (row-ref row key)
+      (let ((pair (and (pair? row) (assq key row))))
+        (and (pair? pair) (cdr pair))))
+
+    ;; A database that exists but has no schema yet — a node killed between
+    ;; `sqlite-open` and `db-create-schema` — answers every query with
+    ;; "no such table". That is an empty chain, not an error.
+    (define (query store sql . args)
+      (guard (e (#t '()))
+        (let ((rows (apply sqlite-query (explorer-store-db store) sql args)))
+          (if (list? rows) rows '()))))
+
+    (define (query-row store sql . args)
+      (let ((rows (apply query store sql args)))
+        (and (pair? rows) (car rows))))
+
+    (define (count-of store sql . args)
+      (let ((row (apply query-row store sql args)))
+        (let ((value (row-ref row 'count)))
+          (if (number? value) value 0))))
+
+    (define (metadata store key)
+      (let ((row (query-row store
+                            "SELECT value FROM metadata WHERE key = ?"
+                            key)))
+        (row-ref row 'value)))
+
+    (define (metadata-number store key default)
+      (let* ((text (metadata store key))
+             (value (and (string? text) (string->number text))))
+        (if (and (number? value) (exact? value) (integer? value))
+            value
+            default)))
+
+    (define %header-columns "hash, prev_hash, height, time, header_hex")
+
+    (define (header-row store hash-text)
+      (query-row store
+                 (string-append "SELECT " %header-columns
+                                " FROM headers WHERE hash = ?")
+                 hash-text))
+
+    (define (block-hex store hash-text)
+      (let ((row (query-row store
+                            "SELECT block_hex FROM blocks WHERE hash = ? AND validated = 1"
+                            hash-text)))
+        (let ((hex (row-ref row 'block_hex)))
+          (and (string? hex) hex))))
+
+    ;; The active tip the node published, or the chain's genesis when the
+    ;; database predates that metadata or has not been written yet.
+    (define (tip-hash-text store)
+      (let ((text (metadata store "active-chain-tip-hash")))
+        (if (and (string? text) (> (string-length text) 0))
+            text
+            (hex-encode (chain-config-genesis-hash
+                          (explorer-store-config store))))))
+
+    ;; ============================================================
+    ;; Block records
+    ;; ============================================================
+
+    ;;; One block, flattened into what a page shows.
+    ;;;
+    ;;; Every body-derived field is `#f` when the body has not arrived or
+    ;;; would not decode, so a mid-sync chain and a corrupt row render the
+    ;;; same honest gap. `problem` names why, for the detail page.
+    (define-struct explorer-block
+      (height integer?)
+      (id string?)
+      (hash-text string?)
+      (time integer?)
+      (parent-id default: #f)
+      (solution default: #f)
+      (solution-source default: #f)
+      (solution-length default: #f)
+      (graffiti default: #f)
+      (par default: #f)
+      (target default: #f)
+      (seed default: #f)
+      (reward default: 0)
+      (payout-script default: #f)
+      (payout-address default: #f)
+      (transaction-count default: #f)
+      (size default: #f)
+      (problem default: #f))
+
+    ;;; How many bytes under par a block's solution came in, or `#f` when
+    ;;; either number is unknown. Negative means the miner published a
+    ;;; longer program than the generator's own baseline.
+    ;;;
+    ;;; ```scheme
+    ;;; (explorer-block-under-par b) ; => 3
+    ;;; ```
+    (define (explorer-block-under-par b)
+      (: explorer-block? -> any?)
+      (let ((par (explorer-block-par b))
+            (used (explorer-block-solution-length b)))
+        (and (number? par) (number? used) (- par used))))
+
+    (define (hash-text->id hash-text)
+      (guard (e (#t hash-text))
+        (hex-encode (reverse-bytevector (hex-decode hash-text)))))
+
+    ;; Canonical source for a solution, or #f when it does not parse. The
+    ;; printer emits the shortest form the parser accepts, so this is the
+    ;; expression as consensus sees it rather than as the miner spaced it.
+    (define (solution-source solution)
+      (let ((parsed (puzzle-parse solution)))
+        (and (puzzle-ok? parsed)
+             (guard (e (#t #f))
+               (puzzle-print-expression (puzzle-result-value parsed))))))
+
+    ;; The puzzle a block at `height` had to solve, given its parent. Genesis
+    ;; solves no puzzle: it has no parent to derive a seed from.
+    (define (puzzle-fields height parent-hash)
+      (if (or (= height 0) (not (bytevector? parent-hash)))
+          (cons #f (cons #f #f))
+          (guard (e (#t (cons #f (cons #f #f))))
+            (let ((spec (coin-puzzle-for parent-hash height)))
+              (cons (puzzle-spec-par spec)
+                    (cons (puzzle-print-value (puzzle-spec-target spec))
+                          (hex-encode (coin-puzzle-seed parent-hash
+                                                        height))))))))
+
+    ;; Build the record from the header row plus, when it has arrived, the
+    ;; body. Every step is guarded: a block row is bytes a peer sent.
+    (define (make-block store hrow)
+      (let* ((hash-text (row-ref hrow 'hash))
+             (prev-text (row-ref hrow 'prev_hash))
+             (height (row-ref hrow 'height))
+             (time (row-ref hrow 'time))
+             (hex (block-hex store hash-text))
+             (parsed (and hex (guard (e (#t #f)) (block-parse (hex-decode hex)))))
+             (base (explorer-block
+                     height: height
+                     id: (hash-text->id hash-text)
+                     hash-text: hash-text
+                     time: time
+                     parent-id: (and (string? prev-text)
+                                     (hash-text->id prev-text))
+                     reward: (guard (e (#t 0)) (coin-block-reward height))
+                     ;; A node stores the genesis HEADER and no genesis
+                     ;; body, so genesis is permanently body-less. Saying
+                     ;; so is honest; calling it "not downloaded yet" is
+                     ;; not, because it never will be.
+                     problem: (cond (hex #f)
+                                    ((= height 0) 'genesis)
+                                    (else 'body-not-downloaded)))))
+        (if (not parsed)
+            (if hex
+                (explorer-block-with-problem base 'block-unparsable)
+                base)
+            (let* ((payload (coin-block-coinbase-payload parsed))
+                   (parent-hash (guard (e (#t #f)) (hex-decode prev-text)))
+                   (puzzle (puzzle-fields height parent-hash))
+                   (coinbase (coin-block-coinbase parsed))
+                   (outputs (guard (e (#t '()))
+                              (if coinbase (transaction-outputs coinbase) '())))
+                   (script (and (pair? outputs) (txout-script-pubkey (car outputs)))))
+              (explorer-block
+                height: height
+                id: (explorer-block-id base)
+                hash-text: hash-text
+                time: time
+                parent-id: (explorer-block-parent-id base)
+                solution: (and (coin-ok? payload)
+                               (coin-coinbase-payload-solution
+                                 (coin-result-value payload)))
+                solution-source: (and (coin-ok? payload)
+                                      (solution-source
+                                        (coin-coinbase-payload-solution
+                                          (coin-result-value payload))))
+                solution-length: (and (coin-ok? payload)
+                                      (bytevector-length
+                                        (coin-coinbase-payload-solution
+                                          (coin-result-value payload))))
+                graffiti: (and (coin-ok? payload)
+                               (coin-coinbase-payload-graffiti
+                                 (coin-result-value payload)))
+                par: (car puzzle)
+                target: (car (cdr puzzle))
+                seed: (cdr (cdr puzzle))
+                reward: (explorer-block-reward base)
+                payout-script: script
+                payout-address: (explorer-script->address script)
+                transaction-count: (guard (e (#t #f))
+                                     (length (block-transactions parsed)))
+                size: (coin-block-size parsed)
+                problem: (if (coin-ok? payload)
+                             #f
+                             (coin-result-reason payload)))))))
+
+    ;; A copy of `b` carrying `reason` instead of its current problem.
+    (define (explorer-block-with-problem b reason)
+      (explorer-block
+        height: (explorer-block-height b)
+        id: (explorer-block-id b)
+        hash-text: (explorer-block-hash-text b)
+        time: (explorer-block-time b)
+        parent-id: (explorer-block-parent-id b)
+        reward: (explorer-block-reward b)
+        problem: reason))
+
+    ;; ============================================================
+    ;; Chain summary
+    ;; ============================================================
+
+    ;;; The numbers a summary page shows.
+    (define-struct explorer-summary
+      (chain-name string?)
+      (tip-height integer?)
+      (tip-id string?)
+      (tip-time integer?)
+      (header-height integer?)
+      (header-count integer?)
+      (block-count integer?)
+      (supply integer?)
+      (max-supply integer?)
+      (next-height integer?)
+      (next-reward integer?)
+      (next-halving-height default: #f)
+      (puzzle-target default: #f)
+      (puzzle-par default: #f)
+      (puzzle-seed default: #f)
+      (empty default: #f))
+
+    ;;; The next height at which the block reward halves, or `#f` once the
+    ;;; schedule has decayed to zero and no later halving changes anything.
+    ;;;
+    ;;; ```scheme
+    ;;; (explorer-next-halving-height 1)   ; => 731
+    ;;; (explorer-next-halving-height 731) ; => 1461
+    ;;; ```
+    (define (explorer-next-halving-height height)
+      (: integer? -> any?)
+      (let* ((epoch (if (< height 1)
+                        0
+                        (quotient (- height 1) coin-halving-interval)))
+             (next (+ (* (+ epoch 1) coin-halving-interval) 1)))
+        (and (> (coin-block-reward next) 0) next)))
+
+    ;;; Read the chain summary.
+    ;;;
+    ;;; `empty` is `#t` when the database holds no headers at all, which is
+    ;;; a node that has not run rather than a chain with no blocks.
+    ;;;
+    ;;; ```scheme
+    ;;; (explorer-summary-tip-height (explorer-chain-summary s)) ; => 3
+    ;;; ```
+    (define (explorer-chain-summary store)
+      (: explorer-store? -> explorer-summary?)
+      (let* ((config (explorer-store-config store))
+             (header-count (count-of store
+                                     "SELECT COUNT(*) AS count FROM headers"))
+             (tip-text (tip-hash-text store))
+             (tip-row (header-row store tip-text))
+             (tip-height (if tip-row
+                             (row-ref tip-row 'height)
+                             (metadata-number store
+                                              "active-chain-tip-height"
+                                              0)))
+             (tip-time (if tip-row (row-ref tip-row 'time) 0))
+             (next-height (+ tip-height 1))
+             (tip-hash (guard (e (#t #f)) (hex-decode tip-text)))
+             (puzzle (puzzle-fields next-height tip-hash)))
+        (explorer-summary
+          chain-name: (chain-config-name config)
+          tip-height: tip-height
+          tip-id: (hash-text->id tip-text)
+          tip-time: tip-time
+          header-height: (let ((row (query-row
+                                      store
+                                      "SELECT MAX(height) AS count FROM headers")))
+                           (let ((value (row-ref row 'count)))
+                             (if (number? value) value 0)))
+          header-count: header-count
+          block-count: (count-of
+                         store
+                         "SELECT COUNT(*) AS count FROM blocks WHERE validated = 1")
+          supply: (guard (e (#t 0)) (coin-cumulative-supply tip-height))
+          max-supply: coin-max-supply
+          next-height: next-height
+          next-reward: (guard (e (#t 0)) (coin-block-reward next-height))
+          next-halving-height: (explorer-next-halving-height tip-height)
+          puzzle-par: (car puzzle)
+          puzzle-target: (car (cdr puzzle))
+          puzzle-seed: (cdr (cdr puzzle))
+          empty: (= header-count 0))))
+
+    ;; ============================================================
+    ;; Block queries
+    ;; ============================================================
+
+    ;; Walk the active chain backwards from the tip, newest first, calling
+    ;; `visit` with each block. `visit` returns #t to keep walking.
+    (define (walk-chain store limit visit)
+      (let loop ((hash-text (tip-hash-text store)) (seen 0))
+        (if (or (>= seen limit) (>= seen %max-walk) (not (string? hash-text)))
+            #t
+            (let ((hrow (header-row store hash-text)))
+              (if (not hrow)
+                  #t
+                  (let ((b (make-block store hrow)))
+                    (if (not (visit b))
+                        #t
+                        (loop (row-ref hrow 'prev_hash) (+ seen 1)))))))))
+
+    ;;; The `limit` most recent blocks on the active chain, newest first.
+    ;;;
+    ;;; ```scheme
+    ;;; (map explorer-block-height (explorer-recent-blocks s 3)) ; => (3 2 1)
+    ;;; ```
+    (define (explorer-recent-blocks store limit)
+      (: explorer-store? integer? -> list?)
+      (let ((out '()))
+        (walk-chain store
+                    (max limit 0)
+                    (lambda (b) (set! out (cons b out)) #t))
+        (reverse out)))
+
+    ;;; The active-chain block at `height`, or `#f`.
+    ;;;
+    ;;; Found by walking the parent links from the tip, so a fork sibling
+    ;;; stored at the same height is never returned.
+    ;;;
+    ;;; ```scheme
+    ;;; (explorer-block-height (explorer-block-by-height s 2)) ; => 2
+    ;;; ```
+    (define (explorer-block-by-height store height)
+      (: explorer-store? any? -> any?)
+      (if (not (and (number? height) (exact? height) (integer? height)
+                    (>= height 0)))
+          #f
+          (let ((found #f))
+            (walk-chain store
+                        %max-walk
+                        (lambda (b)
+                          (cond ((= (explorer-block-height b) height)
+                                 (set! found b)
+                                 #f)
+                                ((< (explorer-block-height b) height) #f)
+                                (else #t))))
+            found)))
+
+    ;;; The block whose display id is `id`, or `#f`.
+    ;;;
+    ;;; The id is the reversed hash humans quote, so it is reversed back into
+    ;;; the internal order the `headers` table is keyed by. Anything that is
+    ;;; not 64 hex characters is `#f` rather than a query.
+    ;;;
+    ;;; ```scheme
+    ;;; (explorer-block-by-id s coin-regtest-genesis-id-constant)
+    ;;; ```
+    (define (explorer-block-by-id store id)
+      (: explorer-store? any? -> any?)
+      (let ((hash-text (guard (e (#t #f))
+                         (and (string? id)
+                              (= 64 (string-length id))
+                              (hex-encode (reverse-bytevector (hex-decode id)))))))
+        (and hash-text
+             (let ((hrow (header-row store hash-text)))
+               (and hrow (make-block store hrow))))))
+
+    ;;; Blocks on the active chain whose coinbase paid `script`, newest
+    ;;; first, at most `limit` of them.
+    ;;;
+    ;;; ```scheme
+    ;;; (length (explorer-address-blocks s script 10)) ; => 2
+    ;;; ```
+    (define (explorer-address-blocks store script limit)
+      (: explorer-store? any? integer? -> list?)
+      (if (not (bytevector? script))
+          '()
+          (let ((out '()) (found 0))
+            (walk-chain store
+                        %max-walk
+                        (lambda (b)
+                          (when (equal? script (explorer-block-payout-script b))
+                            (set! out (cons b out))
+                            (set! found (+ found 1)))
+                          (< found limit)))
+            (reverse out))))
+
+    ;;; Current balance of `script` in daviwils, from the node's UTXO set.
+    ;;;
+    ;;; Unspent outputs only; the node keeps spent rows around with
+    ;;; `active = 0`.
+    ;;;
+    ;;; ```scheme
+    ;;; (explorer-address-balance s script) ; => 10000000000
+    ;;; ```
+    (define (explorer-address-balance store script)
+      (: explorer-store? any? -> integer?)
+      (if (not (bytevector? script))
+          0
+          (let* ((row (query-row
+                        store
+                        "SELECT COALESCE(SUM(value), 0) AS count FROM utxos WHERE active = 1 AND script_pubkey = ?"
+                        (hex-encode script)))
+                 (value (row-ref row 'count)))
+            (if (number? value) value 0))))))
