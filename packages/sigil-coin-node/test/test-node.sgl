@@ -30,13 +30,21 @@
     (bytevector-u8-set! bv 0 k)
     bv))
 
-(define (header-at previous time)
+;; The solution length a header commits to when the commitment is not what
+;; the test is about. Any legal length does; this one is mid-range.
+(define %default-solution-length 40)
+
+(define (header-claiming previous time solution-length)
   (block-header version: coin-header-version
                 previous-block: previous
                 merkle-root: %zero32
                 time: time
                 bits: coin-header-bits
-                nonce: coin-header-nonce))
+                ;; The solution-length commitment fork choice ranks by.
+                nonce: solution-length))
+
+(define (header-at previous time)
+  (header-claiming previous time %default-solution-length))
 
 ;; A block whose coinbase claims a solution of exactly `solution-length`
 ;; bytes. The solution is not a real one: `chain-work` ranks by the length of
@@ -62,19 +70,24 @@
                                                    script-pubkey: #u8(#x6a)))
                              lock-time: 0)))))
 
+;; `body-known?` is #f throughout: SigilCoin's rank comes from the header, so
+;; the flag carries no information the rule reads, and pinning it to the
+;; headers-first value proves the rule never consults it.
 (define (candidate-at height work hash extended?)
   (chain-candidate hash: hash
                    height: height
                    work: work
-                   body-known?: (not (= 0 (coin-rank-tip-saving work)))
+                   body-known?: #f
                    extended?: extended?))
 
-;; A settled candidate at `height` whose tip solution is `solution-length`
-;; bytes, as `chain-work` would have ranked it.
-(define (settled-candidate height solution-length hash extended?)
+;; A candidate at `height` whose header commits to a `solution-length`-byte
+;; solution, ranked exactly as `chain-work` ranks it.
+(define (candidate-claiming height solution-length hash extended?)
   (candidate-at height
-                (coin-chain-work (header-at %zero32 1767225600)
-                                 (block-claiming height solution-length)
+                (coin-chain-work (header-claiming %zero32
+                                                  1767225600
+                                                  solution-length)
+                                 #f
                                  0)
                 hash
                 extended?))
@@ -148,7 +161,7 @@
     (assert-equal 1 (coin-solution-saving coin-max-solution-bytes))
     (assert-true (> (coin-solution-saving 10) (coin-solution-saving 11))))
 
-  (test "an impossible length scores the reserved unknown value"
+  (test "an impossible length scores the reserved rejected value"
     (assert-equal 0 (coin-solution-saving 0))
     (assert-equal 0 (coin-solution-saving (+ coin-max-solution-bytes 1)))
     (assert-equal 0 (coin-solution-saving -1))
@@ -165,52 +178,55 @@
     (assert-equal 7 (coin-rank-accumulated (coin-rank-encode 7 0)))))
 
 (test-group "sigilcoin chain work"
-  (test "a validated body settles the tip digit"
-    (let ((work (coin-chain-work (header-at %zero32 1767225600)
-                                 (block-claiming 1 10)
+  (test "the tip digit is the length the header commits to"
+    (let ((work (coin-chain-work (header-claiming %zero32 1767225600 10)
+                                 #f
                                  0)))
       (assert-equal (coin-solution-saving 10) (coin-rank-tip-saving work))
       (assert-equal (coin-solution-saving 10) (coin-rank-accumulated work))))
 
   (test "the accumulated digit sums the whole chain"
-    (let* ((header (header-at %zero32 1767225600))
-           (first (coin-chain-work header (block-claiming 1 10) 0))
-           (second (coin-chain-work header (block-claiming 2 20) first)))
+    (let* ((first (coin-chain-work (header-claiming %zero32 1767225600 10)
+                                   #f
+                                   0))
+           (second (coin-chain-work (header-claiming %zero32 1767225601 20)
+                                    #f
+                                    first)))
       (assert-equal (+ (coin-solution-saving 10) (coin-solution-saving 20))
                     (coin-rank-accumulated second))
       (assert-equal (coin-solution-saving 20) (coin-rank-tip-saving second))))
 
-  (test "a headers-first block ranks provisionally"
-    (let ((work (coin-chain-work (header-at %zero32 1767225600) #f 0)))
-      ;; Reserved unknown tip, and the least any valid block can contribute.
-      (assert-equal 0 (coin-rank-tip-saving work))
-      (assert-equal 1 (coin-rank-accumulated work))))
-
-  (test "the provisional value never overstates the settled one"
-    (let* ((header (header-at %zero32 1767225600))
-           (provisional (coin-chain-work header #f 0)))
-      (let loop ((length 1))
-        (when (<= length coin-max-solution-bytes)
-          (assert-true (>= (coin-chain-work header
-                                            (block-claiming 1 length)
-                                            0)
-                           provisional))
-          (loop (* length 2))))))
+  (test "the provisional value equals the settled one"
+    ;; This is the property the header commitment exists for: the number the
+    ;; node stores at header ingest is the number it stores again when the
+    ;; body validates, so a block is rankable before anyone has its body.
+    (let loop ((length 1))
+      (when (<= length coin-max-solution-bytes)
+        (let ((header (header-claiming %zero32 1767225600 length)))
+          (assert-equal (coin-chain-work header #f 0)
+                        (coin-chain-work header
+                                         (block-claiming 1 length)
+                                         0)))
+        (loop (* length 2)))))
 
   (test "the key is strictly increasing along a chain"
-    (let* ((header (header-at %zero32 1767225600))
-           ;; The worst settled block followed by the best possible one, then
-           ;; a provisional block: every step must still climb.
-           (a (coin-chain-work header (block-claiming 1 1) 0))
-           (b (coin-chain-work header
-                               (block-claiming 2 coin-max-solution-bytes)
-                               a))
-           (c (coin-chain-work header #f b)))
+    ;; The worst block a header can claim, then the best: every step climbs.
+    (let* ((a (coin-chain-work
+                (header-claiming %zero32 1767225600 coin-max-solution-bytes)
+                #f
+                0))
+           (b (coin-chain-work (header-claiming %zero32 1767225601 1) #f a))
+           (c (coin-chain-work
+                (header-claiming %zero32 1767225602 coin-max-solution-bytes)
+                #f
+                b)))
       (assert-true (> a 0))
       (assert-true (> b a))
       (assert-true (> c b))))
 
-  (test "an undecodable body ranks as provisional rather than raising"
+  (test "the body is ignored, however hostile it is"
+    ;; The seam passes a body once one validates. SigilCoin's rank does not
+    ;; read it, so junk in that argument cannot change a rank or raise.
     (let ((header (header-at %zero32 1767225600)))
       (assert-equal #f (coin-block-solution-length 42))
       (assert-equal (coin-chain-work header #f 0)
@@ -219,7 +235,21 @@
                     (coin-chain-work header
                                      (block header-field: header
                                             transactions: '())
-                                     0)))))
+                                     0))
+      ;; Not even a body whose solution disagrees with the header: the
+      ;; disagreement is a body rule, not a ranking input.
+      (assert-equal (coin-chain-work header #f 0)
+                    (coin-chain-work header (block-claiming 1 7) 0))))
+
+  (test "a header claiming an illegal length ranks at the floor"
+    ;; `accept?` refuses to store such a header, so this only has to be
+    ;; total, not meaningful.
+    (let ((work (coin-chain-work (header-claiming %zero32 1767225600 0)
+                                 #f
+                                 0)))
+      (assert-equal 0 (coin-rank-tip-saving work))
+      (assert-equal 1 (coin-rank-accumulated work)))
+    (assert-equal (coin-rank-encode 1 0) (coin-chain-work 42 #f 0))))
 
 ;; ============================================================
 ;; Fork choice
@@ -227,88 +257,81 @@
 
 (test-group "sigilcoin fork choice"
   (test "the taller chain wins"
-    (assert-true (coin-better-chain? (settled-candidate 2 200 (hash-of 9) #f)
-                                     (settled-candidate 1 1 (hash-of 1) #f)))
+    (assert-true (coin-better-chain? (candidate-claiming 2 200 (hash-of 9) #f)
+                                     (candidate-claiming 1 1 (hash-of 1) #f)))
     (assert-equal #f
-                  (coin-better-chain? (settled-candidate 1 1 (hash-of 1) #f)
-                                      (settled-candidate 2 200 (hash-of 9) #f))))
+                  (coin-better-chain? (candidate-claiming 1 1 (hash-of 1) #f)
+                                      (candidate-claiming 2 200 (hash-of 9) #f))))
 
   (test "at equal height the shorter solution wins"
-    (assert-true (coin-better-chain? (settled-candidate 5 10 (hash-of 9) #f)
-                                     (settled-candidate 5 11 (hash-of 1) #f)))
+    (assert-true (coin-better-chain? (candidate-claiming 5 10 (hash-of 9) #f)
+                                     (candidate-claiming 5 11 (hash-of 1) #f)))
     (assert-equal #f
-                  (coin-better-chain? (settled-candidate 5 11 (hash-of 1) #f)
-                                      (settled-candidate 5 10 (hash-of 9) #f))))
+                  (coin-better-chain? (candidate-claiming 5 11 (hash-of 1) #f)
+                                      (candidate-claiming 5 10 (hash-of 9) #f))))
 
   (test "an equal-length tie breaks on the lower internal hash"
-    (assert-true (coin-better-chain? (settled-candidate 5 10 (hash-of 1) #f)
-                                     (settled-candidate 5 10 (hash-of 2) #f)))
+    (assert-true (coin-better-chain? (candidate-claiming 5 10 (hash-of 1) #f)
+                                     (candidate-claiming 5 10 (hash-of 2) #f)))
     (assert-equal #f
-                  (coin-better-chain? (settled-candidate 5 10 (hash-of 2) #f)
-                                      (settled-candidate 5 10 (hash-of 1) #f))))
+                  (coin-better-chain? (candidate-claiming 5 10 (hash-of 2) #f)
+                                      (candidate-claiming 5 10 (hash-of 1) #f))))
 
   (test "an identical candidate does not displace the incumbent"
     (assert-equal #f
-                  (coin-better-chain? (settled-candidate 5 10 (hash-of 1) #f)
-                                      (settled-candidate 5 10 (hash-of 1) #f))))
+                  (coin-better-chain? (candidate-claiming 5 10 (hash-of 1) #f)
+                                      (candidate-claiming 5 10 (hash-of 1) #f))))
 
-  (test "a settled sibling outranks one whose body is unknown"
-    (let ((unsettled (candidate-at 5 (coin-chain-work (header-at %zero32 1)
-                                                      #f
-                                                      0)
-                                   (hash-of 0)
-                                   #f)))
-      (assert-true (coin-better-chain? (settled-candidate 5
-                                                          coin-max-solution-bytes
-                                                          (hash-of 250)
-                                                          #f)
-                                       unsettled))
-      (assert-equal #f
-                    (coin-better-chain? unsettled
-                                        (settled-candidate 5
-                                                           coin-max-solution-bytes
-                                                           (hash-of 250)
-                                                           #f)))))
+  (test "a sibling whose body nobody has still ranks by its commitment"
+    ;; Both candidates are headers-first: no body has been validated for
+    ;; either. The shorter claim still wins, which is what lets the node
+    ;; decide whose body to go and get.
+    (let ((short (candidate-claiming 5 1 (hash-of 250) #f))
+          (long (candidate-claiming 5 coin-max-solution-bytes (hash-of 0) #f)))
+      (assert-equal #f (chain-candidate-body-known? short))
+      (assert-equal #f (chain-candidate-body-known? long))
+      (assert-true (coin-better-chain? short long))
+      (assert-equal #f (coin-better-chain? long short))))
 
   (test "a height a child already extends is never re-selected"
     ;; The best possible sibling, arriving after the height was settled.
     (assert-equal #f
-                  (coin-better-chain? (settled-candidate 5 1 (hash-of 0) #t)
-                                      (settled-candidate 5 200 (hash-of 250) #f))))
+                  (coin-better-chain? (candidate-claiming 5 1 (hash-of 0) #t)
+                                      (candidate-claiming 5 200 (hash-of 250) #f))))
 
   (test "an extended incumbent yields to any live candidate"
-    (assert-true (coin-better-chain? (settled-candidate 6 200 (hash-of 250) #f)
-                                     (settled-candidate 5 1 (hash-of 0) #t))))
+    (assert-true (coin-better-chain? (candidate-claiming 6 200 (hash-of 250) #f)
+                                     (candidate-claiming 5 1 (hash-of 0) #t))))
 
   (test "two settled candidates still rank against each other"
     ;; Equally settled means settledness decides nothing, so the ordinary
     ;; height/solution/hash order applies. `best-row` never reaches this
     ;; case, but the relation has to be an order regardless.
-    (assert-true (coin-better-chain? (settled-candidate 6 10 (hash-of 1) #t)
-                                     (settled-candidate 5 10 (hash-of 1) #t)))
+    (assert-true (coin-better-chain? (candidate-claiming 6 10 (hash-of 1) #t)
+                                     (candidate-claiming 5 10 (hash-of 1) #t)))
     (assert-equal #f
-                  (coin-better-chain? (settled-candidate 5 10 (hash-of 1) #t)
-                                      (settled-candidate 6 10 (hash-of 1) #t)))
-    (assert-true (coin-better-chain? (settled-candidate 5 10 (hash-of 1) #t)
-                                     (settled-candidate 5 11 (hash-of 1) #t)))
-    (assert-true (coin-better-chain? (settled-candidate 5 10 (hash-of 1) #t)
-                                     (settled-candidate 5 10 (hash-of 2) #t)))
+                  (coin-better-chain? (candidate-claiming 5 10 (hash-of 1) #t)
+                                      (candidate-claiming 6 10 (hash-of 1) #t)))
+    (assert-true (coin-better-chain? (candidate-claiming 5 10 (hash-of 1) #t)
+                                     (candidate-claiming 5 11 (hash-of 1) #t)))
+    (assert-true (coin-better-chain? (candidate-claiming 5 10 (hash-of 1) #t)
+                                     (candidate-claiming 5 10 (hash-of 2) #t)))
     ;; Irreflexive: no candidate outranks itself.
     (assert-equal #f
-                  (coin-better-chain? (settled-candidate 5 10 (hash-of 1) #t)
-                                      (settled-candidate 5 10 (hash-of 1) #t))))
+                  (coin-better-chain? (candidate-claiming 5 10 (hash-of 1) #t)
+                                      (candidate-claiming 5 10 (hash-of 1) #t))))
 
   (test "the relation is antisymmetric over every settledness pairing"
     ;; At most one direction may be #t, across both `extended?` values and
     ;; candidates differing in height, in solution length and in hash.
-    (let ((candidates (list (settled-candidate 5 10 (hash-of 1) #f)
-                            (settled-candidate 5 10 (hash-of 2) #f)
-                            (settled-candidate 5 11 (hash-of 1) #f)
-                            (settled-candidate 6 10 (hash-of 1) #f)
-                            (settled-candidate 5 10 (hash-of 1) #t)
-                            (settled-candidate 5 10 (hash-of 2) #t)
-                            (settled-candidate 5 11 (hash-of 1) #t)
-                            (settled-candidate 6 10 (hash-of 1) #t))))
+    (let ((candidates (list (candidate-claiming 5 10 (hash-of 1) #f)
+                            (candidate-claiming 5 10 (hash-of 2) #f)
+                            (candidate-claiming 5 11 (hash-of 1) #f)
+                            (candidate-claiming 6 10 (hash-of 1) #f)
+                            (candidate-claiming 5 10 (hash-of 1) #t)
+                            (candidate-claiming 5 10 (hash-of 2) #t)
+                            (candidate-claiming 5 11 (hash-of 1) #t)
+                            (candidate-claiming 6 10 (hash-of 1) #t))))
       (for-each
         (lambda (x)
           (for-each
@@ -323,12 +346,12 @@
           (long #u8(49 50)))
       (assert-equal
         (coin-better-solution? short (hash-of 9) long (hash-of 1))
-        (coin-better-chain? (settled-candidate 5 1 (hash-of 9) #f)
-                            (settled-candidate 5 2 (hash-of 1) #f)))
+        (coin-better-chain? (candidate-claiming 5 1 (hash-of 9) #f)
+                            (candidate-claiming 5 2 (hash-of 1) #f)))
       (assert-equal
         (coin-better-solution? short (hash-of 2) short (hash-of 1))
-        (coin-better-chain? (settled-candidate 5 1 (hash-of 2) #f)
-                            (settled-candidate 5 1 (hash-of 1) #f))))))
+        (coin-better-chain? (candidate-claiming 5 1 (hash-of 2) #f)
+                            (candidate-claiming 5 1 (hash-of 1) #f))))))
 
 ;; ============================================================
 ;; Header acceptance
@@ -394,7 +417,7 @@
                                                merkle-root: %zero32
                                                time: (+ %parent-time 1)
                                                bits: coin-header-bits
-                                               nonce: coin-header-nonce)))
+                                               nonce: %default-solution-length)))
       (assert-equal #f
                     (accept-with sigilcoin-regtest-chain
                                  (list %parent)
@@ -403,16 +426,35 @@
                                                merkle-root: %zero32
                                                time: (+ %parent-time 1)
                                                bits: #x1d00ffff
-                                               nonce: coin-header-nonce)))
-      (assert-equal #f
-                    (accept-with sigilcoin-regtest-chain
-                                 (list %parent)
-                                 (block-header version: coin-header-version
-                                               previous-block: %parent-hash
-                                               merkle-root: %zero32
-                                               time: (+ %parent-time 1)
-                                               bits: coin-header-bits
-                                               nonce: 1)))))
+                                               nonce: %default-solution-length)))))
+
+  (test "the solution-length commitment must be a legal length"
+    ;; The header field is 32 bits wide; only 1..256 describes a block that
+    ;; could ever decode, so `accept?` refuses the rest before storing it.
+    (assert-true (coin-header-solution-length-ok? 1))
+    (assert-true (coin-header-solution-length-ok? coin-max-solution-bytes))
+    (assert-equal #f (coin-header-solution-length-ok? 0))
+    (assert-equal #f (coin-header-solution-length-ok?
+                       (+ coin-max-solution-bytes 1)))
+    (assert-equal %default-solution-length
+                  (coin-header-solution-length (child-at 1)))
+    (assert-true (accept-with sigilcoin-regtest-chain
+                              (list %parent)
+                              (header-claiming %parent-hash
+                                               (+ %parent-time 1)
+                                               1)))
+    (assert-equal #f
+                  (accept-with sigilcoin-regtest-chain
+                               (list %parent)
+                               (header-claiming %parent-hash
+                                                (+ %parent-time 1)
+                                                0)))
+    (assert-equal #f
+                  (accept-with sigilcoin-regtest-chain
+                               (list %parent)
+                               (header-claiming %parent-hash
+                                                (+ %parent-time 1)
+                                                (+ coin-max-solution-bytes 1)))))
 
   (test "a malformed header is rejected rather than raising"
     (assert-equal #f (accept-with sigilcoin-regtest-chain (list %parent) 42)))
@@ -524,6 +566,23 @@
     (assert-true (header-rules?
                    (chain-config-header-rules sigilcoin-regtest-chain))))
 
+  (test "the node resolves the chain's own block rules"
+    (let ((rules (chain-config-block-rules sigilcoin-main-chain)))
+      (assert-true (block-rules? rules))
+      (assert-true (eq? coin-block-rules rules))
+      (assert-true (eq? coin-connect-block (block-rules-connect rules)))
+      (assert-true (eq? coin-block-reward (block-rules-subsidy rules)))
+      (assert-equal coin-coinbase-script-bounds
+                    (block-rules-coinbase-script-bounds rules))
+      ;; Not Bitcoin's, which is what the seam falls back to when a chain
+      ;; attaches nothing: Bitcoin's emission and its 100-byte coinbase cap
+      ;; would both reject a real SigilCoin block.
+      (assert-true (not (eq? bitcoin-block-rules rules)))
+      (assert-true (not (equal? bitcoin-coinbase-script-bounds
+                                coin-coinbase-script-bounds))))
+    (assert-true (eq? coin-block-rules
+                      (chain-config-block-rules sigilcoin-regtest-chain))))
+
   (test "policy and flavour are published in extensions"
     (assert-equal "#systemcrafters"
                   (mining-of sigilcoin-main-chain 'irc-channel))
@@ -543,7 +602,10 @@
     (assert-equal coin-target-block-spacing
                   (policy-of sigilcoin-main-chain 'target-block-spacing))
     (assert-equal coin-max-supply
-                  (policy-of sigilcoin-main-chain 'max-supply))))
+                  (policy-of sigilcoin-main-chain 'max-supply))
+    (assert-equal coin-max-coinbase-script-bytes
+                  (policy-of sigilcoin-main-chain
+                             'max-coinbase-script-bytes))))
 
 ;; ============================================================
 ;; Genesis
@@ -575,28 +637,21 @@
     (assert-equal coin-regtest-genesis-id-constant
                   (block-header-id %regtest-genesis)))
 
-  (test "genesis work stays provisional forever"
+  (test "genesis is seeded with its real rank"
     ;; The node seeds its header table with `(chain-work genesis #f 0)` and
-    ;; only re-settles a block whose BODY it downloaded and validated.
-    ;; Genesis has no body to download, so the provisional value is the one
-    ;; it keeps for good — status-output drift in the accumulated digit,
-    ;; which fork choice never reads.
-    (let ((stored (coin-chain-work %main-genesis #f 0))
-          (settled (coin-chain-work %main-genesis %genesis-block 0)))
-      (assert-equal (coin-rank-encode 1 0) stored)
-      (assert-equal coin-rank-base stored)
-      (assert-equal 1 (coin-rank-accumulated stored))
-      (assert-equal 0 (coin-rank-tip-saving stored))
-      ;; What genesis is really worth, pinned so the gap cannot widen
-      ;; unnoticed: the solution length is the generator's, not a choice.
+    ;; never revisits it, because genesis has no body to download. The header
+    ;; commitment is what makes that seeded value the true one rather than a
+    ;; placeholder every later chain then inherits.
+    (let ((stored (coin-chain-work %main-genesis #f 0)))
+      ;; The solution length is the generator's, not a choice.
       (assert-equal 49 (bytevector-length coin-genesis-solution))
+      (assert-equal 49 (coin-header-solution-length %main-genesis))
       (assert-equal 208 (coin-solution-saving 49))
-      (assert-equal 208 (coin-rank-accumulated settled))
-      (assert-equal 208 (coin-rank-tip-saving settled))
-      ;; So every chain's accumulated digit reads 207 low, forever.
-      (assert-equal 207 (- (coin-rank-accumulated settled)
-                           (coin-rank-accumulated stored)))
-      (assert-true (> settled stored))))
+      (assert-equal (coin-rank-encode 208 208) stored)
+      (assert-equal 208 (coin-rank-accumulated stored))
+      (assert-equal 208 (coin-rank-tip-saving stored))
+      ;; And handing the body over changes nothing.
+      (assert-equal stored (coin-chain-work %main-genesis %genesis-block 0))))
 
   (test "a different quote is a different genesis"
     (assert-true (not (equal? (coin-genesis-hash coin-genesis-quote
@@ -649,8 +704,14 @@
                              coin-genesis-time)))
     (assert-equal coin-header-version (block-header-version %main-genesis))
     (assert-equal coin-header-bits (block-header-bits %main-genesis))
-    (assert-equal coin-header-nonce (block-header-nonce %main-genesis))
-    (assert-equal %zero32 (block-header-previous-block %main-genesis))))
+    (assert-true (coin-header-solution-length-ok?
+                   (coin-header-solution-length %main-genesis)))
+    (assert-equal %zero32 (block-header-previous-block %main-genesis))
+    ;; Version 4 is not decoration: Bitcoin's connector reads the buried
+    ;; deployment heights in these params as version floors, and SigilCoin
+    ;; sets all of them to 0.
+    (assert-equal 4 coin-header-version)
+    (assert-true (>= coin-header-version 4))))
 
 
 ;; ============================================================
@@ -658,13 +719,10 @@
 ;; ============================================================
 ;;
 ;; These exercise the exact entry points `(sigil bitcoin node)` calls on a
-;; chain's rules: header-chain acceptance, accumulated work, and tip choice.
-;; A live `node-open` is NOT exercised here: building `(sigil bitcoin node)`
-;; as a dependency of this workspace mis-parses its `node` struct — the field
-;; `(chain chain-config?)` comes out named `chain-config?`, so `node-chain` is
-;; unbound and `(node chain: ...)` raises "unknown field". That reproduces on
-;; a clean build with none of this task's code present, and is a toolchain
-;; bug outside SigilCoin.
+;; chain's rules: header-chain acceptance, accumulated work, and tip choice,
+;; with candidates built by hand so a case a live chain would take many
+;; blocks to reach is one line. `test-chain.sgl` drives the same rules
+;; through a real `node-open` instead.
 
 (define (headers-from-genesis genesis count spacing)
   (let loop ((i 0)
@@ -699,10 +757,17 @@
                     %regtest-rules)))
 
   (test "accumulated work is what the library would persist"
-    (let ((work (header-chain-work %regtest-headers %regtest-rules)))
-      ;; Four headers, none with a body yet: four provisional contributions.
-      (assert-equal 0 (coin-rank-tip-saving work))
-      (assert-equal 4 (coin-rank-accumulated work))
+    (let ((work (header-chain-work %regtest-headers %regtest-rules))
+          (saving (coin-solution-saving %default-solution-length)))
+      ;; Four headers, no bodies anywhere, and every rank is already the
+      ;; final one because each header carries its own commitment: genesis
+      ;; contributes what its own 49-byte solution is worth, the three
+      ;; children what they each claim.
+      (assert-equal saving (coin-rank-tip-saving work))
+      (assert-equal (+ (coin-solution-saving
+                         (coin-header-solution-length %regtest-genesis))
+                       (* 3 saving))
+                    (coin-rank-accumulated work))
       (assert-equal work
                     (coin-chain-work
                       (list-ref %regtest-headers 3)
@@ -714,19 +779,19 @@
 
   (test "tip selection follows the tallest chain"
     (let ((candidates (with-extended-flags
-                        (list (settled-candidate 0 200 (hash-of 0) #f)
-                              (settled-candidate 1 200 (hash-of 1) #f)
-                              (settled-candidate 2 200 (hash-of 2) #f)))))
+                        (list (candidate-claiming 0 200 (hash-of 0) #f)
+                              (candidate-claiming 1 200 (hash-of 1) #f)
+                              (candidate-claiming 2 200 (hash-of 2) #f)))))
       (assert-equal 2
                     (chain-candidate-height
                       (best-candidate %regtest-rules candidates)))))
 
   (test "a shorter sibling takes the tip while the height is unsettled"
-    (let* ((long (settled-candidate 2 40 (hash-of 3) #f))
-           (short (settled-candidate 2 12 (hash-of 9) #f))
+    (let* ((long (candidate-claiming 2 40 (hash-of 3) #f))
+           (short (candidate-claiming 2 12 (hash-of 9) #f))
            (candidates (with-extended-flags
-                         (list (settled-candidate 0 200 (hash-of 0) #f)
-                               (settled-candidate 1 200 (hash-of 1) #f)
+                         (list (candidate-claiming 0 200 (hash-of 0) #f)
+                               (candidate-claiming 1 200 (hash-of 1) #f)
                                long
                                short))))
       (assert-equal (hash-of 9)
@@ -734,12 +799,12 @@
                       (best-candidate %regtest-rules candidates)))))
 
   (test "a child settles the height against a later, shorter sibling"
-    (let* ((incumbent (settled-candidate 2 40 (hash-of 3) #f))
-           (child (settled-candidate 3 40 (hash-of 4) #f))
-           (late-and-shorter (settled-candidate 2 1 (hash-of 9) #f))
+    (let* ((incumbent (candidate-claiming 2 40 (hash-of 3) #f))
+           (child (candidate-claiming 3 40 (hash-of 4) #f))
+           (late-and-shorter (candidate-claiming 2 1 (hash-of 9) #f))
            (candidates (with-extended-flags
-                         (list (settled-candidate 0 200 (hash-of 0) #f)
-                               (settled-candidate 1 200 (hash-of 1) #f)
+                         (list (candidate-claiming 0 200 (hash-of 0) #f)
+                               (candidate-claiming 1 200 (hash-of 1) #f)
                                incumbent
                                child
                                late-and-shorter)))
@@ -749,15 +814,22 @@
       (assert-equal 3 (chain-candidate-height best))
       (assert-equal (hash-of 4) (chain-candidate-hash best))))
 
-  (test "a header-only sibling cannot displace a validated one"
-    (let* ((settled (settled-candidate 2 200 (hash-of 3) #f))
-           (header-only (candidate-at 2
-                                      (coin-chain-work (header-at %zero32 1)
-                                                       #f
-                                                       0)
-                                      (hash-of 0)
-                                      #f))
-           (candidates (with-extended-flags (list header-only settled))))
+  (test "a header-only sibling displaces a validated one when it is shorter"
+    ;; The reorganisation SigilCoin's consensus demands and headers-first
+    ;; sync has to start: nobody has the challenger's body yet, and its
+    ;; header alone is enough to make the node go and fetch it.
+    (let* ((validated (candidate-claiming 2 200 (hash-of 3) #f))
+           (header-only (candidate-claiming 2 12 (hash-of 0) #f))
+           (candidates (with-extended-flags (list header-only validated))))
+      (assert-equal #f (chain-candidate-body-known? header-only))
+      (assert-equal (hash-of 0)
+                    (chain-candidate-hash
+                      (best-candidate %regtest-rules candidates)))))
+
+  (test "a longer header-only sibling does not displace anything"
+    (let* ((validated (candidate-claiming 2 12 (hash-of 3) #f))
+           (header-only (candidate-claiming 2 200 (hash-of 0) #f))
+           (candidates (with-extended-flags (list header-only validated))))
       (assert-equal (hash-of 3)
                     (chain-candidate-hash
                       (best-candidate %regtest-rules candidates))))))

@@ -1,0 +1,218 @@
+;;; (sigil coin node miner) — assembling a SigilCoin block
+;;;
+;;; Mining SigilCoin is not a loop. There is no nonce to grind and no target
+;;; to hit: a miner writes a program, and the block is finished the moment
+;;; the program is written. So this module is a BUILDER, not a search — the
+;;; only thing it has to get right is that the block it hands back is one a
+;;; node accepts.
+;;;
+;;; Everything a node checks about a freshly built block is fixed here:
+;;;
+;;;   * the coinbase scriptSig is the canonical three-push payload, so
+;;;     `coin-block-coinbase-payload` decodes it
+;;;   * the coinbase claims exactly `coin-block-reward` for the height, so
+;;;     the subsidy rule is satisfied with nothing left over
+;;;   * the merkle root commits to the transactions
+;;;   * `version` and `bits` are the frozen values `coin-accept-header?`
+;;;     demands, and the header's solution-length commitment is set from the
+;;;     solution actually being mined, so the header and the coinbase cannot
+;;;     disagree
+;;;   * the timestamp clears the chain's spacing floor
+;;;
+;;; What is NOT fixed here is the solution. That is the miner's whole job,
+;;; and the builder takes it as an argument. `coin-generator-solution` hands
+;;; back the one solution that always exists — the quoted literal of the
+;;; puzzle's own target, which the generator publishes as
+;;; `puzzle-spec-solution` — so a block can always be built. Beating it is
+;;; the game: any shorter program that evaluates to the same target is a
+;;; better block, and `coin-build-block` takes whatever the miner wrote.
+;;;
+;;; ```scheme
+;;; ;; par: the always-legal solution
+;;; (coin-mine-block n #f "hi there" payout-script)
+;;; ;; golfed: a shorter program for the same puzzle
+;;; (coin-mine-block n "(list (iota 11) 694)" "hi there" payout-script)
+;;; ```
+;;;
+;;; ONE TRANSACTION PER BLOCK. The builder assembles a coinbase-only block.
+;;; Nothing about the format prevents more, but a block with fee-paying
+;;; transactions needs a fee total to size the coinbase claim, and that is
+;;; mempool selection rather than block assembly.
+;;; ponytail: coinbase-only; take a transaction list and add the fees to the
+;;; coinbase claim when there is a mempool to select from.
+
+(define-library (sigil coin node miner)
+  (import (sigil math)
+          ;; `string->utf8` lives here; solutions and graffiti are text on
+          ;; the way in and bytes everywhere after.
+          (sigil io)
+          (sigil bitcoin utils)
+          (sigil bitcoin tx)
+          (sigil bitcoin consensus)
+          (sigil bitcoin node)
+          (sigil coin puzzle generator)
+          (sigil coin consensus)
+          (sigil coin node rules)
+          (sigil coin node chain))
+  (export
+    coin-mining-bytes
+    coin-generator-solution
+    coin-mining-coinbase
+    coin-build-block
+    coin-next-block-time
+    coin-mine-block)
+
+  (begin
+
+    (define %zero32 (make-bytevector 32 0))
+    (define %coinbase-index #xffffffff)
+    (define %sequence-final #xffffffff)
+
+    ;;; Coerce a solution or graffiti argument to bytes.
+    ;;;
+    ;;; Miners write text and blocks carry bytes, so both are accepted and a
+    ;;; string is encoded as UTF-8. Anything else raises: a miner handing over
+    ;;; the wrong type would otherwise get an unminable block back.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-mining-bytes "ab") ; => #u8(97 98)
+    ;;; (coin-mining-bytes #u8(1)) ; => #u8(1)
+    ;;; ```
+    (define (coin-mining-bytes who value)
+      (: string? any? -> bytevector?)
+      (cond ((bytevector? value) value)
+            ((string? value) (string->utf8 value))
+            (else
+             (error (string-append who ": expected a string or bytevector")))))
+
+    ;;; The solution the generator publishes for the puzzle at `height`.
+    ;;;
+    ;;; This is the quoted literal of the puzzle's target, which is legal for
+    ;;; every puzzle by construction — the generator refuses to emit a puzzle
+    ;;; whose literal does not fit the solution cap and does not re-evaluate
+    ;;; to the target. It is a miner's floor, not a ceiling: it is what you
+    ;;; publish when you have not golfed anything.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-ok? (coin-check-solution (coin-puzzle-for parent 1)
+    ;;;                                (coin-generator-solution parent 1)))
+    ;;; ; => #t
+    ;;; ```
+    (define (coin-generator-solution previous-hash height)
+      (: bytevector? integer? -> bytevector?)
+      (string->utf8 (puzzle-spec-solution
+                      (coin-puzzle-for previous-hash height))))
+
+    ;;; Build the coinbase transaction for a SigilCoin block.
+    ;;;
+    ;;; The claim is exactly `coin-block-reward` for the height: there are no
+    ;;; fees in a coinbase-only block, and claiming less would burn coins for
+    ;;; nothing.
+    ;;;
+    ;;; ```scheme
+    ;;; (txout-value (car (transaction-outputs
+    ;;;                     (coin-mining-coinbase 1 "'()" "" #u8(#x6a)))))
+    ;;; ; => 100000000
+    ;;; ```
+    (define (coin-mining-coinbase height solution graffiti script-pubkey)
+      (: integer? any? any? bytevector? -> transaction?)
+      (if (not (bytevector? script-pubkey))
+          (error "coin-mining-coinbase: expected a payout scriptPubKey"))
+      (transaction
+        version: 1
+        inputs: (list
+                  (txin previous-output: (outpoint txid: %zero32
+                                                   index: %coinbase-index)
+                        script-sig: (coin-coinbase-payload-encode
+                                      (coin-coinbase-payload
+                                        height: height
+                                        solution: (coin-mining-bytes
+                                                    "coin-mining-coinbase solution"
+                                                    solution)
+                                        graffiti: (coin-mining-bytes
+                                                    "coin-mining-coinbase graffiti"
+                                                    graffiti)))
+                        sequence: %sequence-final
+                        witness: '()))
+        outputs: (list (txout value: (coin-block-reward height)
+                              script-pubkey: script-pubkey))
+        lock-time: 0))
+
+    ;;; Build a block extending `parent-header` at `height`.
+    ;;;
+    ;;; Every field a node checks is set from the arguments or from the
+    ;;; frozen constants; nothing is left for the caller to patch up
+    ;;; afterwards. Passing a `time` below the chain's spacing floor, or a
+    ;;; `height` that is not the parent's plus one, builds a block the node
+    ;;; will reject — which is what makes this usable for negative tests.
+    ;;;
+    ;;; ```scheme
+    ;;; (block? (coin-build-block parent 1 "'()" "" #u8(#x6a) 1767225601))
+    ;;; ; => #t
+    ;;; ```
+    (define (coin-build-block parent-header height solution graffiti
+                              script-pubkey time)
+      (: block-header? integer? any? any? bytevector? integer? -> block?)
+      (if (not (block-header? parent-header))
+          (error "coin-build-block: expected a parent block header"))
+      (let* ((solution-bytes (coin-mining-bytes "coin-build-block solution"
+                                                solution))
+             (coinbase (coin-mining-coinbase height
+                                             solution-bytes
+                                             graffiti
+                                             script-pubkey))
+             (root (merkle-root (list (transaction-txid coinbase)))))
+        (block header-field:
+                 (block-header version: coin-header-version
+                               previous-block: (block-header-hash
+                                                 parent-header)
+                               merkle-root: root
+                               time: time
+                               bits: coin-header-bits
+                               ;; The solution-length commitment fork choice
+                               ;; ranks by, taken from the solution itself.
+                               nonce: (bytevector-length solution-bytes))
+               transactions: (list coinbase))))
+
+    ;;; The earliest timestamp a child of `parent-header` may carry.
+    ;;;
+    ;;; The spacing floor is the binding rule; the median-time-past rule is
+    ;;; satisfied for free, because the parent is the newest header in the
+    ;;; window and the median can never exceed it.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-next-block-time parent 1) ; => the parent's time plus one
+    ;;; ```
+    (define (coin-next-block-time parent-header min-spacing)
+      (: block-header? integer? -> integer?)
+      ;; A floor of 0 would permit equal timestamps, which the median rule
+      ;; rejects; one second is the smallest step that always advances.
+      (+ (block-header-time parent-header) (max min-spacing 1)))
+
+    ;;; Mine the next block on a node's current tip.
+    ;;;
+    ;;; The parent, the height and the spacing floor come from the node and
+    ;;; its chain config, so a caller supplies only the parts that are a
+    ;;; miner's choice. `solution` may be `#f`, which mines the generator's
+    ;;; own solution for the tip's puzzle.
+    ;;;
+    ;;; The block is returned, not submitted: storing it is the node's job,
+    ;;; and a test that wants to submit an invalid block needs the block
+    ;;; without the submission.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-mine-block n #f "hello" payout-script)
+    ;;; ```
+    (define (coin-mine-block n solution graffiti script-pubkey)
+      (: node? any? any? bytevector? -> block?)
+      (let* ((parent (node-best-header n))
+             (parent-hash (block-header-hash parent))
+             (height (+ 1 (node-status-snapshot-best-height (node-status n))))
+             (min-spacing (coin-chain-min-block-spacing (node-config n))))
+        (coin-build-block parent
+                          height
+                          (or solution
+                              (coin-generator-solution parent-hash height))
+                          graffiti
+                          script-pubkey
+                          (coin-next-block-time parent min-spacing))))))

@@ -59,10 +59,12 @@
           (sigil coin puzzle generator)
           (sigil coin consensus)
           (sigil coin node rules)
+          (sigil coin node body)
           (sigil coin node genesis))
   (export
     coin-target-block-spacing
     coin-regtest-min-block-spacing
+    coin-chain-min-block-spacing
     coin-irc-channel
     coin-genesis-quote
     coin-genesis-time
@@ -128,20 +130,20 @@
     ;;; and asserts these bytes, so the constant cannot drift from the
     ;;; builder.
     (define coin-genesis-header-constant
-      "0100000000000000000000000000000000000000000000000000000000000000000000007c95e9e1f3fed6ac0776e4fd69d20ba3f63364906a532befc67246ee58743ed800376d6affff7f2000000000")
+      "0400000000000000000000000000000000000000000000000000000000000000000000007c95e9e1f3fed6ac0776e4fd69d20ba3f63364906a532befc67246ee58743ed800376d6affff7f2031000000")
 
     ;;; Serialized regtest genesis header, as hex. Same provenance.
     (define coin-regtest-genesis-header-constant
-      "0100000000000000000000000000000000000000000000000000000000000000000000000a1269df86dc4739f15171c6fab69a35bf7e948aa581b66ddd2ade0028a3cd6c00b95569ffff7f2000000000")
+      "0400000000000000000000000000000000000000000000000000000000000000000000000a1269df86dc4739f15171c6fab69a35bf7e948aa581b66ddd2ade0028a3cd6c00b95569ffff7f2031000000")
 
     ;;; Display id (reversed hash) of the mainnet genesis block, for humans.
     ;;; No leading zeros: there is no proof-of-work to produce them.
     (define coin-genesis-id-constant
-      "788c8ee32796090d2125b28b6f4100c9e3bfb86237b8f60ed666eb3cc66bf80f")
+      "ff198b5235d6fbf60fad0a9f462feffdff23788d330659d086f34abc4a91c14d")
 
     ;;; Display id of the regtest genesis block.
     (define coin-regtest-genesis-id-constant
-      "89a6dfebfbb0fda7fe5ad21445973d60f21bbd0a227bd36cac3c5112f454bd37")
+      "e42a0833e85b849033d22db6c517d08ad5f544324da25b4b4d102aade75e378b")
 
     ;; ============================================================
     ;; Consensus params
@@ -167,11 +169,16 @@
     ;; ============================================================
 
     ;; The policy every SigilCoin config publishes. `consensus` carries the
-    ;; live rules record the node runs; `policy` restates the numbers behind
-    ;; it so a status command can print them without unpacking a closure.
+    ;; live rules records the node runs — `rules` for headers and fork
+    ;; choice, `block-rules` for bodies — and `policy` restates the numbers
+    ;; behind them so a status command can print them without unpacking a
+    ;; closure. Only the header rules are built per chain, because the
+    ;; spacing floor is the only chain-varying rule; the body rules are
+    ;; chain-independent and shared.
     (define (coin-chain-extensions min-spacing)
       (list
-        (cons 'consensus (list (cons 'rules (coin-header-rules min-spacing))))
+        (cons 'consensus (list (cons 'rules (coin-header-rules min-spacing))
+                               (cons 'block-rules coin-block-rules)))
         (cons 'mining (list (cons 'rule 'program-golf)
                             (cons 'irc-channel coin-irc-channel)
                             (cons 'puzzle-generator-version
@@ -184,7 +191,27 @@
                             (cons 'max-block-bytes coin-max-block-bytes)
                             (cons 'max-solution-bytes coin-max-solution-bytes)
                             (cons 'max-graffiti-bytes coin-max-graffiti-bytes)
-                            (cons 'max-supply coin-max-supply)))))
+                            (cons 'max-supply coin-max-supply)
+                            (cons 'max-coinbase-script-bytes
+                                  coin-max-coinbase-script-bytes)))))
+
+    ;;; The spacing floor a chain config enforces, in seconds.
+    ;;;
+    ;;; The floor is carried twice on purpose: inside the `header-rules`
+    ;;; closure, where it is enforced, and in the `policy` extension, where
+    ;;; it can be read. This reads it, which is what a miner needs to date a
+    ;;; block the chain will accept.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-chain-min-block-spacing sigilcoin-regtest-chain) ; => 1
+    ;;; ```
+    (define (coin-chain-min-block-spacing chain)
+      (: chain-config? -> integer?)
+      (let ((entry (assq 'min-block-spacing
+                         (chain-config-extension chain 'policy '()))))
+        (if (not (pair? entry))
+            (error "coin-chain-min-block-spacing: chain publishes no spacing floor"))
+        (cdr entry)))
 
     ;; One shape, two chains: everything except identity and the spacing
     ;; floor is shared, so the test chain cannot drift away from the rules it

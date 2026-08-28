@@ -4,8 +4,10 @@
 ;;; something `sigil-bitcoin-node` can run:
 ;;;
 ;;;   (sigil coin node rules)    header acceptance and fork choice
+;;;   (sigil coin node body)     block-body validation and emission
 ;;;   (sigil coin node genesis)  the deterministic genesis builder
 ;;;   (sigil coin node chain)    the mainnet and regtest chain configs
+;;;   (sigil coin node miner)    assembling a block to submit
 ;;;
 ;;; A node opens a SigilCoin chain the same way it opens a Bitcoin one:
 ;;;
@@ -20,8 +22,10 @@
 
 (define-library (sigil coin node)
   (import (sigil coin node rules)
+          (sigil coin node body)
           (sigil coin node genesis)
-          (sigil coin node chain))
+          (sigil coin node chain)
+          (sigil coin node miner))
   (export
     ;; Package metadata
     node-package-version
@@ -29,7 +33,8 @@
     ;; Header rules
     coin-header-version
     coin-header-bits
-    coin-header-nonce
+    coin-header-solution-length
+    coin-header-solution-length-ok?
     coin-rank-base
     coin-solution-saving
     coin-rank-encode
@@ -41,6 +46,13 @@
     coin-accept-header?
     coin-header-rules
 
+    ;; Block-body rules
+    coin-min-coinbase-script-bytes
+    coin-max-coinbase-script-bytes
+    coin-coinbase-script-bounds
+    coin-connect-block
+    coin-block-rules
+
     ;; Genesis
     coin-genesis-solution
     coin-genesis-script-pubkey
@@ -50,9 +62,18 @@
     coin-genesis-hash
     coin-genesis-header-hex
 
+    ;; Mining
+    coin-mining-bytes
+    coin-generator-solution
+    coin-mining-coinbase
+    coin-build-block
+    coin-next-block-time
+    coin-mine-block
+
     ;; Chain configs
     coin-target-block-spacing
     coin-regtest-min-block-spacing
+    coin-chain-min-block-spacing
     coin-irc-channel
     coin-genesis-quote
     coin-genesis-time

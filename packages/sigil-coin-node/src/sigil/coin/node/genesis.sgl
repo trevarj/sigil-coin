@@ -17,9 +17,10 @@
 ;;;     output is provably unspendable rather than merely unspent — no key
 ;;;     exists that could ever move it, so the emission schedule starts at
 ;;;     height 1 with an empty UTXO set.
-;;;   * the HEADER fields SigilCoin freezes: version, `bits` and nonce all
-;;;     come from `(sigil coin node rules)`, so genesis satisfies the same
-;;;     `accept?` every later header does.
+;;;   * the HEADER fields SigilCoin constrains: `version` and `bits` come
+;;;     from `(sigil coin node rules)`, and the solution-length commitment is
+;;;     the length of the genesis solution, so genesis satisfies the same
+;;;     `accept?` every later header does and ranks by the same rule.
 ;;;
 ;;; Only the quote and the timestamp vary, which is what lets one builder
 ;;; serve mainnet and a local test chain.
@@ -130,12 +131,16 @@
       (: string? integer? -> block?)
       (let* ((coinbase (coin-genesis-coinbase quote-text))
              (root (merkle-root (list (transaction-txid coinbase)))))
-        (block header-field: (block-header version: coin-header-version
-                                           previous-block: %zero32
-                                           merkle-root: root
-                                           time: time
-                                           bits: coin-header-bits
-                                           nonce: coin-header-nonce)
+        (block header-field:
+                 (block-header version: coin-header-version
+                               previous-block: %zero32
+                               merkle-root: root
+                               time: time
+                               bits: coin-header-bits
+                               ;; The solution-length commitment; see
+                               ;; `coin-header-solution-length`.
+                               nonce: (bytevector-length
+                                        coin-genesis-solution))
                transactions: (list coinbase))))
 
     ;;; The genesis header for `quote-text` and `time`.
