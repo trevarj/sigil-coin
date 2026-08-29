@@ -83,15 +83,28 @@ sigilcoin 0.1.0
 and `nix flake check`, run from inside `deploy/`:
 
 ```
-running 6 flake checks...
+running 2 flake checks...
 all checks passed!
 ```
 
-The count is what is left to build, not a fixed number: six on a cold store
-(this flake's `sigilcoin-runs`, which builds both binaries and runs
-`sigilcoin version`, plus `module-eval`, plus the four systemd unit files the
-module generates), two on a warm one. What matters is that it is not zero —
-`running 0 flake checks` means nothing was checked.
+The count is what is LEFT TO BUILD, not how many checks exist. There are
+exactly two: `sigilcoin-runs`, which builds both binaries and runs
+`sigilcoin version`, and `module-eval`, which evaluates a host, asserts the
+units it generates, and fails if a `sigilcoin-listen-proxy` unit ever comes
+back. A run whose dependencies are already built legitimately prints
+`running 0 flake checks`.
+Zero means "nothing left to do", not "nothing was verified" — but it also
+proves nothing, so when you want the checks to actually execute, force them:
+
+```sh
+nix build --rebuild --no-link \
+  .#checks.x86_64-linux.module-eval .#checks.x86_64-linux.sigilcoin-runs
+```
+
+```
+checking outputs of '/nix/store/…-sigilcoin-module-eval.drv'...
+checking outputs of '/nix/store/…-sigilcoin-runs.drv'...
+```
 
 `deploy/` and `LAUNCH.md` must be at least `git add`ed for any of this to
 work; Nix refuses to read a file the git tree does not track, and reports
@@ -122,8 +135,7 @@ Put a TLS reverse proxy in front of the explorer. Nothing here terminates TLS.
 
 | Port | Chain | Who needs it open |
 | --- | --- | --- |
-| 19444/tcp | `sigilcoin-main` | Everyone. `openFirewall = true` opens it. Held by `sigilcoin-listen-proxy.socket`, not by the node process. |
-| 19544/tcp | `sigilcoin-main` | Loopback only. `listen.internalPort`, where `sigilcoin listen` actually binds. Never open it. |
+| 19444/tcp | `sigilcoin-main` | Everyone. `openFirewall = true` opens it. Bound by `sigilcoin listen` itself. |
 | 19445/tcp | `sigilcoin-regtest` | Local only. Never expose it. |
 | 8080/tcp | explorer | Localhost only; reverse-proxy it, do not open the port. |
 
@@ -136,13 +148,39 @@ is `/sigilcoin-node:0.1.0/`.
 
 | Path | What it is |
 | --- | --- |
-| `sigilcoin-main.sqlite` | Headers, blocks, UTXOs, mempool, peer table |
-| `wallet.key` | 32-byte secret, hex, mode 0600 |
+| `sigilcoin-main.sqlite` | Headers, blocks, UTXOs, mempool, peer table, mode 0644 |
+| `wallet/` | Key directory, mode 0700 |
+| `wallet/wallet.key` | 32-byte secret, hex, mode 0600 |
 
-The explorer's PRIMARY group is `sigilcoin`, so it can read the directory and
-the database and cannot read `wallet.key` (0600, owned by the node user). Its
-unit also carries `ReadOnlyPaths=/var/lib/sigilcoin`, so read-only is
-enforced by the kernel rather than by a flag the explorer promises to honour.
+The key is in its own 0700 subdirectory, not loose in the data directory, and
+that separation is load-bearing. The CLI locks the directory that holds the
+key down to 0700 before it creates the file; when the key lived in the data
+directory, the first `sigilcoin address` took the data directory from 0750 to
+0700 and destroyed the group-execute bit the explorer needs to traverse into
+it. Measured against the two builds:
+
+```
+old binary, after `sigilcoin address`:   drwx------ /tmp/sgl-before
+                                         -rw-r--r-- /tmp/sgl-before/sigilcoin-main.sqlite
+                                         -rw------- /tmp/sgl-before/wallet.key
+this build, after `sigilcoin address`:   drwxr-x--- /tmp/sgl-after
+                                         -rw-r--r-- /tmp/sgl-after/sigilcoin-main.sqlite
+                                         drwx------ /tmp/sgl-after/wallet
+                                         -rw------- /tmp/sgl-after/wallet/wallet.key
+```
+
+The explorer's PRIMARY group is `sigilcoin`, so it can traverse the directory
+and read the database, and it cannot reach the key: the group has no bits at
+all on `wallet/`, and the key inside is 0600 owned by the node user. Its unit
+also carries `ReadOnlyPaths=/var/lib/sigilcoin`, so read-only is enforced by
+the kernel rather than by a flag the explorer promises to honour.
+
+A key written by an older build at `<dataDir>/wallet.key` is MOVED into
+`wallet/` the first time any key-using command runs, and the move is printed:
+`wallet: moved …/wallet.key to …/wallet/wallet.key`. If a key exists at BOTH
+paths the CLI refuses rather than guessing which one holds the coins; keep
+the right one, move the other somewhere safe, and remove it from the data
+directory.
 
 Primary group rather than supplementary is load-bearing. Every unit here runs
 with `PrivateUsers=true`, and in that user namespace only the unit's own UID
@@ -161,12 +199,12 @@ still read `<dataDir>` before deciding the explorer is broken.
 
 ```sh
 sudo nixos-rebuild switch --flake /path/to/host-config
-systemctl status sigilcoin-listen-proxy.socket sigilcoin-listen sigilcoin-sync
+systemctl status sigilcoin-listen sigilcoin-sync
 sudo -u sigilcoin sigilcoin status --chain sigilcoin-main --data-dir /var/lib/sigilcoin
 ```
 
-`sigilcoin-listen-proxy.socket` must be `active (listening)`. It is the unit
-that owns port 19444; the node process itself binds only loopback.
+`sigilcoin-listen` must be `active (running)`. It binds port 19444 itself;
+there is no socket unit and no proxy in front of it.
 
 A node that has done nothing but open its database reports genesis, which is
 verified output from a fresh mainnet data directory:
@@ -200,19 +238,34 @@ max-supply: 143029.99991970 SGL
 string reversed: `ff198b5235d6fbf60fad0a9f462feffdff23788d330659d086f34abc4a91c14d`.
 Both are placeholders until the launch-day quote is chosen; see `../LAUNCH.md`.
 
-Creating the node's own address writes `wallet.key`:
+Creating the node's own address writes the wallet key:
 
 ```sh
 sudo -u sigilcoin sigilcoin address --chain sigilcoin-main --data-dir /var/lib/sigilcoin
 ```
 
+Verbatim from this build on a mainnet data directory at `/tmp/sgl-after`,
+which is a 0750 directory standing in for `/var/lib/sigilcoin`:
+
 ```
-address: sgl1qt7d93uz6att7y2934szv6gdu98e76nwrrn95a6
-chain: sigilcoin-regtest
-key-file: /tmp/sgl-verify/wallet.key
+address: sgl1q396xfcr5yjygshnnjxazyu5lhufgzy6r9hpptg
+chain: sigilcoin-main
+key-file: /tmp/sgl-after/wallet/wallet.key
 ```
 
-(that sample is from a regtest run; the mainnet form is the same shape, `sgl1…`)
+The address is whatever that node's own fresh key derives; the seed's will
+differ. What must not differ is the data directory's mode, which the explorer
+depends on:
+
+```sh
+stat -c '%A %n' /var/lib/sigilcoin /var/lib/sigilcoin/wallet /var/lib/sigilcoin/wallet/wallet.key
+```
+
+```
+drwxr-x--- /var/lib/sigilcoin
+drwx------ /var/lib/sigilcoin/wallet
+-rw------- /var/lib/sigilcoin/wallet/wallet.key
+```
 
 Back the key up before the node earns anything. See
 [Backup and restore](#backup-and-restore).
@@ -221,7 +274,7 @@ Back the key up before the node earns anything. See
 
 ```sh
 sudo -u sigilcoin sigilcoin status --chain sigilcoin-main --data-dir /var/lib/sigilcoin
-journalctl -u sigilcoin-sync -u sigilcoin-listen -u sigilcoin-listen-proxy -n 50
+journalctl -u sigilcoin-sync -u sigilcoin-listen -n 50
 ```
 
 **Read deltas, not absolutes.** `sync-stage` and `sync-last-error` are sticky:
@@ -288,9 +341,9 @@ are the game.
 nc -vz seed.<yourdomain> 19444
 ```
 
-On the host itself, `systemctl is-active sigilcoin-listen-proxy.socket`
-answers whether the kernel is holding the port. That socket stays active
-across every restart of the node process, which is the point of it.
+On the host itself, `systemctl is-active sigilcoin-listen` answers whether
+the node is up, and `ss -ltnp | grep 19444` whether it is holding the port.
+The port is closed for the few seconds of a restart, and only then.
 
 ## Adding peers
 
@@ -333,7 +386,7 @@ by anything.
 sudo systemctl stop sigilcoin-sync sigilcoin-listen
 sudo install -d -m 0700 /var/backups/sigilcoin
 sudo cp -a /var/lib/sigilcoin/sigilcoin-main.sqlite /var/backups/sigilcoin/
-sudo cp -a /var/lib/sigilcoin/wallet.key /var/backups/sigilcoin/
+sudo cp -a /var/lib/sigilcoin/wallet/wallet.key /var/backups/sigilcoin/
 sudo systemctl start sigilcoin-sync sigilcoin-listen
 ```
 
@@ -350,8 +403,9 @@ block a day.
 
 ```sh
 sudo systemctl stop sigilcoin-sync sigilcoin-listen
+sudo install -d -o sigilcoin -g sigilcoin -m 0700 /var/lib/sigilcoin/wallet
 sudo install -o sigilcoin -g sigilcoin -m 0600 \
-  /var/backups/sigilcoin/wallet.key /var/lib/sigilcoin/wallet.key
+  /var/backups/sigilcoin/wallet.key /var/lib/sigilcoin/wallet/wallet.key
 sudo install -o sigilcoin -g sigilcoin -m 0644 \
   /var/backups/sigilcoin/sigilcoin-main.sqlite /var/lib/sigilcoin/
 sudo systemctl start sigilcoin-sync sigilcoin-listen
@@ -449,50 +503,42 @@ What that means operationally:
 Verified behaviour of `sigilcoin 0.1.0` that the module works around. Read
 this before deciding something is broken.
 
-**`sigilcoin listen` must be run with `--max-connections 0`, and the kernel
-holds the port either way.** Measured against the binary this flake builds,
-on loopback:
+**`sigilcoin listen` must be run with `--max-connections 0`, which is what
+makes it a daemon.** Measured against the binary this flake builds, on
+loopback, with the results pasted from the runs:
 
 | Invocation | Result |
 | --- | --- |
-| `--max-connections 1`, one connect | exits 0 after serving it (`connections-served: 1`) |
-| `--max-connections 0`, idle, `--accept-timeout 3000` | still running at 20 s; killed by `timeout`, not by itself |
-| `--max-connections 0`, 3 garbage writes then 3 bare hangups | alive after all six; each logged and the loop continued |
+| `--max-connections 0 --accept-timeout 2000`, idle | alive at 30 s and at 55 s; ended by an external `timeout 61` (exit 124), never by itself |
+| `--max-connections 0`, 3 garbage writes then 3 bare hangups | all six absorbed, a 7th connect accepted afterwards, process still alive |
+| `--max-connections 7`, the same six plus one | `connections-accepted: 7`, `connections-dropped: 7`, exit 0 only when its own budget was reached |
+| `--max-connections 1`, one connect | `connections-accepted: 1`, exit 0 |
 
-So `--max-connections 0` — what the module sets, and not the CLI's default of
-1 — gives a process that behaves like a daemon in every case tried here. The
-accept timeout did not end it: `socket-ready?` blocked rather than returning
-false.
+The accept timeout is a poll interval under `--max-connections 0`:
+`operate.sgl`'s loop answers an idle poll with `((= max-connections 0) (loop
+last))` instead of returning. A POSITIVE `--max-connections` is what makes
+the command exit on an idle timeout, which is what a probe or a test wants
+and what a seed must not have.
 
-That is measured behaviour, not a guarantee, and it disagrees with an earlier
-report of `--max-connections 0` exiting after 3.079 s. Do not build the
-deployment on either reading. The module is arranged so neither matters:
+Each connection is served inside its own guard, so a hangup, garbage bytes or
+a silent client drop end that connection and nothing else. That is why the
+unit is an ordinary `Type=simple` service that binds `0.0.0.0:19444`
+directly, with `Restart=always`, `RestartSec=5s` and systemd's start rate
+limit left on (5 starts in 60 s). A restart now means a real fault, so a
+crash loop should reach `failed` and be visible rather than spin forever.
 
-- `sigilcoin-listen-proxy.socket` binds `0.0.0.0:19444` with `Accept=no` and
-  holds it for the lifetime of the host. The accept backlog therefore
-  survives every restart of everything behind it, and a peer that dials
-  during one waits in the backlog instead of being refused.
-- `systemd-socket-proxyd` forwards to `127.0.0.1:19544`, where
-  `sigilcoin listen` binds.
-- `sigilcoin-listen` itself is `Restart=always`, `RestartSec=100ms`,
-  `StartLimitIntervalSec=0`. Startup-to-bind is ~0.08 s, so a restart leaves
-  the loopback listener missing for roughly 0.18 s, during which the proxy
-  drops the connections it cannot forward. The public port never closes.
+An earlier revision of this module ran the node on loopback behind
+`sigilcoin-listen-proxy.socket` and `systemd-socket-proxyd`, because the
+listen command of the time exited on an accept timeout and died on a bare
+connect-and-hangup. Both defects were fixed in the CLI, so the workaround is
+gone: it added a hop, it hid the peer address from a node that will one day
+want to ban one, and its own `Restart=always` without
+`StartLimitIntervalSec=0` could leave the proxy `failed` with port 19444 out
+of service. If you are looking at a host that still has those units, it is
+running an old generation.
 
-Real socket activation — handing `sigilcoin listen` the listening fd itself
-and deleting the proxy — is not possible today: nothing in the Sigil runtime
-or in sigil-bitcoin reads `$LISTEN_FDS`, and `run-listen` unconditionally
-calls `tcp-listen` to make its own socket. When the CLI learns to adopt an
-inherited fd, point `sigilcoin-listen.socket` straight at it and drop
-`sigilcoin-listen-proxy` entirely.
-
-The proxy costs nothing in fidelity: the node never recorded inbound peer
-addresses in the first place. `node-serve-inbound-socket` takes the address
-as a display label and the CLI passes the literal string `"inbound"`.
-
-So: `systemctl status sigilcoin-listen` showing a recent start time is fine,
-and `systemctl is-active sigilcoin-listen-proxy.socket` is the thing that
-must always say `active`.
+So: `systemctl is-active sigilcoin-listen` is the thing that must say
+`active`, and a recent start time on it is worth a look rather than a shrug.
 
 **Two processes share one SQLite file.** `sigilcoin-listen` and
 `sigilcoin-sync` both open `<data-dir>/<chain>.sqlite`. The Sigil SQLite
@@ -527,6 +573,10 @@ options:
   --port N          port to bind (default: 8080)
   -h, --help        print this and exit
   --version         print the package version and exit
+
+The explorer never writes: it opens the node's database read-only,
+answers one request per connection, and closes.
+  --version         print the package version and exit
 ```
 
 MINIMUM VERSION: `--help`, `-h` and `--version` answer and exit before
@@ -553,9 +603,25 @@ explorer: sigilcoin-regtest at /tmp/n/sigilcoin-regtest.sqlite
 explorer: http://127.0.0.1:18099/
 ```
 
-**A read-only SQLite reader still needs the database to be clean.** If the
-node crashes mid-write and leaves a hot journal, recovery requires a write,
-which the explorer cannot perform. Symptom: the explorer fails to start until
-one of the node units has opened the database once. Starting
-`sigilcoin-explorer` after `sigilcoin-sync`, which the unit ordering already
-does, is the mitigation.
+**A read-only SQLite reader cannot recover a hot journal.** If the node is
+killed mid-write — `SIGKILL`, a power cut, the soak plan's own hard-kill test
+— SQLite leaves `sigilcoin-main.sqlite-journal` beside the database, and
+rolling it back is a WRITE. The explorer's unit has
+`ReadOnlyPaths=/var/lib/sigilcoin`, so it cannot perform that write and will
+not serve; expect it to fail on start, or to error on every query, until
+something writable has opened the database.
+
+What the operator does about it:
+
+1. Do not delete the journal. It is the uncommitted transaction, and removing
+   it corrupts the database instead of repairing it.
+2. Let a node unit open the database, which performs the rollback:
+   `systemctl start sigilcoin-sync`, or
+   `sudo -u sigilcoin sigilcoin status --chain sigilcoin-main --data-dir /var/lib/sigilcoin`.
+3. Confirm the journal is gone: `ls /var/lib/sigilcoin` should show only the
+   `.sqlite` file and `wallet/`.
+4. Then `systemctl restart sigilcoin-explorer`.
+
+The unit ordering (`After=sigilcoin-sync.service`) makes that sequence happen
+by itself on a normal boot, so this is a manual step only when the explorer
+is started while the node units are stopped.

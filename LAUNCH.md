@@ -121,9 +121,13 @@ Follow [`deploy/RUNBOOK.md`](deploy/RUNBOOK.md); the checklist here is only
 the launch-day gate.
 
 - [ ] `cd …/sigil-coin/deploy && nix flake check` passes on the build host.
-      It must report a non-zero number of checks (six on a cold store, fewer
-      when they are already built); one of them builds both binaries and runs
-      `sigilcoin version`. `running 0 flake checks` means nothing ran.
+      The number it prints is what was left to build (two checks exist;
+      zero once cached), so do not read it as a pass count.
+      Force the two real checks to execute:
+      `nix build --rebuild --no-link .#checks.x86_64-linux.module-eval .#checks.x86_64-linux.sigilcoin-runs`.
+      One builds both binaries and runs `sigilcoin version`; `module-eval`
+      asserts that no `sigilcoin-listen-proxy` unit exists and that the
+      listen unit binds the public port itself.
 - [ ] `nix build …/sigil-coin?dir=deploy#sigilcoin` produces
       `result/bin/sigilcoin` and `result/bin/sigilcoin-explorer`, and
       `./result/bin/sigilcoin version` prints `sigilcoin 0.1.0`.
@@ -133,11 +137,14 @@ the launch-day gate.
       `openFirewall = true`.
 - [ ] 19444/tcp reachable from off-host. Check from somewhere else, not from
       the seed: `nc -vz seed.<yourdomain> 19444`.
-- [ ] `systemctl is-active sigilcoin-listen-proxy.socket` says `active`. That
-      socket unit, not the node process, is what holds 19444.
+- [ ] `systemctl is-active sigilcoin-listen` says `active`. The node process
+      itself holds 19444; there is no socket unit and no proxy.
 - [ ] `sigilcoin status` on the seed reports the published genesis hash.
 - [ ] Wallet key backed up, encrypted, offline, before the seed can earn
-      anything.
+      anything. It is `/var/lib/sigilcoin/wallet/wallet.key`, inside a 0700
+      directory the explorer cannot enter; `stat -c '%A' /var/lib/sigilcoin`
+      must still read `drwxr-x---` after the key exists, because that is
+      what the explorer traverses.
 - [ ] `timeout 5 sigilcoin-explorer --version` prints
       `sigilcoin-explorer 0.1.0` and returns. If it blocks instead, the
       build predates `--help`/`--version` handling and every explorer
@@ -186,9 +193,8 @@ community; the announcement should read like a toy.
 ## 7. Post-launch checks
 
 **First hour:** seed reachable from off-host (`nc -vz`, run from elsewhere);
-`sigilcoin-listen-proxy.socket` active; two `sigilcoin status` readings ten
-minutes apart show `peer-successes` strictly larger in the second; explorer
-serving.
+`sigilcoin-listen` active; two `sigilcoin status` readings ten minutes apart
+show `peer-successes` strictly larger in the second; explorer serving.
 
 Do NOT use "`peer-failures` not climbing" or "`sync-last-error` empty" as
 criteria. Both fields are sticky records of the last outcome, and one
@@ -208,7 +214,7 @@ published emission schedule at the current height; disk growth measured and
 extrapolated — 8192 bytes per block is about 3 MB a year, so this should be
 a non-issue, and if it is not, something is wrong.
 
-**Ongoing:** back up `wallet.key` and the database on a schedule; watch for
+**Ongoing:** back up `wallet/wallet.key` and the database on a schedule; watch for
 anyone reporting a solution their node accepts and the seed rejects, which
 is the consensus-divergence signal and the one thing worth waking up for.
 
@@ -238,7 +244,12 @@ What to run:
   earliest legal timestamp, and a competing block at the same height to force
   a tie-break.
 - Restart both hosts at least once. Kill the seed with `SIGKILL` mid-write at
-  least once, and confirm both units come back and the explorer recovers.
+  least once, and confirm both node units come back. The explorer will NOT
+  recover on its own: a hard kill can leave a SQLite hot journal, rolling it
+  back is a write, and the explorer's unit is `ReadOnlyPaths`. Let
+  `sigilcoin-sync` open the database first (that performs the rollback),
+  check the `-journal` file is gone, then restart the explorer. Do not delete
+  the journal by hand. See the runbook's last rough edge.
 - Restore from backup onto a third, empty machine and confirm the address and
   balance match.
 
@@ -252,10 +263,10 @@ absolute values:
   peer hanging up is the normal end of a conversation and leaves an error
   string behind.
 - `issued-supply` matching the published schedule exactly.
-- `systemctl show sigilcoin-listen -p NRestarts` — record it daily. What
-  matters is whether the rate is steady or accelerating, not the number.
-  `systemctl is-active sigilcoin-listen-proxy.socket` must never have
-  changed.
+- `systemctl show sigilcoin-listen -p NRestarts` — record it daily. The
+  listener is persistent and absorbs peer faults itself, so this should stay
+  at whatever the last `nixos-rebuild` left it. Any growth is a real crash,
+  and five restarts inside a minute put the unit in `failed` on purpose.
 - RSS against the unit's 1G `MemoryMax`; validation CPU against `CPUQuota`.
 
 **Abort the launch if any of these happen:**
@@ -270,9 +281,10 @@ absolute values:
 - A single block takes more than a few seconds to validate. Solution
   verification is bounded but not cheap, and a chain where a hostile block is
   a denial of service is not ready to be public.
-- Port 19444 is ever observed refusing a connection from off-host while the
-  host is up. The socket unit holds it across restarts, so a refusal means
-  that mechanism is not working.
+- Port 19444 is ever observed refusing a connection from off-host while
+  `sigilcoin-listen` is active. The node holds the port for as long as it
+  runs, so a refusal while it is up means the accept loop is wedged. (A
+  refusal during the few seconds of a deliberate restart is expected.)
 - `peer-successes` is flat for a full day on either node while blocks are
   being mined.
 - Memory or CPU climbs steadily over the soak rather than flattening.
@@ -298,5 +310,5 @@ past step 5.
 | 7 | ~~Confirm the explorer's flags~~ — RESOLVED. `--regtest`, `--data-dir`, `--host`, `--port` confirmed against `explorer-main` and against `sigilcoin-explorer --help` run from the built binary. | `services.sigilcoin-explorer.command` in `deploy/module.nix` |
 | 8 | Seed host, domain, and TLS certificate for the explorer | Not in the tree at all |
 | 9 | Whether to launch without an explorer if it is not ready | Recommendation: yes |
-| 10 | ~~Whether `sigilcoin listen` gets a persistent accept loop before launch~~ — NOT DEFERRED, and no longer a launch blocker. The kernel holds port 19444: `sigilcoin-listen-proxy.socket` binds it with `Accept=no` and keeps the accept backlog across every restart of the node process, which binds loopback behind `systemd-socket-proxyd`. A restarting or crashing listener can no longer take the seed off the air. | `deploy/module.nix` |
-| 10b | Whether to delete the proxy once the CLI can adopt an inherited fd | Real socket activation needs `run-listen` to take the fd in `$LISTEN_FDS` instead of calling `tcp-listen`; nothing in the Sigil runtime or sigil-bitcoin reads it today. Post-launch cleanup, not a blocker. |
+| 10 | ~~Whether `sigilcoin listen` gets a persistent accept loop before launch~~ — RESOLVED IN THE CLI, not worked around. `run-listen` now loops indefinitely under `--max-connections 0` (`operate.sgl`: `((= max-connections 0) (loop last))`) and serves each connection inside its own guard, so a hangup, garbage bytes or a silent drop kill that connection only. Re-measured against this build: idle at `--accept-timeout 2000` it was alive at 30 s and 55 s and ended only by an external `timeout`; six hostile connections were absorbed and a seventh still accepted. The seed therefore binds 19444 itself. | `packages/sigil-coin-cli/src/sigil/coin/cli/operate.sgl`, `deploy/module.nix` |
+| 10b | ~~Whether to delete the socket proxy once the CLI can adopt an inherited fd~~ — DELETED NOW, and no fd adoption was needed. The proxy existed only because the old listener died on an accept timeout and on hostile input; with that fixed it was pure cost: an extra unit pair and hop, no inbound peer address ever reaching the node (which forecloses abuse-banning), and a `Restart=always` without `StartLimitIntervalSec=0` that could park `systemd-socket-proxyd` in `failed` and take port 19444 out of service — the outage it was supposed to prevent. `nix flake check`'s `module-eval` now fails if any `sigilcoin-listen-proxy` unit comes back. | `deploy/module.nix`, `deploy/flake.nix` |

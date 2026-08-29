@@ -22,8 +22,8 @@
 ;;;
 ;;; ## Key storage
 ;;;
-;;; One 32-byte secret in `<data-dir>/wallet.key`, hex, mode 0600, created
-;;; on first use from `/dev/urandom` — the kernel CSPRNG, never
+;;; One 32-byte secret in `<data-dir>/wallet/wallet.key`, hex, mode 0600,
+;;; created on first use from `/dev/urandom` — the kernel CSPRNG, never
 ;;; `(sigil random)`, whose Xorshift128 stream is fine for dice and fatal
 ;;; for keys. The file is refused if its mode is readable by group or other,
 ;;; because a key another account can read is not a key. Nothing here ever
@@ -36,9 +36,22 @@
 ;;; written after that chmod, so it never lands under a permissive mode —
 ;;; but the empty file does exist at 0644 for an instant, and a descriptor
 ;;; opened in that instant keeps reading after the mode changes, because
-;;; permissions are checked at open. So the data directory is created and
-;;; chmodded to 0700 BEFORE the key file is created: another account cannot
-;;; traverse into it to get that descriptor in the first place.
+;;; permissions are checked at open. So the key's own directory is created
+;;; and chmodded to 0700 BEFORE the key file is created: another account
+;;; cannot traverse into it to get that descriptor in the first place.
+;;;
+;;; That 0700 directory is `<data-dir>/wallet`, NOT the data directory
+;;; itself. The data directory also holds `<chain>.sqlite`, which a
+;;; read-only reader such as `sigilcoin-explorer` opens through the group;
+;;; locking the data directory to 0700 destroyed the group-execute bit that
+;;; reader needs to traverse into it, so the first `sigilcoin address` took
+;;; the explorer offline. Key privacy and database readability are now
+;;; separate directories rather than one mode fighting two requirements.
+;;;
+;;; A key at the old `<data-dir>/wallet.key` is MOVED into the new
+;;; directory on first use, never left behind and never silently ignored;
+;;; if both paths hold a key the wallet refuses rather than guessing which
+;;; one is the coins.
 ;;;
 ;;; ```scheme
 ;;; (coin-address (wallet-public-key (wallet-key "/tmp/node"))) ; => "sgl1..."
@@ -67,6 +80,7 @@
     coin-address
     coin-address->script-pubkey
     wallet-key-file
+    wallet-legacy-key-file
     wallet-key
     wallet-public-key
     wallet-script-pubkey
@@ -197,9 +211,18 @@
     ;;; Path of the key file inside a node's data directory.
     ;;;
     ;;; ```scheme
-    ;;; (wallet-key-file "/tmp/node") ; => "/tmp/node/wallet.key"
+    ;;; (wallet-key-file "/tmp/node") ; => "/tmp/node/wallet/wallet.key"
     ;;; ```
     (define (wallet-key-file data-dir)
+      (: string? -> string?)
+      (path-join data-dir "wallet" "wallet.key"))
+
+    ;;; Where the key used to live: directly in the data directory.
+    ;;;
+    ;;; ```scheme
+    ;;; (wallet-legacy-key-file "/tmp/node") ; => "/tmp/node/wallet.key"
+    ;;; ```
+    (define (wallet-legacy-key-file data-dir)
       (: string? -> string?)
       (path-join data-dir "wallet.key"))
 
@@ -243,9 +266,11 @@
         (error (string-append "wallet: could not restrict permissions on "
                               path))))
 
-    ;; The key's containing directory, owner-only, before the key file
+    ;; The key's own containing directory, owner-only, before the key file
     ;; exists. See the module header: this is what closes the window the
-    ;; file's own create-then-chmod leaves open.
+    ;; file's own create-then-chmod leaves open. This is `<data-dir>/wallet`
+    ;; and never the data directory, whose mode belongs to the database's
+    ;; readers.
     (define (ensure-private-directory dir)
       (ensure-directory dir)
       (restrict-permissions "0700" dir)
@@ -303,6 +328,35 @@
                                 " is not a valid secp256k1 private key.")))
         key))
 
+    ;; A key written by a build that kept it in the data directory is moved,
+    ;; not ignored: that file is somebody's coins. Two keys is refused
+    ;; rather than resolved, because picking one would silently strand the
+    ;; other's balance.
+    (define (migrate-legacy-key data-dir path)
+      (let ((legacy (wallet-legacy-key-file data-dir)))
+        (when (file-exists? legacy)
+          (when (file-exists? path)
+            (error (string-append
+                     "wallet: a key exists at both "
+                     legacy
+                     " and "
+                     path
+                     ". Keep the one holding your coins, move the other"
+                     " somewhere safe, and delete it from the data"
+                     " directory.")))
+          ;; Checked BEFORE the move, and refused rather than repaired. The
+          ;; data directory is group-readable so the explorer can reach the
+          ;; database, so a legacy key with group or other bits was readable
+          ;; by that account: silently chmodding it here would launder a real
+          ;; exposure into a clean-looking wallet.
+          (require-private-permissions legacy)
+          (ensure-private-directory (path-dirname path))
+          (rename-file legacy path)
+          (restrict-permissions "0600" path)
+          (println "wallet: moved ~a to ~a (the data directory stays readable by the explorer)"
+                   legacy
+                   path))))
+
     ;;; Load the wallet key for a data directory, creating it if absent.
     ;;;
     ;;; The returned bytes are secret: they are used to sign and to derive a
@@ -314,6 +368,7 @@
     (define (wallet-key data-dir)
       (: string? -> bytevector?)
       (let ((path (wallet-key-file data-dir)))
+        (migrate-legacy-key data-dir path)
         (if (file-exists? path)
             (read-key-file path)
             (let ((key (fresh-private-key)))

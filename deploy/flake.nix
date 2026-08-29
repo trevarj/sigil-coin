@@ -249,10 +249,22 @@
           in
           pkgs.runCommand "sigilcoin-module-eval" { } ''
             test -n "${units."sigilcoin-listen.service".unit}"
-            test -n "${units."sigilcoin-listen-proxy.socket".unit}"
-            test -n "${units."sigilcoin-listen-proxy.service".unit}"
             test -n "${units."sigilcoin-sync.service".unit}"
             test -n "${units."sigilcoin-explorer.service".unit}"
+
+            # The socket proxy is gone for good: the node binds its own
+            # public port. Any unit named after the proxy is a regression,
+            # and so is a listen unit that went back to loopback.
+            test -z "${
+              toString (
+                builtins.attrNames (
+                  nixpkgs.lib.filterAttrs (name: _: nixpkgs.lib.hasPrefix "sigilcoin-listen-proxy" name) units
+                )
+              )
+            }"
+            grep -q "0.0.0.0" ${units."sigilcoin-listen.service".unit}/sigilcoin-listen.service
+            grep -q "19444" ${units."sigilcoin-listen.service".unit}/sigilcoin-listen.service
+
             touch $out
           '';
       };

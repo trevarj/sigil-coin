@@ -58,6 +58,7 @@
     coin-dust-threshold
     coin-default-fee
     wallet-key-file
+    wallet-legacy-key-file
     wallet-key
     wallet-public-key
     wallet-script-pubkey

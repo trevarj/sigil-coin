@@ -18,6 +18,7 @@
         (sigil fs)
         (sigil io)
         (sigil math)
+        (sigil path)
         (sigil time)
         (sigil error)
         (sigil string)
@@ -1412,7 +1413,7 @@
               (not (equal? key
                            (wallet-key (cli-data-dir (fresh-args)))))))))
 
-      (test "the directory is locked down before the key file exists"
+      (test "the key's own directory is locked down before the key file exists"
         ;; The file is created empty and chmodded a moment later, so for an
         ;; instant it exists under the umask's mode. A descriptor opened in
         ;; that instant keeps reading afterwards, because permissions are
@@ -1420,19 +1421,98 @@
         ;; unreachable from another account.
         (let* ((args (fresh-args))
                (dir (cli-data-dir args))
-               (path (wallet-key-file dir)))
+               (path (wallet-key-file dir))
+               (key-dir (path-dirname path)))
           (wallet-key dir)
-          (assert-equal 0 (bitwise-and (stat-mode (file-stat dir)) #o077))
+          (assert-equal 0 (bitwise-and (stat-mode (file-stat key-dir))
+                                       #o077))
           (assert-equal 0 (bitwise-and (stat-mode (file-stat path)) #o077))
-          ;; A data directory left group- or world-reachable is locked down
+          ;; A key directory left group- or world-reachable is locked down
           ;; before the key file is created in it, not after.
-          (let ((other (cli-data-dir (fresh-args))))
-            (assert-equal 0 (process-run "mkdir" "-p" other))
-            (assert-equal 0 (process-run "chmod" "0755" other))
+          (let* ((other (cli-data-dir (fresh-args)))
+                 (other-key-dir (path-dirname (wallet-key-file other))))
+            (assert-equal 0 (process-run "mkdir" "-p" other-key-dir))
+            (assert-equal 0 (process-run "chmod" "0755" other-key-dir))
             (wallet-key other)
             (assert-equal 0
-                          (bitwise-and (stat-mode (file-stat other))
+                          (bitwise-and (stat-mode (file-stat other-key-dir))
                                        #o077)))))
+
+      (test "writing a key leaves the data directory traversable"
+        ;; The explorer reads `<data-dir>/<chain>.sqlite` through the group,
+        ;; which needs group-execute on the data directory itself. Locking
+        ;; the key used to lock that away: the key lives in its own 0700
+        ;; subdirectory precisely so this bit survives.
+        (let* ((args (fresh-args))
+               (dir (cli-data-dir args)))
+          (assert-equal 0 (process-run "chmod" "0750" dir))
+          (wallet-key dir)
+          (assert-equal #o750 (bitwise-and (stat-mode (file-stat dir))
+                                           #o777))
+          ;; The key is still private, and the group cannot even reach it.
+          (assert-equal #o700
+                        (bitwise-and (stat-mode
+                                       (file-stat
+                                         (path-dirname
+                                           (wallet-key-file dir))))
+                                     #o777))
+          (assert-equal 0 (bitwise-and (stat-mode
+                                         (file-stat (wallet-key-file dir)))
+                                       #o077))))
+
+      (test "a key at the old path is moved, not abandoned"
+        (let* ((args (fresh-args))
+               (dir (cli-data-dir args))
+               (legacy (wallet-legacy-key-file dir))
+               (path (wallet-key-file dir)))
+          ;; A key written where an older build put it.
+          (let ((key (wallet-key dir)))
+            (assert-equal 0 (process-run "mv" path legacy))
+            (assert-equal 0 (process-run "rmdir" (path-dirname path)))
+            (assert-equal #f (file-exists? path))
+            ;; Same coins, new location, old file gone.
+            (assert-equal key (wallet-key dir))
+            (assert-true (file-exists? path))
+            (assert-equal #f (file-exists? legacy))
+            (assert-equal 0 (bitwise-and (stat-mode (file-stat path))
+                                         #o077))
+            (assert-equal 0 (bitwise-and (stat-mode
+                                           (file-stat (path-dirname path)))
+                                         #o077)))))
+
+      (test "a group-readable key at the old path is refused, not repaired"
+        ;; The data directory is group-readable so the explorer can reach the
+        ;; database, so a legacy key carrying group bits was readable by that
+        ;; account. Migrating it quietly would repair the mode and hide the
+        ;; exposure, leaving the operator believing a leaked key is private.
+        (let* ((args (fresh-args))
+               (dir (cli-data-dir args))
+               (legacy (wallet-legacy-key-file dir))
+               (path (wallet-key-file dir)))
+          (wallet-key dir)
+          (assert-equal 0 (process-run "mv" path legacy))
+          (assert-equal 0 (process-run "rmdir" (path-dirname path)))
+          (assert-equal 0 (process-run "chmod" "0640" legacy))
+          (let ((message (raises-message (lambda () (wallet-key dir)))))
+            (assert-true (string-contains? message "readable by other accounts"))
+            (assert-true (string-contains? message legacy)))
+          ;; Refused means untouched: not moved, not silently chmodded.
+          (assert-true (file-exists? legacy))
+          (assert-equal #f (file-exists? path))
+          (assert-equal #o040 (bitwise-and (stat-mode (file-stat legacy))
+                                           #o077))))
+
+      (test "two keys are refused rather than one of them being stranded"
+        (let* ((args (fresh-args))
+               (dir (cli-data-dir args))
+               (legacy (wallet-legacy-key-file dir))
+               (path (wallet-key-file dir)))
+          (wallet-key dir)
+          (assert-equal 0 (process-run "cp" path legacy))
+          (let ((message (raises-message (lambda () (wallet-key dir)))))
+            (assert-true (string-contains? message "a key exists at both"))
+            (assert-true (string-contains? message legacy))
+            (assert-true (string-contains? message path)))))
 
       (test "a key file other accounts can read is refused"
         (let* ((args (fresh-args))

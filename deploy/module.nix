@@ -9,44 +9,38 @@
 #                      and validates. This is what keeps the seed's own view
 #                      of the chain current.
 #
-# `sigilcoin listen` IS NOT A DAEMON. Verified against the 0.1.0 binary: the
-# accept loop returns, and the process exits 0, as soon as `--accept-timeout`
-# elapses with no connection waiting (or the `--max-connections` count is
-# reached). `--max-connections 0` removes the connection COUNT limit; it does
-# NOT make the loop persistent — see the option's description. So the listen
-# process is short-lived by design and restarts constantly.
+# `sigilcoin listen --max-connections 0` IS A DAEMON, and each unit below is
+# an ordinary long-lived service that binds its own socket:
 #
-# That is survivable for the process. It is NOT survivable for the port: a
-# restarting process closes its listening socket, which destroys the accept
-# backlog and refuses every peer that dials during the gap. Measured on the
-# 0.1.0 binary, a bare TCP connect-and-hangup ended the accept loop 3/3
-# times, so an `nc` loop was enough to keep the seed unreachable.
+#   sigilcoin-listen.service   `sigilcoin listen` bound directly to
+#                              `listen.bind:listen.port`
+#   sigilcoin-sync.service     `sigilcoin run --iterations 0`
 #
-# The kernel therefore owns the public port here, not the node:
+# Measured against the binary this flake builds, on this host:
 #
-#   sigilcoin-listen-proxy.socket    holds `listen.bind:listen.port` for the
-#                                    lifetime of the host. Accept=no, so the
-#                                    backlog survives every restart below.
-#   sigilcoin-listen-proxy.service   systemd-socket-proxyd, socket-activated,
-#                                    forwards to the loopback listener
-#   sigilcoin-listen.service         `sigilcoin listen` bound to
-#                                    127.0.0.1:listen.internalPort
-#   sigilcoin-sync.service           `sigilcoin run --iterations 0`, which
-#                                    genuinely does loop forever, so this one
-#                                    is an ordinary long-lived service
+#   --max-connections 0 --accept-timeout 2000, idle: alive at 30 s and at
+#     55 s, ended only by an external `timeout 61` (exit 124). The accept
+#     timeout is a poll interval, not a deadline.
+#   6 hostile connections (3 garbage writes, 3 bare hangups): every one
+#     absorbed, `connections-dropped: 7` counting the 7th, the process alive
+#     throughout and still accepting.
+#   --max-connections 1, one connect: `connections-accepted: 1`, exit 0. A
+#     POSITIVE count is what makes the command return; 0 never does.
 #
-# Why a proxy and not `Accept=no` straight into `sigilcoin listen`: real
-# socket activation needs the program to adopt the fd systemd passes in
-# $LISTEN_FDS. Neither the Sigil runtime nor sigil-bitcoin has any such API
-# (grep for LISTEN_FDS across both trees returns nothing), and `run-listen`
-# unconditionally calls `tcp-listen` to make its own socket. Until the CLI
-# can adopt an inherited fd, systemd-socket-proxyd is the only way to put a
-# permanently-bound kernel socket in front of it.
+# `operate.sgl` is explicit about why: the accept loop's `(= max-connections
+# 0)` branch loops instead of returning, so the accept timeout is only a poll
+# interval, and each connection is served inside its own guard, so a hangup,
+# garbage bytes or a silent drop kill that connection and nothing else.
 #
-# The proxy costs nothing in fidelity: `node-serve-inbound-socket` takes the
-# peer address as a display label only, and the CLI already passes the
-# literal string "inbound" and a counter rather than the real remote address,
-# so nothing downstream ever knew where an inbound peer came from.
+# An earlier revision of this module put `systemd-socket-proxyd` in front of
+# a loopback listener, on the belief that `listen` exited on an accept
+# timeout and that a bare connect-and-hangup ended the accept loop. Both were
+# true of an older build and are false now, and the proxy was worse than
+# useless: it added a unit pair and a hop, it hid the real peer address from
+# a node that will eventually want to ban one, and its own `Restart=always`
+# without `StartLimitIntervalSec=0` could put the proxy in `failed` and take
+# the public port out of service — the exact outage it was meant to prevent.
+# It is gone. The node binds the public port itself.
 #
 # Both open the same SQLite file, `<dataDir>/<chain>.sqlite`. The Sigil SQLite
 # driver sets busy_timeout=0 and retries a contended step rather than blocking,
@@ -147,9 +141,10 @@ in
       type = lib.types.path;
       default = "/var/lib/sigilcoin";
       description = ''
-        Node state. Holds `<chain>.sqlite` (headers, blocks, UTXOs, mempool,
-        peers) and `wallet.key` (32-byte secret, mode 0600). Back both up;
-        see RUNBOOK.md.
+        Node state, mode 0750. Holds `<chain>.sqlite` (headers, blocks,
+        UTXOs, mempool, peers) and `wallet/wallet.key` (32-byte secret, mode
+        0600, inside a 0700 subdirectory the explorer cannot enter). Back
+        both up; see RUNBOOK.md.
       '';
     };
 
@@ -177,9 +172,8 @@ in
         default = "0.0.0.0";
         example = "127.0.0.1";
         description = ''
-          Public address the `.socket` unit binds. A seed must bind a
-          reachable address. The node process itself always binds loopback
-          and is reached through the proxy; see the header comment.
+          Address `sigilcoin listen` binds. A seed must bind a reachable
+          address; the CLI's own default of 127.0.0.1 serves nobody.
         '';
       };
 
@@ -187,42 +181,24 @@ in
         type = lib.types.port;
         default = if cfg.chain == "sigilcoin-regtest" then 19445 else 19444;
         defaultText = lib.literalExpression "19444 on sigilcoin-main, 19445 on sigilcoin-regtest";
-        description = "Public TCP port for inbound peers, held by the socket unit.";
-      };
-
-      internalPort = lib.mkOption {
-        type = lib.types.port;
-        default = cfg.listen.port + 100;
-        defaultText = lib.literalExpression "listen.port + 100";
-        description = ''
-          Loopback port `sigilcoin listen` binds, and the address
-          systemd-socket-proxyd forwards to. Never reachable off-host: the
-          node binds 127.0.0.1 and the firewall option only opens
-          `listen.port`.
-        '';
+        description = "Public TCP port for inbound peers, bound by the node itself.";
       };
 
       backlog = lib.mkOption {
         type = lib.types.ints.positive;
         default = 16;
-        description = ''
-          Accept backlog. Applied to the kernel-held `.socket` unit, which is
-          the one that matters, and passed to the node's own loopback socket
-          as well.
-        '';
+        description = "Accept backlog passed to the node's listening socket.";
       };
 
       maxConnections = lib.mkOption {
         type = lib.types.ints.unsigned;
         default = 0;
         description = ''
-          Connections to serve before exiting. 0 removes the connection COUNT
-          limit; it does NOT make the process persistent. The accept loop
-          still returns, and the process still exits 0, when
-          `acceptTimeout` elapses with nothing waiting — measured at 3.079 s
-          with `--accept-timeout 3000 --max-connections 0` and no peers. The
-          CLI's own default is 1, which would make the node exit after every
-          single peer, so 0 is still the right value for a service.
+          Connections to serve before exiting. 0 means serve indefinitely:
+          the accept loop treats `acceptTimeout` as a poll interval and
+          never returns on its own, which is what a supervised seed wants.
+          The CLI's own default is 1, which would exit after a single peer,
+          so 0 is the only sensible value for a service.
         '';
       };
 
@@ -230,12 +206,11 @@ in
         type = lib.types.ints.positive;
         default = 60000;
         description = ''
-          Milliseconds to wait for an inbound connection before the process
-          exits and systemd restarts it. This is the idle re-exec period of
-          the listen unit, not just a socket timeout: see the header comment.
-          Peers do not see the gap, because the `.socket` unit keeps the
-          public port bound across it. Lower it and the unit churns; raise it
-          and a crashed listener stays down longer.
+          Milliseconds the accept loop waits for an inbound connection
+          before looking again. With `maxConnections = 0` this is a poll
+          interval and nothing else: the process does not exit when it
+          elapses. It costs one wakeup per period, so there is no reason to
+          make it small.
         '';
       };
 
@@ -347,8 +322,9 @@ in
       description = ''
         User the explorer runs as. Its PRIMARY group is the node's group,
         which is what lets it read the 0750 data directory and the database.
-        It still cannot read `wallet.key`, which is 0600 and owned by the
-        node user.
+        It still cannot read the wallet key: that lives in
+        `<dataDir>/wallet`, mode 0700, which the group cannot traverse, and
+        the key itself is 0600 and owned by the node user.
 
         It is not a supplementary group, and that is deliberate: every unit
         here runs with `PrivateUsers=true`, and in that user namespace only
@@ -417,10 +393,15 @@ in
       };
       users.groups.${cfg.group} = { };
 
-      # 0750: the explorer's user reads the database through the group; no
-      # other account on the host sees the wallet key's directory at all.
+      # 0750: the explorer's user reads the database through the group. The
+      # wallet key is NOT in this directory — the CLI keeps it in
+      # `<dataDir>/wallet`, which it creates 0700 — so group-execute here
+      # does not expose it. An earlier CLI chmodded this directory itself to
+      # 0700 on first key use and took the explorer offline; see
+      # `wallet.sgl`.
       systemd.tmpfiles.rules = [
         "d ${cfg.dataDir} 0750 ${cfg.user} ${cfg.group} - -"
+        "d ${cfg.dataDir}/wallet 0700 ${cfg.user} ${cfg.group} - -"
       ];
 
       environment.systemPackages = [ cfg.package ];
@@ -429,60 +410,17 @@ in
         cfg.listen.port
       ];
 
-      # The kernel holds the public port. Accept=no, so systemd passes the
-      # LISTENING socket to the proxy: the backlog outlives every restart of
-      # everything below it, and a peer that dials during a restart waits in
-      # that backlog instead of being refused.
-      systemd.sockets.sigilcoin-listen-proxy = lib.mkIf cfg.listen.enable {
-        description = "SigilCoin public inbound socket (${cfg.chain})";
-        wantedBy = [ "sockets.target" ];
-        listenStreams = [ "${cfg.listen.bind}:${toString cfg.listen.port}" ];
-        socketConfig = {
-          Accept = false;
-          Backlog = cfg.listen.backlog;
-          # Bind at boot even if the interface has no address yet, so the
-          # port is never briefly absent on a host with slow DHCP or SLAAC.
-          FreeBind = true;
-        };
-      };
-
-      systemd.services.sigilcoin-listen-proxy = lib.mkIf cfg.listen.enable {
-        description = "SigilCoin inbound socket proxy (${cfg.chain})";
-        requires = [ "sigilcoin-listen-proxy.socket" ];
-        after = [
-          "sigilcoin-listen-proxy.socket"
-          "sigilcoin-listen.service"
-        ];
-
-        serviceConfig = {
-          Type = "notify";
-          User = cfg.user;
-          Group = cfg.group;
-          ExecStart = lib.escapeShellArgs [
-            "${config.systemd.package}/lib/systemd/systemd-socket-proxyd"
-            "127.0.0.1:${toString cfg.listen.internalPort}"
-          ];
-          Restart = "always";
-          RestartSec = 1;
-          StandardOutput = "journal";
-          StandardError = "journal";
-          SyslogIdentifier = "sigilcoin-listen-proxy";
-        }
-        // hardening
-        // {
-          MemoryMax = "64M";
-          CPUQuota = "25%";
-          TasksMax = 16;
-          LimitNOFILE = 4096;
-        };
-      };
-
       systemd.services.sigilcoin-listen = lib.mkIf cfg.listen.enable {
         description = "SigilCoin inbound peer service (${cfg.chain})";
         wantedBy = [ "multi-user.target" ];
         after = [ "network-online.target" ];
         wants = [ "network-online.target" ];
-        startLimitIntervalSec = 0;
+        # The listener is persistent and absorbs peer faults itself, so a
+        # restart now means a real fault rather than routine operation. Five
+        # of them in a minute is a crash loop worth surfacing as `failed`
+        # instead of hiding behind an infinite retry.
+        startLimitIntervalSec = 60;
+        startLimitBurst = 5;
 
         serviceConfig = {
           Type = "simple";
@@ -493,12 +431,10 @@ in
             [
               "${cfg.package}/bin/sigilcoin"
               "listen"
-              # Loopback on purpose: the public port belongs to the socket
-              # unit, and this process is allowed to come and go behind it.
               "--bind"
-              "127.0.0.1"
+              cfg.listen.bind
               "--port"
-              (toString cfg.listen.internalPort)
+              (toString cfg.listen.port)
               "--backlog"
               (toString cfg.listen.backlog)
               "--max-connections"
@@ -516,17 +452,14 @@ in
             ++ dataFlag
             ++ cfg.extraArgs
           );
-          # `listen` exits 0 on an accept timeout, so the restart IS the
-          # service. The default start rate limit (5 starts in 10s) would put
-          # the unit in `failed` within a minute of normal peer traffic, so
-          # it is turned off here. RestartSec is 100ms rather than 1s because
-          # the loopback listener is unbound for the whole delay and the
-          # proxy drops connections it cannot forward; startup-to-bind was
-          # measured at ~0.08 s, so this makes the hole ~0.18 s instead of
-          # ~1.07 s. It is not 0: a genuinely crash-looping binary would then
-          # spin as fast as it can exit, bounded only by CPUQuota.
+          # The process is expected to run for the lifetime of the host, so
+          # this restart is for crashes and for `nixos-rebuild`, not for
+          # normal traffic. Five seconds because the port is unbound for the
+          # whole delay and there is nothing else holding it: long enough
+          # that a crash loop cannot spin on CPU, short enough that a peer
+          # retrying a dial gets through on its next attempt.
           Restart = "always";
-          RestartSec = "100ms";
+          RestartSec = "5s";
           ReadWritePaths = [ cfg.dataDir ];
           StandardOutput = "journal";
           StandardError = "journal";
