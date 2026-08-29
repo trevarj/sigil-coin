@@ -1,0 +1,387 @@
+;;; (sigil coin puzzle constraints) — the v2 rotating constraint catalogue
+;;;
+;;; Every height draws one of eight syntactic rules from the block seed, and
+;;; a solution must satisfy it. A rule is a decidable predicate over the raw
+;;; source bytes, the parsed AST, or both: no evaluation, one byte scan and
+;;; one AST walk, both bounded by `puzzle-v2-max-source-bytes`. That is what
+;;; lets consensus reject a constraint violation before paying for
+;;; evaluation.
+;;;
+;;; The catalogue and the rule semantics are consensus. Changing what
+;;; `puzzle-constraint-ok?` accepts is a chain split, not a soft fork.
+;;;
+;;; This module deliberately sits outside `(sigil coin puzzle)`: the
+;;; interpreter is the language and nothing else. The generator, the miner
+;;; and the consensus solution check all import the catalogue from here.
+
+(define-library (sigil coin puzzle constraints)
+  (import (sigil struct)
+          (sigil math)
+          (sigil coin puzzle))
+  (export
+    ;; Catalogue
+    puzzle-constraint-count
+    puzzle-constraint-names
+    puzzle-constraint-name
+    puzzle-constraint-tier-catalogue
+    puzzle-constraint-builtin-cap
+
+    ;; Checking
+    puzzle-constraint-ok?
+    puzzle-constraint-source-ok?
+    puzzle-constraint-ast-ok?
+    puzzle-constraint-facts-ok?
+
+    ;; Collected facts
+    puzzle-constraint-walk
+    puzzle-facts
+    puzzle-facts?
+    puzzle-facts-quote-seen
+    puzzle-facts-letrec-seen
+    puzzle-facts-lambda-count
+    puzzle-facts-free-builtins
+    puzzle-facts-max-integer
+
+    ;; Repair
+    puzzle-constraint-wrap)
+
+  (begin
+
+    ;; ============================================================
+    ;; Catalogue
+    ;; ============================================================
+
+    ;;; Number of frozen constraints. Ids run `0 .. 7`.
+    (define puzzle-constraint-count 8)
+
+    (define %constraint-names
+      '(none no-digits no-quote letrec-required builtin-cap single-lambda
+        small-literals fold-required))
+
+    ;;; Names of every constraint, in id order.
+    ;;;
+    ;;; ```scheme
+    ;;; (length (puzzle-constraint-names)) ; => 8
+    ;;; ```
+    (define (puzzle-constraint-names)
+      (: -> list?)
+      %constraint-names)
+
+    ;;; Name of one constraint. The name is a detail for failure reporting
+    ;;; and is not consensus; the id is.
+    ;;;
+    ;;; ```scheme
+    ;;; (puzzle-constraint-name 3) ; => letrec-required
+    ;;; ```
+    (define (puzzle-constraint-name ci)
+      (: integer? -> symbol?)
+      (check-constraint ci)
+      (list-ref %constraint-names ci))
+
+    (define (check-constraint ci)
+      (if (not (and (number? ci) (exact? ci) (integer? ci)
+                    (>= ci 0) (< ci puzzle-constraint-count)))
+          (error "puzzle constraints: constraint id out of range"))
+      ci)
+
+    (define (check-tier tier)
+      (if (not (and (number? tier) (exact? tier) (integer? tier)
+                    (>= tier 0) (< tier 3)))
+          (error "puzzle constraints: tier out of range"))
+      tier)
+
+    ;; Tier 0 is unconstrained, so a chain that has retargeted down to
+    ;; trivial puzzles is never made harder by a rule. Tier 1 holds rules
+    ;; that cost a wrapper or a printing change; tier 2 holds rules that
+    ;; materially restrict what a program may say.
+    (define %tier-catalogues
+      '((0)
+        (0 1 3 5)
+        (1 2 4 6 7)))
+
+    ;;; Constraint ids drawn on at a complexity tier.
+    ;;;
+    ;;; ```scheme
+    ;;; (puzzle-constraint-tier-catalogue 2) ; => (1 2 4 6 7)
+    ;;; ```
+    (define (puzzle-constraint-tier-catalogue tier)
+      (: integer? -> list?)
+      (check-tier tier)
+      (list-ref %tier-catalogues tier))
+
+    ;;; `D` for the `builtin-cap` rule: the most distinct free builtins a
+    ;;; solution may name at this tier.
+    ;;;
+    ;;; ```scheme
+    ;;; (puzzle-constraint-builtin-cap 2) ; => 4
+    ;;; ```
+    (define (puzzle-constraint-builtin-cap tier)
+      (: integer? -> integer?)
+      (check-tier tier)
+      (if (>= tier 2) 4 6))
+
+    ;; ============================================================
+    ;; Source-level rules
+    ;; ============================================================
+
+    ;; True when any source byte satisfies `pred`. Accepts the same source
+    ;; shapes the parser does, so the cheap rejection path runs before a
+    ;; parse.
+    (define (source-any? source pred)
+      (cond
+        ((string? source)
+         (let ((n (string-length source)))
+           (let loop ((i 0))
+             (cond
+               ((>= i n) #f)
+               ((pred (char->integer (string-ref source i))) #t)
+               (else (loop (+ i 1)))))))
+        ((bytevector? source)
+         (let ((n (bytevector-length source)))
+           (let loop ((i 0))
+             (cond
+               ((>= i n) #f)
+               ((pred (bytevector-u8-ref source i)) #t)
+               (else (loop (+ i 1)))))))
+        (else (error "puzzle constraints: source must be a string or bytes"))))
+
+    (define (digit-byte? b) (and (>= b 48) (<= b 57)))
+
+    (define (quote-byte? b) (= b 39))
+
+    ;;; The lexical half of a constraint: `O(|source|)`, no parse needed.
+    ;;;
+    ;;; Only `no-digits` and `no-quote` have one; every other rule is
+    ;;; vacuously true here and decided by `puzzle-constraint-ast-ok?`.
+    ;;;
+    ;;; ```scheme
+    ;;; (puzzle-constraint-source-ok? 1 "(lambda(x)(list x x))") ; => #t
+    ;;; (puzzle-constraint-source-ok? 1 "(lambda(x)(+ x 1))")    ; => #f
+    ;;; ```
+    (define (puzzle-constraint-source-ok? ci source)
+      (: integer? any? -> boolean?)
+      (check-constraint ci)
+      (cond
+        ((= ci 1) (not (source-any? source digit-byte?)))
+        ((= ci 2) (not (source-any? source quote-byte?)))
+        (else #t)))
+
+    ;; ============================================================
+    ;; The AST walk
+    ;; ============================================================
+
+    ;;; Facts one walk collects, enough to decide every AST-level rule.
+    ;;;
+    ;;; `free-builtins` holds the distinct builtin names used free — a name
+    ;;; bound by `lambda`, `let` or `letrec` is a local, not a builtin, which
+    ;;; is what rule 4 has to get right. `max-integer` is the largest integer
+    ;;; literal magnitude anywhere in the AST, quoted data included.
+    (define-struct puzzle-facts
+      (quote-seen default: #f mutable: #t)
+      (letrec-seen default: #f mutable: #t)
+      (lambda-count default: 0 mutable: #t)
+      (free-builtins default: '() mutable: #t)
+      (max-integer default: 0 mutable: #t))
+
+    ;; The builtin vocabulary is frozen, so this list is computed once.
+    (define %builtins (puzzle-builtin-names))
+
+    (define (exact-integer? v)
+      (and (number? v) (exact? v) (integer? v)))
+
+    (define (note-integer! facts n)
+      (let ((magnitude (abs n)))
+        (if (> magnitude (puzzle-facts-max-integer facts))
+            (set-puzzle-facts-max-integer! facts magnitude))))
+
+    (define (note-builtin! facts name)
+      (if (not (memq name (puzzle-facts-free-builtins facts)))
+          (set-puzzle-facts-free-builtins!
+            facts
+            (cons name (puzzle-facts-free-builtins facts)))))
+
+    (define (safe-car x) (if (pair? x) (car x) '()))
+    (define (safe-cdr x) (if (pair? x) (cdr x) '()))
+
+    ;; Inside `(quote d)` nothing binds and nothing is applied, so only
+    ;; integer literals are recorded. An improper tail cannot come from the
+    ;; parser, but the walk handles one rather than assuming.
+    (define (walk-quoted node facts)
+      (cond
+        ((exact-integer? node) (note-integer! facts node))
+        ((pair? node)
+         (walk-quoted (car node) facts)
+         (walk-quoted (cdr node) facts))
+        (else #t)))
+
+    (define (walk-each nodes facts bound)
+      (if (pair? nodes)
+          (begin
+            (walk-node (car nodes) facts bound)
+            (walk-each (cdr nodes) facts bound))))
+
+    ;; Names a binding form introduces. Malformed entries bind nothing; the
+    ;; program cannot evaluate anyway, and the walk must stay total.
+    (define (binding-names bindings)
+      (let loop ((bs bindings) (acc '()))
+        (if (not (pair? bs))
+            acc
+            (let ((b (car bs)))
+              (loop (cdr bs)
+                    (if (and (pair? b) (symbol? (car b)))
+                        (cons (car b) acc)
+                        acc))))))
+
+    (define (walk-inits bindings facts bound)
+      (if (pair? bindings)
+          (begin
+            (let ((b (car bindings)))
+              (if (pair? b) (walk-each (cdr b) facts bound)))
+            (walk-inits (cdr bindings) facts bound))))
+
+    ;; Parameter lists are not walked: `(lambda (car) car)` binds `car` as a
+    ;; local, so treating the parameter list as an application would record a
+    ;; builtin that is never used as one.
+    (define (lambda-params rest)
+      (let loop ((ps (safe-car rest)) (acc '()))
+        (if (not (pair? ps))
+            acc
+            (loop (cdr ps)
+                  (if (symbol? (car ps)) (cons (car ps) acc) acc)))))
+
+    (define (walk-form node facts bound)
+      (let ((head (car node))
+            (rest (cdr node)))
+        (cond
+          ((eq? head 'quote)
+           (set-puzzle-facts-quote-seen! facts #t)
+           (walk-quoted rest facts))
+          ((eq? head 'lambda)
+           (set-puzzle-facts-lambda-count!
+             facts (+ 1 (puzzle-facts-lambda-count facts)))
+           (walk-each (safe-cdr rest) facts
+                      (append (lambda-params rest) bound)))
+          ((eq? head 'let)
+           (let ((bindings (safe-car rest)))
+             (walk-inits bindings facts bound)
+             (walk-each (safe-cdr rest) facts
+                        (append (binding-names bindings) bound))))
+          ((eq? head 'letrec)
+           (set-puzzle-facts-letrec-seen! facts #t)
+           (let* ((bindings (safe-car rest))
+                  (inner (append (binding-names bindings) bound)))
+             (walk-inits bindings facts inner)
+             (walk-each (safe-cdr rest) facts inner)))
+          ((memq head '(if and or)) (walk-each rest facts bound))
+          (else
+            (walk-node head facts bound)
+            (walk-each rest facts bound)))))
+
+    (define (walk-node node facts bound)
+      (cond
+        ((exact-integer? node) (note-integer! facts node))
+        ((symbol? node)
+         (if (and (not (memq node bound)) (memq node %builtins))
+             (note-builtin! facts node)))
+        ((pair? node) (walk-form node facts bound))
+        (else #t)))
+
+    ;;; Walk a parsed AST once and return the collected facts.
+    ;;;
+    ;;; Total on any datum the parser can produce, and on hand-built data
+    ;;; besides: a malformed form binds nothing and is walked generically.
+    ;;;
+    ;;; ```scheme
+    ;;; (puzzle-facts-lambda-count
+    ;;;   (puzzle-constraint-walk '(lambda (x) (map car x)))) ; => 1
+    ;;; (puzzle-facts-free-builtins
+    ;;;   (puzzle-constraint-walk '(let ((map 1)) map)))      ; => ()
+    ;;; ```
+    (define (puzzle-constraint-walk ast)
+      (: any? -> puzzle-facts?)
+      (let ((facts (puzzle-facts)))
+        (walk-node ast facts '())
+        facts))
+
+    ;; ============================================================
+    ;; Rule predicates
+    ;; ============================================================
+
+    ;;; Decide an AST-level rule from already-collected facts.
+    ;;;
+    ;;; `d` is the `builtin-cap` limit from `puzzle-constraint-builtin-cap`
+    ;;; and is read by rule 4 only.
+    ;;;
+    ;;; ```scheme
+    ;;; (puzzle-constraint-facts-ok?
+    ;;;   5 (puzzle-constraint-walk '(lambda (x) x)) 4) ; => #t
+    ;;; ```
+    (define (puzzle-constraint-facts-ok? ci facts d)
+      (: integer? puzzle-facts? integer? -> boolean?)
+      (check-constraint ci)
+      (cond
+        ((= ci 0) #t)
+        ;; `no-digits` is lexical only; the byte scan already decided it.
+        ((= ci 1) #t)
+        ((= ci 2) (not (puzzle-facts-quote-seen facts)))
+        ((= ci 3) (puzzle-facts-letrec-seen facts))
+        ((= ci 4) (<= (length (puzzle-facts-free-builtins facts)) d))
+        ((= ci 5) (= 1 (puzzle-facts-lambda-count facts)))
+        ((= ci 6) (<= (puzzle-facts-max-integer facts) 9))
+        (else (and (memq 'fold (puzzle-facts-free-builtins facts)) #t))))
+
+    ;;; Decide the AST half of a rule for a parsed AST.
+    ;;;
+    ;;; ```scheme
+    ;;; (puzzle-constraint-ast-ok? 3 '(lambda (x) x) 4) ; => #f
+    ;;; ```
+    (define (puzzle-constraint-ast-ok? ci ast d)
+      (: integer? any? integer? -> boolean?)
+      (puzzle-constraint-facts-ok? ci (puzzle-constraint-walk ast) d))
+
+    ;;; True when `source`, parsed into `ast`, satisfies constraint `ci`.
+    ;;;
+    ;;; Both halves are checked. Rule 2 needs both deliberately: the byte
+    ;;; scan is the cheap path that runs before parsing, and the AST check is
+    ;;; what catches a hand-built `(quote x)` that spells no apostrophe.
+    ;;;
+    ;;; ```scheme
+    ;;; (puzzle-constraint-ok? 2 "(lambda(x)(list x x))"
+    ;;;                        '(lambda (x) (list x x)) 4) ; => #t
+    ;;; (puzzle-constraint-ok? 2 "(lambda(x)(quote a))"
+    ;;;                        '(lambda (x) (quote a)) 4)  ; => #f
+    ;;; ```
+    (define (puzzle-constraint-ok? ci source ast d)
+      (: integer? any? any? integer? -> boolean?)
+      (and (puzzle-constraint-source-ok? ci source)
+           (puzzle-constraint-ast-ok? ci ast d)))
+
+    ;; ============================================================
+    ;; Repair
+    ;; ============================================================
+
+    ;;; Wrap a one-argument body in the lambda that constraint `ci` demands.
+    ;;;
+    ;;; This is the repair transform: `letrec-required` and `fold-required`
+    ;;; are the only rules a body cannot be expected to satisfy on its own,
+    ;;; and both are repaired by a fixed, semantics-preserving wrapper —
+    ;;; `f` is the identity, and `fold` over the empty list returns its init.
+    ;;; Every other rule is satisfied by choosing the body and the example
+    ;;; domain, so the wrapper is the bare lambda. The generator never trusts
+    ;;; this: it prints, parses, re-checks the constraint and re-runs the
+    ;;; result (see `(sigil coin puzzle examples)`).
+    ;;;
+    ;;; ```scheme
+    ;;; (puzzle-constraint-wrap 0 "(list x x)") ; => "(lambda(x)(list x x))"
+    ;;; (puzzle-constraint-wrap 7 "x")
+    ;;; ; => "(lambda(x)(fold(lambda(a b)a)x '()))"
+    ;;; ```
+    (define (puzzle-constraint-wrap ci body)
+      (: integer? string? -> string?)
+      (check-constraint ci)
+      (cond
+        ((= ci 3)
+         (string-append "(lambda(x)(letrec((f(lambda(y)y)))(f " body ")))"))
+        ((= ci 7)
+         (string-append "(lambda(x)(fold(lambda(a b)a)" body " '()))"))
+        (else (string-append "(lambda(x)" body ")"))))))

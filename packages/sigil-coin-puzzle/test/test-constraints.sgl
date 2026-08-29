@@ -1,0 +1,271 @@
+;;; Golden vectors for the v2 rotating constraint catalogue.
+;;;
+;;; The catalogue, the ids and what each rule accepts are consensus. Drift
+;;; here changes which blocks nodes accept, so these expectations must fail
+;;; loudly rather than be updated.
+
+(import (sigil test)
+        (sigil math)
+        (sigil coin puzzle)
+        (sigil coin puzzle constraints))
+
+;; ============================================================
+;; Helpers
+;; ============================================================
+
+(define (facts-of source)
+  (puzzle-constraint-walk (puzzle-result-value (puzzle-parse source))))
+
+(define (ast-of source)
+  (puzzle-result-value (puzzle-parse/limit source puzzle-v2-max-source-bytes)))
+
+(define (ok? ci source d)
+  (puzzle-constraint-ok? ci source (ast-of source) d))
+
+;; ============================================================
+;; Catalogue
+;; ============================================================
+
+(test-group "constraint catalogue"
+  (test "the catalogue is frozen"
+    (assert-equal 8 puzzle-constraint-count)
+    (assert-equal '(none no-digits no-quote letrec-required builtin-cap
+                    single-lambda small-literals fold-required)
+                  (puzzle-constraint-names))
+    (assert-equal 'none (puzzle-constraint-name 0))
+    (assert-equal 'fold-required (puzzle-constraint-name 7)))
+
+  (test "the tier catalogues are frozen"
+    (assert-equal '(0) (puzzle-constraint-tier-catalogue 0))
+    (assert-equal '(0 1 3 5) (puzzle-constraint-tier-catalogue 1))
+    (assert-equal '(1 2 4 6 7) (puzzle-constraint-tier-catalogue 2)))
+
+  (test "every catalogued id is a real constraint"
+    (let loop ((tier 0))
+      (if (> tier 2)
+          (assert-true #t)
+          (begin
+            (let inner ((ids (puzzle-constraint-tier-catalogue tier)))
+              (if (pair? ids)
+                  (begin
+                    (assert-true (>= (car ids) 0))
+                    (assert-true (< (car ids) puzzle-constraint-count))
+                    (inner (cdr ids)))))
+            (loop (+ tier 1))))))
+
+  (test "the builtin cap tightens with the tier"
+    (assert-equal 6 (puzzle-constraint-builtin-cap 0))
+    (assert-equal 6 (puzzle-constraint-builtin-cap 1))
+    (assert-equal 4 (puzzle-constraint-builtin-cap 2)))
+
+  (test "out-of-range ids and tiers are rejected"
+    (assert-error (puzzle-constraint-name 8))
+    (assert-error (puzzle-constraint-name -1))
+    (assert-error (puzzle-constraint-tier-catalogue 3))
+    (assert-error (puzzle-constraint-builtin-cap -1))))
+
+;; ============================================================
+;; The lexical half
+;; ============================================================
+
+(test-group "constraint source rules"
+  (test "no-digits scans bytes, not the AST"
+    (assert-true (puzzle-constraint-source-ok? 1 "(lambda(x)(list x x))"))
+    (assert-false (puzzle-constraint-source-ok? 1 "(lambda(x)(+ x 1))"))
+    ;; a digit inside a string or a symbol still counts
+    (assert-false (puzzle-constraint-source-ok? 1 "(lambda(x)\"a1\")"))
+    (assert-false (puzzle-constraint-source-ok? 1 "(lambda(x)'a1)")))
+
+  (test "no-quote scans for the apostrophe"
+    (assert-true (puzzle-constraint-source-ok? 2 "(lambda(x)(list x 1))"))
+    (assert-false (puzzle-constraint-source-ok? 2 "(lambda(x)'a)")))
+
+  (test "bytevector source is scanned identically"
+    (let ((bv (make-bytevector 1 49)))       ; "1"
+      (assert-false (puzzle-constraint-source-ok? 1 bv))
+      (assert-true (puzzle-constraint-source-ok? 2 bv))))
+
+  (test "every other rule is vacuous lexically"
+    (let loop ((ci 0))
+      (if (> ci 7)
+          (assert-true #t)
+          (begin
+            (if (and (not (= ci 1)) (not (= ci 2)))
+                (assert-true (puzzle-constraint-source-ok? ci "'a1")))
+            (loop (+ ci 1))))))
+
+  (test "a malformed source is rejected rather than guessed at"
+    (assert-error (puzzle-constraint-source-ok? 1 42))))
+
+;; ============================================================
+;; The AST walk
+;; ============================================================
+
+(test-group "constraint walk"
+  (test "lambdas are counted"
+    (assert-equal 1 (puzzle-facts-lambda-count (facts-of "(lambda (x) x)")))
+    (assert-equal 2 (puzzle-facts-lambda-count
+                      (facts-of "(lambda (x) (map (lambda (y) y) x))")))
+    (assert-equal 0 (puzzle-facts-lambda-count (facts-of "(car x)"))))
+
+  (test "free builtins are collected"
+    (let ((facts (facts-of "(lambda (x) (map car x))")))
+      (assert-true (memq 'map (puzzle-facts-free-builtins facts)))
+      (assert-true (memq 'car (puzzle-facts-free-builtins facts)))
+      (assert-equal 2 (length (puzzle-facts-free-builtins facts)))))
+
+  (test "a name is counted once however often it is used"
+    ;; `list` and `car`, however often either appears.
+    (assert-equal 2 (length (puzzle-facts-free-builtins
+                              (facts-of "(list (car x) (car (car x)))")))))
+
+  (test "a bound name is a local, not a builtin"
+    ;; Rule 4 hangs on this: builtin names are shadowable in v1/v2 semantics.
+    (assert-equal '() (puzzle-facts-free-builtins
+                        (facts-of "(lambda (car) (car 1))")))
+    (assert-equal '() (puzzle-facts-free-builtins
+                        (facts-of "(let ((map 1)) (map 2))")))
+    (assert-equal '() (puzzle-facts-free-builtins
+                        (facts-of "(letrec ((fold 1)) (fold 2))"))))
+
+  (test "a let init is walked in the outer scope"
+    ;; `map` in the init is still the builtin; `map` in the body is not.
+    (let ((facts (facts-of "(let ((map (map car x))) (map 1))")))
+      (assert-true (memq 'map (puzzle-facts-free-builtins facts)))
+      (assert-true (memq 'car (puzzle-facts-free-builtins facts)))
+      (assert-equal 2 (length (puzzle-facts-free-builtins facts)))))
+
+  (test "letrec is seen and binds its own inits"
+    (let ((facts (facts-of "(letrec ((f (lambda (y) (f y)))) (f 1))")))
+      (assert-true (puzzle-facts-letrec-seen facts))
+      (assert-equal 1 (puzzle-facts-lambda-count facts))
+      (assert-equal '() (puzzle-facts-free-builtins facts))))
+
+  (test "quote is seen and its data are not applications"
+    (let ((facts (facts-of "'(car cdr)")))
+      (assert-true (puzzle-facts-quote-seen facts))
+      (assert-equal '() (puzzle-facts-free-builtins facts))))
+
+  (test "integer literals are collected, quoted data included"
+    (assert-equal 9 (puzzle-facts-max-integer (facts-of "(+ x 9)")))
+    (assert-equal 99 (puzzle-facts-max-integer (facts-of "'(1 (99))")))
+    (assert-equal 12 (puzzle-facts-max-integer (facts-of "(- x -12)")))
+    (assert-equal 0 (puzzle-facts-max-integer (facts-of "(list x)"))))
+
+  (test "the walk is total on malformed forms"
+    ;; Constraint checking runs before evaluation, so it must not raise on a
+    ;; program the evaluator would reject.
+    (assert-true (puzzle-facts? (puzzle-constraint-walk '(lambda))))
+    (assert-true (puzzle-facts? (puzzle-constraint-walk '(let 5 6))))
+    (assert-true (puzzle-facts? (puzzle-constraint-walk '(letrec ((1 2)) 3))))
+    (assert-true (puzzle-facts? (puzzle-constraint-walk '(quote))))
+    (assert-true (puzzle-facts? (puzzle-constraint-walk '(1 . 2))))
+    (assert-equal 1 (puzzle-facts-lambda-count
+                      (puzzle-constraint-walk '(lambda 5 (car x)))))))
+
+;; ============================================================
+;; The rules
+;; ============================================================
+
+(test-group "constraint rules"
+  (test "none accepts anything"
+    (assert-true (ok? 0 "(lambda(x)'a1)" 4)))
+
+  (test "no-digits"
+    (assert-true (ok? 1 "(lambda(x)(list x x))" 4))
+    (assert-false (ok? 1 "(lambda(x)(list x 1))" 4)))
+
+  (test "no-quote checks the bytes and the AST"
+    (assert-true (ok? 2 "(lambda(x)(list x x))" 4))
+    (assert-false (ok? 2 "(lambda(x)'a)" 4))
+    ;; The byte scan alone would miss this one, which is why both halves run.
+    (assert-true (puzzle-constraint-source-ok? 2 "(lambda(x)(quote a))"))
+    (assert-false (ok? 2 "(lambda(x)(quote a))" 4)))
+
+  (test "letrec-required"
+    (assert-false (ok? 3 "(lambda(x)(list x x))" 4))
+    (assert-true (ok? 3 "(lambda(x)(letrec((f(lambda(y)y)))(f x)))" 4)))
+
+  (test "builtin-cap counts distinct free builtins"
+    (let ((five "(lambda(x)(list (car x) (cdr x) (length x) (reverse x)))"))
+      (assert-false (ok? 4 five 4))
+      (assert-true (ok? 4 five 6))
+      (assert-true (ok? 4 "(lambda(x)(list x (car x)))" 4))
+      ;; special forms are not builtins and never count
+      (assert-true (ok? 4 "(lambda(x)(if x (let ((y x)) y) 'a))" 1))))
+
+  (test "single-lambda"
+    (assert-true (ok? 5 "(lambda(x)(list x x))" 4))
+    (assert-false (ok? 5 "(lambda(x)(map (lambda(y)y) x))" 4))
+    (assert-false (ok? 5 "(car x)" 4)))
+
+  (test "small-literals"
+    (assert-true (ok? 6 "(lambda(x)(+ x 9))" 4))
+    (assert-false (ok? 6 "(lambda(x)(+ x 10))" 4))
+    (assert-false (ok? 6 "(lambda(x)'(1 2 300))" 4))
+    (assert-false (ok? 6 "(lambda(x)(- x -10))" 4)))
+
+  (test "fold-required"
+    (assert-false (ok? 7 "(lambda(x)(list x x))" 4))
+    (assert-true (ok? 7 "(lambda(x)(fold(lambda(a b)a)x '()))" 4))
+    ;; a shadowed `fold` is not the builtin, so it does not satisfy the rule
+    (assert-false (ok? 7 "(lambda(x)(let ((fold x)) fold))" 4))))
+
+;; ============================================================
+;; Repair
+;; ============================================================
+
+(define %examples '((1 . 2) (3 . 4)))
+
+;; `(lambda(x)BODY)` and its repaired form must agree on every example.
+(define (wrap-runs? ci body pairs)
+  (let ((source (puzzle-constraint-wrap ci body)))
+    (and (puzzle-report-ok? (puzzle-run-examples source pairs))
+         (puzzle-constraint-ok? ci source (ast-of source) 4))))
+
+(test-group "constraint repair"
+  (test "the wrappers are frozen"
+    (assert-equal "(lambda(x)(list x x))" (puzzle-constraint-wrap 0 "(list x x)"))
+    (assert-equal "(lambda(x)(letrec((f(lambda(y)y)))(f x)))"
+                  (puzzle-constraint-wrap 3 "x"))
+    (assert-equal "(lambda(x)(fold(lambda(a b)a)x '()))"
+                  (puzzle-constraint-wrap 7 "x"))
+    ;; every other rule is satisfied by the body and the domain, not a wrapper
+    (let loop ((ci 0))
+      (if (> ci 7)
+          (assert-true #t)
+          (begin
+            (if (and (not (= ci 3)) (not (= ci 7)))
+                (assert-equal "(lambda(x)(car x))"
+                              (puzzle-constraint-wrap ci "(car x)")))
+            (loop (+ ci 1))))))
+
+  (test "a repaired program still computes the same thing"
+    ;; `f` is the identity and `fold` over the empty list returns its init,
+    ;; so both wrappers are semantics-preserving.
+    (assert-true (wrap-runs? 0 "(+ x 1)" %examples))
+    (assert-true (wrap-runs? 3 "(+ x 1)" %examples))
+    (assert-true (wrap-runs? 7 "(+ x 1)" %examples)))
+
+  (test "the letrec wrapper satisfies letrec-required"
+    (let ((source (puzzle-constraint-wrap 3 "(+ x 1)")))
+      (assert-true (puzzle-facts-letrec-seen
+                     (puzzle-constraint-walk (ast-of source))))))
+
+  (test "the fold wrapper satisfies fold-required"
+    (let ((source (puzzle-constraint-wrap 7 "(+ x 1)")))
+      (assert-true (memq 'fold (puzzle-facts-free-builtins
+                                 (puzzle-constraint-walk (ast-of source)))))))
+
+  (test "the wrappers cost what the size budget assumes"
+    ;; The table solution is sized against these, so a wrapper that grew
+    ;; would silently eat the headroom under `puzzle-v2-max-source-bytes`.
+    (assert-equal 11 (- (string-length (puzzle-constraint-wrap 0 ""))
+                        0))
+    (assert-equal 29 (- (string-length (puzzle-constraint-wrap 3 ""))
+                        (string-length (puzzle-constraint-wrap 0 ""))))
+    (assert-equal 24 (- (string-length (puzzle-constraint-wrap 7 ""))
+                        (string-length (puzzle-constraint-wrap 0 "")))))
+
+  (test "an out-of-range constraint cannot be wrapped"
+    (assert-error (puzzle-constraint-wrap 8 "x"))))

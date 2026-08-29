@@ -36,6 +36,8 @@
     puzzle-max-source-bytes
     puzzle-max-parse-depth
     puzzle-max-fuel
+    puzzle-v2-max-source-bytes
+    puzzle-v2-max-fuel
     puzzle-max-integer
     puzzle-max-allocations
     puzzle-max-string-bytes
@@ -55,8 +57,22 @@
 
     ;; Front end
     puzzle-parse
+    puzzle-parse/limit
     puzzle-eval
     puzzle-run
+
+    ;; Program-by-example front end (v2)
+    puzzle-report
+    puzzle-report?
+    puzzle-report-status
+    puzzle-report-value
+    puzzle-report-steps
+    puzzle-report-cells
+    puzzle-report-error-kind
+    puzzle-report-index
+    puzzle-report-message
+    puzzle-report-ok?
+    puzzle-run-examples
 
     ;; Values
     puzzle-value?
@@ -109,6 +125,22 @@
 
     ;;; Maximum evaluator steps ("fuel") for one evaluation.
     (define puzzle-max-fuel 1000000)
+
+    ;;; Maximum program-by-example solution source size, in bytes.
+    ;;;
+    ;;; v2 solutions are functions, so the liveness escape is a `k`-branch
+    ;;; lookup table (see `(sigil coin puzzle examples)`), which does not fit
+    ;;; 256 bytes at `k = 10`. Only `puzzle-run-examples` and
+    ;;; `puzzle-parse/limit` honour this cap; the v1 entry points keep
+    ;;; `puzzle-max-source-bytes`, so nothing about v1 moves.
+    (define puzzle-v2-max-source-bytes 512)
+
+    ;;; Maximum evaluator steps for one program-by-example evaluation.
+    ;;;
+    ;;; One machine serves the solution's own evaluation and all `k`
+    ;;; applications, so validation cost is bounded by this number
+    ;;; regardless of `k`.
+    (define puzzle-v2-max-fuel 200000)
 
     ;;; Exclusive bound on integer magnitude: every literal, intermediate and
     ;;; result must satisfy `(< (abs n) puzzle-max-integer)`.
@@ -517,11 +549,11 @@
     ;; Decode the source into an ASCII string, enforcing the size cap. Source
     ;; is restricted to ASCII so that byte counts and character counts agree
     ;; on every host.
-    (define (puzzle--source->text source)
+    (define (puzzle--source->text source limit)
       (cond
         ((string? source)
          (let ((n (string-length source)))
-           (if (> n puzzle-max-source-bytes)
+           (if (> n limit)
                (fail 'parse-oversize "source exceeds the byte cap"))
            (let loop ((i 0))
              (if (>= i n)
@@ -532,7 +564,7 @@
                    (loop (+ i 1)))))))
         ((bytevector? source)
          (let ((n (bytevector-length source)))
-           (if (> n puzzle-max-source-bytes)
+           (if (> n limit)
                (fail 'parse-oversize "source exceeds the byte cap"))
            (let loop ((i 0) (acc '()))
              (if (>= i n)
@@ -652,17 +684,35 @@
     ;;; ```
     (define (puzzle-parse source)
       (: any? -> puzzle-result?)
+      (puzzle-parse/limit source puzzle-max-source-bytes))
+
+    ;;; Parse solution source under an explicit byte cap.
+    ;;;
+    ;;; `puzzle-parse` is this with `puzzle-max-source-bytes`; the v2
+    ;;; program-by-example path passes `puzzle-v2-max-source-bytes`. Nothing
+    ;;; else about parsing differs, so one grammar serves both.
+    ;;;
+    ;;; ```scheme
+    ;;; (puzzle-result-error-kind (puzzle-parse/limit "(+ 1 2)" 3))
+    ;;; ; => parse-oversize
+    ;;; ```
+    (define (puzzle-parse/limit source limit)
+      (: any? integer? -> puzzle-result?)
       (guard (e (#t (abort->result e 0 0)))
-        (let* ((text (puzzle--source->text source))
-               (n (string-length text))
-               (start (puzzle--skip-space text 0 n)))
-          (if (>= start n)
-              (fail 'parse-syntax "empty source"))
-          (let* ((parsed (puzzle--read text start n 1))
-                 (after (puzzle--skip-space text (cdr parsed) n)))
-            (if (< after n)
-                (fail 'parse-syntax "trailing input after the expression"))
-            (puzzle-result status: 'ok value: (car parsed))))))
+        (puzzle-result status: 'ok value: (puzzle--parse-datum source limit))))
+
+    ;; Parse one datum or raise a `puzzle--abort`.
+    (define (puzzle--parse-datum source limit)
+      (let* ((text (puzzle--source->text source limit))
+             (n (string-length text))
+             (start (puzzle--skip-space text 0 n)))
+        (if (>= start n)
+            (fail 'parse-syntax "empty source"))
+        (let* ((parsed (puzzle--read text start n 1))
+               (after (puzzle--skip-space text (cdr parsed) n)))
+          (if (< after n)
+              (fail 'parse-syntax "trailing input after the expression"))
+          (car parsed))))
 
     ;; ============================================================
     ;; Machine state
@@ -671,7 +721,10 @@
     (define-struct puzzle--machine
       (fuel default: 0 mutable: #t)
       (cells default: 0 mutable: #t)
-      (string-bytes default: 0 mutable: #t))
+      (string-bytes default: 0 mutable: #t)
+      ;; The budget the machine opened with, so `steps-used` is exact for
+      ;; both the v1 fuel cap and the v2 one.
+      (budget default: 0))
 
     (define (spend! m cost)
       (let ((left (- (puzzle--machine-fuel m) cost)))
@@ -700,7 +753,7 @@
         (set-puzzle--machine-string-bytes! m used)))
 
     (define (steps-used m)
-      (- puzzle-max-fuel (puzzle--machine-fuel m)))
+      (- (puzzle--machine-budget m) (puzzle--machine-fuel m)))
 
     (define (cells-used m)
       (puzzle--machine-cells m))
@@ -1382,7 +1435,8 @@
     ;;; ```
     (define (puzzle-eval ast)
       (: any? -> puzzle-result?)
-      (let ((m (puzzle--machine fuel: puzzle-max-fuel)))
+      (let ((m (puzzle--machine fuel: puzzle-max-fuel
+                                budget: puzzle-max-fuel)))
         (guard (e (#t (abort->result e (steps-used m) (cells-used m))))
           (let ((value (ev m ast '() 1)))
             (puzzle-result status: 'ok
@@ -1401,4 +1455,118 @@
       (let ((parsed (puzzle-parse source)))
         (if (puzzle-ok? parsed)
             (puzzle-eval (puzzle-result-value parsed))
-            parsed)))))
+            parsed)))
+
+    ;; ============================================================
+    ;; Program-by-example front end (v2)
+    ;; ============================================================
+
+    ;;; Outcome of running a program-by-example solution.
+    ;;;
+    ;;; `status` is `ok` or `error`. On `ok`, `value` holds the 1-arity
+    ;;; procedure the source evaluated to. `steps` and `cells` report what
+    ;;; the whole check consumed — the solution's own evaluation and every
+    ;;; application — because all of it runs on one machine. On error,
+    ;;; `error-kind` is an interpreter kind, `solution-not-a-procedure` or
+    ;;; `solution-mismatch`, and `index` is the failing example for the
+    ;;; latter. `message` is a detail and is NOT consensus-relevant.
+    ;;;
+    ;;; ```scheme
+    ;;; (puzzle-report-status
+    ;;;   (puzzle-run-examples "(lambda(x)(list x x))" '((1 . (1 1)))))
+    ;;; ; => ok
+    ;;; ```
+    (define-struct puzzle-report
+      (status)
+      (value default: #f)
+      (steps default: 0)
+      (cells default: 0)
+      (error-kind default: #f)
+      (index default: #f)
+      (message default: ""))
+
+    ;;; True when a report carries a procedure that reproduced every pair.
+    ;;;
+    ;;; ```scheme
+    ;;; (puzzle-report-ok? (puzzle-run-examples "car" '(((1 2) . 1))))
+    ;;; ; => #t
+    ;;; ```
+    (define (puzzle-report-ok? report)
+      (: any? -> boolean?)
+      (and (puzzle-report? report)
+           (eq? 'ok (puzzle-report-status report))))
+
+    ;; A solution must be applicable to exactly one argument.
+    (define (puzzle--one-arity? proc)
+      (cond
+        ((puzzle-closure? proc)
+         (list-of-length? (puzzle-closure-params proc) 1))
+        ((puzzle-builtin? proc)
+         (let ((lo (puzzle-builtin-arity-min proc))
+               (hi (puzzle-builtin-arity-max proc)))
+           (and (<= lo 1) (or (not hi) (>= hi 1)))))
+        (else #f)))
+
+    (define (puzzle--report-error m kind index message)
+      (puzzle-report status: 'error
+                     steps: (steps-used m)
+                     cells: (cells-used m)
+                     error-kind: kind
+                     index: index
+                     message: message))
+
+    (define (puzzle--abort->report condition m)
+      (if (puzzle--abort? condition)
+          (puzzle--report-error m
+                                (puzzle--abort-kind condition)
+                                #f
+                                (puzzle--abort-message condition))
+          (puzzle--report-error m 'internal-error #f
+                                "interpreter invariant violated")))
+
+    ;;; Run a program-by-example solution against its `(input . output)`
+    ;;; pairs.
+    ;;;
+    ;;; Source is capped at `puzzle-v2-max-source-bytes` and the whole check
+    ;;; runs on a single machine with `puzzle-v2-max-fuel` steps: the source
+    ;;; is parsed, evaluated to a 1-arity procedure, and applied to each
+    ;;; input in order. A result that is a procedure, is not a
+    ;;; `puzzle-value?`, or is not `puzzle-value=?` to the expected output
+    ;;; fails with `solution-mismatch` and the failing index. No host
+    ;;; exception escapes.
+    ;;;
+    ;;; ```scheme
+    ;;; (puzzle-report-index
+    ;;;   (puzzle-run-examples "(lambda(x)x)" '((1 . 1) (2 . 3))))
+    ;;; ; => 1
+    ;;; ```
+    (define (puzzle-run-examples source pairs)
+      (: any? list? -> puzzle-report?)
+      (let ((m (puzzle--machine fuel: puzzle-v2-max-fuel
+                                budget: puzzle-v2-max-fuel)))
+        (guard (e (#t (puzzle--abort->report e m)))
+          (let* ((ast (puzzle--parse-datum source puzzle-v2-max-source-bytes))
+                 (proc (ev m ast '() 1)))
+            (if (not (puzzle--one-arity? proc))
+                (puzzle--report-error m 'solution-not-a-procedure #f
+                                      "solution is not a 1-arity procedure")
+                (let loop ((ps pairs) (i 0))
+                  (cond
+                    ((null? ps)
+                     (puzzle-report status: 'ok
+                                    value: proc
+                                    steps: (steps-used m)
+                                    cells: (cells-used m)))
+                    ((not (pair? ps))
+                     (puzzle--report-error m 'bad-syntax #f
+                                           "examples must be a proper list"))
+                    (else
+                      (let* ((example (car ps))
+                             (got (puzzle--apply m proc
+                                                 (list (car example)) 1)))
+                        (if (or (puzzle-procedure? got)
+                                (not (puzzle-value? got))
+                                (not (puzzle-value=? (cdr example) got)))
+                            (puzzle--report-error m 'solution-mismatch i
+                                                  "example not reproduced")
+                            (loop (cdr ps) (+ i 1)))))))))))) ))

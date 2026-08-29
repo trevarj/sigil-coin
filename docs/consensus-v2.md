@@ -751,21 +751,35 @@ compares with.
 
 ### 8.3 Size bound
 
-Per test branch: `(if(equal? x '` = 15 bytes, plus the input literal, plus `)'`
-= 2, plus the output literal, plus one closing paren = 18 + `|i|` + `|o|`. The
-wrapper `(lambda(x)` + `)` = 12, plus the default output literal.
+Per test branch: 18 + `|i|` + `|o|`. The bare wrapper `(lambda(x)` + `)` is 11
+bytes, and a constraint repair adds to it: `ci 3` (`letrec` required) is the
+worst at +29, `ci 7` (`fold` required) +24.
 
-At `k = 10`, `|i| <= 8`, `|o| <= 24`:
+**The arithmetic in the first draft of this section was wrong, and the
+implementation caught it.** At `k = 10`, `|i| <= 8`, `|o| <= 24`, the worst
+reachable table is not 486 bytes:
 
 ```
-12 + 9 * (18 + 8 + 24) + 24 = 12 + 450 + 24 = 486 <= 512
+ci 3, k = 10 : 40 + 9 * (18 + 8 + 24) + 25 = 515   > 512, INFEASIBLE
+ci 7, k = 10 : 35 + 9 * 50 + 25            = 510   fits, 2 bytes spare
+ci 3, k =  8 : 40 + 7 * 50 + 25            = 415   fits, 97 bytes spare
 ```
 
-This is why `puzzle-max-source-bytes` is 512 and why
-`puzzle-max-input-literal-bytes` and `puzzle-max-output-literal-bytes` are 8 and
-24. The generator does not trust this arithmetic: §3.4 step 8 constructs the
-actual table solution, prints it, and rejects the attempt if it exceeds 512
-bytes or fails any check.
+`ci 3` at `k = 10` does not fit at all, and is survivable today only because
+`ci 3` is drawn from the tier-1 catalogue where `k <= 4`. The reachable tier-2
+maximum is 510 bytes — two bytes of headroom, which is not a margin.
+
+**`k` is therefore frozen at a maximum of 8**, giving a proven worst case of
+415 bytes and 97 bytes (19%) of headroom, enough to absorb one further repair
+wrapper. Difficulty above that point grows through grammar width `w`, which
+does not lengthen the table. This bound is exact rather than sampled: the
+generator enforces `|i| <= 8` and `|o| <= 24` before building the table, so
+the expression above is a true maximum over all inputs.
+
+The generator does not trust any of this arithmetic: §3.4 step 8 constructs the
+actual table solution, prints it, parses it, constraint-checks it, and runs it
+against all `k` pairs before a puzzle can be published. That check is what
+found the 515-byte case; the numbers here are documentation, not the guarantee.
 
 ### 8.4 Constraint repair transforms
 
@@ -776,11 +790,11 @@ Each transform is mechanical and its cost is bounded:
 | 0 | none | none | 0 |
 | 1 | no digits | none needed: the generator draws the example domain from digit-free values (symbols, strings, booleans and lists of those) whenever `ci = 1` | 0 |
 | 2 | no `quote` | print literals with a quote-free printer: integers and strings are self-evaluating, lists become `(list ...)`; the example domain excludes symbols when `ci = 2` | varies, bounded by the printer and re-checked |
-| 3 | `letrec` required | `(lambda(x)(letrec((f(lambda(y)y)))(f BODY)))` | +26 |
+| 3 | `letrec` required | `(lambda(x)(letrec((f(lambda(y)y)))(f BODY)))` | +29 |
 | 4 | at most `D` distinct builtins | none needed: the table uses only `equal?`, and `if`/`lambda`/`quote` are special forms, not builtins. `1 <= D` always | 0 |
 | 5 | exactly one `lambda` | none needed: the table has exactly one | 0 |
 | 6 | no integer literal with \|n\| > 9 | none needed: the generator restricts the example domain to \|n\| <= 9 when `ci = 6` | 0 |
-| 7 | `fold` required | `(lambda(x)(fold(lambda(a b)a)BODY '()))` — `fold` on the empty list returns its init | +23 |
+| 7 | `fold` required | `(lambda(x)(fold(lambda(a b)a)BODY '()))` — `fold` on the empty list returns its init | +24 |
 
 **Therefore the claim holds:** for every accepted puzzle the generator has
 already evaluated a concrete, constraint-satisfying, in-budget, in-size table
