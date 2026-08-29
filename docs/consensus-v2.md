@@ -62,7 +62,7 @@ resource caps, because every node re-evaluates every solution.
 | `puzzle-language-version` | 1 | 2 | split marker |
 | `puzzle-max-source-bytes` | 256 | **512** | the liveness escape (§8) is a `k`-branch lookup table plus a constraint repair wrapper; at `k=10` it does not fit in 256 B |
 | `puzzle-max-fuel` | 1000000 | **200000** | observed peak 300 steps (0.03% of 1e6); 200000 is 660x observed peak and cuts the hostile per-solution cost from ~5.5 s to ~1.1 s, which matters because v2 validates up to 9 solutions per block |
-| `puzzle-max-allocations` | 100000 | 100000 | unchanged; observed peak 80 cells |
+| `puzzle-max-allocations` | 100000 | **400000** | charging became honest (environment frames, boxes, closures and argument lists are counted, and `append`/`map`/`filter`/`fold` charge what they really cons), so the old number no longer meant the same thing; 400000 restores comparable headroom for real programs |
 | `puzzle-max-string-bytes` | 65536 | 65536 | unchanged |
 | `puzzle-max-eval-depth` | 128 | 128 | unchanged |
 | `puzzle-max-parse-depth` | 64 | 64 | unchanged |
@@ -802,8 +802,8 @@ solution against all `k` pairs. Every published puzzle is provably solvable by
 anyone who can read the chain. The chain cannot stall.
 
 Overfitting is self-punishing: the table solution is by construction the longest
-thing anybody would submit (486 bytes at `k = 10`), so any structural program
-beats it on the primary ranking key.
+thing anybody would submit (415 bytes at the frozen `k = 8`), so any structural
+program beats it on the primary ranking key.
 
 ---
 
@@ -1242,10 +1242,12 @@ more than 2x in opposite directions.
 
 **5. `k` and grammar width both scale with `C`, and they interact.**
 Raising `k` makes overfitting more expensive (good) but also makes the table
-solution longer, which pushes against the 512-byte cap (§8.3 shows `k = 10` at
-486 bytes, only 26 bytes of headroom). Widening the grammar raises the hidden
-function's complexity independently. Whether they should scale together is
-untested.
+solution longer, which pushes against the 512-byte cap. This was measured and
+resolved: `k = 10` reaches 515 bytes under the `letrec` repair and does not
+fit at all, so `k` is frozen at a maximum of 8 (worst case 415 bytes, 97
+spare) and difficulty above that point climbs through grammar width, which
+does not lengthen the table. Widening the grammar raises the hidden function's
+complexity independently.
 *Recommendation:* as specified, with the generator's explicit `|T| <= 512`
 re-check as the backstop — if the two knobs ever conflict, the generator
 re-rolls rather than publishing an unsolvable puzzle. If re-roll rates climb

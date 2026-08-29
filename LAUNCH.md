@@ -106,12 +106,16 @@ should be in the same place the code is.
       SGL halving every 730 blocks, total supply 143029.99991970 SGL
       (14302999991970 daviwils; 1 SGL = 100000000 daviwils). Zero premine.
       The genesis coinbase is unspendable.
-- [ ] Rules a miner hits: solutions at most 256 bytes, graffiti at most 400
-      bytes, blocks at most 8192 bytes, block spacing floor 72000 seconds,
-      future drift allowance 7200 seconds, coinbase maturity 100 blocks.
+- [ ] Rules a miner hits: solutions at most 512 bytes, graffiti at most 400
+      bytes, blocks at most 16384 bytes, at most 8 example pairs per puzzle,
+      block spacing floor 72000 seconds, future drift allowance 7200 seconds,
+      coinbase maturity 100 blocks.
 - [ ] Fork choice, stated plainly: greater height wins; at equal height the
-      shorter program wins; at equal height and length the lower block hash
-      wins.
+      better score wins, where score is the shorter program, then the one
+      that allocated less, then the one that ran in fewer steps, then the one
+      carrying more co-op shares. There is no block-hash tie-break: two blocks
+      that score identically are incomparable and the one seen first is kept,
+      which is what stops a copied solution from being ground into a win.
 
 Anyone can check the first two against their own build with
 `sigilcoin status`, which prints `best-hash` on a fresh data directory.
@@ -167,23 +171,25 @@ direct questions.
 
 Draft, to send as-is:
 
-> SigilCoin is up: a blockchain where mining is program golf instead of hash
-> grinding. Each block publishes a generated puzzle and the shortest program
-> that solves it wins the block. It's written in Sigil, it's worth nothing
-> and is never intended to be worth anything, and there's no premine.
+> SigilCoin is up: a blockchain where mining is program synthesis instead of
+> hash grinding. Each block publishes a handful of input/output pairs and a
+> rule for the day, and you win by writing the smallest function that
+> reproduces every pair. Mining it with a model or a search script is the
+> intended way to play, not a loophole. It's written in Sigil, it's worth
+> nothing and is never intended to be worth anything, and there's no premine.
 > Blocks are one a day. Graffiti in the coinbase is by convention a quote
 > from here. Code, genesis hash and network parameters:
 > https://github.com/trevarj/sigil-coin. To play: build the `sigilcoin`
 > binary, run
-> `sigilcoin sync`, then `sigilcoin puzzle` to see the current target and
-> `sigilcoin mine --solution '<your program>'` when you can beat the
-> baseline it prints.
+> `sigilcoin sync`, then `sigilcoin puzzle` to see today's pairs and
+> `sigilcoin mine --solution '<your program>'` when you have something that
+> beats the baseline it prints.
 
 Before sending:
 
 - [x] Repository URL is `https://github.com/trevarj/sigil-coin`.
 - [ ] The claims match what shipped: worth nothing, no premine, one block a
-      day, shortest program wins.
+      day, smallest function reproducing every pair wins.
 - [ ] The three commands were run against the real mainnet build, in that
       order, on a machine that is not the seed.
 - [x] The quote in genesis needs no third-party credit:
@@ -212,11 +218,12 @@ instructions were followed; `validated-blocks` matching between the seed and
 the second node at the same height; `peer-successes` still rising on both.
 
 **First two weeks:** cadence roughly one block a day; reorgs happening and
-resolving without intervention (expected: ties are the normal case, and the
-tie-break is grindable through graffiti); `issued-supply` matching the
-published emission schedule at the current height; disk growth measured and
-extrapolated — 8192 bytes per block is about 3 MB a year, so this should be
-a non-issue, and if it is not, something is wrong.
+resolving without intervention (expected: equal-scoring blocks are
+incomparable and settle on first-seen, so a fork should resolve the moment a
+child arrives, not linger); `issued-supply` matching the published emission
+schedule at the current height; disk growth measured and extrapolated — 16384
+bytes per block is about 6 MB a year, so this should be a non-issue, and if it
+is not, something is wrong.
 
 **Ongoing:** back up `wallet/wallet.key` and the database on a schedule; watch for
 anyone reporting a solution their node accepts and the seed rejects, which
@@ -243,8 +250,8 @@ What to run:
 - Seed host with the real module, real ports, real firewall. Not a laptop.
 - Second node on unrelated hardware and a different network, syncing from the
   seed by DNS name, never by IP.
-- Mine deliberately awkward blocks: a solution at exactly 256 bytes, graffiti
-  at exactly 400 bytes, a block filled to the 8192-byte cap, a block at the
+- Mine deliberately awkward blocks: a solution at exactly 512 bytes, graffiti
+  at exactly 400 bytes, a block filled to the 16384-byte cap, a block at the
   earliest legal timestamp, and a competing block at the same height to force
   a tie-break.
 - Restart both hosts at least once. Kill the seed with `SIGKILL` mid-write at
