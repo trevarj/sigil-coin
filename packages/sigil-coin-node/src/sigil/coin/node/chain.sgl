@@ -101,17 +101,16 @@
     ;; Genesis
     ;; ============================================================
 
-    ;;; PLACEHOLDER genesis graffiti. The real launch-day quote is chosen on
-    ;;; launch day; replacing this string changes the genesis hash, which is
-    ;;; exactly the intended effect, and the two hex constants below must be
-    ;;; regenerated with `coin-genesis-header-hex` when it changes.
+    ;;; The launch genesis graffiti, 32 bytes of UTF-8, well inside the
+    ;;; 400-byte graffiti cap. Replacing this string changes the genesis
+    ;;; hash, so the two hex constants below must be regenerated with
+    ;;; `coin-genesis-header-hex` whenever it changes.
     (define coin-genesis-quote
-      "PLACEHOLDER: the launch-day #systemcrafters quote goes here")
+      "Sigil - Practical Symbolic Power")
 
-    ;;; Genesis timestamp: 2026-08-01T00:00:00Z. Placeholder alongside the
-    ;;; quote, and far enough in the past that the future-drift rule accepts
-    ;;; genesis, and a first block a full spacing interval later, on any node
-    ;;; with a sane clock.
+    ;;; Genesis timestamp: 2026-08-01T00:00:00Z. Far enough in the past that
+    ;;; the future-drift rule accepts genesis, and a first block a full
+    ;;; spacing interval later, on any node with a sane clock.
     (define coin-genesis-time 1785542400)
 
     ;;; The local test chain's graffiti. Different from mainnet's on purpose:
@@ -130,7 +129,7 @@
     ;;; and asserts these bytes, so the constant cannot drift from the
     ;;; builder.
     (define coin-genesis-header-constant
-      "0400000000000000000000000000000000000000000000000000000000000000000000007c95e9e1f3fed6ac0776e4fd69d20ba3f63364906a532befc67246ee58743ed800376d6affff7f2031000000")
+      "04000000000000000000000000000000000000000000000000000000000000000000000099a5066258b8dc1726a6d0dcb92472129769a290b29421f39c823e692b5e7a6b00376d6affff7f2031000000")
 
     ;;; Serialized regtest genesis header, as hex. Same provenance.
     (define coin-regtest-genesis-header-constant
@@ -139,7 +138,7 @@
     ;;; Display id (reversed hash) of the mainnet genesis block, for humans.
     ;;; No leading zeros: there is no proof-of-work to produce them.
     (define coin-genesis-id-constant
-      "ff198b5235d6fbf60fad0a9f462feffdff23788d330659d086f34abc4a91c14d")
+      "9dee7d0078ae464eedf3ae7fdbf69e80ede1d4aa5d934f7b18a84d56a6a30c21")
 
     ;;; Display id of the regtest genesis block.
     (define coin-regtest-genesis-id-constant
@@ -259,8 +258,8 @@
     ;;;
     ;;; Port 19444 sits deliberately next to Bitcoin's regtest 18444:
     ;;; SigilCoin is a toy chain and never wants to be mistaken for Bitcoin
-    ;;; mainnet traffic. The seed host is a placeholder until the real seed is
-    ;;; hosted.
+    ;;; mainnet traffic. The seed is `seed.sigilcoin.lol`, operated by the
+    ;;; chain's operator.
     ;;;
     ;;; ```scheme
     ;;; (chain-config-network-id sigilcoin-main-chain) ; => "sigilcoin-main"
@@ -269,7 +268,7 @@
       (coin-chain-config "sigilcoin-main"
                          #u8(#x8f #xd1 #xc0 #xa5)
                          19444
-                         '(("seed.sigilcoin.invalid" . 19444))
+                         '(("seed.sigilcoin.lol" . 19444))
                          coin-min-block-spacing
                          coin-genesis-header-constant))
 

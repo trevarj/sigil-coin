@@ -5,9 +5,11 @@ public node up: after that, changing any of them splits the network or
 invalidates the chain. Operational detail lives in
 [`deploy/RUNBOOK.md`](deploy/RUNBOOK.md).
 
-Current state: **nothing here has ever run on a public network.** The
-genesis quote, the genesis timestamp and the seed hostname are all
-placeholders. See [Decisions still owed](#decisions-still-owed-by-the-operator).
+Current state: **nothing here has ever run on a public network.** The genesis
+quote, the derived genesis constants, the seed hostname, the repository URL
+and the explorer hostname are all decided and in the tree. See
+[Decisions still owed](#decisions-still-owed-by-the-operator) for what is
+left.
 
 ---
 
@@ -44,26 +46,27 @@ the genesis hash: change one byte and every constant below changes.
 - [ ] Pick the genesis timestamp, UTC, in the recent past. It must be far
       enough back that genesis, and a first block 20 hours later, both clear
       the 7200-second future-drift rule on any node with a sane clock.
-- [ ] Edit `QUOTE` and `TIME` in `deploy/genesis-constants.sgl` and run it
+- [x] Edit `QUOTE` and `TIME` in `deploy/genesis-constants.sgl` and run it
       from the repository root:
 
       nix develop /home/trev/Workspace/sigil -c \
         sigil deploy/genesis-constants.sgl --redirects ./dev-redirects.sgl
 
-      Verified output for the current placeholder:
+      Verified output for the launch quote:
 
-      quote: PLACEHOLDER: the launch-day #systemcrafters quote goes here
-      quote-bytes: 59
+      quote: Sigil - Practical Symbolic Power
+      quote-bytes: 32
       time: 1785542400
-      header-hex: 0400000000000000000000000000000000000000000000000000000000000000000000007c95e9e1f3fed6ac0776e4fd69d20ba3f63364906a532befc67246ee58743ed800376d6affff7f2031000000
-      hash: 4dc1914abc4af386d05906338d7823fffdef2f469f0aad0ff6fbd635528b19ff
-      id: ff198b5235d6fbf60fad0a9f462feffdff23788d330659d086f34abc4a91c14d
+      header-hex: 04000000000000000000000000000000000000000000000000000000000000000000000099a5066258b8dc1726a6d0dcb92472129769a290b29421f39c823e692b5e7a6b00376d6affff7f2031000000
+      hash: 210ca3a6564da8187b4f935daad4e1ed809ef6db7faef3ed4e46ae78007dee9d
+      id: 9dee7d0078ae464eedf3ae7fdbf69e80ede1d4aa5d934f7b18a84d56a6a30c21
 
-- [ ] Check `quote-bytes` against the 400-byte graffiti cap. It is a BYTE
+- [x] Check `quote-bytes` against the 400-byte graffiti cap. 32 bytes used,
+      368 to spare. It is a BYTE
       count of the UTF-8 the coinbase actually carries, not a character
       count, so a quote with any non-ASCII in it costs more than it looks.
 
-- [ ] Paste all four into
+- [x] Paste all four into
       `packages/sigil-coin-node/src/sigil/coin/node/chain.sgl`:
       `coin-genesis-quote`, `coin-genesis-time`,
       `coin-genesis-header-constant` (the `header-hex` line) and
@@ -73,22 +76,20 @@ the genesis hash: change one byte and every constant below changes.
 - [ ] Leave the regtest constants alone. A distinct regtest genesis is what
       stops a local block being mistaken for a real one.
 
-## 3. Replace the placeholder seed host
+## 3. Stand the seed host's DNS up
 
-`sigilcoin-main-chain` currently ships `seed.sigilcoin.invalid:19444`.
-`.invalid` never resolves, by design — a node with no configured peer finds
-nothing and says so, rather than silently reaching a stranger's host.
+`sigilcoin-main-chain` ships `seed.sigilcoin.lol:19444`. The earlier
+`.invalid` placeholder never resolved, by design — a node with no configured
+peer found nothing and said so, rather than silently reaching a stranger's
+host. It is gone.
 
-- [ ] Register the real DNS name and point it at the seed host's A/AAAA
-      records.
-- [ ] Replace the `seed-peers` entry in `chain.sgl` with
-      `("seed.<yourdomain> . 19444)`.
+- [ ] Point `seed.sigilcoin.lol` at the seed host's A/AAAA records.
+- [x] `seed-peers` in `chain.sgl` is `(("seed.sigilcoin.lol" . 19444))`.
 - [ ] Re-run the suite, rebuild, and confirm a fresh data directory finds the
       seed with no `--peer` flag and no manual `peers add`.
 
-Do not launch with the `.invalid` placeholder still in place. Every new node
-would need a hand-typed peer, and the first thing anyone would ask in the
-channel is what to type.
+DNS must resolve before step 5. Otherwise every new node needs a hand-typed
+peer, and the first thing anyone would ask in the channel is what to type.
 
 ## 4. Publish the parameters
 
@@ -136,7 +137,7 @@ the launch-day gate.
       `chain = "sigilcoin-main"`, `listen.bind = "0.0.0.0"`,
       `openFirewall = true`.
 - [ ] 19444/tcp reachable from off-host. Check from somewhere else, not from
-      the seed: `nc -vz seed.<yourdomain> 19444`.
+      the seed: `nc -vz seed.sigilcoin.lol 19444`.
 - [ ] `systemctl is-active sigilcoin-listen` says `active`. The node process
       itself holds 19444; there is no socket unit and no proxy.
 - [ ] `sigilcoin status` on the seed reports the published genesis hash.
@@ -149,7 +150,9 @@ the launch-day gate.
       `sigilcoin-explorer 0.1.0` and returns. If it blocks instead, the
       build predates `--help`/`--version` handling and every explorer
       command has to be run under `timeout`.
-- [ ] Explorer up behind TLS, and it renders genesis. If the explorer is not
+- [ ] Explorer up at `explorer.sigilcoin.lol` behind a TLS reverse proxy, and
+      it renders genesis. The explorer itself stays bound to `127.0.0.1:8080`;
+      the proxy is the only public path to it. If the explorer is not
       ready, launch without it and say so in the announcement rather than
       delaying — a chain with no explorer is fine; a chain with no seed is
       not.
@@ -170,20 +173,21 @@ Draft, to send as-is:
 > and is never intended to be worth anything, and there's no premine.
 > Blocks are one a day. Graffiti in the coinbase is by convention a quote
 > from here. Code, genesis hash and network parameters:
-> <REPO URL>. To play: build the `sigilcoin` binary, run
+> https://github.com/trevarj/sigil-coin. To play: build the `sigilcoin`
+> binary, run
 > `sigilcoin sync`, then `sigilcoin puzzle` to see the current target and
 > `sigilcoin mine --solution '<your program>'` when you can beat the
 > baseline it prints.
 
 Before sending:
 
-- [ ] `<REPO URL>` replaced.
+- [x] Repository URL is `https://github.com/trevarj/sigil-coin`.
 - [ ] The claims match what shipped: worth nothing, no premine, one block a
       day, shortest program wins.
 - [ ] The three commands were run against the real mainnet build, in that
       order, on a machine that is not the seed.
-- [ ] The quote in genesis is credited to whoever said it, in the repository
-      if not in the message.
+- [x] The quote in genesis needs no third-party credit:
+      `Sigil - Practical Symbolic Power` is the operator's own line.
 - [ ] Nobody is asked to install anything unsigned from a stranger.
 
 Do not post it as a coin launch, do not mention value, price, exchanges or
@@ -296,19 +300,20 @@ flag — is a post-launch fix, not an abort.
 
 ## Decisions still owed by the operator
 
-Every one of these is a placeholder in the current tree. None can be deferred
-past step 5.
+What is left is DNS, a certificate, and one go/no-go call. Nothing in this
+table can be deferred past step 5.
 
 | # | Decision | Where it lives now |
 | --- | --- | --- |
-| 1 | The genesis quote, and permission from whoever said it | `coin-genesis-quote` in `packages/sigil-coin-node/src/sigil/coin/node/chain.sgl`: `"PLACEHOLDER: the launch-day #systemcrafters quote goes here"` |
-| 2 | The genesis timestamp | `coin-genesis-time`, currently `1785542400` (2026-08-01T00:00:00Z) |
-| 3 | The two derived genesis constants | `coin-genesis-header-constant` and `coin-genesis-id-constant`, both still derived from the placeholder quote |
-| 4 | The real seed DNS name | `sigilcoin-main-chain` seed peers, currently `seed.sigilcoin.invalid:19444` |
-| 5 | Where the repository is published | `<REPO URL>` in the announcement; `package.sgl` says `https://github.com/trevarj/sigil-coin`, unconfirmed |
+| 1 | ~~The genesis quote~~ — RESOLVED: `Sigil - Practical Symbolic Power`, the operator's own words, so no third-party permission is needed. 32 UTF-8 bytes, 368 under the 400-byte graffiti cap. | `coin-genesis-quote` in `packages/sigil-coin-node/src/sigil/coin/node/chain.sgl` |
+| 2 | The genesis timestamp | `coin-genesis-time`, currently `1785542400` (2026-08-01T00:00:00Z). Still the value the constants below were derived from; changing it means regenerating them. |
+| 3 | ~~The two derived genesis constants~~ — RESOLVED. Regenerated from the launch quote with `deploy/genesis-constants.sgl`: header `04…2b5e7a6b00376d6affff7f2031000000`, id `9dee7d0078ae464eedf3ae7fdbf69e80ede1d4aa5d934f7b18a84d56a6a30c21`. `test-node.sgl` rebuilds genesis from the quote and asserts both. | `coin-genesis-header-constant` and `coin-genesis-id-constant` in `chain.sgl` |
+| 4 | ~~The real seed DNS name~~ — RESOLVED: `seed.sigilcoin.lol:19444`, on the operator's own domain. The A/AAAA records still have to exist before step 5. | `sigilcoin-main-chain` seed peers in `chain.sgl` |
+| 5 | ~~Where the repository is published~~ — RESOLVED and confirmed: `https://github.com/trevarj/sigil-coin`, the operator's account. Every `package.sgl` and the announcement now say so. | `package.sgl` files, the step 6 announcement |
 | 6 | ~~`depsHash`~~ — RESOLVED. There is no vendoring derivation and no hash to fill in: every `from-git` dependency is a pinned flake input, so Nix fetches it and the sandbox stays offline. Bumping one is `nix flake update <input>` in `deploy/`. | — |
 | 7 | ~~Confirm the explorer's flags~~ — RESOLVED. `--regtest`, `--data-dir`, `--host`, `--port` confirmed against `explorer-main` and against `sigilcoin-explorer --help` run from the built binary. | `services.sigilcoin-explorer.command` in `deploy/module.nix` |
-| 8 | Seed host, domain, and TLS certificate for the explorer | Not in the tree at all |
+| 8 | The TLS certificate for `explorer.sigilcoin.lol` | Still owed. The domain is `sigilcoin.lol` and the explorer's public name is `explorer.sigilcoin.lol` (`deploy/RUNBOOK.md`), but nothing in the tree issues or terminates a certificate: that is the reverse proxy's job on the host. |
 | 9 | Whether to launch without an explorer if it is not ready | Recommendation: yes |
+| 11 | Whether to run the 14-day pre-launch soak, or launch without it | Still owed. See [Pre-launch soak](#pre-launch-soak); nothing has ever run outside loopback. |
 | 10 | ~~Whether `sigilcoin listen` gets a persistent accept loop before launch~~ — RESOLVED IN THE CLI, not worked around. `run-listen` now loops indefinitely under `--max-connections 0` (`operate.sgl`: `((= max-connections 0) (loop last))`) and serves each connection inside its own guard, so a hangup, garbage bytes or a silent drop kill that connection only. Re-measured against this build: idle at `--accept-timeout 2000` it was alive at 30 s and 55 s and ended only by an external `timeout`; six hostile connections were absorbed and a seventh still accepted. The seed therefore binds 19444 itself. | `packages/sigil-coin-cli/src/sigil/coin/cli/operate.sgl`, `deploy/module.nix` |
 | 10b | ~~Whether to delete the socket proxy once the CLI can adopt an inherited fd~~ — DELETED NOW, and no fd adoption was needed. The proxy existed only because the old listener died on an accept timeout and on hostile input; with that fixed it was pure cost: an extra unit pair and hop, no inbound peer address ever reaching the node (which forecloses abuse-banning), and a `Restart=always` without `StartLimitIntervalSec=0` that could park `systemd-socket-proxyd` in `failed` and take port 19444 out of service — the outage it was supposed to prevent. `nix flake check`'s `module-eval` now fails if any `sigilcoin-listen-proxy` unit comes back. | `deploy/module.nix`, `deploy/flake.nix` |

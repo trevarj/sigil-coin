@@ -340,7 +340,10 @@ in
       default = "127.0.0.1";
       description = ''
         Address the explorer binds, passed as the explorer's own `--host`.
-        Keep it local and put a TLS reverse proxy in front.
+        Keep it local and put a TLS reverse proxy in front. The public name
+        is `explorer.sigilcoin.lol`, which is the proxy's job, not this
+        module's: the explorer serves plaintext HTTP and must never be given
+        a public bind address.
       '';
     };
 

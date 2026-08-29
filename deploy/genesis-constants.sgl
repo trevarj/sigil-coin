@@ -23,7 +23,7 @@
         (sigil coin node genesis))
 
 ;; ---- edit these two ----------------------------------------------------
-(define QUOTE "PLACEHOLDER: the launch-day #systemcrafters quote goes here")
+(define QUOTE "Sigil - Practical Symbolic Power")
 (define TIME 1785542400) ;; seconds since the Unix epoch, UTC
 ;; ------------------------------------------------------------------------
 

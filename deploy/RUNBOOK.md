@@ -129,7 +129,10 @@ work; Nix refuses to read a file the git tree does not track, and reports
 }
 ```
 
-Put a TLS reverse proxy in front of the explorer. Nothing here terminates TLS.
+The explorer's public name is `explorer.sigilcoin.lol`. Put a TLS reverse
+proxy in front of it on that name; nothing here terminates TLS, and the
+explorer keeps binding `127.0.0.1:8080` so the proxy is the only way in. Do
+not give it a public bind address.
 
 ### Ports and firewall
 
@@ -212,14 +215,14 @@ verified output from a fresh mainnet data directory:
 ```
 chain: sigilcoin-main
 best-height: 0
-best-hash: 4dc1914abc4af386d05906338d7823fffdef2f469f0aad0ff6fbd635528b19ff
+best-hash: 210ca3a6564da8187b4f935daad4e1ed809ef6db7faef3ed4e46ae78007dee9d
 best-work: 53872
 best-header-time: 1785542400
 headers: 1
 blocks: 0
 validated-blocks: 0
 best-block-height: 0
-best-block-hash: 4dc1914abc4af386d05906338d7823fffdef2f469f0aad0ff6fbd635528b19ff
+best-block-hash: 210ca3a6564da8187b4f935daad4e1ed809ef6db7faef3ed4e46ae78007dee9d
 mempool: 0
 peers: 0
 peer-successes: 0
@@ -235,8 +238,9 @@ max-supply: 143029.99991970 SGL
 ```
 
 `best-hash` is the internal byte order. The display id humans quote is that
-string reversed: `ff198b5235d6fbf60fad0a9f462feffdff23788d330659d086f34abc4a91c14d`.
-Both are placeholders until the launch-day quote is chosen; see `../LAUNCH.md`.
+string reversed: `9dee7d0078ae464eedf3ae7fdbf69e80ede1d4aa5d934f7b18a84d56a6a30c21`.
+Both are the launch values, derived from the genesis quote
+`Sigil - Practical Symbolic Power`; see `../LAUNCH.md`.
 
 Creating the node's own address writes the wallet key:
 
@@ -338,7 +342,7 @@ are the game.
 **Is the seed actually reachable?** The only real answer comes from off-host:
 
 ```sh
-nc -vz seed.<yourdomain> 19444
+nc -vz seed.sigilcoin.lol 19444
 ```
 
 On the host itself, `systemctl is-active sigilcoin-listen` answers whether

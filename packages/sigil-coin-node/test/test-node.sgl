@@ -475,7 +475,7 @@
     (assert-equal #u8(#x8f #xd1 #xc0 #xa5)
                   (chain-config-magic sigilcoin-main-chain))
     (assert-equal 19444 (chain-config-default-port sigilcoin-main-chain))
-    (assert-equal '(("seed.sigilcoin.invalid" . 19444))
+    (assert-equal '(("seed.sigilcoin.lol" . 19444))
                   (chain-config-seed-peers sigilcoin-main-chain))
     (assert-equal 70015
                   (chain-config-protocol-version sigilcoin-main-chain))
