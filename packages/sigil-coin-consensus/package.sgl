@@ -10,6 +10,9 @@
 
   dependencies: (list
     (from-workspace name: "sigil-coin-puzzle")
+    ;; Co-op share signatures are ECDSA over the §6.3 preimage.
+    (from-git url: "github:trevarj/sigil-bitcoin"
+              package: "sigil-secp256k1" version: "^0.1")
     (from-git url: "github:trevarj/sigil-bitcoin"
               package: "sigil-bitcoin-utils" version: "^0.1")
     (from-git url: "github:trevarj/sigil-bitcoin"

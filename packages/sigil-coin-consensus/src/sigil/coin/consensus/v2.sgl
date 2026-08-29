@@ -12,16 +12,14 @@
 ;;; is prefixed `coin-v2-` so the two facades can be imported side by side
 ;;; during that migration without an ambiguous import.
 ;;;
-;;;   (sigil coin consensus v2 rules)     the frozen v2 caps
-;;;   (sigil coin consensus v2 seed)      puzzle derivation, and its cache
-;;;   (sigil coin consensus v2 solution)  program-by-example verification
-;;;   (sigil coin consensus v2 score)     the 32-bit composite score word
-;;;   (sigil coin consensus v2 retarget)  margin retargeting and `bits`
-;;;
-;;; What is NOT here yet: co-op shares, commit-reveal, the five-push
-;;; coinbase codec, the reward split and fork choice. Those are part B and
-;;; consume this: `coin-v2-check-solution` is callable per share, and the
-;;; score word already carries the share-count field they will fill in.
+;;;   (sigil coin consensus v2 rules)       the frozen v2 caps
+;;;   (sigil coin consensus v2 seed)        puzzle derivation, and its cache
+;;;   (sigil coin consensus v2 solution)    program-by-example verification
+;;;   (sigil coin consensus v2 score)       the 32-bit composite score word
+;;;   (sigil coin consensus v2 retarget)    margin retargeting and `bits`
+;;;   (sigil coin consensus v2 shares)      co-op shares, commit-reveal, split
+;;;   (sigil coin consensus v2 coinbase)    the five-push coinbase codec
+;;;   (sigil coin consensus v2 fork-choice) ranking blocks
 ;;;
 ;;; The package stays pure. It validates data it is handed — no database, no
 ;;; network, no clock beyond the one a caller passes in.
@@ -42,7 +40,10 @@
           (sigil coin consensus v2 seed)
           (sigil coin consensus v2 solution)
           (sigil coin consensus v2 score)
-          (sigil coin consensus v2 retarget))
+          (sigil coin consensus v2 retarget)
+          (sigil coin consensus v2 shares)
+          (sigil coin consensus v2 coinbase)
+          (sigil coin consensus v2 fork-choice))
   (export
     ;; Package metadata
     coin-v2-version
@@ -133,7 +134,72 @@
     coin-v2-bits-prefix
     coin-v2-bits-encode
     coin-v2-bits-decode
-    coin-v2-check-bits)
+    coin-v2-check-bits
+
+    ;; Co-op shares, commit-reveal and the reward split
+    coin-v2-share-pubkey-bytes
+    coin-v2-share-signature-bytes
+    coin-v2-share-blind-bytes
+    coin-v2-commitment-bytes
+    coin-v2-share-fixed-bytes
+    coin-v2-max-share-bytes
+    coin-v2-max-shares-bytes
+    coin-v2-max-commits-bytes
+    coin-v2-empty-shares
+    coin-v2-empty-commits
+    coin-v2-share-tag
+    coin-v2-commit-tag
+    coin-v2-share-preimage
+    coin-v2-commitment
+    coin-v2-share-commitment
+    coin-v2-share-script
+    coin-v2-share
+    coin-v2-share?
+    coin-v2-share-pubkey
+    coin-v2-share-signature
+    coin-v2-share-blind
+    coin-v2-share-solution
+    coin-v2-share-encode
+    coin-v2-shares-encode
+    coin-v2-shares-decode
+    coin-v2-commits-encode
+    coin-v2-commits-decode
+    coin-v2-coop-context
+    coin-v2-coop-context?
+    coin-v2-coop-context-parent-prev-hash
+    coin-v2-coop-context-puzzle-height
+    coin-v2-coop-context-complexity
+    coin-v2-coop-context-spec
+    coin-v2-coop-context-commits
+    coin-v2-share-signature-ok?
+    coin-v2-check-shares
+    coin-v2-producer-weight
+    coin-v2-split-weight-total
+    coin-v2-split-unit
+    coin-v2-split-plan
+    coin-v2-check-split
+
+    ;; The coinbase payload
+    coin-v2-min-coinbase-script-bytes
+    coin-v2-max-coinbase-script-bytes
+    coin-v2-coinbase-script-bounds
+    coin-v2-coinbase-payload
+    coin-v2-coinbase-payload?
+    coin-v2-coinbase-payload-height
+    coin-v2-coinbase-payload-solution
+    coin-v2-coinbase-payload-shares
+    coin-v2-coinbase-payload-commits
+    coin-v2-coinbase-payload-graffiti
+    coin-v2-coinbase-payload-encode
+    coin-v2-coinbase-payload-decode
+    coin-v2-block-coinbase-payload
+    coin-v2-carrier-script
+    coin-v2-check-coop
+
+    ;; Fork choice
+    coin-v2-block-compare
+    coin-v2-better-block?
+    coin-v2-replaces-tip?)
 
   (begin
 

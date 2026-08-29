@@ -77,7 +77,7 @@ Builtins (41), special forms (7), value domain, and error kinds are unchanged.
 |---|---|---|---|
 | `coin-max-solution-bytes` | 256 | **512** | tracks `puzzle-max-source-bytes` |
 | `coin-max-graffiti-bytes` | 400 | 400 | unchanged; grinding it is inert in v2 (§5.4) |
-| `coin-max-block-bytes` | 8192 | **16384** | worst-case coinbase is 6332 B of scriptSig plus ~390 B of outputs (§6.6); 16384 leaves ~9.5 KB for transactions, more than 8192 ever gave |
+| `coin-max-block-bytes` | 8192 | **16384** | worst-case coinbase is 6588 B of scriptSig plus ~390 B of outputs (§6.6); 16384 leaves ~9.4 KB for transactions, more than 8192 ever gave |
 | `coin-max-shares` | — | **8** | see §6.6 sizing |
 | `coin-max-commitments` | — | **16** | 16 x 32 B = 512 B; 2x the reveal cap, so competing candidates fit |
 | `coin-min-block-spacing` | 72000 | 72000 | unchanged |
@@ -455,7 +455,7 @@ The scriptSig is exactly five minimally-encoded data pushes:
 |---|---|---|---|
 | 1 | HEIGHT | 0–5 B | BIP34 script number, unchanged |
 | 2 | SOLUTION | 1–512 B | the producer's own solution for puzzle `H` |
-| 3 | SHARES | 0–4889 B | reveals for puzzle `H-1` (§6.2) |
+| 3 | SHARES | 0–5145 B | reveals for puzzle `H-1` (§6.2) |
 | 4 | COMMITS | 0–513 B | commitments for puzzle `H` (§7.1) |
 | 5 | GRAFFITI | 0–400 B | opaque |
 
@@ -475,13 +475,14 @@ SHARES := u8 R                       ; 0 .. 8
 
 share  := pubkey     33 B            ; compressed secp256k1
           signature  64 B            ; ECDSA, fixed-width r||s, low-s
+          blind      32 B            ; the commitment's blind, opened here (§7.1)
           len        2 B  u16le      ; 1 .. 512
           solution   len B
 ```
 
 Fixed-width fields throughout; the only variable field is length-prefixed. A
 trailing byte or a short read is `shares-malformed`. Maximum
-`1 + 8 * (33 + 64 + 2 + 512) = 4889` bytes.
+`1 + 8 * (33 + 64 + 32 + 2 + 512) = 5145` bytes (the 32 is the blind, published in the reveal — see §7.1).
 
 Shares MUST appear in strictly ascending lexicographic order of `pubkey`. This
 is canonical (one encoding per set), it forces distinct payout keys, and it
@@ -590,11 +591,11 @@ Worst-case coinbase scriptSig:
 ```
 HEIGHT     5 data +   1 opcode  =    6
 SOLUTION 512 data +   3         =  515   (OP_PUSHDATA2)
-SHARES  4889 data +   3         = 4892
+SHARES  5145 data +   3         = 5148
 COMMITS  513 data +   3         =  516
 GRAFFITI 400 data +   3         =  403
                                  ------
-                                   6332  = coin-max-coinbase-script-bytes
+                                   6588  = coin-max-coinbase-script-bytes
 ```
 
 Plus 10 outputs at ~34 B and ~50 B of transaction overhead: ~6720 B of
@@ -635,10 +636,27 @@ COMMITS := u8 K                                  ; 0 .. 16
 Commitments MUST appear in strictly ascending lexicographic order and be
 pairwise distinct: `commits-unordered`. Maximum `1 + 16 * 32 = 513` bytes.
 
-The `blind` is 32 bytes of the miner's choosing and is never published. Without
-it, the commitment would be a hash over public-plus-solution data and an
-attacker with a guessable solution space could confirm a guess. With it, the
-commitment is hiding.
+The `blind` is 32 bytes of the miner's choosing. Without it, the commitment
+would be a hash over public-plus-solution data and an attacker with a guessable
+solution space could confirm a guess. With it, the commitment is hiding.
+
+**The blind is published in the reveal, not withheld.** An earlier draft of
+this section said it was never published, which made §6.4's commitment check
+uncheckable: no validator can recompute `commitment` without it, so the check
+would have to be dropped, and dropping it makes the carrier payment fakeable
+— a producer could claim carrier weight for commitments nobody ever made. The
+blind therefore rides in the reveal alongside the signature:
+
+```
+reveal := pubkey (33 B) || sig (64 B) || blind (32 B) || u16le len || solution
+```
+
+This costs nothing in hiding. The blind's only job is to keep the commitment
+opaque during the window between commit and reveal; once the solution itself is
+published, the blind protects nothing and its disclosure lets every validator
+verify the commitment matched. Derived size caps move accordingly (5145 and
+6588 bytes), and the binding constraint — the coinbase staying under about
+7 KB inside a 16384-byte block — still holds at roughly 6976 bytes.
 
 ### 7.2 The pipeline
 
@@ -1015,7 +1033,7 @@ Per block, worst case, with the frozen v2 caps:
 |---|---|---|
 | header checks | O(1) | version, bits, `W` field ranges, MTP, drift, spacing |
 | block size | one serialization | first body rule, bounds everything after |
-| coinbase decode | O(6332) bytes | five pushes + one re-encode |
+| coinbase decode | O(6588) bytes | five pushes + one re-encode |
 | puzzle derivation | 64 x 20000 = 1.28 M steps | `puzzle-generator-max-fuel` per attempt, shared across all evaluations in the attempt; **cached per `(prev_hash, H)`** so siblings pay once |
 | producer solution | 200000 steps | one machine across all `k` applications |
 | share solutions | 8 x 200000 = 1.6 M steps | same, per share |
@@ -1061,7 +1079,7 @@ validate bodies for concurrently. That is policy, not consensus.
 **Never call `sigil-bitcoin`'s `connect-block` or `connect-block/structural`
 directly on a SigilCoin block.** They enforce Bitcoin's 100-byte coinbase
 scriptSig cap and Bitcoin's block subsidy; a real SigilCoin coinbase scriptSig
-is up to 6332 bytes. `coin-connect-block` passes SigilCoin's own rules record
+is up to 6588 bytes. `coin-connect-block` passes SigilCoin's own rules record
 into Bitcoin's connector, which is the only supported path.
 
 ---
@@ -1129,7 +1147,7 @@ not, emission was touched by mistake.
   `coin-accept-header?` gains the `C` derivation, which means it now needs the
   parent chain's last 16 headers — `previous-headers` already supplies a
   window, and the window requirement grows from 11 (MTP) to 16.
-- `body.sgl`: coinbase script bounds become 8..6332; new validation order
+- `body.sgl`: coinbase script bounds become 8..6588; new validation order
   (§11); the header commitment check compares `W`, not a length.
 - `chain.sgl`: `max-block-bytes`, `max-solution-bytes`, `max-coinbase-script-bytes`
   and the advertised `puzzle-generator-version` all move; add

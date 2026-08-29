@@ -1,0 +1,117 @@
+;;; (sigil coin consensus v2 fork-choice) — ranking blocks
+;;;
+;;; The block key is `key(b) = (height(b), W(b))` and the order is (§5.6):
+;;;
+;;;   b1 < b2  iff  height(b1) > height(b2)
+;;;                 or (height(b1) = height(b2) and W(b1) < W(b2))
+;;;
+;;; where "<" means "is the better tip". Height dominates, so this is
+;;; longest-chain first; `W` only ever decides between siblings.
+;;;
+;;; HOW SHARE COUNT COMPOSES. `W` packs `(L-1, MB, SB, 8-R)` into disjoint
+;;; fixed-width fields, most significant first, so unsigned `<` on `W` is
+;;; lexicographic `<` on that tuple (see `(sigil coin consensus v2 score)`
+;;; for why). `8-R` occupies the four bits BELOW every producer field.
+;;; Therefore `R` changes the comparison of two blocks if and only if their
+;;; `(L, MB, SB)` are equal: it decides exactly the comparisons the
+;;; producer's own solution leaves tied, and nothing else. A producer cannot
+;;; buy a win by collecting shares — only a tie.
+;;;
+;;; STRICT WEAK ORDERING. Let `f(b) = (-height(b), W(b))` in Z x Z under the
+;;; lexicographic order, which is a strict total order because both
+;;; components are. Then `b1 < b2` iff `f(b1) < f(b2)`, so:
+;;;
+;;;   irreflexive               lexicographic `<` on a total order is
+;;;   asymmetric                  irreflexive and asymmetric
+;;;   transitive                inherited
+;;;   incomparability is        `b1` and `b2` are incomparable iff
+;;;     transitive                `f(b1) = f(b2)`, and equality is an
+;;;                               equivalence relation
+;;;
+;;; which is exactly the definition of a strict weak ordering. Its
+;;; equivalence classes are "same height, same score word". Extending `W`
+;;; with the share field does not touch this proof: `W` is still one
+;;; integer, and the axioms are properties of the lexicographic order on
+;;; `Z x Z`, not of how `W`'s bits are spent.
+;;;
+;;; THE BLOCK-HASH TIE-BREAK OF v1 IS DELETED, AND MUST NOT COME BACK.
+;;; A thief who copies the producer's own solution — which he can, it is
+;;; published in the clear with no commitment possible (§7.5) — produces a
+;;; block that scores IDENTICALLY. Under v1 he would then grind graffiti
+;;; until his block hash sorted lower and take the height. With no hash
+;;; tie-break the two blocks are incomparable, `coin-v2-replaces-tip?`
+;;; answers `#f`, and the incumbent keeps the tip. First-seen decides, and
+;;; first-seen is the honest producer, because the thief had to see the
+;;; block to copy it.
+;;;
+;;; Equal keys being incomparable is order-dependent across nodes, exactly
+;;; as Bitcoin's equal-work siblings are, and converges the moment a child
+;;; arrives because height dominates the key.
+
+(define-library (sigil coin consensus v2 fork-choice)
+  (import (sigil math)
+          (sigil coin consensus v2 score))
+  (export
+    coin-v2-block-compare
+    coin-v2-better-block?
+    coin-v2-replaces-tip?)
+
+  (begin
+
+    (define (require-height who height)
+      (if (not (and (number? height) (exact? height) (integer? height)
+                    (>= height 0)))
+          (error (string-append who ": height out of range")))
+      height)
+
+    ;;; Rank two blocks by `key = (height, W)`. Lower is the better tip.
+    ;;;
+    ;;; Returns -1 when the first block is better, 1 when the second is, and
+    ;;; 0 when the two are INCOMPARABLE — same height, same score word — in
+    ;;; which case the caller keeps whatever it already has.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-v2-block-compare 2 999 1 0)  ; => -1
+    ;;; (coin-v2-block-compare 1 40 1 40)  ; => 0
+    ;;; ```
+    (define (coin-v2-block-compare a-height a-score b-height b-score)
+      (: integer? integer? integer? integer? -> integer?)
+      (require-height "coin-v2-block-compare" a-height)
+      (require-height "coin-v2-block-compare" b-height)
+      (cond
+        ((> a-height b-height) -1)
+        ((< a-height b-height) 1)
+        (else (coin-v2-score-compare a-score b-score))))
+
+    ;;; True when the first block strictly outranks the second.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-v2-better-block? 1 40 1 48) ; => #t
+    ;;; ```
+    (define (coin-v2-better-block? a-height a-score b-height b-score)
+      (: integer? integer? integer? integer? -> boolean?)
+      (< (coin-v2-block-compare a-height a-score b-height b-score) 0))
+
+    ;;; True when a sibling should displace the current tip (§5.7).
+    ;;;
+    ;;; `tip-extended?` is whether a child already builds on the tip. Once
+    ;;; one does, the height is settled and no sibling displaces it however
+    ;;; good its score; before that, a STRICTLY lower score word wins and an
+    ;;; equal one does not.
+    ;;;
+    ;;; That hysteresis is also what protects a revealed share (§7.5). A
+    ;;; reveal for puzzle `P` is published in a block at height `P+1`, so by
+    ;;; the time a thief can read it, height `P` has already been extended by
+    ;;; the very block that carried it and no sibling of `P` can take it
+    ;;; back. The reveal is safe precisely because publishing it requires a
+    ;;; block that settles its height.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-v2-replaces-tip? 48 #f 40) ; => #t
+    ;;; (coin-v2-replaces-tip? 48 #t 40) ; => #f
+    ;;; (coin-v2-replaces-tip? 40 #f 40) ; => #f
+    ;;; ```
+    (define (coin-v2-replaces-tip? tip-score tip-extended? candidate-score)
+      (: integer? boolean? integer? -> boolean?)
+      (and (not tip-extended?)
+           (coin-v2-score-better? candidate-score tip-score)))))

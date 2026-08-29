@@ -9,7 +9,7 @@
 ;;;     can never be accepted, and a solution consensus would refuse must
 ;;;     never be parsed.
 ;;;   * `coin-v2-max-block-bytes` grows to 16384 because the worst-case
-;;;     coinbase scriptSig is 6332 bytes once co-op shares ride in it. The
+;;;     coinbase scriptSig is 6588 bytes once co-op shares ride in it. The
 ;;;     bigger cap still leaves more room for transactions than v1's whole
 ;;;     block.
 ;;;   * `coin-v2-max-fuel` FALLS to 200000. Difficulty in v2 comes from
