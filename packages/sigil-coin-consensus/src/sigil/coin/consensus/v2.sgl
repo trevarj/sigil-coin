@@ -1,0 +1,147 @@
+;;; (sigil coin consensus v2) — SigilCoin consensus v2
+;;;
+;;; v2 is a chain split, not a soft fork: the puzzle is a function rather
+;;; than a value, the score is a composite rather than a length, and
+;;; difficulty is a retargeted parameter rather than an accident of the
+;;; generator. There is no migration path from a v1 chain and none is
+;;; wanted.
+;;;
+;;; This facade is additive. `(sigil coin consensus)` still exists, still
+;;; behaves exactly as it did, and is still what the node, CLI and explorer
+;;; call; a later switchover migrates them and deletes it. Every name here
+;;; is prefixed `coin-v2-` so the two facades can be imported side by side
+;;; during that migration without an ambiguous import.
+;;;
+;;;   (sigil coin consensus v2 rules)     the frozen v2 caps
+;;;   (sigil coin consensus v2 seed)      puzzle derivation, and its cache
+;;;   (sigil coin consensus v2 solution)  program-by-example verification
+;;;   (sigil coin consensus v2 score)     the 32-bit composite score word
+;;;   (sigil coin consensus v2 retarget)  margin retargeting and `bits`
+;;;
+;;; What is NOT here yet: co-op shares, commit-reveal, the five-push
+;;; coinbase codec, the reward split and fork choice. Those are part B and
+;;; consume this: `coin-v2-check-solution` is callable per share, and the
+;;; score word already carries the share-count field they will fill in.
+;;;
+;;; The package stays pure. It validates data it is handed — no database, no
+;;; network, no clock beyond the one a caller passes in.
+;;;
+;;; ```scheme
+;;; (import (sigil coin consensus v2))
+;;; (define spec (coin-v2-puzzle-for parent-hash height complexity))
+;;; (define checked (coin-v2-check-solution spec solution))
+;;; (coin-v2-score-encode (coin-v2-solution-length solution)
+;;;                       (puzzle-report-cells (coin-result-value checked))
+;;;                       (puzzle-report-steps (coin-result-value checked))
+;;;                       0)
+;;; ```
+
+(define-library (sigil coin consensus v2)
+  (import (sigil coin consensus result)
+          (sigil coin consensus v2 rules)
+          (sigil coin consensus v2 seed)
+          (sigil coin consensus v2 solution)
+          (sigil coin consensus v2 score)
+          (sigil coin consensus v2 retarget))
+  (export
+    ;; Package metadata
+    coin-v2-version
+
+    ;; Tagged results
+    coin-result
+    coin-result?
+    coin-result-status
+    coin-result-value
+    coin-result-reason
+    coin-result-detail
+    coin-ok
+    coin-error
+    coin-ok?
+    coin-failed?
+
+    ;; Frozen caps
+    coin-v2-max-block-bytes
+    coin-v2-max-solution-bytes
+    coin-v2-max-graffiti-bytes
+    coin-v2-max-shares
+    coin-v2-max-commitments
+    coin-v2-max-k
+    coin-v2-max-fuel
+    coin-v2-min-block-spacing
+    coin-v2-max-future-drift
+    coin-v2-median-time-span
+    coin-v2-median-time-past
+    coin-v2-validate-header-context
+    coin-v2-block-size
+    coin-v2-validate-block-size
+
+    ;; Puzzle derivation
+    coin-v2-puzzle-tag
+    coin-v2-genesis-seed-tag
+    coin-v2-genesis-seed
+    coin-v2-height-encode
+    coin-v2-complexity-encode
+    coin-v2-puzzle-seed
+    coin-v2-puzzle-for
+    coin-v2-puzzle-cache
+    coin-v2-puzzle-cache?
+    coin-v2-puzzle-cache-capacity
+    coin-v2-puzzle-cache-entries
+    coin-v2-puzzle-cache-open
+    coin-v2-puzzle-cache-size
+    coin-v2-puzzle-cache-ref
+    coin-v2-puzzle-cached
+
+    ;; Solution verification
+    coin-v2-solution-length
+    coin-v2-spec-builtin-cap
+    coin-v2-check-solution
+
+    ;; Score
+    coin-v2-bucket7
+    coin-v2-max-bucket
+    coin-v2-score
+    coin-v2-score?
+    coin-v2-score-length
+    coin-v2-score-memory
+    coin-v2-score-steps
+    coin-v2-score-shares
+    coin-v2-score-encode
+    coin-v2-score-pack
+    coin-v2-score-decode
+    coin-v2-score-valid?
+    coin-v2-score-check
+    coin-v2-max-score-word
+    coin-v2-score-compare
+    coin-v2-score-better?
+
+    ;; Retargeting
+    coin-v2-retarget-window
+    coin-v2-target-margin
+    coin-v2-margin-clamp
+    coin-v2-factor-min
+    coin-v2-factor-max
+    coin-v2-complexity-min
+    coin-v2-complexity-max
+    coin-v2-complexity-genesis
+    coin-v2-margin
+    coin-v2-margin-median
+    coin-v2-retarget-height?
+    coin-v2-next-complexity
+    coin-v2-complexity-for
+    coin-v2-complexity-at
+    coin-v2-bits-prefix
+    coin-v2-bits-encode
+    coin-v2-bits-decode
+    coin-v2-check-bits)
+
+  (begin
+
+    ;;; Version of the consensus rules this facade implements.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-v2-version) ; => 2
+    ;;; ```
+    (define (coin-v2-version)
+      (: -> integer?)
+      2)))

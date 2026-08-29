@@ -60,6 +60,7 @@
     puzzle-complexity-min
     puzzle-complexity-max
     puzzle-complexity-genesis
+    puzzle-max-k
     puzzle-production-count
 
     ;; Derived complexity knobs
@@ -120,6 +121,12 @@
     ;;; worst case for a height, and it is cached per `(prev-hash, height)`.
     (define puzzle-generator-max-fuel 20000)
 
+    ;;; Most example pairs a puzzle may carry.
+    ;;;
+    ;;; Frozen at 8 by measurement, not taste: see `puzzle-complexity-k`. The
+    ;;; consensus layer re-exports this bound, so the two must agree.
+    (define puzzle-max-k 8)
+
     ;;; Largest canonical literal, in bytes, an example input may print to.
     (define puzzle-max-input-literal-bytes 8)
 
@@ -174,12 +181,21 @@
         ((< complexity 1024) 1)
         (else 2)))
 
-    ;;; Example count `k` for a complexity, in `[3, 10]`.
+    ;;; Example count `k` for a complexity, in `[3, 8]`.
     ;;;
     ;;; `k` is the slower of the two difficulty knobs on purpose: each extra
     ;;; pair lengthens the guaranteed table solution by `18 + |i| + |o|`
     ;;; bytes, and the table is what bounds the whole scheme against
     ;;; `puzzle-v2-max-source-bytes`. Difficulty is meant to come from `w`.
+    ;;;
+    ;;; The ceiling is 8 and not 10 because 10 does not fit. Measured at the
+    ;;; literal caps, the table runs 515 bytes under the `letrec` repair and
+    ;;; 510 under `fold`, against a 512-byte limit: one is already infeasible
+    ;;; and the other leaves two bytes. At `k = 8` the worst case is 415
+    ;;; bytes, 97 spare. The generator would reject an oversized table rather
+    ;;; than publish an unsolvable puzzle, so the old ceiling did not risk a
+    ;;; stall -- it risked burning retries at high complexity and leaving the
+    ;;; scheme with no margin for another repair wrapper.
     ;;;
     ;;; ```scheme
     ;;; (puzzle-complexity-k 128) ; => 3
@@ -187,7 +203,7 @@
     (define (puzzle-complexity-k complexity)
       (: integer? -> integer?)
       (check-complexity complexity)
-      (clamp-integer (+ 3 (quotient complexity 512)) 3 10))
+      (clamp-integer (+ 3 (quotient complexity 512)) 3 puzzle-max-k))
 
     ;;; Grammar width `w` for a complexity: the enabled prefix of the frozen
     ;;; production list, in `[6, 24]`.

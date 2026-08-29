@@ -1,0 +1,181 @@
+;;; (sigil coin consensus v2 solution) — the v2 mining rule
+;;;
+;;; A v1 solution produced a VALUE and the survey found that value was best
+;;; transcribed as a quoted literal 78.3% of the time. A v2 solution
+;;; produces a FUNCTION: a source that evaluates to a one-argument procedure
+;;; reproducing all `k` published input/output pairs. A function cannot be
+;;; quoted, which is the entire reason for the change.
+;;;
+;;; The checks run in the order §4.3 freezes, first failure wins:
+;;;
+;;;   1. bytes or string                        solution-malformed
+;;;   2. 1 <= |s| <= 512                        solution-oversize / -malformed
+;;;   3. the day's constraint, source half      constraint-violated
+;;;   4. parses                                 solution-parse-failed
+;;;   5. the day's constraint, AST half         constraint-violated
+;;;   6. evaluates                              solution-eval-failed
+;;;   7. a 1-arity procedure                    solution-not-a-procedure
+;;;   8. every example reproduced               solution-mismatch
+;;;   -  anything raises                        internal-error
+;;;
+;;; The order is cost, not taste. The constraint's lexical half is an
+;;; `O(|s|)` byte scan and runs before the parse; its AST half is one walk
+;;; of at most 512 bytes of source and runs before evaluation, which is the
+;;; only unbounded-looking step. A hostile solution that violates the day's
+;;; rule is therefore rejected without ever reaching a machine.
+;;;
+;;; ONE MACHINE PER SOLUTION. `puzzle-run-examples` parses, evaluates and
+;;; applies all `k` inputs on a single machine sharing one 200000-step
+;;; budget. That is load-bearing twice over: total validation cost for a
+;;; solution is bounded by one fuel budget REGARDLESS of `k`, so raising `k`
+;;; through the retarget cannot raise node cost; and `steps` and `cells`
+;;; become well-defined single numbers, which is what the score word packs.
+;;;
+;;; The parse is deliberately performed twice — once here to separate
+;;; `solution-parse-failed` from `solution-eval-failed` and to hand the AST
+;;; to the constraint walker, once inside `puzzle-run-examples` on the
+;;; machine that will run it. Reusing the first AST would mean charging the
+;;; parse to nobody's budget, and the second parse costs `O(512)` against an
+;;; evaluation budget of 200000 steps.
+;;;
+;;; Nothing raises. Every entry point returns a `coin-result`, so a node can
+;;; reject a hostile block without a handler on the validation path.
+
+(define-library (sigil coin consensus v2 solution)
+  (import (sigil math)
+          (sigil coin puzzle)
+          (sigil coin puzzle constraints)
+          (sigil coin puzzle examples)
+          (sigil coin consensus result)
+          (sigil coin consensus v2 rules))
+  (export
+    coin-v2-solution-length
+    coin-v2-spec-builtin-cap
+    coin-v2-check-solution)
+
+  (begin
+
+    ;; `puzzle-parse` accepts both, and a node reading a block always has
+    ;; bytes; strings are accepted so tests and miners can pass source text.
+    ;; The length is the SOURCE length in either shape, which is what the
+    ;; cap and the score word's `L` field both mean.
+    (define (source-length solution)
+      (if (bytevector? solution)
+          (bytevector-length solution)
+          (string-length solution)))
+
+    ;;; Length of a candidate solution in bytes, or `#f` when it is neither
+    ;;; bytes nor a string.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-v2-solution-length "car") ; => 3
+    ;;; (coin-v2-solution-length 42)    ; => #f
+    ;;; ```
+    (define (coin-v2-solution-length solution)
+      (: any? -> any?)
+      (and (or (bytevector? solution) (string? solution))
+           (source-length solution)))
+
+    ;;; The distinct-builtin cap `D` the `builtin-cap` constraint applies at
+    ;;; a puzzle's complexity: 6 at tier 1, 4 at tier 2.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-v2-spec-builtin-cap (pbe-fallback 1 128)) ; => 6
+    ;;; ```
+    (define (coin-v2-spec-builtin-cap spec)
+      (: pbe-spec? -> integer?)
+      (puzzle-constraint-builtin-cap
+        (puzzle-complexity-tier (pbe-spec-complexity spec))))
+
+    (define (kind-detail kind)
+      (if (symbol? kind) (symbol->string kind) "unknown"))
+
+    (define (constraint-detail ci)
+      (symbol->string (puzzle-constraint-name ci)))
+
+    ;; Map the interpreter's report onto the frozen consensus tags.
+    ;;
+    ;; `puzzle-run-examples` distinguishes exactly the two outcomes that are
+    ;; not interpreter errors — the source did not evaluate to a 1-arity
+    ;; procedure, and some example was not reproduced — and reports every
+    ;; other failure as an evaluator kind. The parse cannot fail here: the
+    ;; caller already parsed the same bytes under the same limit.
+    (define (report->result report)
+      (let ((kind (puzzle-report-error-kind report)))
+        (cond
+          ((eq? kind 'solution-not-a-procedure)
+           (coin-error 'solution-not-a-procedure
+                       "solution is not a 1-arity procedure"))
+          ((eq? kind 'solution-mismatch)
+           (coin-error 'solution-mismatch
+                       (string-append
+                         "example "
+                         (if (number? (puzzle-report-index report))
+                             (number->string (puzzle-report-index report))
+                             "?")
+                         " was not reproduced")))
+          (else (coin-error 'solution-eval-failed (kind-detail kind))))))
+
+    ;;; Check a candidate solution against an already-derived puzzle.
+    ;;;
+    ;;; On success the value is the `puzzle-report`, whose `steps` and
+    ;;; `cells` are what the score word buckets and whose `value` is the
+    ;;; procedure itself. Returning the report rather than a fresh record
+    ;;; keeps one definition of "what running this solution cost", and is
+    ;;; what lets part B call this per share and sum nothing.
+    ;;;
+    ;;; `puzzle-spec-par` is NOT a bound here. Par is the shortest solution
+    ;;; the generator happens to know, an upper bound on the true optimum
+    ;;; and often a loose one; shorter solutions are legal, expected, and
+    ;;; the whole point of the game. Par's only role is the retarget signal.
+    ;;;
+    ;;; Rejection reasons are `solution-malformed`, `solution-oversize`,
+    ;;; `constraint-violated`, `solution-parse-failed`,
+    ;;; `solution-eval-failed`, `solution-not-a-procedure`,
+    ;;; `solution-mismatch` and `internal-error`. Details name the
+    ;;; interpreter kind, the constraint or the failing example index, and
+    ;;; are advisory: two nodes may print different details for the same
+    ;;; rejection and still agree on the chain.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-ok? (coin-v2-check-solution spec (pbe-spec-table-solution spec)))
+    ;;; ; => #t
+    ;;; (coin-result-reason (coin-v2-check-solution spec "car"))
+    ;;; ; => solution-mismatch
+    ;;; ```
+    (define (coin-v2-check-solution spec solution)
+      (: any? any? -> coin-result?)
+      (guard (e (#t (coin-error 'internal-error
+                                "the solution check raised")))
+        (cond
+          ((not (pbe-spec? spec))
+           (coin-error 'internal-error "expected a puzzle spec"))
+          ((not (or (bytevector? solution) (string? solution)))
+           (coin-error 'solution-malformed
+                       "solution must be bytes or a string"))
+          ((> (source-length solution) coin-v2-max-solution-bytes)
+           (coin-error 'solution-oversize "solution exceeds the byte cap"))
+          ((= 0 (source-length solution))
+           (coin-error 'solution-malformed "solution is empty"))
+          (else
+            (let ((ci (pbe-spec-constraint spec))
+                  (d (coin-v2-spec-builtin-cap spec)))
+              (if (not (puzzle-constraint-source-ok? ci solution))
+                  (coin-error 'constraint-violated (constraint-detail ci))
+                  (let ((parsed (puzzle-parse/limit
+                                  solution coin-v2-max-solution-bytes)))
+                    (cond
+                      ((puzzle-failed? parsed)
+                       (coin-error 'solution-parse-failed
+                                   (kind-detail
+                                     (puzzle-result-error-kind parsed))))
+                      ((not (puzzle-constraint-ast-ok?
+                              ci (puzzle-result-value parsed) d))
+                       (coin-error 'constraint-violated
+                                   (constraint-detail ci)))
+                      (else
+                        (let ((report (puzzle-run-examples
+                                        solution (pbe-spec-examples spec))))
+                          (if (puzzle-report-ok? report)
+                              (coin-ok report)
+                              (report->result report)))))))))))))) 
