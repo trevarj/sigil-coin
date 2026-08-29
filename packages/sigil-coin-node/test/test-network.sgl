@@ -8,25 +8,14 @@
 ;;; so every command it runs is the one an operator runs, and every
 ;;; assertion about it is read back out of its own database afterwards.
 ;;;
-;;; WHAT IS REAL, AND THE ONE THING THAT IS NOT. Headers cross the wire
+;;; NOTHING HERE IS SIMULATED. Headers and block bodies both cross the wire
 ;;; through the node's own code on both sides: the peer's
 ;;; `node-sync-with-peer` asks, and this process's
-;;; `node-serve-inbound-transport` answers. Block BODIES cannot, because
-;;; `sigil-bitcoin` has no `getdata` responder anywhere:
-;;; `inbound-handle-envelope` answers `getheaders`, `getaddr` and the relay
-;;; commands and nothing else, and the fallback
-;;; `p2p-session-apply-envelope` answers only `version`, `ping` and `inv`.
-;;; A node ASKS for bodies — `node-download-blocks-for-peer` writes
-;;; `getdata` and reads `block` — but nothing in the library ever replies,
-;;; so two nodes of this codebase alone can sync headers and never bodies.
-;;;
-;;; So the serving side wraps its transport: a `getdata` is answered out of
-;;; the serving node's own `blocks` table as the `block` message a Bitcoin
-;;; peer would send, and every other envelope is handed to the node
-;;; untouched. `serve-getdata-blocks` is the whole of what a test had to
-;;; supply. Nothing on the receiving side is simulated: the peer process
-;;; requests, parses, stores, validates, reorganises and rejects with its
-;;; own code, over the socket.
+;;; `node-serve-inbound-transport` answers — `getheaders` with headers and
+;;; `getdata` with the bodies `sigil-bitcoin`'s own responder reads out of
+;;; the serving node's `blocks` table. The receiving process requests,
+;;; parses, stores, validates, reorganises and rejects with its own code,
+;;; over the socket.
 ;;;
 ;;; Every wait is bounded — the accept, every envelope read, and each peer
 ;;; process's own connect and read timeouts — so a peer that stops talking
@@ -70,8 +59,8 @@
 (define %read-timeout 60000)
 
 ;; Envelopes the serving node handles on one connection. A whole sync round
-;; is a handful; block messages are answered inside the transport and do not
-;; count against it.
+;; is a handful, and one `getdata` is one of them however many bodies it
+;; buys.
 (define %serve-steps 512)
 
 ;; Transaction announcements accepted in one relay message.
@@ -223,52 +212,7 @@
         (let ((sym (assoc (string->symbol key) row)))
           (and sym (cdr sym))))))
 
-;; The serving node's own copy of a block, as the bytes it stored.
-(define (stored-block-payload n hash-bytes)
-  (let ((rows (sqlite-query
-                (node-db n)
-                "SELECT block_hex FROM blocks WHERE hash = ? AND block_hex IS NOT NULL"
-                (hex-encode hash-bytes))))
-    (and (pair? rows) (hex-decode (row-value (car rows) "block_hex")))))
-
-(define (block-inventory? item)
-  (or (= inv-block (inventory-vector-type item))
-      (= inv-witness-block (inventory-vector-type item))))
-
-;; Answer one `getdata`: a `block` message for every block this node has,
-;; and one `notfound` naming the rest. The responder `sigil-bitcoin` does
-;; not have; see the file header.
-(define (serve-getdata-blocks n sock envelope)
-  (let ((magic (chain-config-magic (node-config n))))
-    (let loop ((items (inventory-message-parse
-                        (p2p-envelope-payload envelope)))
-               (missing '()))
-      (if (null? items)
-          (unless (null? missing)
-            (p2p-socket-write-envelope
-              sock
-              (p2p-envelope magic: magic
-                            command: "notfound"
-                            payload: (notfound-message (reverse missing)))))
-          (let* ((item (car items))
-                 (payload (and (block-inventory? item)
-                               (stored-block-payload
-                                 n
-                                 (inventory-vector-hash item)))))
-            (if payload
-                (begin
-                  (p2p-socket-write-envelope
-                    sock
-                    (p2p-envelope magic: magic
-                                  command: "block"
-                                  payload: payload))
-                  (loop (cdr items) missing))
-                (loop (cdr items) (cons item missing))))))))
-
 ;;; Serve one accepted peer with the node's own inbound handler.
-;;;
-;;; The read callback is where the block responder lives: a `getdata` is
-;;; answered there and never reaches the node, which has no case for it.
 (define (serve-peer n sock)
   ;; The peer hanging up is how every one of these connections ends — it
   ;; finishes its pass and closes, and the node's reader raises.
@@ -277,13 +221,7 @@
       n
       "127.0.0.1"
       0
-      (lambda ()
-        (let loop ()
-          (let ((envelope (p2p-socket-read-envelope-timeout sock
-                                                            %read-timeout)))
-            (if (string=? "getdata" (p2p-envelope-command envelope))
-                (begin (serve-getdata-blocks n sock envelope) (loop))
-                envelope))))
+      (lambda () (p2p-socket-read-envelope-timeout sock %read-timeout))
       (lambda (envelope) (p2p-socket-write-envelope sock envelope))
       (lambda () (socket-close sock))
       %serve-steps
