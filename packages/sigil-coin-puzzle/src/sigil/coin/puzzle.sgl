@@ -47,6 +47,7 @@
     puzzle-result-status
     puzzle-result-value
     puzzle-result-steps
+    puzzle-result-allocations
     puzzle-result-error-kind
     puzzle-result-message
     puzzle-ok?
@@ -113,29 +114,77 @@
     ;;; result must satisfy `(< (abs n) puzzle-max-integer)`.
     (define puzzle-max-integer (expt 2 256))
 
-    ;;; Maximum *charged* list cells for one evaluation.
+    ;;; Maximum cells an evaluation may allocate.
     ;;;
-    ;;; This is a consensus budget, not a host heap measurement. Only the
-    ;;; list-producing builtins charge it: `cons`, `list`, `reverse`,
-    ;;; `append`, `map`, `filter` and `iota`. It deliberately undercounts
-    ;;; real host allocation, and the undercount is part of v1:
+    ;;; A *cell* is one host object the evaluator allocates: one pair, one
+    ;;; binding box, or one closure struct. The counter is an allocation
+    ;;; total, not a residency high-water mark, so it counts transient conses
+    ;;; too. Because every retained object is also a charged object, the total
+    ;;; is an upper bound on live memory as well, which is what makes it
+    ;;; usable as a fork-choice score and not merely a cap.
     ;;;
-    ;;;   * environment frames, binding boxes and closure structs are free
-    ;;;   * the argument list `ev-args` builds per application is free
-    ;;;   * `append`, `map` and `filter` accumulate a reversed list and then
-    ;;;     copy it, so they touch about `2n` host pairs while charging `n`
+    ;;; CHARGED (the complete list; every site is exercised by a golden
+    ;;; vector in `test-puzzle.sgl`):
     ;;;
-    ;;; Both the charge and the undercount are deterministic, so every node
-    ;;; reaches `allocation-exceeded` on exactly the same step. The name is a
-    ;;; budget, not a byte count.
+    ;;;   * binding a name — 3: the box, the `(name . box)` pair, and the
+    ;;;     environment spine pair. Charged by `let`, `letrec` and every
+    ;;;     closure application, once per bound name.
+    ;;;   * `let`/`letrec` duplicate-name check — 1 per binding, the list
+    ;;;     `ev-bindings` accumulates while validating.
+    ;;;   * `lambda` — 1 for the closure struct. Its parameters, body and
+    ;;;     captured environment are shared, not copied.
+    ;;;   * an application's argument list — 2 per argument: `ev-args`
+    ;;;     conses each value then reverses the accumulator.
+    ;;;   * `cons` — 1. `reverse` and `iota` — n.
+    ;;;   * `append` — 2 per element of every list but the last: each is
+    ;;;     copied onto a reversed accumulator and then copied back out. The
+    ;;;     final list is shared as the tail and costs nothing.
+    ;;;   * `map` — 3n: n one-element argument lists, n accumulator conses,
+    ;;;     n more to reverse it.
+    ;;;   * `filter` — n for the argument lists, plus 2 per kept element.
+    ;;;   * `fold` — 2n for the two-element argument list per step.
+    ;;;   * `quote` and `equal?` — 4 per node of the datum, an upper bound on
+    ;;;     the transient worklists their iterative walks build. The quoted
+    ;;;     datum itself is shared and costs nothing.
     ;;;
-    ;;; Real memory is bounded by `puzzle-max-fuel` instead: every host
-    ;;; allocation an evaluation can make is charged at least one step within
-    ;;; a small constant factor, so peak residency is `O(puzzle-max-fuel)`
-    ;;; host objects. The measured worst case is a closure-retaining `letrec`
-    ;;; loop at roughly 124 MB RSS. That figure, not this constant, is the
-    ;;; memory ceiling to re-measure before either cap moves.
-    (define puzzle-max-allocations 100000)
+    ;;; NOT CHARGED, each bounded by another cap:
+    ;;;
+    ;;;   * strings — `puzzle-max-string-bytes` (64 KiB) is their budget.
+    ;;;   * integers — `puzzle-max-integer` caps a bignum at 32 bytes, and
+    ;;;     each arithmetic result costs at least one step, so fuel bounds
+    ;;;     them at `32 * puzzle-max-fuel` bytes of churn.
+    ;;;   * parsing — the AST is built once from at most
+    ;;;     `puzzle-max-source-bytes` (256) bytes of source.
+    ;;;   * failure paths — the abort struct and its message are allocated
+    ;;;     once, as evaluation ends.
+    ;;;
+    ;;; MEMORY CEILING: a cell is one host object of at most 48 bytes (a pair
+    ;;; is 3 words, the widest struct here is 5). 400000 cells is therefore
+    ;;; about 19 MB, and since nothing can be retained that was not charged,
+    ;;; that is a ceiling on live data as well as on churn.
+    ;;;
+    ;;; Fuel alone does not give that ceiling. The densest measured programs
+    ;;; allocate about 1.4 cells per step and `map` can reach 3, so
+    ;;; `puzzle-max-fuel` on its own permits roughly 3e6 cells, near 140 MB —
+    ;;; consistent with the 124 MB RSS a reviewer measured for a
+    ;;; closure-retaining `letrec` loop that the v1 counter charged zero for.
+    ;;; This cap, not fuel, is what bounds memory.
+    ;;;
+    ;;; CALIBRATION: 400000 was chosen against measurement, not carried over.
+    ;;; Across 300 generated puzzles, the heaviest generated source charges
+    ;;; 356 cells and the heaviest quoting solution 380, so the cap leaves
+    ;;; legitimate golf programs about 1050x headroom; the v1 cap of 100000
+    ;;; over an observed peak of 80 left 1250x. What moves is which programs
+    ;;; are legal: pure list building gets cheaper relative to the cap
+    ;;; (`(iota 100001)` and `(append (iota 100000) (iota 1))` were refused
+    ;;; and now succeed), while closure- and binding-heavy loops get dearer
+    ;;; (a tail `letrec` countdown now stops at about 36000 iterations
+    ;;; instead of running to fuel exhaustion).
+    ;;;
+    ;;; The bound is a pure function of the program and its inputs — no host
+    ;;; word size, allocator, GC or build flag enters it — so every node
+    ;;; reaches `allocation-exceeded` on exactly the same cell.
+    (define puzzle-max-allocations 400000)
 
     ;;; Maximum bytes of string constructed during one evaluation.
     (define puzzle-max-string-bytes 65536)
@@ -156,17 +205,20 @@
     ;;; `status` is `ok` or `error`. On `ok`, `value` holds the AST (parse) or
     ;;; the computed value (eval). On `error`, `error-kind` is one of the
     ;;; frozen kind symbols and `message` is a human-readable detail that is
-    ;;; NOT consensus-relevant. `steps` is the fuel consumed, and is
-    ;;; meaningful for evaluation results only.
+    ;;; NOT consensus-relevant. `steps` is the fuel consumed and
+    ;;; `allocations` the cells charged; both are meaningful for evaluation
+    ;;; results only, and both are consensus-visible.
     ;;;
     ;;; ```scheme
     ;;; (puzzle-result-status (puzzle-run "(+ 1 2)")) ; => ok
     ;;; (puzzle-result-value (puzzle-run "(+ 1 2)"))  ; => 3
+    ;;; (puzzle-result-allocations (puzzle-run "(+ 1 2)")) ; => 4
     ;;; ```
     (define-struct puzzle-result
       (status)
       (value default: #f)
       (steps default: 0)
+      (allocations default: 0)
       (error-kind default: #f)
       (message default: ""))
 
@@ -207,14 +259,16 @@
     ;; Convert any caught host condition into an error result. A non-abort
     ;; condition means the interpreter itself misbehaved (or the host hit a
     ;; limit we failed to bound); it is still reported deterministically.
-    (define (abort->result condition steps)
+    (define (abort->result condition steps cells)
       (if (puzzle--abort? condition)
           (puzzle-result status: 'error
                          steps: steps
+                         allocations: cells
                          error-kind: (puzzle--abort-kind condition)
                          message: (puzzle--abort-message condition))
           (puzzle-result status: 'error
                          steps: steps
+                         allocations: cells
                          error-kind: 'internal-error
                          message: "interpreter invariant violated")))
 
@@ -598,7 +652,7 @@
     ;;; ```
     (define (puzzle-parse source)
       (: any? -> puzzle-result?)
-      (guard (e (#t (abort->result e 0)))
+      (guard (e (#t (abort->result e 0 0)))
         (let* ((text (puzzle--source->text source))
                (n (string-length text))
                (start (puzzle--skip-space text 0 n)))
@@ -627,10 +681,16 @@
               (fail 'fuel-exhausted "step limit reached")))
         (set-puzzle--machine-fuel! m left)))
 
+    ;; Charge `cells` allocated host objects. On overflow the counter is
+    ;; pinned at the cap first, so a failed evaluation reports exactly
+    ;; `puzzle-max-allocations` rather than a number that depends on the
+    ;; size of the request that broke it.
     (define (alloc! m cells)
       (let ((used (+ (puzzle--machine-cells m) cells)))
         (if (> used puzzle-max-allocations)
-            (fail 'allocation-exceeded "list allocation limit reached"))
+            (begin
+              (set-puzzle--machine-cells! m puzzle-max-allocations)
+              (fail 'allocation-exceeded "allocation limit reached")))
         (set-puzzle--machine-cells! m used)))
 
     (define (alloc-string! m bytes)
@@ -641,6 +701,9 @@
 
     (define (steps-used m)
       (- puzzle-max-fuel (puzzle--machine-fuel m)))
+
+    (define (cells-used m)
+      (puzzle--machine-cells m))
 
     ;; ============================================================
     ;; Environments
@@ -663,7 +726,10 @@
                   (fail 'unbound-variable (symbol->string name)))
               builtin))))
 
-    (define (env-bind env name value)
+    ;; Binding a name allocates three host objects: the box, the
+    ;; `(name . box)` pair, and the environment spine pair.
+    (define (env-bind m env name value)
+      (alloc! m 3)
       (cons (cons name (puzzle--box value: value)) env))
 
     ;; ============================================================
@@ -747,9 +813,12 @@
                    (args (ev-args m rest env (+ depth 1))))
               (puzzle--apply m proc args depth))))))
 
-    ;; Quoted data is shared, not copied, so it costs no allocation. It does
-    ;; cost fuel proportional to its size, which bounds the validation walk
-    ;; even when `puzzle-eval` is handed a hand-built AST.
+    ;; The quoted datum itself is shared, not copied, so the value costs no
+    ;; allocation. The two iterative walks below — sizing it, then validating
+    ;; it — each build a worklist of at most two pairs per node, and those do
+    ;; allocate; 4 per node bounds both. Fuel is charged per node as well,
+    ;; which bounds the walk even when `puzzle-eval` is handed a hand-built
+    ;; AST.
     (define (ev-quote m rest)
       (if (not (list-of-length? rest 1))
           (fail 'bad-syntax "quote takes exactly one datum"))
@@ -758,6 +827,7 @@
         (spend! m size)
         (if (>= size puzzle-max-allocations)
             (fail 'bad-syntax "quoted datum is too large"))
+        (alloc! m (* 4 size))
         (if (not (puzzle-value? datum))
             (fail 'bad-syntax "quoted datum is not a v1 value"))
         datum))
@@ -782,11 +852,16 @@
                 (if (memq (car ps) (cdr ps))
                     (fail 'bad-syntax "duplicate lambda parameter"))
                 (loop (cdr ps)))))
+        ;; The closure struct is the only object made here; params, body and
+        ;; the captured environment are shared.
+        (alloc! m 1)
         (puzzle-closure params: params
                         body: (car (cdr rest))
                         env: env)))
 
-    (define (ev-bindings rest form)
+    ;; The duplicate-name scan conses one pair per binding, charged as it
+    ;; goes so a malformed binding list stops at the same cell on every node.
+    (define (ev-bindings m rest form)
       (if (not (list-of-length? rest 2))
           (fail 'bad-syntax (string-append form " takes bindings and one body")))
       (let ((bindings (car rest)))
@@ -801,24 +876,26 @@
                 (check-binding-name (car b))
                 (if (memq (car b) names)
                     (fail 'bad-syntax "duplicate binding name"))
+                (alloc! m 1)
                 (loop (cdr bs) (cons (car b) names)))))))
 
     (define (ev-let m rest env depth)
-      (let ((bindings (ev-bindings rest "let")))
+      (let ((bindings (ev-bindings m rest "let")))
         (let loop ((bs bindings) (new-env env))
           (if (null? bs)
               (ev m (car (cdr rest)) new-env depth)
               (let ((value (ev m (car (cdr (car bs))) env (+ depth 1))))
-                (loop (cdr bs) (env-bind new-env (car (car bs)) value)))))))
+                (loop (cdr bs) (env-bind m new-env (car (car bs)) value)))))))
 
     (define (ev-letrec m rest env depth)
-      (let* ((bindings (ev-bindings rest "letrec"))
+      (let* ((bindings (ev-bindings m rest "letrec"))
              (new-env
                (let loop ((bs bindings) (acc env))
                  (if (null? bs)
                      acc
                      (loop (cdr bs)
-                           (env-bind acc (car (car bs)) puzzle--unassigned))))))
+                           (env-bind m acc (car (car bs))
+                                     puzzle--unassigned))))))
         (let loop ((bs bindings))
           (if (null? bs)
               (ev m (car (cdr rest)) new-env depth)
@@ -847,12 +924,15 @@
                 value
                 (ev-or m (cdr rest) env depth))))))
 
+    ;; Two cells per argument: one cons onto the accumulator, one more when
+    ;; the accumulator is reversed into the argument list.
     (define (ev-args m exprs env depth)
       (let loop ((exprs exprs) (acc '()))
         (if (null? exprs)
             (reverse acc)
-            (loop (cdr exprs)
-                  (cons (ev m (car exprs) env depth) acc)))))
+            (let ((value (ev m (car exprs) env depth)))
+              (alloc! m 2)
+              (loop (cdr exprs) (cons value acc))))))
 
     (define (count-args args)
       (let loop ((a args) (n 0))
@@ -874,7 +954,7 @@
              (if (null? ps)
                  (ev m (puzzle-closure-body proc) env depth)
                  (loop (cdr ps) (cdr as)
-                       (env-bind env (car ps) (car as)))))))
+                       (env-bind m env (car ps) (car as)))))))
         ((puzzle-builtin? proc)
          (let ((n (count-args args))
                (lo (puzzle-builtin-arity-min proc))
@@ -954,10 +1034,11 @@
     (define (bi-cdr m args depth)
       (cdr (need-pair "cdr" (car args))))
 
+    ;; `list` returns the argument list `ev-args` already built and charged;
+    ;; it allocates nothing of its own.
     (define (bi-list m args depth)
       (let ((n (count-args args)))
         (spend! m n)
-        (alloc! m n)
         args))
 
     (define (bi-null? m args depth)
@@ -988,10 +1069,13 @@
                 (let ((tail (need-list "append" (car rest))))
                   (let build ((x acc) (out tail))
                     (if (null? x) out (build (cdr x) (cons (car x) out)))))
+                ;; Each element of a non-final list is consed twice: once
+                ;; onto the reversed accumulator, once back out in `build`.
+                ;; The final list is shared as the tail and costs nothing.
                 (let* ((lst (need-list "append" (car rest)))
                        (n (list-length "append" lst)))
                   (spend! m n)
-                  (alloc! m n)
+                  (alloc! m (* 2 n))
                   (let copy ((x lst) (acc acc))
                     (if (null? x)
                         (loop (cdr rest) acc)
@@ -1002,7 +1086,9 @@
              (lst (need-list "map" (car (cdr args))))
              (n (list-length "map" lst)))
         (spend! m n)
-        (alloc! m n)
+        ;; Per element: the one-element argument list, the accumulator cons,
+        ;; and the cons that reverses it.
+        (alloc! m (* 3 n))
         (let loop ((x lst) (acc '()))
           (if (null? x)
               (reverse acc)
@@ -1015,13 +1101,17 @@
              (lst (need-list "filter" (car (cdr args))))
              (n (list-length "filter" lst)))
         (spend! m n)
+        ;; One argument list per element, whether or not it is kept.
+        (alloc! m n)
         (let loop ((x lst) (acc '()))
           (if (null? x)
               (reverse acc)
               (let ((keep (puzzle--apply m proc (list (car x)) (+ depth 1))))
                 (if (truthy? keep)
                     (begin
-                      (alloc! m 1)
+                      ;; Kept elements are consed onto the accumulator and
+                      ;; consed again when it is reversed.
+                      (alloc! m 2)
                       (loop (cdr x) (cons (car x) acc)))
                     (loop (cdr x) acc)))))))
 
@@ -1033,6 +1123,8 @@
              (lst (need-list "fold" (car (cdr (cdr args)))))
              (n (list-length "fold" lst)))
         (spend! m n)
+        ;; A two-element argument list per step.
+        (alloc! m (* 2 n))
         (let loop ((x lst) (acc seed))
           (if (null? x)
               acc
@@ -1043,8 +1135,11 @@
       (let ((n (need-integer "iota" (car args))))
         (if (< n 0)
             (fail 'type-error "iota: expected a non-negative count"))
+        ;; Screened before `spend!` so an absurd count reports the
+        ;; allocation cap rather than burning the whole fuel budget first.
+        ;; `alloc!` cannot return here: it pins the counter and raises.
         (if (> n puzzle-max-allocations)
-            (fail 'allocation-exceeded "iota: list allocation limit reached"))
+            (alloc! m n))
         (spend! m n)
         (alloc! m n)
         (let loop ((i (- n 1)) (acc '()))
@@ -1159,8 +1254,12 @@
     (define (bi-equal? m args depth)
       (let ((a (car args))
             (b (car (cdr args))))
-        (spend! m (+ 1 (puzzle--value-size a puzzle-max-allocations)))
-        (puzzle-value=? a b)))
+        (let ((size (puzzle--value-size a puzzle-max-allocations)))
+          (spend! m (+ 1 size))
+          ;; Sizing and comparing both build iterative worklists of at most
+          ;; two pairs per node; 4 per node bounds the pair of walks.
+          (alloc! m (* 4 size))
+          (puzzle-value=? a b))))
 
     (define (bi-number? m args depth)
       (let ((v (car args)))
@@ -1274,7 +1373,8 @@
     ;;; failure `error-kind` is one of `bad-syntax`, `unbound-variable`,
     ;;; `uninitialized`, `arity-error`, `type-error`, `division-by-zero`,
     ;;; `index-error`, `overflow`, `fuel-exhausted`, `allocation-exceeded`,
-    ;;; `string-limit`, `depth-exceeded` or `internal-error`.
+    ;;; `string-limit`, `depth-exceeded` or `internal-error`. `steps` and
+    ;;; `allocations` report what the evaluation consumed either way.
     ;;;
     ;;; ```scheme
     ;;; (puzzle-result-value (puzzle-eval '(+ 1 2)))     ; => 3
@@ -1283,11 +1383,12 @@
     (define (puzzle-eval ast)
       (: any? -> puzzle-result?)
       (let ((m (puzzle--machine fuel: puzzle-max-fuel)))
-        (guard (e (#t (abort->result e (steps-used m))))
+        (guard (e (#t (abort->result e (steps-used m) (cells-used m))))
           (let ((value (ev m ast '() 1)))
             (puzzle-result status: 'ok
                            value: value
-                           steps: (steps-used m))))))
+                           steps: (steps-used m)
+                           allocations: (cells-used m))))))
 
     ;;; Parse and evaluate solution source in one step.
     ;;;

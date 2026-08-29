@@ -264,12 +264,23 @@
                     (coin-check-solution %spec (string->bytes "(car '())")))))
 
   (test "a solution that burns the fuel budget is rejected, not hung"
+    ;; `expt` charges steps for its exponent but allocates almost nothing, so
+    ;; this exhausts fuel specifically. A recursive loop cannot test fuel any
+    ;; more: every call binds a parameter, so it now trips the allocation cap
+    ;; first — that case is the test below.
+    (let ((result (coin-check-solution
+                    %spec
+                    (string->bytes "(expt 1 1000000)"))))
+      (assert-equal 'solution-eval-failed (coin-result-reason result))
+      (assert-equal "fuel-exhausted" (coin-result-detail result))))
+
+  (test "a solution that exhausts the allocation budget is rejected, not hung"
     (let ((result (coin-check-solution
                     %spec
                     (string->bytes
                       "(letrec ((f (lambda (n) (f (+ n 1))))) (f 0))"))))
       (assert-equal 'solution-eval-failed (coin-result-reason result))
-      (assert-equal "fuel-exhausted" (coin-result-detail result))))
+      (assert-equal "allocation-exceeded" (coin-result-detail result))))
 
   (test "a solution that recurses too deep is rejected, not a stack overflow"
     (let ((result (coin-check-solution

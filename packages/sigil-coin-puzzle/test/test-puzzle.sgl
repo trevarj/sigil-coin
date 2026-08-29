@@ -23,6 +23,9 @@
 (define (steps src)
   (puzzle-result-steps (puzzle-run src)))
 
+(define (cells src)
+  (puzzle-result-allocations (puzzle-run src)))
+
 (define (ast src)
   (puzzle-result-value (puzzle-parse src)))
 
@@ -56,7 +59,7 @@
     (assert-equal 256 puzzle-max-source-bytes)
     (assert-equal 64 puzzle-max-parse-depth)
     (assert-equal 1000000 puzzle-max-fuel)
-    (assert-equal 100000 puzzle-max-allocations)
+    (assert-equal 400000 puzzle-max-allocations)
     (assert-equal 65536 puzzle-max-string-bytes)
     (assert-equal 128 puzzle-max-eval-depth))
 
@@ -711,30 +714,158 @@
     (assert-kind 'overflow "(+ (expt 2 255) (expt 2 255))")
     (assert-kind 'overflow "(- (- (expt 2 255)) (expt 2 255))"))
 
-  (test "allocation beyond the cap is refused"
-    (assert-kind 'allocation-exceeded "(iota 100001)")
-    (assert-kind 'allocation-exceeded "(append (iota 100000) (iota 1))"))
+  (test "the allocation cap is pinned on both sides"
+    ;; `(iota n)` charges 2 for the argument list plus n for the result, so
+    ;; 399998 lands exactly on the cap and 399999 is one cell over it.
+    (assert-equal 'ok (status "(iota 399998)"))
+    (assert-equal 400000 (cells "(iota 399998)"))
+    (assert-kind 'allocation-exceeded "(iota 399999)")
+    ;; A failed evaluation reports the cap exactly, not the size of the
+    ;; request that broke it.
+    (assert-equal 400000 (cells "(iota 399999)"))
+    (assert-equal 400000 (cells "(iota 100000000)")))
 
-  (test "allocation exactly at the cap is allowed"
-    (assert-value 100000 "(length (iota 100000))"))
-
-  (test "the allocation counter charges list-builtin cells only"
-    ;; `iota` charges n and `map` charges its input length, so this pair
-    ;; lands exactly on the cap even though `map` conses about 2n host
-    ;; pairs. The counter is a consensus budget, not a heap measurement.
+  (test "list building that fits the cap is allowed"
+    (assert-value 100000 "(length (iota 100000))")
     (assert-value 50000 "(length (map (lambda (x) x) (iota 50000)))")
+    ;; Both of these were `allocation-exceeded` under the v1 undercount and
+    ;; its 100000 cap; honest charging moved the cap, not just the counter.
+    (assert-value 100001 "(length (append (iota 100000) (iota 1)))")
+    (assert-value 100001 "(length (iota 100001))"))
+
+  (test "a closure-retaining loop is charged in proportion to its bindings"
+    ;; The reviewer's ~124 MB case. Each iteration allocates 11 cells: two
+    ;; argument lists of one, one of two, and the three objects that bind
+    ;; the parameter. v1 charged this loop nothing at all.
+    (assert-equal 110012
+                  (cells "(letrec ((f (lambda (n) (if (zero? n) 0 (f (- n 1)))))) (f 10000))"))
+    (assert-equal 11012
+                  (cells "(letrec ((f (lambda (n) (if (zero? n) 0 (f (- n 1)))))) (f 1000))"))
+    ;; Ten times the work, ten times the charge, to within the fixed setup.
     (assert-kind 'allocation-exceeded
-                 "(length (map (lambda (x) x) (iota 50001)))")
-    ;; Environment frames, binding boxes and closures are never charged:
-    ;; this loop makes 10000 bindings and spends none of the budget.
-    (assert-value 0
-                  "(letrec ((f (lambda (n) (if (zero? n) 0 (f (- n 1)))))) (f 10000))"))
+                 "(letrec ((f (lambda (n) (if (zero? n) 0 (f (- n 1)))))) (f 100000))"))
 
   (test "string construction beyond the cap is refused"
     (assert-kind 'string-limit
                  (string-append "(letrec ((f (lambda (n s) (if (zero? n) s"
                                 " (f (- n 1) (string-append s s))))))"
                                 " (f 40 \"ab\"))"))))
+
+;; ============================================================
+;; Allocation accounting
+;; ============================================================
+;;
+;; One vector per charged site. A cell is one host object; these numbers
+;; are consensus-visible and are what fork choice scores.
+
+(test-group "puzzle allocation accounting"
+  (test "atoms and variable references allocate nothing"
+    (assert-equal 0 (cells "1"))
+    (assert-equal 0 (cells "\"ab\""))
+    (assert-equal 0 (cells "#t"))
+    (assert-equal 0 (cells "car")))
+
+  (test "quote shares its datum and charges 4 per node walked"
+    ;; The datum is shared, so only the sizing and validation worklists are
+    ;; charged: `a` is one node, `(1 2)` is five (two pairs, two integers,
+    ;; the empty tail).
+    (assert-equal 4 (cells "'a"))
+    (assert-equal 4 (cells "'()"))
+    (assert-equal 20 (cells "'(1 2)")))
+
+  (test "an application charges 2 per argument for the argument list"
+    (assert-equal 0 (cells "(list)"))
+    (assert-equal 2 (cells "(abs 1)"))
+    (assert-equal 4 (cells "(+ 1 2)"))
+    (assert-equal 6 (cells "(+ 1 2 3)"))
+    ;; `list` returns that same argument list, so it adds nothing.
+    (assert-equal 6 (cells "(list 1 2 3)")))
+
+  (test "lambda charges 1 for the closure struct"
+    (assert-equal 1 (cells "(lambda (x) x)"))
+    (assert-equal 1 (cells "(lambda (x y z) x)")))
+
+  (test "binding a name charges 3"
+    ;; The box, the (name . box) pair, and the environment spine pair, plus
+    ;; 1 per binding for the duplicate-name scan.
+    (assert-equal 4 (cells "(let ((a 1)) a)"))
+    (assert-equal 8 (cells "(let ((a 1) (b 2)) a)"))
+    (assert-equal 4 (cells "(letrec ((a 1)) a)"))
+    (assert-equal 8 (cells "(letrec ((a 1) (b 2)) a)"))
+    ;; Applying a closure binds each parameter the same way: 1 closure,
+    ;; 2 for the argument list, 3 for the binding.
+    (assert-equal 6 (cells "((lambda (x) x) 1)"))
+    (assert-equal 11 (cells "((lambda (x y) x) 1 2)")))
+
+  (test "special forms that bind nothing allocate nothing"
+    (assert-equal 0 (cells "(if #t 1 2)"))
+    (assert-equal 0 (cells "(and 1 2)"))
+    (assert-equal 0 (cells "(or #f 2)")))
+
+  (test "cons, reverse and iota charge one cell per pair"
+    (assert-equal 6 (cells "(iota 4)"))
+    (assert-equal 9 (cells "(cons 1 '())"))
+    (assert-equal 12 (cells "(reverse (iota 4))")))
+
+  (test "append charges 2 per element of every list but the last"
+    ;; Each `(iota 4)` costs 6, plus 2 for its slot in the argument list, so
+    ;; the arguments alone are 16. The final list is shared as the tail, so
+    ;; only the first four elements are copied, at 2 cells apiece.
+    (assert-equal 24 (cells "(append (iota 4) (iota 4))"))
+    ;; One list is the last list: nothing is copied, so append adds nothing.
+    (assert-equal 8 (cells "(append (iota 4))"))
+    (assert-equal 0 (cells "(append)")))
+
+  (test "map charges 3 per element"
+    ;; 7 for `(iota 3)` and its argument slot, 3 for the closure and its
+    ;; slot, 9 for map itself, 9 to bind the parameter across three calls.
+    (assert-equal 28 (cells "(map (lambda (x) x) (iota 3))"))
+    ;; A builtin mapper binds nothing, so only map's own 3n is left.
+    (assert-equal 18 (cells "(map abs (iota 3))")))
+
+  (test "filter charges 1 per element and 2 more per kept element"
+    ;; `(iota 3)` and the argument list cost 9; filter charges 3 for the
+    ;; per-element argument lists, then 2 for each element it keeps.
+    (assert-equal 16 (cells "(filter even? (iota 3))"))
+    (assert-equal 14 (cells "(filter odd? (iota 3))")))
+
+  (test "fold charges 2 per element for its argument list"
+    ;; 34 for the three arguments, 6 for the three (element accumulator)
+    ;; pairs fold builds.
+    (assert-equal 40 (cells "(fold + 0 '(1 2 3))"))
+    (assert-equal 10 (cells "(fold + 0 '())")))
+
+  (test "equal? charges 4 per node of its first argument"
+    (assert-equal 40 (cells "(equal? '(1) '(1))"))
+    (assert-equal 8 (cells "(equal? 1 1)")))
+
+  (test "strings and integers are charged to their own caps, not to cells"
+    (assert-equal 4 (cells "(string-append \"a\" \"b\")"))
+    (assert-equal 2 (cells "(number->string 12345)"))
+    (assert-equal 4 (cells "(expt 2 200)")))
+
+  (test "allocations are reported on failure as well as success"
+    ;; 4 to bind `a`, 6 for the quoted `()` and its argument slot.
+    (let ((result (puzzle-run "(let ((a 1)) (car '()))")))
+      (assert-equal 'error (puzzle-result-status result))
+      (assert-equal 10 (puzzle-result-allocations result))))
+
+  (test "parse results carry no allocations"
+    (assert-equal 0 (puzzle-result-allocations (puzzle-parse "(+ 1 2)")))
+    (assert-equal 0 (puzzle-result-allocations (puzzle-run "("))))
+
+  (test "identical programs charge identically across repeated runs"
+    (let loop ((sources '("(map (lambda (x) (* x x)) (iota 20))"
+                          "(filter odd? (iota 30))"
+                          "(fold + 0 (iota 50))"
+                          "(letrec ((f (lambda (n) (if (zero? n) 0 (f (- n 1)))))) (f 500))"
+                          "(iota 399999)")))
+      (if (pair? sources)
+          (let ((source (car sources)))
+            (assert-equal (cells source) (cells source))
+            (assert-equal (cells source) (cells source))
+            (assert-true (> (cells source) 0))
+            (loop (cdr sources)))))))
 
 ;; ============================================================
 ;; Determinism
