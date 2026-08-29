@@ -288,7 +288,18 @@
       (if (not (coin-v2-puzzle-cache? cache))
           (error "coin-v2-puzzle-cached: expected a cache"))
       (let* ((seed (coin-v2-puzzle-seed previous-hash height complexity))
-             (hit (lookup cache seed)))
+             (found (lookup cache seed))
+             ;; The seed alone is NOT a sufficient key. At height 0 the seed is
+             ;; the fixed genesis tag for every complexity, so a hit cached at
+             ;; one `C` would answer for another and the cache would stop being
+             ;; correctness-neutral. No node path derives height 0 at a
+             ;; non-genesis complexity today, but the cache must not depend on
+             ;; that: confirm the entry is for this height and complexity, and
+             ;; treat a mismatch as a miss.
+             (hit (and found
+                       (= height (pbe-spec-height found))
+                       (= complexity (pbe-spec-complexity found))
+                       found)))
         (if hit
             hit
             (let ((spec (pbe-for seed height complexity)))

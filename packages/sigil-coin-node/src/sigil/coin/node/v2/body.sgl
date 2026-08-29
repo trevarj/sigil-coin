@@ -1,0 +1,293 @@
+;;; (sigil coin node v2 body) — v2 block-body validation
+;;;
+;;; The v2 shape of `(sigil coin node body)`: the `block-rules` a node
+;;; validates bodies with, against the v2 caps (block 16384, solution 512,
+;;; fuel 200000) and the program-by-example mining rule.
+;;;
+;;; ============================================================
+;;; WHAT THE BODY OWES THE HEADER
+;;; ============================================================
+;;;
+;;; The header carries two claims about a body nobody may have yet: `bits`
+;;; carries `C`, and `nonce` carries the composite score word `W`. Header
+;;; acceptance checks `bits` against the chain, because `C` is derivable
+;;; from history alone. `W` is not derivable from history: it is a summary of
+;;; the coinbase, so the check lives here.
+;;;
+;;; `coin-v2-block-score` recomputes `W` from the validated body and
+;;; `coin-v2-connect-block` requires byte equality with the header
+;;; (`score-mismatch`). The check bites in BOTH directions, because `W` is
+;;; equality and not a bound: a header understating its solution's length,
+;;; its memory or its steps is rejected for claiming a block better than the
+;;; one it carries, and a header overstating them is rejected too. There is
+;;; no "close enough" and no free entropy — the low nibble is reserved zero,
+;;; so there is not even a nonce to grind.
+;;;
+;;; That equality is exactly what makes header-only fork choice safe. A liar
+;;; does not outrank an honest chain: he produces an invalid block, and the
+;;; node marks the header and its whole descendant branch invalid, for good.
+;;;
+;;; ============================================================
+;;; ORDER, AND WHY IT IS THE ORDER
+;;; ============================================================
+;;;
+;;; §11 makes the pre-validation gate a requirement, not advice. Nothing
+;;; evaluates a solution before the block has passed size, payload decode and
+;;; the header-commitment field checks:
+;;;
+;;;   1. block size            one serialization; bounds everything after
+;;;   2. header field ranges   `W` and `bits`, both O(1)
+;;;   3. coinbase decode       five pushes plus one canonicality re-encode
+;;;   4. height agreement      the BIP34 push against the connector's height
+;;;   5. the co-op seam        see `(sigil coin node v2 adapter)`
+;;;   6. the solution          constraint scan, parse, then one machine
+;;;   7. `W` equality          the header commitment
+;;;   8. Bitcoin's connector   transactions, UTXOs, value conservation
+;;;
+;;; Solution evaluation stays ahead of Bitcoin's connector for v1's reason,
+;;; unchanged: the connector mutates the indexed UTXO set it is handed, so
+;;; raising after it has run would leave the caller's in-memory set carrying
+;;; a rejected block's outputs.
+;;;
+;;; The puzzle derivation inside step 6 goes through the node's cache, so
+;;; the second sibling at a height pays nothing for it. See
+;;; `(sigil coin node v2 rules)`.
+;;;
+;;; WHERE `C` AND THE PARENT HASH COME FROM. `connect` is handed the height
+;;; but neither the parent nor the chain, so both are read from the block's
+;;; own header. That is not the block choosing its own puzzle: by the time a
+;;; body is validated, `coin-v2-accept-header?` has already checked that this
+;;; header links to a stored parent AND that its `bits` equals the complexity
+;;; derived from that parent's chain, and the node has already checked that
+;;; the stored body's header serializes to the accepted header byte for byte.
+;;;
+;;; NEVER CALL Bitcoin's `connect-block` DIRECTLY on a SigilCoin block. It
+;;; enforces Bitcoin's 100-byte coinbase scriptSig cap and Bitcoin's block
+;;; subsidy; a real v2 coinbase scriptSig runs to 6332 bytes. Passing
+;;; SigilCoin's own rules record into Bitcoin's connector, as here, is the
+;;; only supported path.
+
+(define-library (sigil coin node v2 body)
+  (import (sigil math)
+          (sigil bitcoin consensus)
+          (sigil coin puzzle)
+          (sigil coin consensus)
+          (sigil coin node v2 adapter)
+          (sigil coin node v2 rules))
+  (export
+    coin-v2-min-coinbase-script-bytes
+    coin-v2-max-coinbase-script-bytes
+    coin-v2-coinbase-script-bounds
+    coin-v2-score-for-solution
+    coin-v2-block-score
+    coin-v2-connect-block
+    coin-v2-block-rules)
+
+  (begin
+
+    ;; The largest height the coinbase payload can carry: the BIP34 domain,
+    ;; and the same bound the encoder enforces.
+    (define %max-height #xffffffff)
+
+    ;;; Smallest legal v2 coinbase scriptSig, in bytes: 8.
+    ;;;
+    ;;; Height 0 as the empty push (`OP_0`, 1), a one-byte solution (2),
+    ;;; `SHARES = #u8(0)` (2), `COMMITS = #u8(0)` (2) and empty graffiti
+    ;;; (`OP_0`, 1). SHARES and COMMITS are never zero-length pushes, because
+    ;;; the count byte is always present — which is what makes the
+    ;;; canonicality re-encode unambiguous. Derived from the encoder rather
+    ;;; than written down, so it cannot drift from the payload format.
+    ;;;
+    ;;; ```scheme
+    ;;; coin-v2-min-coinbase-script-bytes ; => 8
+    ;;; ```
+    (define coin-v2-min-coinbase-script-bytes
+      (bytevector-length
+        (coin-v2-coinbase-payload-encode
+          (coin-v2-coinbase-payload height: 0
+                                    solution: (make-bytevector 1 49)
+                                    shares: coin-v2-empty-shares
+                                    commits: coin-v2-empty-commits
+                                    graffiti: #u8()))))
+
+    ;;; Largest legal v2 coinbase scriptSig, in bytes: 6332.
+    ;;;
+    ;;;   HEIGHT      6 = 5 data (`#xffffffff` as a script number, four
+    ;;;                 magnitude bytes plus the sign pad) + 1 opcode
+    ;;;   SOLUTION  515 = 512 data + `OP_PUSHDATA2` and its two length bytes
+    ;;;   SHARES   4892 = 4889 data + `OP_PUSHDATA2`
+    ;;;   COMMITS   516 = 513 data + `OP_PUSHDATA2`
+    ;;;   GRAFFITI  403 = 400 data + `OP_PUSHDATA2`
+    ;;;
+    ;;; Derived from the encoder for the same reason as the floor. Bitcoin
+    ;;; caps this field at 100 bytes because nothing consensus-bearing lives
+    ;;; in it; in SigilCoin the whole mining claim does.
+    ;;;
+    ;;; ```scheme
+    ;;; coin-v2-max-coinbase-script-bytes ; => 6332
+    ;;; ```
+    (define coin-v2-max-coinbase-script-bytes
+      (bytevector-length
+        (coin-v2-coinbase-payload-encode
+          (coin-v2-coinbase-payload
+            height: %max-height
+            solution: (make-bytevector coin-v2-max-solution-bytes 49)
+            shares: (make-bytevector coin-v2-max-shares-bytes 0)
+            commits: (make-bytevector coin-v2-max-commits-bytes 0)
+            graffiti: (make-bytevector coin-v2-max-graffiti-bytes 49)))))
+
+    ;;; SigilCoin v2's inclusive `(min . max)` coinbase scriptSig bounds.
+    ;;;
+    ;;; A length bound only. It admits plenty of junk besides every canonical
+    ;;; payload; the decoder is what rejects the junk, and it runs on every
+    ;;; block.
+    ;;;
+    ;;; ```scheme
+    ;;; coin-v2-coinbase-script-bounds ; => (8 . 6332)
+    ;;; ```
+    (define coin-v2-coinbase-script-bounds
+      (cons coin-v2-min-coinbase-script-bytes
+            coin-v2-max-coinbase-script-bytes))
+
+    ;; ============================================================
+    ;; The score a body earns
+    ;; ============================================================
+
+    ;;; The score word a `solution` earns against the puzzle for
+    ;;; `(previous-hash, height, complexity)`, with `shares` reveals.
+    ;;;
+    ;;; This is the one definition of "what this solution is worth": body
+    ;;; validation calls it to check the header's claim, and the miner calls
+    ;;; it to make the claim in the first place, so the two cannot disagree.
+    ;;;
+    ;;; Total: rejection reasons are `coin-v2-check-solution`'s, and on
+    ;;; success the value is the 32-bit word.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-ok? (coin-v2-score-for-solution parent 1 128 solution 0)) ; => #t
+    ;;; ```
+    (define (coin-v2-score-for-solution previous-hash height complexity
+                                        solution shares)
+      (: bytevector? integer? integer? any? integer? -> coin-result?)
+      (let* ((spec (coin-v2-node-puzzle previous-hash height complexity))
+             (checked (coin-v2-check-solution spec solution)))
+        (if (coin-failed? checked)
+            checked
+            (let ((report (coin-result-value checked)))
+              (coin-ok
+                (coin-v2-score-encode
+                  (coin-v2-solution-length solution)
+                  (puzzle-report-cells report)
+                  (puzzle-report-steps report)
+                  shares))))))
+
+    ;;; Recompute a block's score word from its own body.
+    ;;;
+    ;;; Steps 3 to 6 of the order in the module header. On success the value
+    ;;; is the word the header is required to carry; rejection reasons are
+    ;;; the decoder's, `height-mismatch`, the co-op seam's and
+    ;;; `coin-v2-check-solution`'s.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-result-reason (coin-v2-block-score parent 1 128 42))
+    ;;; ; => missing-coinbase
+    ;;; ```
+    (define (coin-v2-block-score previous-hash height complexity b)
+      (: any? any? any? any? -> coin-result?)
+      (guard (e (#t (coin-error 'internal-error
+                                "the block score check raised")))
+        (let ((decoded (coin-v2-block-coinbase-payload b)))
+          (if (coin-failed? decoded)
+              decoded
+              (let ((payload (coin-result-value decoded)))
+                (if (not (= height (coin-v2-coinbase-payload-height payload)))
+                    (coin-error 'height-mismatch
+                                "the coinbase height is not the block height")
+                    (let ((coop (coin-v2-check-coop payload)))
+                      (if (coin-failed? coop)
+                          coop
+                          (coin-v2-score-for-solution
+                            previous-hash
+                            height
+                            complexity
+                            (coin-v2-coinbase-payload-solution payload)
+                            (coin-result-value coop))))))))))
+
+    ;; ============================================================
+    ;; Connect
+    ;; ============================================================
+
+    ;; Turn a rejected `coin-result` into the raise the node seam expects,
+    ;; naming the frozen reason symbol so the stored failure reason is
+    ;; machine-readable, and appending the advisory detail for a human.
+    (define (require-coin-ok who result)
+      (if (coin-failed? result)
+          (error (string-append who
+                                ": "
+                                (symbol->string (coin-result-reason result))
+                                " ("
+                                (coin-result-detail result)
+                                ")")))
+      (coin-result-value result))
+
+    ;;; Validate a v2 SigilCoin block body and return the updated UTXO set.
+    ;;;
+    ;;; The `block-rules` `connect` procedure, called by the node as
+    ;;; `(coin-v2-connect-block rules params height utxos b verify-scripts?)`.
+    ;;; `rules` is the record this procedure was reached through and is
+    ;;; passed on unchanged, so the delegated Bitcoin connector reads
+    ;;; SigilCoin's emission and coinbase bounds out of it.
+    ;;;
+    ;;; Raises on any rejection, naming the reason symbol.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-v2-connect-block coin-v2-block-rules params 1 '() b #t)
+    ;;; ```
+    (define (coin-v2-connect-block rules params height utxos b verify-scripts?)
+      (: block-rules? consensus-params? integer? list? block? any? -> list?)
+      ;; One serialization, and it also establishes that `b` is a block, so
+      ;; reading its header below cannot raise.
+      (require-coin-ok "coin-v2-connect-block: block size"
+                       (coin-v2-validate-block-size b))
+      (let* ((header (block-header-field b))
+             (claimed (coin-v2-header-score header))
+             ;; O(1) header field ranges, both of them, before anything is
+             ;; decoded or evaluated.
+             (complexity (require-coin-ok
+                           "coin-v2-connect-block: bits"
+                           (coin-v2-header-complexity header))))
+        (require-coin-ok "coin-v2-connect-block: score"
+                         (coin-v2-score-check claimed))
+        (let ((score (require-coin-ok
+                       "coin-v2-connect-block: score"
+                       (coin-v2-block-score
+                         (block-header-previous-block header)
+                         height
+                         complexity
+                         b))))
+          ;; The header ranked this block by the word it claims. Now that the
+          ;; body is in hand, the claim has to be true — in both directions.
+          (unless (= claimed score)
+            (error (string-append
+                     "coin-v2-connect-block: score-mismatch"
+                     " (the header's score word does not describe the"
+                     " coinbase it commits to)")))))
+      ((block-rules-connect bitcoin-block-rules)
+       rules
+       params
+       height
+       utxos
+       b
+       verify-scripts?))
+
+    ;;; SigilCoin v2's block-body validation rules.
+    ;;;
+    ;;; ```scheme
+    ;;; ((block-rules-subsidy coin-v2-block-rules) 1) ; => 100000000
+    ;;; ```
+    (define coin-v2-block-rules
+      (block-rules connect: coin-v2-connect-block
+                   ;; Emission is untouched by v2: the split is an output
+                   ;; shape rule, and `coin-max-supply` is the same number.
+                   subsidy: coin-block-reward
+                   coinbase-script-bounds: coin-v2-coinbase-script-bounds))))

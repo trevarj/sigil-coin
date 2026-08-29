@@ -327,6 +327,22 @@
       (assert-equal (pbe-spec-examples direct)
                     (pbe-spec-examples cached))))
 
+  (test "a hit for another complexity at height 0 is treated as a miss"
+    ;; The seed is the fixed genesis tag at height 0 whatever the complexity,
+    ;; so keying on the seed alone would answer a C=2000 derivation with a
+    ;; C=128 entry. No node path derives height 0 off-genesis today, but the
+    ;; cache is only correctness-neutral if it does not rely on that.
+    (let* ((cache (coin-v2-puzzle-cache-open))
+           (warm-128 (coin-v2-puzzle-cached cache (filled 32 0) 0 128))
+           (warm-2000 (coin-v2-puzzle-cached cache (filled 32 0) 0 2000))
+           (cold-2000 (coin-v2-puzzle-for (filled 32 0) 0 2000)))
+      (assert-equal 128 (pbe-spec-complexity warm-128))
+      (assert-equal 2000 (pbe-spec-complexity warm-2000))
+      (assert-equal (pbe-spec-hidden-source cold-2000)
+                    (pbe-spec-hidden-source warm-2000))
+      (assert-equal (pbe-spec-examples cold-2000)
+                    (pbe-spec-examples warm-2000))))
+
   (test "distinct heights are distinct entries"
     (let ((cache (coin-v2-puzzle-cache-open)))
       (coin-v2-puzzle-cached cache (filled 32 7) 1 128)

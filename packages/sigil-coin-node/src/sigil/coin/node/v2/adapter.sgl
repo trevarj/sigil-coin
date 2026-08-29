@@ -1,0 +1,392 @@
+;;; (sigil coin node v2 adapter) — the node's single seam onto consensus v2
+;;;
+;;; Two jobs, and both of them are temporary by design.
+;;;
+;;; 1. RE-EXPORT. Every v2 name the node modules use is re-exported from
+;;;    here, so `(sigil coin node v2 rules)`, `body`, `genesis` and `miner`
+;;;    name `(sigil coin consensus v2 ...)` in exactly one place. When the
+;;;    switchover flips the node onto v2 for real, or when a v2 facade name
+;;;    moves, this file is the only one that changes.
+;;;
+;;;    The v2 submodules are imported directly rather than through the
+;;;    `(sigil coin consensus v2)` facade, because that facade re-exports
+;;;    the unprefixed `coin-result` family that `(sigil coin consensus)`
+;;;    also exports; importing both would be ambiguous. Every submodule
+;;;    exports `coin-v2-` names only, so importing them alongside v1 is not.
+;;;
+;;; 2. THE COINBASE PAYLOAD CODEC, which consensus does not have yet.
+;;;    §6.1 makes the scriptSig five minimally-encoded pushes:
+;;;
+;;;      1. HEIGHT    0-5 B     BIP34 script number, unchanged from v1
+;;;      2. SOLUTION  1-512 B   the producer's own solution for puzzle H
+;;;      3. SHARES    1-4889 B  reveals for puzzle H-1
+;;;      4. COMMITS   1-513 B   commitments for puzzle H
+;;;      5. GRAFFITI  0-400 B   opaque
+;;;
+;;;    SHARES and COMMITS are never zero-length: the count byte is always
+;;;    present, which is what keeps the canonicality re-encode unambiguous.
+;;;    The codec is v1's, widened by two fields and a cap; the one-shot
+;;;    re-encode check is kept verbatim, because it rejects non-minimal
+;;;    pushes, non-minimal height encodings and trailing bytes in one line.
+;;;
+;;;    THE CO-OP SEAM. This module decodes SHARES and COMMITS as opaque
+;;;    bytes and `coin-v2-check-coop` is the seam where the LATER co-op task
+;;;    lands: §6.4's share validation and §7's commitment rules. Until then
+;;;    the seam admits only the empty forms — a block carrying reveals or
+;;;    commitments is rejected as `shares-unsupported` or
+;;;    `commits-unsupported` rather than accepted unvalidated, because
+;;;    accepting data no rule checks is how a consensus bug ships.
+;;;
+;;; When part B lands the real codec in `(sigil coin consensus v2 coinbase)`
+;;; this section is deleted and its names re-exported from there instead.
+
+(define-library (sigil coin node v2 adapter)
+  (import (sigil struct)
+          (sigil math)
+          (sigil bitcoin script)
+          (sigil bitcoin tx)
+          (sigil bitcoin consensus)
+          (sigil coin consensus)
+          (sigil coin consensus v2 rules)
+          (sigil coin consensus v2 seed)
+          (sigil coin consensus v2 solution)
+          (sigil coin consensus v2 score)
+          (sigil coin consensus v2 retarget))
+  (export
+    ;; Re-exported from (sigil coin consensus v2 rules)
+    coin-v2-max-block-bytes
+    coin-v2-max-solution-bytes
+    coin-v2-max-graffiti-bytes
+    coin-v2-max-shares
+    coin-v2-max-commitments
+    coin-v2-max-fuel
+    coin-v2-validate-block-size
+    coin-v2-validate-header-context
+
+    ;; Re-exported from (sigil coin consensus v2 seed)
+    coin-v2-puzzle-for
+    coin-v2-puzzle-cache-open
+    coin-v2-puzzle-cache-size
+    coin-v2-puzzle-cached
+
+    ;; Re-exported from (sigil coin consensus v2 solution)
+    coin-v2-solution-length
+    coin-v2-check-solution
+
+    ;; Re-exported from (sigil coin consensus v2 score)
+    coin-v2-score-encode
+    coin-v2-score-pack
+    coin-v2-score-check
+    coin-v2-score-decode
+    coin-v2-score-valid?
+    coin-v2-score-length
+    coin-v2-score-shares
+    coin-v2-max-score-word
+
+    ;; Re-exported from (sigil coin consensus v2 retarget)
+    coin-v2-retarget-window
+    coin-v2-retarget-height?
+    coin-v2-complexity-min
+    coin-v2-complexity-max
+    coin-v2-complexity-genesis
+    coin-v2-complexity-for
+    coin-v2-margin
+    coin-v2-bits-encode
+    coin-v2-bits-decode
+    coin-v2-check-bits
+
+    ;; The coinbase payload codec, until consensus part B owns it
+    coin-v2-max-shares-bytes
+    coin-v2-max-commits-bytes
+    coin-v2-empty-shares
+    coin-v2-empty-commits
+    coin-v2-coinbase-payload
+    coin-v2-coinbase-payload?
+    coin-v2-coinbase-payload-height
+    coin-v2-coinbase-payload-solution
+    coin-v2-coinbase-payload-shares
+    coin-v2-coinbase-payload-commits
+    coin-v2-coinbase-payload-graffiti
+    coin-v2-coinbase-payload-encode
+    coin-v2-coinbase-payload-decode
+    coin-v2-block-coinbase-payload
+    coin-v2-check-coop)
+
+  (begin
+
+    (define %max-height #xffffffff)
+
+    ;; One share is a 33-byte pubkey, a 64-byte signature, a 2-byte length
+    ;; and up to a full-size solution (§6.2). Derived rather than written so
+    ;; the cap and the format cannot disagree.
+    (define %share-bytes (+ 33 64 2 coin-v2-max-solution-bytes))
+
+    ;; A commitment is one SHA256d digest (§7.1).
+    (define %commitment-bytes 32)
+
+    ;;; Largest legal SHARES push, in bytes: 4889.
+    ;;;
+    ;;; ```scheme
+    ;;; coin-v2-max-shares-bytes ; => 4889
+    ;;; ```
+    (define coin-v2-max-shares-bytes
+      (+ 1 (* coin-v2-max-shares %share-bytes)))
+
+    ;;; Largest legal COMMITS push, in bytes: 513.
+    ;;;
+    ;;; ```scheme
+    ;;; coin-v2-max-commits-bytes ; => 513
+    ;;; ```
+    (define coin-v2-max-commits-bytes
+      (+ 1 (* coin-v2-max-commitments %commitment-bytes)))
+
+    ;;; The SHARES push of a block carrying no reveals: `R = 0`.
+    (define coin-v2-empty-shares (make-bytevector 1 0))
+
+    ;;; The COMMITS push of a block carrying no commitments: `K = 0`.
+    (define coin-v2-empty-commits (make-bytevector 1 0))
+
+    ;;; The decoded contents of a v2 coinbase scriptSig.
+    ;;;
+    ;;; `shares` and `commits` are the raw pushes. They are carried rather
+    ;;; than parsed because parsing them is part B's rule, and because the
+    ;;; canonicality check has to re-encode exactly what it read.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-v2-coinbase-payload-height
+    ;;;   (coin-v2-coinbase-payload height: 7
+    ;;;                             solution: #u8(49)
+    ;;;                             shares: coin-v2-empty-shares
+    ;;;                             commits: coin-v2-empty-commits
+    ;;;                             graffiti: #u8()))
+    ;;; ; => 7
+    ;;; ```
+    (define-struct coin-v2-coinbase-payload
+      (height integer?)
+      (solution bytevector?)
+      (shares bytevector?)
+      (commits bytevector?)
+      (graffiti bytevector?))
+
+    (define (height-ok? height)
+      (and (number? height) (exact? height) (integer? height)
+           (<= 0 height %max-height)))
+
+    (define (solution-ok? solution)
+      (and (bytevector? solution)
+           (>= (bytevector-length solution) 1)
+           (<= (bytevector-length solution) coin-v2-max-solution-bytes)))
+
+    (define (shares-ok? shares)
+      (and (bytevector? shares)
+           (>= (bytevector-length shares) 1)
+           (<= (bytevector-length shares) coin-v2-max-shares-bytes)))
+
+    (define (commits-ok? commits)
+      (and (bytevector? commits)
+           (>= (bytevector-length commits) 1)
+           (<= (bytevector-length commits) coin-v2-max-commits-bytes)))
+
+    (define (graffiti-ok? graffiti)
+      (and (bytevector? graffiti)
+           (<= (bytevector-length graffiti) coin-v2-max-graffiti-bytes)))
+
+    ;;; Encode a payload as coinbase scriptSig bytes.
+    ;;;
+    ;;; Raises when a field is out of range, exactly as v1 does: the encoder
+    ;;; is only ever handed locally built data, and a silent truncation would
+    ;;; produce an unminable block.
+    ;;;
+    ;;; ```scheme
+    ;;; (bytevector-length
+    ;;;   (coin-v2-coinbase-payload-encode
+    ;;;     (coin-v2-coinbase-payload height: 0
+    ;;;                               solution: #u8(49)
+    ;;;                               shares: coin-v2-empty-shares
+    ;;;                               commits: coin-v2-empty-commits
+    ;;;                               graffiti: #u8())))
+    ;;; ; => 8
+    ;;; ```
+    (define (coin-v2-coinbase-payload-encode payload)
+      (: coin-v2-coinbase-payload? -> bytevector?)
+      (if (not (coin-v2-coinbase-payload? payload))
+          (error
+            "coin-v2-coinbase-payload-encode: expected a coinbase payload"))
+      (let ((height (coin-v2-coinbase-payload-height payload))
+            (solution (coin-v2-coinbase-payload-solution payload))
+            (shares (coin-v2-coinbase-payload-shares payload))
+            (commits (coin-v2-coinbase-payload-commits payload))
+            (graffiti (coin-v2-coinbase-payload-graffiti payload)))
+        (if (not (height-ok? height))
+            (error "coin-v2-coinbase-payload-encode: height out of range"))
+        (if (not (solution-ok? solution))
+            (error
+              "coin-v2-coinbase-payload-encode: solution length out of range"))
+        (if (not (shares-ok? shares))
+            (error
+              "coin-v2-coinbase-payload-encode: shares length out of range"))
+        (if (not (commits-ok? commits))
+            (error
+              "coin-v2-coinbase-payload-encode: commits length out of range"))
+        (if (not (graffiti-ok? graffiti))
+            (error
+              "coin-v2-coinbase-payload-encode: graffiti length out of range"))
+        (script-append
+          (script-push-data (script-number-encode height))
+          (script-push-data solution)
+          (script-push-data shares)
+          (script-push-data commits)
+          (script-push-data graffiti))))
+
+    ;; Parse the script into chunks, or #f when it is malformed.
+    ;; `script-parse` raises on a truncated push, so the raise is absorbed.
+    (define (parse-chunks script)
+      (guard (e (#t #f))
+        (script-parse script)))
+
+    (define (chunk-count chunks)
+      (let loop ((xs chunks) (n 0))
+        (if (null? xs) n (loop (cdr xs) (+ n 1)))))
+
+    (define (all-pushes? chunks)
+      (let loop ((xs chunks))
+        (cond
+          ((null? xs) #t)
+          ((bytevector? (script-chunk-data (car xs))) (loop (cdr xs)))
+          (else #f))))
+
+    (define (nth-chunk chunks i)
+      (let loop ((xs chunks) (n i))
+        (if (= 0 n) (car xs) (loop (cdr xs) (- n 1)))))
+
+    ;;; Decode coinbase scriptSig bytes into a v2 payload.
+    ;;;
+    ;;; Total: any input, however hostile, yields a `coin-result`. Rejection
+    ;;; reasons are `not-bytevector`, `malformed-script`, `wrong-field-count`
+    ;;; (five pushes now), `not-a-push`, `bad-height`, `solution-empty`,
+    ;;; `solution-oversize`, `shares-malformed`, `shares-oversize`,
+    ;;; `commits-malformed`, `commits-oversize`, `graffiti-oversize` and
+    ;;; `non-canonical`.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-result-reason (coin-v2-coinbase-payload-decode #u8(#x02 #x01)))
+    ;;; ; => malformed-script
+    ;;; ```
+    (define (coin-v2-coinbase-payload-decode script)
+      (: any? -> coin-result?)
+      (guard (e (#t (coin-error 'malformed-script
+                                "coinbase scriptSig could not be decoded")))
+        (if (not (bytevector? script))
+            (coin-error 'not-bytevector "coinbase scriptSig must be bytes")
+            (let ((chunks (parse-chunks script)))
+              (cond
+                ((not chunks)
+                 (coin-error 'malformed-script "truncated pushdata"))
+                ((not (= 5 (chunk-count chunks)))
+                 (coin-error 'wrong-field-count
+                             "expected exactly five pushes"))
+                ((not (all-pushes? chunks))
+                 (coin-error 'not-a-push "expected data pushes only"))
+                (else
+                  (let* ((height-bytes (script-chunk-data
+                                         (nth-chunk chunks 0)))
+                         (solution (script-chunk-data (nth-chunk chunks 1)))
+                         (shares (script-chunk-data (nth-chunk chunks 2)))
+                         (commits (script-chunk-data (nth-chunk chunks 3)))
+                         (graffiti (script-chunk-data (nth-chunk chunks 4)))
+                         (height (script-number-decode height-bytes)))
+                    (cond
+                      ((not (height-ok? height))
+                       (coin-error 'bad-height "height out of range"))
+                      ((= 0 (bytevector-length solution))
+                       (coin-error 'solution-empty "solution push is empty"))
+                      ((> (bytevector-length solution)
+                          coin-v2-max-solution-bytes)
+                       (coin-error 'solution-oversize
+                                   "solution exceeds the byte cap"))
+                      ;; The count byte is mandatory, so an empty push is
+                      ;; malformed rather than "no shares".
+                      ((= 0 (bytevector-length shares))
+                       (coin-error 'shares-malformed "shares push is empty"))
+                      ((> (bytevector-length shares) coin-v2-max-shares-bytes)
+                       (coin-error 'shares-oversize
+                                   "shares exceed the byte cap"))
+                      ((= 0 (bytevector-length commits))
+                       (coin-error 'commits-malformed
+                                   "commits push is empty"))
+                      ((> (bytevector-length commits)
+                          coin-v2-max-commits-bytes)
+                       (coin-error 'commits-oversize
+                                   "commits exceed the byte cap"))
+                      ((> (bytevector-length graffiti)
+                          coin-v2-max-graffiti-bytes)
+                       (coin-error 'graffiti-oversize
+                                   "graffiti exceeds the byte cap"))
+                      (else
+                        (let ((payload (coin-v2-coinbase-payload
+                                         height: height
+                                         solution: solution
+                                         shares: shares
+                                         commits: commits
+                                         graffiti: graffiti)))
+                          ;; v1's one-shot canonicality check, verbatim: the
+                          ;; canonical encoding of what we read must be the
+                          ;; bytes we were given.
+                          (if (not (equal? script
+                                           (coin-v2-coinbase-payload-encode
+                                             payload)))
+                              (coin-error
+                                'non-canonical
+                                "scriptSig is not the canonical encoding")
+                              (coin-ok payload))))))))))))
+
+    ;;; Decode a block's v2 coinbase payload.
+    ;;;
+    ;;; Adds `missing-coinbase` to the decoder's rejection reasons.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-result-reason (coin-v2-block-coinbase-payload 42))
+    ;;; ; => missing-coinbase
+    ;;; ```
+    (define (coin-v2-block-coinbase-payload b)
+      (: any? -> coin-result?)
+      (let ((tx (coin-block-coinbase b)))
+        (if (not tx)
+            (coin-error 'missing-coinbase
+                        "block has no coinbase transaction")
+            (coin-v2-coinbase-payload-decode
+              (txin-script-sig (car (transaction-inputs tx)))))))
+
+    ;;; THE CO-OP SEAM: check the SHARES and COMMITS pushes of a payload.
+    ;;;
+    ;;; Today it admits only `R = 0` and `K = 0`. The LATER co-op task
+    ;;; replaces this body with §6.4's share validation — pubkey, ordering,
+    ;;; commitment membership in the parent, signature, dedup, and one
+    ;;; `coin-v2-check-solution` per share — and §7's commitment ordering,
+    ;;; and returns the accepted share count `R` instead of a constant zero.
+    ;;; Everything above it is already shaped for that: the codec carries the
+    ;;; raw pushes, and the score word's share field is the value this
+    ;;; returns.
+    ;;;
+    ;;; Rejecting rather than ignoring is deliberate. A block carrying
+    ;;; reveals nobody validates would be a block whose reward split nobody
+    ;;; checks, which is worse than a block refused for a rule that is not
+    ;;; written yet.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-result-value (coin-v2-check-coop payload)) ; => 0
+    ;;; ```
+    (define (coin-v2-check-coop payload)
+      (: coin-v2-coinbase-payload? -> coin-result?)
+      (cond
+        ((not (coin-v2-coinbase-payload? payload))
+         (coin-error 'internal-error "expected a coinbase payload"))
+        ((not (equal? coin-v2-empty-shares
+                      (coin-v2-coinbase-payload-shares payload)))
+         (coin-error 'shares-unsupported
+                     "co-op reveals are not validated yet"))
+        ((not (equal? coin-v2-empty-commits
+                      (coin-v2-coinbase-payload-commits payload)))
+         (coin-error 'commits-unsupported
+                     "commitments are not validated yet"))
+        (else (coin-ok 0))))))
