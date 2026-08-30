@@ -1,43 +1,4 @@
-;;; (sigil coin node v2 miner) — assembling a v2 SigilCoin block
-;;;
-;;; Still a BUILDER and still not a loop: there is no nonce to grind and, in
-;;; v2, not even a target to hit. A miner writes a PROGRAM — a source that
-;;; evaluates to a one-argument procedure reproducing all `k` published
-;;; input/output pairs — and the block is finished the moment it is written.
-;;;
-;;; What changed from v1 is what the floor is. v1's always-legal solution was
-;;; the quoted literal of the puzzle's target, which the survey found was the
-;;; whole game 78.3% of the time. A v2 puzzle has no literal to quote,
-;;; because the answer is a function, so the floor is the TABLE SOLUTION
-;;; (§8.2): the `if`/`equal?` chain over the published pairs that the
-;;; generator has already printed, parsed, constraint-checked and run before
-;;; the puzzle could be published at all. `coin-v2-table-solution` hands it
-;;; back, so a block can always be built and the chain cannot stall.
-;;;
-;;; Beating it is the game, and overfitting is self-punishing: the table is
-;;; by construction the longest thing anybody would submit, so any structural
-;;; program beats it on the primary ranking key.
-;;;
-;;; ```scheme
-;;; ;; the floor: the table solution for this height's puzzle
-;;; (coin-v2-build-block parent 1 128 #f "hi" payout time)
-;;; ;; golfed: a shorter program reproducing the same pairs
-;;; (coin-v2-build-block parent 1 128 "(lambda(x)(car x))" "hi" payout time)
-;;; ```
-;;;
-;;; THE HEADER IS BUILT FROM THE BODY, NOT CHOSEN. `bits` is
-;;; `0x207F0000 | C` for the complexity the caller derived from the parent
-;;; chain, and `nonce` is the score word `coin-v2-score-for-solution`
-;;; computes by actually running the solution — the same procedure body
-;;; validation calls, so the header and the coinbase cannot disagree. A
-;;; solution that does not solve the puzzle raises here rather than becoming
-;;; a block the node would reject.
-;;;
-;;; The complexity is an argument rather than something derived here for the
-;;; same reason the fee total is: it is a function of the parent chain, which
-;;; block assembly has no handle on. `coin-v2-required-complexity` is what
-;;; the caller uses, and passing a wrong one builds a block the node rejects
-;;; — which is what makes this usable for negative tests.
+;;; (sigil coin node v2 miner) — producer and co-op block builders
 
 (define-library (sigil coin node v2 miner)
   (import (sigil math)
@@ -53,7 +14,9 @@
   (export
     coin-v2-table-solution
     coin-v2-mining-coinbase
-    coin-v2-build-block)
+    coin-v2-mining-coinbase/coop
+    coin-v2-build-block
+    coin-v2-build-coop-block)
 
   (begin
 
@@ -61,19 +24,7 @@
     (define %coinbase-index #xffffffff)
     (define %sequence-final #xffffffff)
 
-    ;;; The table solution for the puzzle at `height`: a miner's floor.
-    ;;;
-    ;;; Legal for every published puzzle by construction — §3.4 step 8 makes
-    ;;; the generator build it, print it, parse it, constraint-check it and
-    ;;; run it against all `k` pairs before accepting the puzzle. It is what
-    ;;; you publish when you have not golfed anything.
-    ;;;
-    ;;; ```scheme
-    ;;; (coin-ok? (coin-v2-check-solution
-    ;;;             (coin-v2-puzzle-for parent 1 128)
-    ;;;             (coin-v2-table-solution parent 1 128)))
-    ;;; ; => #t
-    ;;; ```
+    ;;; Return producer table solution for one v2 puzzle.
     (define (coin-v2-table-solution previous-hash height complexity)
       (: bytevector? integer? integer? -> bytevector?)
       (coin-mining-bytes
@@ -83,9 +34,7 @@
 
     (define (require-fees who fees)
       (unless (and (number? fees) (exact? fees) (integer? fees) (>= fees 0))
-        (error (string-append who
-                              ": expected a non-negative total of the fees"
-                              " the block's transactions pay")))
+        (error (string-append who ": expected non-negative fees")))
       fees)
 
     (define (optional-argument rest index default)
@@ -94,25 +43,24 @@
               ((= 0 i) (car xs))
               (else (loop (cdr xs) (- i 1))))))
 
-    ;;; Build the coinbase transaction for a v2 SigilCoin block.
-    ;;;
-    ;;; The scriptSig is the canonical five-push payload with empty SHARES
-    ;;; and COMMITS, which is what the co-op seam admits today; the LATER
-    ;;; co-op task fills those two pushes and replaces the single output with
-    ;;; §6.5's split.
-    ;;;
-    ;;; ```scheme
-    ;;; (txout-value (car (transaction-outputs
-    ;;;                     (coin-v2-mining-coinbase 1 "car" "" #u8(#x6a)))))
-    ;;; ; => 100000000
-    ;;; ```
-    (define (coin-v2-mining-coinbase height solution graffiti script-pubkey
-                                     . maybe-fees)
-      (: integer? any? any? bytevector? integer? ... -> transaction?)
-      (if (not (bytevector? script-pubkey))
-          (error "coin-v2-mining-coinbase: expected a payout scriptPubKey"))
-      (let ((fees (require-fees "coin-v2-mining-coinbase"
-                                (optional-argument maybe-fees 0 0))))
+    (define (outputs-for plan producer-script)
+      (map (lambda (entry)
+             (txout value: (car entry)
+                    script-pubkey: (or (cdr entry) producer-script)))
+           plan))
+
+    ;;; Build a canonical v2 coinbase, including exact co-op payouts.
+    (define (coin-v2-mining-coinbase/coop height solution shares commitments
+                                           graffiti producer-script
+                                           carrier-script . maybe-fees)
+      (: integer? any? list? list? any? bytevector? any? integer? ...
+         -> transaction?)
+      (if (not (bytevector? producer-script))
+          (error "coin-v2-mining-coinbase/coop: expected producer script"))
+      (let* ((fees (require-fees "coin-v2-mining-coinbase/coop"
+                                 (optional-argument maybe-fees 0 0)))
+             (value (+ (coin-block-reward height) fees))
+             (plan (coin-v2-split-plan value shares carrier-script)))
         (transaction
           version: 1
           inputs: (list
@@ -122,79 +70,125 @@
                                         (coin-v2-coinbase-payload
                                           height: height
                                           solution: (coin-mining-bytes
-                                                      "coin-v2-mining-coinbase solution"
+                                                      "coin-v2 coinbase solution"
                                                       solution)
-                                          shares: coin-v2-empty-shares
-                                          commits: coin-v2-empty-commits
+                                          shares: (coin-v2-shares-encode shares)
+                                          commits: (coin-v2-commits-encode
+                                                     commitments)
                                           graffiti: (coin-mining-bytes
-                                                      "coin-v2-mining-coinbase graffiti"
+                                                      "coin-v2 coinbase graffiti"
                                                       graffiti)))
                           sequence: %sequence-final
                           witness: '()))
-          outputs: (list (txout value: (+ (coin-block-reward height) fees)
-                                script-pubkey: script-pubkey))
+          outputs: (outputs-for plan producer-script)
           lock-time: 0)))
 
-    ;;; Build a v2 block extending `parent-header` at `height`.
-    ;;;
-    ;;; `solution` may be `#f`, which mines the table solution. Everything a
-    ;;; node checks is set here: the five-push coinbase, the exact subsidy
-    ;;; plus `fees`, the merkle root, `version`, `bits` from `complexity`,
-    ;;; and `nonce` from the solution actually being mined.
-    ;;;
-    ;;; `transactions` and `fees` are optional and default to none.
-    ;;;
-    ;;; ```scheme
-    ;;; (block? (coin-v2-build-block parent 1 128 #f "" #u8(#x6a) t)) ; => #t
-    ;;; ```
-    (define (coin-v2-build-block parent-header height complexity solution
-                                 graffiti script-pubkey time
-                                 . maybe-transactions)
-      (: block-header? integer? integer? any? any? bytevector? integer? list?
-         integer? ... -> block?)
-      (if (not (block-header? parent-header))
-          (error "coin-v2-build-block: expected a parent block header"))
-      (if (not (list? (optional-argument maybe-transactions 0 '())))
-          (error "coin-v2-build-block: expected a list of transactions"))
-      (let* ((txs (optional-argument maybe-transactions 0 '()))
-             (fees (require-fees "coin-v2-build-block"
-                                 (optional-argument maybe-transactions 1 0)))
-             (parent-hash (block-header-hash parent-header))
+    ;;; Build a producer-only coinbase. Optional argument is total fees.
+    (define (coin-v2-mining-coinbase height solution graffiti script-pubkey
+                                     . maybe-fees)
+      (: integer? any? any? bytevector? integer? ... -> transaction?)
+      (coin-v2-mining-coinbase/coop
+        height solution '() '() graffiti script-pubkey #f
+        (require-fees "coin-v2-mining-coinbase"
+                      (optional-argument maybe-fees 0 0))))
+
+    (define (score-or-raise previous-hash height complexity solution quality)
+      (let ((scored (coin-v2-score-for-solution previous-hash height complexity
+                                                solution quality)))
+        (if (coin-failed? scored)
+            (error (string-append
+                     "coin-v2-build-block: solution rejected ("
+                     (symbol->string (coin-result-reason scored))
+                     ")"))
+            (coin-result-value scored))))
+
+    (define (build parent-header height complexity solution shares commitments
+                   graffiti producer-script carrier-script time txs fees
+                   quality)
+      (let* ((parent-hash (block-header-hash parent-header))
              (solution-bytes
                (coin-mining-bytes
                  "coin-v2-build-block solution"
                  (or solution
                      (coin-v2-table-solution parent-hash height complexity))))
-             ;; The same procedure body validation calls, so the claim the
-             ;; header makes is the one the coinbase can back.
-             (scored (coin-v2-score-for-solution parent-hash
-                                                 height
-                                                 complexity
-                                                 solution-bytes
-                                                 0))
-             (score (if (coin-failed? scored)
-                        (error (string-append
-                                 "coin-v2-build-block: the solution does not"
-                                 " solve this height's puzzle ("
-                                 (symbol->string (coin-result-reason scored))
-                                 ")"))
-                        (coin-result-value scored)))
-             (coinbase (coin-v2-mining-coinbase height
-                                                solution-bytes
-                                                graffiti
-                                                script-pubkey
-                                                fees))
-             (transactions (cons coinbase txs))
-             (root (merkle-root (map transaction-txid transactions))))
+             (score (score-or-raise parent-hash height complexity
+                                    solution-bytes quality))
+             (coinbase (coin-v2-mining-coinbase/coop
+                         height solution-bytes shares commitments graffiti
+                         producer-script carrier-script fees))
+             (transactions (cons coinbase txs)))
         (block header-field:
                  (block-header version: coin-v2-header-version
                                previous-block: parent-hash
-                               merkle-root: root
+                               merkle-root: (merkle-root
+                                              (map transaction-txid
+                                                   transactions))
                                time: time
-                               ;; The complexity commitment; derived from the
-                               ;; parent chain by the caller, never chosen.
                                bits: (coin-v2-bits-encode complexity)
-                               ;; The composite score word fork choice ranks
-                               ;; by, computed from the body itself.
                                nonce: score)
-               transactions: transactions)))))
+               transactions: transactions)))
+
+    ;;; Build a producer-only block. Optional values are transactions, fees,
+    ;;; then commitments for this height's future shares.
+    (define (coin-v2-build-block parent-header height complexity solution
+                                 graffiti script-pubkey time
+                                 . maybe-transactions)
+      (: block-header? integer? integer? any? any? bytevector? integer? list?
+         integer? list? ... -> block?)
+      (if (not (block-header? parent-header))
+          (error "coin-v2-build-block: expected parent header"))
+      (let ((txs (optional-argument maybe-transactions 0 '()))
+            (fees (require-fees "coin-v2-build-block"
+                                (optional-argument maybe-transactions 1 0)))
+            (commitments (optional-argument maybe-transactions 2 '())))
+        (if (not (list? txs))
+            (error "coin-v2-build-block: expected transactions"))
+        (if (not (list? commitments))
+            (error "coin-v2-build-block: expected commitments"))
+        (build parent-header height complexity solution '() commitments
+               graffiti script-pubkey #f time txs fees 0)))
+
+    ;;; Build a co-op block revealing personalized shares committed by parent.
+    ;;; Optional values are transactions, fees, then this block's commitments.
+    (define (coin-v2-build-coop-block parent-block height complexity solution
+                                      shares graffiti producer-script time
+                                      . maybe-transactions)
+      (: block? integer? integer? any? list? any? bytevector? integer? list?
+         integer? list? ... -> block?)
+      (if (not (block? parent-block))
+          (error "coin-v2-build-coop-block: expected parent block"))
+      (let* ((parent-header (block-header-field parent-block))
+             (context (coin-v2-parent-context parent-block))
+             (txs (optional-argument maybe-transactions 0 '()))
+             (fees (require-fees "coin-v2-build-coop-block"
+                                 (optional-argument maybe-transactions 1 0)))
+             (commitments (optional-argument maybe-transactions 2 '()))
+             (producer (coin-mining-bytes
+                         "coin-v2-build-coop-block solution"
+                         (or solution
+                             (coin-v2-table-solution
+                               (block-header-hash parent-header)
+                               height complexity))))
+             (payload (coin-v2-coinbase-payload
+                        height: height
+                        solution: producer
+                        shares: (coin-v2-shares-encode shares)
+                        commits: (coin-v2-commits-encode commitments)
+                        graffiti: (coin-mining-bytes
+                                    "coin-v2-build-coop-block graffiti"
+                                    graffiti)))
+             (checked (coin-v2-check-coop payload context)))
+        (if (coin-failed? checked)
+            (error (string-append
+                     "coin-v2-build-coop-block: shares rejected ("
+                     (symbol->string (coin-result-reason checked))
+                     ")")))
+        (if (not (list? txs))
+            (error "coin-v2-build-coop-block: expected transactions"))
+        (if (not (list? commitments))
+            (error "coin-v2-build-coop-block: expected commitments"))
+        (let* ((accepted (coin-result-value checked))
+               (quality (coin-v2-shares-quality context accepted))
+               (carrier (coin-v2-carrier-script parent-block)))
+          (build parent-header height complexity producer accepted commitments
+                 graffiti producer-script carrier time txs fees quality))))))

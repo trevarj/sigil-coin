@@ -15,8 +15,8 @@
 ;;;   * `bits` is `0x207F0080` — the v2 prefix over
 ;;;     `puzzle-complexity-genesis`, 128 — which is what `C(0)` is by rule.
 ;;;   * `nonce` is genesis's own score word, computed by running its
-;;;     solution. Genesis carries `R = 0`, so the share field is `8-0 = 8`
-;;;     and the reserved low nibble is zero.
+;;;     solution. Genesis carries no shares, so aggregate quality is `Q = 0`
+;;;     and the stored low score field is `15-Q = 15`.
 ;;;   * the REWARD is nothing. `coin-block-reward` pays 0 at height 0 and the
 ;;;     single output is a 0-value `OP_RETURN`: no premine, and provably
 ;;;     unspendable rather than merely unspent.
@@ -189,18 +189,18 @@
     ;;; `(sigil coin node chain)`. The launch date replaces that timestamp
     ;;; later, which is one argument and one regenerated constant.
     (define coin-v2-genesis-header-constant
-      "0500000000000000000000000000000000000000000000000000000000000000000000003d10cf70177724eb1c97d2336dc4745aa45975a7c7e453bd42b536ba7adfb01000376d6a80007f2080a35315")
+      "0500000000000000000000000000000000000000000000000000000000000000000000003d10cf70177724eb1c97d2336dc4745aa45975a7c7e453bd42b536ba7adfb01000376d6a80007f20f0a35315")
 
     ;;; Serialized v2 regtest genesis header, as hex. Same provenance, from
     ;;; `coin-regtest-genesis-quote` and `coin-regtest-genesis-time`.
     (define coin-v2-regtest-genesis-header-constant
-      "0500000000000000000000000000000000000000000000000000000000000000000000001c340052f7f6ba1e3c633eff169616463b86bfd88cb98103c9f98251162fb78900b9556980007f2080a35315")
+      "0500000000000000000000000000000000000000000000000000000000000000000000001c340052f7f6ba1e3c633eff169616463b86bfd88cb98103c9f98251162fb78900b9556980007f20f0a35315")
 
     ;;; Display id (reversed hash) of the v2 mainnet genesis block, for
     ;;; humans. No leading zeros: there is no proof-of-work to produce them.
     (define coin-v2-genesis-id-constant
-      "845ac9a0699db49854133faf89bbff77d0a281d03ef7a1c055b395a997a9a7e6")
+      "0d26deef956e7b2eecc7d44fc5656a98a4f3847ebecc62bb0626908e613f6b5e")
 
     ;;; Display id of the v2 regtest genesis block.
     (define coin-v2-regtest-genesis-id-constant
-      "6caeaca4e51ea84f7922d62f56151d8d1792096d20be536d24c954244f8453cc")))
+      "2f5013c600e7d1c0010c484a627e9bf23b1f972887d81f55bc0d07fef33a3f87")))

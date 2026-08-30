@@ -166,7 +166,8 @@
     ;;; Validate a SigilCoin block body and return the updated UTXO set.
     ;;;
     ;;; The `block-rules` `connect` procedure: called by the node as
-    ;;; `(coin-connect-block rules params height utxos b verify-scripts?)`.
+    ;;; `(coin-connect-block rules params height utxos b verify-scripts?
+    ;;;                      parent-block)`.
     ;;; `rules` is the record this procedure was reached through, and is
     ;;; passed on unchanged so the delegated Bitcoin connector reads
     ;;; SigilCoin's emission and coinbase bounds out of it.
@@ -179,10 +180,11 @@
     ;;; own messages from everything it validates.
     ;;;
     ;;; ```scheme
-    ;;; (coin-connect-block coin-block-rules params 1 '() b #t)
+    ;;; (coin-connect-block coin-block-rules params 1 '() b #t parent)
     ;;; ```
-    (define (coin-connect-block rules params height utxos b verify-scripts?)
-      (: block-rules? consensus-params? integer? list? block? any? -> list?)
+    (define (coin-connect-block rules params height utxos b verify-scripts?
+                                parent-block)
+      (: block-rules? consensus-params? integer? list? block? any? any? -> list?)
       ;; One serialization, and it also establishes that `b` is a block, so
       ;; reading its header below cannot raise.
       (require-coin-ok "coin-connect-block: block size"
@@ -209,7 +211,8 @@
        height
        utxos
        b
-       verify-scripts?))
+       verify-scripts?
+       parent-block))
 
     ;;; SigilCoin's block-body validation rules.
     ;;;

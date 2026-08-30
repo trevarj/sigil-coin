@@ -18,7 +18,7 @@
 ;;;              of work is imposed anywhere.
 ;;;   `nonce`    the 32-bit composite score word `W` (§5.3), not a raw
 ;;;              solution length. Lower is better, and plain unsigned `<` on
-;;;              `W` IS the composite order on `(L, MB, SB, 8-R)`.
+;;;              `W` IS the composite order on `(L, MB, SB, 15-Q)`.
 ;;;
 ;;; Both `bits` and `nonce` are claims a header makes about a body nobody
 ;;; may have yet, which is what keeps fork choice decidable from headers
@@ -152,7 +152,7 @@
       (block-header-nonce header))
 
     ;;; Whether a header's score word passes the field-range check: a 32-bit
-    ;;; unsigned integer, low nibble zero, share field at most eight.
+    ;;; unsigned integer with low nibble zero; every `15-Q` nibble is legal.
     ;;;
     ;;; This is a range check only. Whether the word describes the block it
     ;;; rides in is `score-mismatch`, decided by the body rules.
