@@ -1,6 +1,29 @@
-;;; (sigil coin cli mine) — the `puzzle` and `mine` commands
+;;; (sigil coin cli mine) — `puzzle`, `mine`, `commit` and `reveal`
 ;;;
-;;; The two commands the game is actually played with.
+;;; The commands the game is actually played with.
+;;;
+;;; ## Two rule sets, one surface
+;;;
+;;; Under v1 a puzzle published a target VALUE and a solution was a program
+;;; producing it. A survey of 480 puzzles killed that: 78.3% of the time the
+;;; shortest program was the quoted literal, so mining was transcription.
+;;; Under v2 a puzzle publishes `k` input/output pairs plus a syntactic
+;;; constraint, and a solution is a one-argument FUNCTION reproducing every
+;;; pair. A function cannot be quoted, which is the whole reason for the
+;;; change.
+;;;
+;;; `puzzle` and `mine` therefore have two shapes. Which one runs is the
+;;; chain's own answer — `puzzle-generator-version` under its `mining`
+;;; extension — so the CLI needs no flag day and no branch to delete later.
+;;; `--v2` forces the v2 surface on a chain still advertising 1, which is
+;;; how a miner reads tomorrow's game today.
+;;;
+;;; WHAT IS LIVE. The v1 path builds and submits blocks, unchanged. Until
+;;; Wave 3 switches chain configs, the v2 path previews global producer work
+;;; or `--share` personalized work without submitting a v1-incompatible
+;;; block. `commit` and `reveal` use consensus v2's preimages, share type and
+;;; canonical codecs directly; only private local commitment storage remains
+;;; CLI-owned.
 ;;;
 ;;; `puzzle` publishes everything a miner needs before they open a REPL: the
 ;;; target in canonical form, the seed it came from, par, and the
@@ -24,6 +47,8 @@
 ;;; ```scheme
 ;;; (run-puzzle '("--regtest"))
 ;;; (run-mine '("--regtest" "--solution" "(iota 11)"))
+;;; (run-puzzle '("--regtest" "--v2"))
+;;; (run-commit '("--regtest" "--solution" "car"))
 ;;; ```
 
 (define-library (sigil coin cli mine)
@@ -32,6 +57,7 @@
           (sigil string)
           (sigil time)
           (sigil sqlite)
+          (sigil secp256k1)
           (sigil bitcoin utils)
           (sigil bitcoin encoding)
           (sigil bitcoin primitives)
@@ -40,10 +66,14 @@
           (sigil bitcoin node)
           (sigil coin puzzle)
           (sigil coin puzzle generator)
+          (sigil coin puzzle constraints)
+          (sigil coin puzzle examples)
           (sigil coin consensus)
+          (sigil coin consensus v2)
           (sigil coin node)
           (sigil coin cli args)
-          (sigil coin cli wallet))
+          (sigil coin cli wallet)
+          (sigil coin cli v2))
   (export
     coin-solution-advice
     coin-validated-tip-height
@@ -54,7 +84,18 @@
     coin-block-transaction-fee
     coin-select-block-transactions
     run-puzzle
-    run-mine)
+    run-mine
+
+    ;; v2
+    coin-puzzle-parent
+    coin-puzzle-version
+    coin-puzzle-context/v2
+    coin-puzzle-report/v2
+    coin-print-puzzle/v2
+    run-puzzle/v2
+    run-mine/v2
+    run-commit
+    run-reveal)
 
   (begin
 
@@ -218,37 +259,61 @@
       (println "baseline: ~a" (report-ref report 'solution))
       report)
 
-    ;;; Show the puzzle for the next block, or for `--height`.
+    ;;; The height a puzzle command works at and the header before it.
     ;;;
-    ;;; A height other than the tip's successor is answered from the header
-    ;;; the node has at that height, so `--height` can be used to look back
-    ;;; at a puzzle someone already solved.
+    ;;; Returns `(height . parent-header)`. The default height is the tip's
+    ;;; successor, and `--height` may look BACK at a puzzle someone already
+    ;;; solved but never forward past the tip, because the parent that
+    ;;; derives a later puzzle does not exist yet.
+    ;;;
+    ;;; ```scheme
+    ;;; (car (coin-puzzle-parent n '("--height" "1"))) ; => 1
+    ;;; ```
+    (define (coin-puzzle-parent n args)
+      (: node? list? -> pair?)
+      (let* ((tip (coin-validated-tip-height n))
+             (height (cli-number args
+                                 "--height"
+                                 (number->string (+ tip 1)))))
+        (when (< height 1)
+          (error "--height: genesis has no puzzle to mine; the lowest minable height is 1."))
+        (when (> height (+ tip 1))
+          (error (string-append
+                   "--height: "
+                   (number->string height)
+                   " is beyond the tip. The next block is height "
+                   (number->string (+ tip 1))
+                   "; sync further before asking about later ones.")))
+        (cons height
+              (if (= height (+ tip 1))
+                  (coin-validated-tip-header n)
+                  (coin-header-at-height n (- height 1))))))
+
+    ;;; Which rule set a command runs under: the chain's own answer, unless
+    ;;; `--v2` forces the newer one.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-puzzle-version '("--v2") sigilcoin-regtest-chain) ; => 2
+    ;;; ```
+    (define (coin-puzzle-version args chain)
+      (: list? any? -> integer?)
+      (if (cli-flag? args "--v2") 2 (cli-v2-chain-version chain)))
+
+    ;;; Show the puzzle for the next block, or for `--height`.
     ;;;
     ;;; ```scheme
     ;;; (run-puzzle '("--regtest" "--height" "1"))
     ;;; ```
     (define (run-puzzle args)
       (: list? -> any?)
-      (cli-with-node args
-        (lambda (n)
-          (let* ((tip (coin-validated-tip-height n))
-                 (height (cli-number args
-                                     "--height"
-                                     (number->string (+ tip 1)))))
-            (when (< height 1)
-              (error "--height: genesis has no puzzle to mine; the lowest minable height is 1."))
-            (when (> height (+ tip 1))
-              (error (string-append
-                       "--height: "
-                       (number->string height)
-                       " is beyond the tip. The next block is height "
-                       (number->string (+ tip 1))
-                       "; sync further before asking about later ones.")))
-            (let ((parent (if (= height (+ tip 1))
-                              (coin-validated-tip-header n)
-                              (coin-header-at-height n (- height 1)))))
-              (coin-print-puzzle
-                (coin-puzzle-report (block-header-hash parent) height)))))))
+      (if (= 2 (coin-puzzle-version args (cli-chain args)))
+          (run-puzzle/v2 args)
+          (cli-with-node args
+            (lambda (n)
+              (let ((where (coin-puzzle-parent n args)))
+                (coin-print-puzzle
+                  (coin-puzzle-report (block-header-hash (cdr where))
+                                      (car where))))))))
 
     ;; ============================================================
     ;; Filling the block from the mempool
@@ -415,7 +480,11 @@
       ;; Resolve the chain before anything else, so a mistyped `--chain`
       ;; cannot leave a freshly created wallet key behind in a directory
       ;; the command then never opens.
-      (cli-chain args)
+      (if (= 2 (coin-puzzle-version args (cli-chain args)))
+          (run-mine/v2 args)
+          (run-mine/v1 args)))
+
+    (define (run-mine/v1 args)
       (let* ((data-dir (cli-data-dir args))
              (address (cli-arg args "--address" #f))
              (graffiti (cli-arg args "--graffiti" ""))
@@ -522,4 +591,572 @@
                    " seconds away, further ahead than the "
                    (number->string coin-max-future-drift)
                    "-second future-drift limit allows.")))
-        (max earliest now)))))
+        (max earliest now)))
+
+    ;; ============================================================
+    ;; v2: program-by-example
+    ;; ============================================================
+
+    (define (hex bytes) (hex-encode bytes))
+
+    ;; A 32-bit score word, printed the way it is compared: unsigned, wide,
+    ;; lower is better. Zero-padded so two words line up in a terminal.
+    (define (score-word->string w)
+      (let ((digits (number->string w 16)))
+        (string-append "0x" (string-pad digits 8 #\0))))
+
+    ;;; Everything a v2 command needs to know about one height.
+    ;;;
+    ;;; Returns an alist carrying `height`, the parent header, the parent's
+    ;;; internal hash, the complexity `C` and the derived puzzle. Deriving
+    ;;; the puzzle is the expensive step — up to 64 attempts of 20000 steps
+    ;;; — so every command takes it from here exactly once.
+    ;;;
+    ;;; ```scheme
+    ;;; (cdr (assq 'complexity (coin-puzzle-context/v2 n '()))) ; => 128
+    ;;; ```
+    (define (coin-puzzle-context/v2 n args)
+      (: node? list? -> list?)
+      (let* ((where (coin-puzzle-parent n args))
+             (height (car where))
+             (parent (cdr where))
+             (parent-hash (block-header-hash parent))
+             (override (let ((text (cli-arg args "--complexity" #f)))
+                         (and text
+                              (or (string->number text)
+                                  (error (string-append
+                                           "--complexity: expected a whole"
+                                           " number, got \""
+                                           text
+                                           "\""))))))
+             (complexity (cli-v2-complexity (block-header-bits parent)
+                                            override)))
+        (list (cons 'height height)
+              (cons 'parent parent)
+              (cons 'parent-hash parent-hash)
+              (cons 'complexity complexity)
+              (cons 'spec (cli-v2-puzzle parent-hash height complexity)))))
+
+    ;;; Everything `puzzle` reports about one v2 height, as an alist.
+    ;;;
+    ;;; Separated from the printing so a test can assert on the values
+    ;;; rather than on a rendered block of text.
+    ;;;
+    ;;; ```scheme
+    ;;; (cdr (assq 'k (coin-puzzle-report/v2 parent-hash 1 128))) ; => 3
+    ;;; ```
+    (define (coin-puzzle-report/spec/v2 previous-hash height complexity spec)
+      (let* ((ci (pbe-spec-constraint spec))
+             (d (coin-v2-spec-builtin-cap spec))
+             (fallback (pbe-spec-table-solution spec))
+             (score (cli-v2-score-report spec fallback 0)))
+        (list (cons 'height height)
+              (cons 'parent (hex (reverse-bytevector previous-hash)))
+              (cons 'seed (hex (coin-v2-puzzle-seed previous-hash
+                                                    height
+                                                    complexity)))
+              (cons 'complexity complexity)
+              (cons 'tier (puzzle-complexity-tier complexity))
+              (cons 'constraint ci)
+              (cons 'constraint-name (puzzle-constraint-name ci))
+              (cons 'constraint-rule (cli-v2-constraint-rule ci d))
+              (cons 'k (pbe-spec-k spec))
+              (cons 'examples (cli-v2-example-lines spec))
+              (cons 'par (pbe-spec-par spec))
+              (cons 'fallback fallback)
+              (cons 'fallback-length (string-length fallback))
+              (cons 'fallback-score (cdr (assq 'word score)))
+              (cons 'reward (coin-block-reward height)))))
+
+    (define (coin-puzzle-report/v2 previous-hash height complexity)
+      (: bytevector? integer? integer? -> list?)
+      (coin-puzzle-report/spec/v2
+        previous-hash height complexity
+        (cli-v2-puzzle previous-hash height complexity)))
+
+    ;;; Print a v2 puzzle report in the CLI's `key: value` form.
+    ;;;
+    ;;; The order is the order a miner reads it in: what the pairs are, what
+    ;;; today's rule is, what beating the field costs, and finally the
+    ;;; fallback that guarantees the height is solvable at all.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-print-puzzle/v2 (coin-puzzle-report/v2 parent-hash 1 128))
+    ;;; ```
+    (define (coin-print-puzzle/v2 report)
+      (: list? -> any?)
+      (println "version: 2")
+      (println "height: ~a" (report-ref report 'height))
+      (println "parent: ~a" (report-ref report 'parent))
+      (println "seed: ~a" (report-ref report 'seed))
+      (let ((personalized (assq 'personalized-pubkey report)))
+        (when personalized
+          (println "personalized-pubkey: ~a" (cdr personalized))))
+      (println "complexity: ~a (tier ~a)"
+               (report-ref report 'complexity)
+               (report-ref report 'tier))
+      (println "constraint: ~a — ~a"
+               (report-ref report 'constraint-name)
+               (report-ref report 'constraint-rule))
+      (println "examples: ~a" (report-ref report 'k))
+      (for-each (lambda (line) (println "  ~a" line))
+                (report-ref report 'examples))
+      (println "par: ~a" (report-ref report 'par))
+      (println "max-solution-bytes: ~a" coin-v2-max-solution-bytes)
+      (println "reward: ~a SGL"
+               (cli-daviwils->sgl (report-ref report 'reward)))
+      (println "fallback-length: ~a" (report-ref report 'fallback-length))
+      (println "fallback-score: ~a"
+               (score-word->string (report-ref report 'fallback-score)))
+      (println "fallback: ~a" (report-ref report 'fallback))
+      (println "solve: write a ONE-ARGUMENT function reproducing every pair above, then `sigilcoin mine~a --solution '<source>'`."
+               (if (assq 'personalized-pubkey report) " --share" ""))
+      (println "rank: shorter wins; ties break on memory, then steps, then aggregate verified share quality.")
+      report)
+
+    ;;; Show the v2 puzzle for the next block, or for `--height`.
+    ;;;
+    ;;; ```scheme
+    ;;; (run-puzzle/v2 '("--regtest" "--v2"))
+    ;;; ```
+    (define (run-puzzle/v2 args)
+      (: list? -> any?)
+      (let* ((share? (cli-flag? args "--share"))
+             (pubkey (and share?
+                          (wallet-public-key
+                            (wallet-key (cli-data-dir args))))))
+        (cli-with-node args
+          (lambda (n)
+            (let* ((context (coin-puzzle-context/v2 n args))
+                   (spec (if share?
+                             (coin-v2-share-puzzle
+                               (share-context context '()) pubkey)
+                             (report-ref context 'spec)))
+                   (report (coin-puzzle-report/spec/v2
+                             (report-ref context 'parent-hash)
+                             (report-ref context 'height)
+                             (report-ref context 'complexity)
+                             spec)))
+              (coin-print-puzzle/v2
+                (if share?
+                    (cons (cons 'personalized-pubkey (hex pubkey)) report)
+                    report)))))))
+
+    ;; The one place a v2 rejection turns into a sentence. Every caller —
+    ;; `mine`, `commit`, `reveal` — refuses the same solution for the same
+    ;; reason with the same words, because a miner should not have to learn
+    ;; three vocabularies for one rule.
+    (define (require-solves who spec height solution score)
+      (when (not (cdr (assq 'ok score)))
+        (error (string-append
+                 who
+                 ": that solution does not solve height "
+                 (number->string height)
+                 " — "
+                 (cli-v2-solution-advice spec
+                                         (cdr (assq 'reason score))
+                                         (cdr (assq 'detail score))
+                                         solution))))
+      score)
+
+    (define (print-score score par)
+      (let ((length (cdr (assq 'length score))))
+        (println "solution-length: ~a" length)
+        (println "par: ~a" par)
+        (println "beats-par: ~a" (if (< length par) "yes" "no"))
+        (println "memory: ~a cells (bucket ~a)"
+                 (cdr (assq 'cells score))
+                 (cdr (assq 'memory-bucket score)))
+        (println "steps: ~a (bucket ~a)"
+                 (cdr (assq 'steps score))
+                 (cdr (assq 'step-bucket score)))
+        (println "quality: ~a" (cdr (assq 'quality score)))
+        (println "score: ~a" (score-word->string (cdr (assq 'word score))))))
+
+    ;;; Check a candidate against the v2 puzzle and report what it scores.
+    ;;;
+    ;;; NOTHING IS BUILT. The check runs before any block would be, which is
+    ;;; the whole point: the failures worth reporting — a pair that came back
+    ;;; wrong, a lambda of the wrong arity, today's constraint broken, the
+    ;;; byte cap — are all knowable without touching the chain, and reporting
+    ;;; them as "the node rejected your block" would tell a miner nothing
+    ;;; about which byte to change.
+    ;;;
+    ;;; A v2 block is not assembled here at all. That needs the five-push
+    ;;; coinbase and the header score codec the node does not have yet, so
+    ;;; this command stops at the verdict and says so rather than mining a
+    ;;; block under the old rules and calling it a v2 one.
+    ;;;
+    ;;; ```scheme
+    ;;; (run-mine/v2 '("--regtest" "--v2" "--solution" "car"))
+    ;;; ```
+    (define (run-mine/v2 args)
+      (: list? -> any?)
+      (let* ((share? (cli-flag? args "--share"))
+             (pubkey (and share?
+                          (wallet-public-key
+                            (wallet-key (cli-data-dir args))))))
+        (cli-with-node args
+          (lambda (n)
+            (let* ((context (coin-puzzle-context/v2 n args))
+                   (height (report-ref context 'height))
+                   (spec (if share?
+                             (coin-v2-share-puzzle
+                               (share-context context '()) pubkey)
+                             (report-ref context 'spec)))
+                   (fallback (pbe-spec-table-solution spec))
+                   (solution (cli-arg args "--solution" fallback))
+                   (preliminary
+                     (require-solves "mine" spec height solution
+                                     (cli-v2-score-report spec solution 0)))
+                   (under-par? (< (cdr (assq 'length preliminary))
+                                  (pbe-spec-par spec)))
+                   (quality (if (and share? under-par?)
+                                (list-ref
+                                  (require-share-solution
+                                    "mine" context pubkey
+                                    (make-bytevector
+                                      coin-v2-share-blind-bytes 0)
+                                    solution)
+                                  3)
+                                0))
+                   (score (if (= quality 0)
+                              preliminary
+                              (cli-v2-score-report spec solution quality)))
+                   (baseline (cli-v2-score-report spec fallback 0)))
+              (println "version: 2")
+              (println "height: ~a" height)
+              (when share?
+                (println "personalized-pubkey: ~a" (hex pubkey)))
+              (println "complexity: ~a" (report-ref context 'complexity))
+              (println "constraint: ~a"
+                       (cli-v2-constraint-detail
+                         (pbe-spec-constraint spec)
+                         (coin-v2-spec-builtin-cap spec)))
+              (println "examples-reproduced: ~a of ~a"
+                       (pbe-spec-k spec)
+                       (pbe-spec-k spec))
+              (print-score score (pbe-spec-par spec))
+              (when share?
+                (println "share-eligible: ~a" (if under-par? "yes" "no")))
+              (println "fallback-score: ~a"
+                       (score-word->string (cdr (assq 'word baseline))))
+              (println "outranks-fallback: ~a"
+                       (if (coin-v2-score-better? (cdr (assq 'word score))
+                                                  (cdr (assq 'word baseline)))
+                           "yes"
+                           "no"))
+              (println "reward: ~a SGL"
+                       (cli-daviwils->sgl (coin-block-reward height)))
+              (println "submitted: no")
+              (println "next: local verification only. Use `--share` for your personalized co-op task, then `sigilcoin commit` for an under-par solution.")
+              score)))))
+
+    ;; ============================================================
+    ;; Commit and reveal
+    ;; ============================================================
+    ;;
+    ;; The pipeline is fixed by the fact that puzzle `H` is not knowable
+    ;; until block `H-1` exists:
+    ;;
+    ;;   block H    carries COMMITS for puzzle H, and the producer's own
+    ;;              solution for puzzle H
+    ;;   block H+1  carries the reveals of puzzle H, and pays them
+    ;;
+    ;; So a commitment is a hash published one block before the program it
+    ;; hides. A 32-byte blind keeps it hiding until consensus publishes that
+    ;; blind with the reveal; branch, height, complexity, source and payout
+    ;; key bind the signed preimage.
+
+    (define (share-context context commits)
+      (coin-v2-coop-context
+        parent-prev-hash: (report-ref context 'parent-hash)
+        puzzle-height: (report-ref context 'height)
+        complexity: (report-ref context 'complexity)
+        spec: (report-ref context 'spec)
+        commits: commits))
+
+    (define (draft-share pubkey blind solution)
+      (coin-v2-share pubkey: pubkey
+                     signature: (make-bytevector
+                                  coin-v2-share-signature-bytes 0)
+                     blind: blind
+                     solution: (string->utf8 solution)))
+
+    ;; Consensus validates personalized work. Global producer solutions are
+    ;; intentionally not accepted as co-op shares.
+    (define (require-share-solution who context pubkey blind solution)
+      (let* ((coop (share-context context '()))
+             (share (draft-share pubkey blind solution))
+             (checked (coin-v2-check-share-solution coop share)))
+        (when (coin-failed? checked)
+          (error
+            (string-append
+              who
+              ": personalized share rejected as `"
+              (symbol->string (coin-result-reason checked))
+              "`"
+              (let ((detail (coin-result-detail checked)))
+                (if (and (string? detail) (not (string=? detail "")))
+                    (string-append " (" detail ")")
+                    ""))
+              ". Run `sigilcoin puzzle --v2 --share` for your co-op task;"
+              " co-op work must solve that pubkey-personalized puzzle and be strictly"
+              " under its par.")))
+        (let* ((spec (coin-v2-share-puzzle coop pubkey))
+               (quality (coin-v2-share-quality coop share))
+               (score (cli-v2-score-report spec solution quality)))
+          (list coop share spec quality score))))
+
+    (define (commit-context args n pubkey)
+      (let* ((context (coin-puzzle-context/v2 n args))
+             (solution (cli-required
+                         args "--solution" "commit"
+                         "the personalized program source you are committing to"))
+             (checked (require-share-solution
+                        "commit" context pubkey
+                        (make-bytevector coin-v2-share-blind-bytes 0)
+                        solution)))
+        (list context solution checked)))
+
+    ;;; Publish and retain one personalized solution commitment.
+    (define (run-commit args)
+      (: list? -> any?)
+      (cli-chain args)
+      (cli-required args "--solution" "commit"
+                    "the personalized program source you are committing to")
+      (let ((data-dir (cli-data-dir args)))
+        (cli-with-node args
+          (lambda (n)
+            (let* ((tip (coin-validated-tip-height n))
+                   (height (cli-number args "--height"
+                                       (number->string (+ tip 1)))))
+              ;; A commitment for puzzle H must ride in block H. Once H is
+              ;; validated, accepting another local secret for it is useless.
+              (unless (= height (+ tip 1))
+                (error (string-append
+                         "commit: puzzle height " (number->string height)
+                         " is not the next block (height "
+                         (number->string (+ tip 1))
+                         "). Commitments must ride in their own puzzle block;"
+                         (if (<= height tip)
+                             " this commitment is expired (`commit-expired`)."
+                             " sync through its parent before committing."))))
+              (let* ((key (wallet-key data-dir))
+                     (pubkey (wallet-public-key key))
+                     (ignored (cli-v2-commit-prune data-dir tip))
+                     (parts (commit-context args n pubkey))
+                     (context (list-ref parts 0))
+                     (solution (list-ref parts 1))
+                     (checked (list-ref parts 2))
+                     (complexity (report-ref context 'complexity))
+                     (parent-hash (report-ref context 'parent-hash))
+                     (blind (wallet-entropy coin-v2-share-blind-bytes))
+                   (preimage (coin-v2-share-preimage
+                               parent-hash height complexity solution pubkey))
+                   (commitment (coin-v2-commitment preimage blind))
+                   (record (cli-v2-commit-save
+                             data-dir
+                             (cli-v2-commit-record
+                               height: height
+                               complexity: complexity
+                               parent: parent-hash
+                               pubkey: pubkey
+                               blind: blind
+                               commitment: commitment
+                               solution: solution)))
+                   (records (cli-v2-commit-records-for
+                              data-dir height parent-hash complexity pubkey))
+                   (commitments (cli-v2-sort-bytes
+                                  (map cli-v2-commit-record-commitment
+                                       records)))
+                   (score (list-ref checked 4)))
+              ;; Consensus encoder is also the local canonicality check.
+              (coin-v2-commits-encode commitments)
+              (println "height: ~a" height)
+              (println "complexity: ~a" complexity)
+              (println "parent: ~a" (hex (reverse-bytevector parent-hash)))
+              (println "personalized-par: ~a"
+                       (pbe-spec-par (list-ref checked 2)))
+              (println "solution-length: ~a" (string-length solution))
+              (println "quality: ~a" (list-ref checked 3))
+              (println "score: ~a"
+                       (score-word->string (cdr (assq 'word score))))
+              (println "commitment: ~a" (hex commitment))
+              (println "stored-candidates: ~a" (length records))
+              (println "commits-push: ~a"
+                       (hex (coin-v2-commits-encode commitments)))
+              (println "stored: ~a" (cli-v2-commit-file data-dir))
+              (println "next: include this commitment in block ~a, then reveal while block ~a is the validated tip."
+                       height height)
+              record))))))
+
+    (define (parse-commitment-option args)
+      (let ((text (cli-arg args "--commitment" #f)))
+        (and text
+             (let ((bytes (guard (e (#t #f)) (hex-decode text))))
+               (unless (and bytes
+                            (= coin-v2-commitment-bytes
+                               (bytevector-length bytes)))
+                 (error "reveal: --commitment must be exactly 32 bytes of hexadecimal"))
+               bytes))))
+
+    ;; Return `(record share score quality)` for a valid stored candidate.
+    (define (assess-record context pubkey record)
+      (guard (e (#t #f))
+        (and (equal? pubkey (cli-v2-commit-record-pubkey record))
+             (let* ((solution (cli-v2-commit-record-solution record))
+                    (blind (cli-v2-commit-record-blind record))
+                    (expected
+                      (coin-v2-commitment
+                        (coin-v2-share-preimage
+                          (report-ref context 'parent-hash)
+                          (report-ref context 'height)
+                          (report-ref context 'complexity)
+                          solution pubkey)
+                        blind)))
+               (and (equal? expected
+                            (cli-v2-commit-record-commitment record))
+                    (let* ((checked (require-share-solution
+                                      "reveal" context pubkey blind solution))
+                           (share (list-ref checked 1))
+                           (quality (list-ref checked 3))
+                           (score (list-ref checked 4)))
+                      (list record share score quality)))))))
+
+    (define (candidate-better? a b)
+      (let ((aw (cdr (assq 'word (list-ref a 2))))
+            (bw (cdr (assq 'word (list-ref b 2)))))
+        (or (coin-v2-score-better? aw bw)
+            (and (= aw bw)
+                 (cli-v2-bytes<?
+                   (cli-v2-commit-record-commitment (car a))
+                   (cli-v2-commit-record-commitment (car b)))))))
+
+    (define (select-candidate context pubkey records requested)
+      (let ((eligible
+              (if requested
+                  (let loop ((xs records))
+                    (cond
+                      ((null? xs) '())
+                      ((equal? requested
+                               (cli-v2-commit-record-commitment (car xs)))
+                       (list (car xs)))
+                      (else (loop (cdr xs)))))
+                  records)))
+        (when (and requested (null? eligible))
+          (error "reveal: requested commitment is not stored for this puzzle, branch, complexity and key"))
+        (let loop ((xs eligible) (best #f) (invalid? #f))
+          (if (null? xs)
+              (cond
+                (best best)
+                (invalid?
+                 (error "reveal: stored commitment is invalid or no longer solves the personalized under-par puzzle"))
+                (else #f))
+              (let ((candidate (assess-record context pubkey (car xs))))
+                (loop (cdr xs)
+                      (if (and candidate
+                               (or (not best)
+                                   (candidate-better? candidate best)))
+                          candidate
+                          best)
+                      (or invalid? (not candidate))))))))
+
+    ;;; Open one commitment using consensus' reveal type and codec.
+    (define (run-reveal args)
+      (: list? -> any?)
+      (cli-chain args)
+      (let* ((data-dir (cli-data-dir args))
+             (key (wallet-key data-dir))
+             (pubkey (wallet-public-key key))
+             (requested (parse-commitment-option args)))
+        (cli-with-node args
+          (lambda (n)
+            (let* ((tip (coin-validated-tip-height n))
+                   (height (cli-number args "--height"
+                                       (number->string tip))))
+              (cli-v2-commit-prune data-dir tip)
+              (cond
+                ((< height tip)
+                 (error (string-append
+                          "reveal: puzzle height " (number->string height)
+                          " expired when block "
+                          (number->string (+ height 1)) " was accepted")))
+                ((> height tip)
+                 (error (string-append
+                          "reveal: puzzle height " (number->string height)
+                          " is not eligible until block "
+                          (number->string height) " is accepted")))
+                ((< height 1)
+                 (error "reveal: no puzzle commitment is eligible at genesis")))
+              (let* ((context (coin-puzzle-context/v2
+                                n (list "--height" (number->string height))))
+                     (parent-hash (report-ref context 'parent-hash))
+                     (complexity (report-ref context 'complexity))
+                     (records (cli-v2-commit-records-for
+                                data-dir height parent-hash complexity pubkey))
+                     (candidate (select-candidate
+                                  context pubkey records requested)))
+                (unless candidate
+                  (error (string-append
+                           "reveal: nothing was committed for puzzle height "
+                           (number->string height)
+                           " on this branch for this key (`share-uncommitted`)")))
+                (let* ((record (list-ref candidate 0))
+                       (unsigned (list-ref candidate 1))
+                       (preimage (coin-v2-share-preimage
+                                   parent-hash height complexity
+                                   (coin-v2-share-solution unsigned) pubkey))
+                       (share (coin-v2-share
+                                pubkey: pubkey
+                                signature: (secp256k1-ecdsa-sign key preimage)
+                                blind: (coin-v2-share-blind unsigned)
+                                solution: (coin-v2-share-solution unsigned)))
+                       (share-bytes (coin-v2-share-encode share))
+                       (push (coin-v2-shares-encode (list share)))
+                       (decoded (coin-v2-shares-decode push)))
+                  ;; Verify exact emitted bytes through consensus before any
+                  ;; public solution is printed.
+                  (unless (coin-ok? decoded)
+                    (error "reveal: consensus rejected the emitted share encoding"))
+                  (let ((back (car (coin-result-value decoded))))
+                    (unless (equal? (cli-v2-commit-record-commitment record)
+                                    (coin-v2-share-commitment
+                                      (share-context context
+                                        (list
+                                          (cli-v2-commit-record-commitment
+                                            record)))
+                                      back))
+                      (error "reveal: emitted share does not open its commitment"))
+                    (unless (coin-v2-share-signature-ok?
+                              (share-context context '()) back)
+                      (error "reveal: emitted share signature does not verify"))
+                    (unless (coin-ok? (coin-v2-check-share-solution
+                                        (share-context context '()) back))
+                      (error "reveal: emitted share fails its personalized under-par puzzle"))
+                    (unless (= (list-ref candidate 3)
+                               (coin-v2-share-quality
+                                 (share-context context '()) back))
+                      (error "reveal: emitted share quality changed")))
+                  (println "height: ~a" height)
+                  (println "reveal-in: ~a" (+ height 1))
+                  (println "parent: ~a" (hex (reverse-bytevector parent-hash)))
+                  (println "complexity: ~a" complexity)
+                  (println "committed: yes")
+                  (println "commitment: ~a"
+                           (hex (cli-v2-commit-record-commitment record)))
+                  (println "pubkey: ~a" (hex pubkey))
+                  (println "signature: ~a" (hex (coin-v2-share-signature share)))
+                  (println "solution-length: ~a"
+                           (bytevector-length (coin-v2-share-solution share)))
+                  (println "solution: ~a"
+                           (cli-v2-commit-record-solution record))
+                  (println "quality: ~a" (list-ref candidate 3))
+                  (println "score: ~a"
+                           (score-word->string
+                             (cdr (assq 'word (list-ref candidate 2)))))
+                  (println "share: ~a" (hex share-bytes))
+                  (println "shares-push: ~a" (hex push))
+                  (println "next: hand this share to the producer of block ~a."
+                           (+ height 1))
+                  share-bytes)))))))))

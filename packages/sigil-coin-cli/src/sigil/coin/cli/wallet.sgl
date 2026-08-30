@@ -82,6 +82,9 @@
     wallet-key-file
     wallet-legacy-key-file
     wallet-key
+    wallet-entropy
+    wallet-write-private-file
+    wallet-read-private-file
     wallet-public-key
     wallet-script-pubkey
     wallet-utxos
@@ -296,16 +299,75 @@
                      " is readable by other accounts. Run: chmod 0600 "
                      path))))))
 
-    (define (write-key-file path key)
-      ;; Owner-only directory first, so nothing else can reach the file
-      ;; during the moment it exists empty under the umask's mode.
+    ;; Owner-only directory first, so nothing else can reach the file during
+    ;; the moment it exists empty under the umask's mode; then create it
+    ;; empty and lock it down BEFORE anything secret is in it, so no secret
+    ;; is ever on disk under a permissive mode.
+    (define (create-private-file path)
       (ensure-private-directory (path-dirname path))
-      ;; Create the file empty and lock it down BEFORE the secret is in it,
-      ;; so the key is never on disk under a permissive mode.
       (write-file-string path "")
-      (restrict-permissions "0600" path)
+      (restrict-permissions "0600" path))
+
+    (define (write-key-file path key)
+      (create-private-file path)
       (write-file-string path (string-append (hex-encode key) "\n"))
       (require-private-permissions path))
+
+    ;;; 32 (or `count`) bytes straight from the kernel CSPRNG.
+    ;;;
+    ;;; Never `(sigil random)`, whose Xorshift128 stream is fine for dice
+    ;;; and fatal for anything a commitment's hiding property rests on.
+    ;;;
+    ;;; ```scheme
+    ;;; (bytevector-length (wallet-entropy 32)) ; => 32
+    ;;; ```
+    (define (wallet-entropy count)
+      (: integer? -> bytevector?)
+      (kernel-entropy count))
+
+    ;;; Write text into the wallet's own 0700 directory at mode 0600.
+    ;;;
+    ;;; For wallet-private data that is not a key: today, the blinds that
+    ;;; make commitments hiding. Same directory and same mode as the key,
+    ;;; because the same argument applies — and never the data directory
+    ;;; itself, whose mode belongs to the explorer's read access.
+    ;;;
+    ;;; ```scheme
+    ;;; (wallet-write-private-file "/tmp/n/wallet/commitments" "")
+    ;;; ```
+    (define (wallet-write-private-file path text)
+      (: string? string? -> any?)
+      ;; Refuse permission drift before touching existing secret bytes.
+      (when (file-exists? path)
+        (require-private-permissions path))
+      (ensure-private-directory (path-dirname path))
+      (let ((tmp (string-append path ".tmp."
+                                (number->string (process-id)))))
+        (when (file-exists? tmp)
+          (error (string-append "wallet: temporary private file already exists: "
+                                tmp)))
+        (guard (err
+                (else
+                  (when (file-exists? tmp)
+                    (guard (ignored (else #f)) (delete-file tmp)))
+                  (raise err)))
+          ;; Mode is private before secret text lands, then rename publishes
+          ;; complete bytes atomically with that mode intact.
+          (create-private-file tmp)
+          (write-file-string tmp text)
+          (require-private-permissions tmp)
+          (rename-file tmp path)
+          (require-private-permissions path))))
+
+    ;;; Read a wallet-private file, refusing one another account can read.
+    ;;;
+    ;;; ```scheme
+    ;;; (wallet-read-private-file "/tmp/n/wallet/commitments")
+    ;;; ```
+    (define (wallet-read-private-file path)
+      (: string? -> string?)
+      (require-private-permissions path)
+      (read-file-string path))
 
     (define (read-key-file path)
       (require-private-permissions path)

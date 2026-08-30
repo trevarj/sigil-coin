@@ -35,7 +35,9 @@
         (sigil bitcoin node)
         (sigil coin puzzle)
         (sigil coin puzzle generator)
+        (sigil coin puzzle examples)
         (sigil coin consensus)
+        (sigil coin consensus v2)
         (sigil coin node)
         (sigil coin cli))
 
@@ -356,7 +358,11 @@
                        (failure-message (list command "--chain" "x"))
                        "--chain")))
       '("puzzle" "mine" "address" "balance" "status"
-        "header-sync" "block-sync" "sync" "run" "listen"))
+        "header-sync" "block-sync" "sync" "run" "listen"
+        "commit" "reveal"))
+    ;; `commit` needs a solution before it will touch a node or a key.
+    (assert-true (string-contains? (failure-message '("commit" "--regtest"))
+                                   "--solution"))
     (assert-true (string-contains?
                    (failure-message '("send" "--chain" "x" "--to" "a"))
                    "--chain"))
@@ -1347,6 +1353,250 @@
       (assert-true #t))))
 
 ;; ============================================================
+;; v2: program by example
+;; ============================================================
+;;
+;; The chain still advertises generator version 1, so these drive the v2
+;; surface through the `--v2` flag that forces it. Every value asserted
+;; here is derived, not invented: height 1 on regtest genesis at the
+;; genesis complexity is one fixed puzzle, and the test pins what it is.
+
+;; Height 1's v2 puzzle at C = 128 maps x to (x x*x), so this is the
+;; shortest thing that answers it: one byte under par.
+(define %v2-height-1 "(lambda(x)(list x(* x x)))")
+
+;; The complexity whose height-1 puzzle draws the `no-digits` constraint.
+;; Tier 0 is unconstrained by design, so a constraint violation is not
+;; reachable at the genesis complexity at all.
+(define %v2-no-digits-complexity "300")
+
+(define (v2-args) (cons "--v2" (fresh-args)))
+
+(test-group "sigilcoin puzzle v2"
+  (test "the report for height 1 is the one the chain derives"
+    (let ((report (coin-puzzle-report/v2 %regtest-genesis-hash 1 128))
+          (spec (cli-v2-puzzle %regtest-genesis-hash 1 128)))
+      (assert-equal 1 (cdr (assq 'height report)))
+      (assert-equal 128 (cdr (assq 'complexity report)))
+      (assert-equal 0 (cdr (assq 'tier report)))
+      (assert-equal (pbe-spec-k spec) (cdr (assq 'k report)))
+      (assert-equal (pbe-spec-par spec) (cdr (assq 'par report)))
+      (assert-equal (pbe-spec-table-solution spec)
+                    (cdr (assq 'fallback report)))
+      ;; The pinned values themselves.
+      (assert-equal 3 (cdr (assq 'k report)))
+      (assert-equal 27 (cdr (assq 'par report)))
+      (assert-equal 'none (cdr (assq 'constraint-name report)))
+      (assert-equal '("0: 188 -> (188 35344)"
+                      "1: 148 -> (148 21904)"
+                      "2: 63 -> (63 3969)")
+                    (cdr (assq 'examples report)))))
+
+  (test "the fallback the report publishes really solves it"
+    (let* ((report (coin-puzzle-report/v2 %regtest-genesis-hash 1 128))
+           (spec (cli-v2-puzzle %regtest-genesis-hash 1 128))
+           (score (cli-v2-score-report spec
+                                       (cdr (assq 'fallback report))
+                                       0)))
+      (assert-true (cdr (assq 'ok score)))
+      ;; The fallback is a lookup table, so it is by construction the
+      ;; longest thing anyone would submit: any real program outranks it.
+      (assert-true (> (cdr (assq 'length score)) (cdr (assq 'par report))))))
+
+  (test "the command answers for the next block on a fresh node"
+    (let* ((result (run (cons "puzzle" (v2-args))))
+           (report (car result))
+           (text (cdr result)))
+      (assert-equal 1 (cdr (assq 'height report)))
+      (assert-true (string-contains? text "version: 2"))
+      (assert-true (string-contains? text "height: 1"))
+      (assert-true (string-contains? text "complexity: 128 (tier 0)"))
+      (assert-true (string-contains? text "constraint: none"))
+      (assert-true (string-contains? text "examples: 3"))
+      (assert-true (string-contains? text "0: 188 -> (188 35344)"))
+      (assert-true (string-contains? text "par: 27"))
+      (assert-true (string-contains? text "max-solution-bytes: 512"))
+      (assert-true (string-contains? text "reward: 1.00000000 SGL"))
+      (assert-true (string-contains? text "fallback: (lambda(x)(if(equal?"))
+      ;; The output has to explain the game, not just state it.
+      (assert-true (string-contains? text "ONE-ARGUMENT function"))))
+
+  (test "--v2 forces the surface the chain does not advertise yet"
+    (assert-equal 1 (cli-v2-chain-version sigilcoin-regtest-chain))
+    (assert-equal 1 (coin-puzzle-version '() sigilcoin-regtest-chain))
+    (assert-equal 2 (coin-puzzle-version '("--v2") sigilcoin-regtest-chain))
+    ;; Without the flag the v1 report is still what `puzzle` prints, so
+    ;; nothing on the live path moved.
+    (assert-true (string-contains? (run-text (cons "puzzle" (fresh-args)))
+                                   "target: (825 826")))
+
+  (test "--complexity previews a tier the chain has not retargeted into"
+    (let ((text (run-text (append (list "puzzle"
+                                        "--complexity"
+                                        %v2-no-digits-complexity)
+                                  (v2-args)))))
+      (assert-true (string-contains? text "complexity: 300 (tier 1)"))
+      (assert-true (string-contains? text "constraint: no-digits"))
+      (assert-true (string-contains? text "no digit (0-9)")))
+    (assert-true (string-contains?
+                   (failure-message (append (list "puzzle" "--complexity" "x")
+                                            (v2-args)))
+                   "--complexity")))
+
+  (test "the puzzle only ever depends on the parent, height and complexity"
+    (assert-equal (run-value (cons "puzzle" (v2-args)))
+                  (run-value (cons "puzzle" (v2-args))))))
+
+(test-group "sigilcoin mine v2"
+  (test "a correct function is accepted and scored against par"
+    (let* ((args (v2-args))
+           (result (run (append (list "mine" "--solution" %v2-height-1)
+                                args)))
+           (score (car result))
+           (text (cdr result)))
+      (assert-true (cdr (assq 'ok score)))
+      (assert-equal 26 (cdr (assq 'length score)))
+      (assert-equal 0 (cdr (assq 'quality score)))
+      (assert-true (string-contains? text "examples-reproduced: 3 of 3"))
+      (assert-true (string-contains? text "solution-length: 26"))
+      (assert-true (string-contains? text "par: 27"))
+      (assert-true (string-contains? text "beats-par: yes"))
+      (assert-true (string-contains? text "outranks-fallback: yes"))
+      ;; The score word is the ranking, so it must be the one consensus
+      ;; would pack from the same three numbers.
+      (assert-equal (coin-v2-score-encode 26
+                                          (cdr (assq 'cells score))
+                                          (cdr (assq 'steps score))
+                                          0)
+                    (cdr (assq 'word score)))
+      ;; Nothing was built: a v2 block needs the node switchover.
+      (assert-true (string-contains? text "submitted: no"))
+      (assert-equal 0 (tip-height args))))
+
+  (test "the fallback is what mine checks when no solution is given"
+    (let ((text (run-text (cons "mine" (v2-args)))))
+      (assert-true (string-contains? text "beats-par: no"))
+      (assert-true (string-contains? text "outranks-fallback: no"))))
+
+  (test "a function of the wrong arity is refused by name"
+    (let ((message (failure-message
+                     (append (list "mine" "--solution" "(lambda(x y)x)")
+                             (v2-args)))))
+      (assert-true (string-contains? message "one-argument procedure"))
+      (assert-true (string-contains? message "FUNCTION")))
+    ;; A program that produces the answer instead of a function fails the
+    ;; same check, which is the v1 habit v2 has to break.
+    (assert-true (string-contains?
+                   (failure-message (append (list "mine" "--solution"
+                                                  "'(188 35344)")
+                                            (v2-args)))
+                   "one-argument procedure")))
+
+  (test "a function failing one pair says which pair and what it returned"
+    (let ((message (failure-message
+                     (append (list "mine" "--solution" "(lambda(x)(list x x))")
+                             (v2-args)))))
+      (assert-true (string-contains? message "example 0"))
+      (assert-true (string-contains? message "on input 188"))
+      (assert-true (string-contains? message "must return (188 35344)"))
+      (assert-true (string-contains? message "it returned (188 188)"))
+      (assert-true (string-contains? message "ALL 3 pairs")))
+    ;; A function that gets the first pair right and a later one wrong is
+    ;; named by that later index, not by the first.
+    (let ((message (failure-message
+                     (append (list "mine" "--solution"
+                                   "(lambda(x)(if(equal? x '188)'(188 35344)'nope))")
+                             (v2-args)))))
+      (assert-true (string-contains? message "example 1"))
+      (assert-true (string-contains? message "on input 148"))))
+
+  (test "a constraint violation names the rule and what it says"
+    (let* ((args (append (list "--complexity" %v2-no-digits-complexity)
+                         (v2-args)))
+           ;; The same shape, with and without a digit in the source.
+           (legal "(lambda(s)(list s 'x s))")
+           (illegal "(lambda(s)(list s(if #t 'x 1)s))"))
+      (assert-true (cdr (assq 'ok (run-value (append (list "mine"
+                                                           "--solution"
+                                                           legal)
+                                                     args)))))
+      (let ((message (failure-message (append (list "mine"
+                                                    "--solution"
+                                                    illegal)
+                                              args))))
+        (assert-true (string-contains? message "no-digits"))
+        (assert-true (string-contains? message "no digit (0-9)"))
+        (assert-true (string-contains? message "knowable before you start")))))
+
+  (test "an oversize source names the cap and the byte count"
+    (let* ((padding (let loop ((i 0) (out ""))
+                      (if (>= i 260) out (loop (+ i 1) (string-append out " x")))))
+           (message (failure-message
+                      (append (list "mine"
+                                    "--solution"
+                                    (string-append "(lambda(x)(list x(* x x)"
+                                                   padding
+                                                   "))"))
+                              (v2-args)))))
+      (assert-true (string-contains? message "and the cap is 512 bytes"))
+      (assert-true (string-contains? message "consensus, not policy"))))
+
+  (test "an unparsable solution names the language, not the block"
+    (assert-true (string-contains?
+                   (failure-message (append (list "mine" "--solution"
+                                                  "(lambda(x")
+                                            (v2-args)))
+                   "does not parse as puzzle-lang v2"))))
+
+(test-group "sigilcoin private commitment store"
+  (test "save atomically keeps 0600 and refuses permission drift before mutation"
+    (let* ((data-dir (make-temp-directory))
+           (path (cli-v2-commit-file data-dir))
+           (record
+             (lambda (n)
+               (cli-v2-commit-record
+                 height: 1 complexity: 128
+                 parent: %regtest-genesis-hash
+                 pubkey: (make-bytevector coin-v2-share-pubkey-bytes 2)
+                 blind: (make-bytevector coin-v2-share-blind-bytes n)
+                 commitment: (make-bytevector coin-v2-commitment-bytes n)
+                 solution: %v2-height-1))))
+      (cli-v2-commit-save data-dir (record 1))
+      (cli-v2-commit-save data-dir (record 2))
+      (assert-equal #o600
+                    (bitwise-and (stat-mode (file-stat path)) #o777))
+      (let ((before (read-file-string path)))
+        (assert-equal 0 (process-run "chmod" "0644" path))
+        (let ((message
+                (raises-message
+                  (lambda () (cli-v2-commit-save data-dir (record 3))))))
+          (assert-true (string-contains? message
+                                         "readable by other accounts"))
+          (assert-true (string-contains? message "chmod 0600")))
+        (let ((after (read-file-string path)))
+          (assert-equal before after)
+          (assert-equal (hash256 before) (hash256 after))))))
+
+  (test "commit rejects any height except the validated tip successor"
+    (let* ((args (v2-args))
+           (data-dir (cli-data-dir args))
+           (path (cli-v2-commit-file data-dir)))
+      (wallet-write-private-file path "existing private commitment bytes\n")
+      (let* ((before (read-file-string path))
+             (message
+               (failure-message
+                 (append (list "commit" "--height" "0"
+                               "--solution" %v2-height-1)
+                         args)))
+             (after (read-file-string path)))
+        (assert-true (string-contains? message "commit-expired"))
+        (assert-true (string-contains? message "next block (height 1)"))
+        (assert-equal before after)
+        (assert-equal (hash256 before) (hash256 after))
+        ;; Height rejection happens before key generation or store pruning.
+        (assert-equal #f (file-exists? (wallet-key-file data-dir)))))))
+
+;; ============================================================
 ;; Everything that needs a private key
 ;; ============================================================
 ;;
@@ -1357,6 +1607,310 @@
 
 (if %native-secp256k1?
   (begin
+
+    ;; Fixed key 4 derives an affine personalized puzzle at height 1.
+    ;; Removing safe structural spaces from its reviewed hidden source gives
+    ;; two real under-par candidates, one byte apart.
+    (define %v2-share-key (make-bytevector 32 4))
+    (define %v2-share-anchor
+      "adegchhjknekkndjfbegbehfbkhbaifpcpbaobmhkfjdoeoadaoplflihcbmofflal")
+    (define %v2-share-best
+      (string-append "(lambda(x)(if(equal? x \"@\")\""
+                     %v2-share-anchor "\"(+(* x 4)74)))"))
+    (define %v2-share-worse
+      (string-append "(lambda(x)(if(equal? x \"@\")\""
+                     %v2-share-anchor "\"(+(* x 4) 74)))"))
+    (define %v2-share-tied
+      (string-append "(lambda(y)(if(equal? y \"@\")\""
+                     %v2-share-anchor "\"(+(* y 4)74)))"))
+
+    (define (fixed-share-args)
+      (let* ((args (v2-args))
+             (data-dir (cli-data-dir args)))
+        (wallet-write-private-file
+          (wallet-key-file data-dir)
+          (string-append (hex-encode %v2-share-key) "\n"))
+        args))
+
+    (define (height-one-share-context commits)
+      (coin-v2-coop-context
+        parent-prev-hash: %regtest-genesis-hash
+        puzzle-height: 1
+        complexity: 128
+        spec: (coin-v2-puzzle-for %regtest-genesis-hash 1 128)
+        commits: commits))
+
+    (define (commit-solution args source)
+      (quietly
+        (lambda ()
+          (cli-run (append (list "commit" "--solution" source) args)))))
+
+    (define (decoded-share share-bytes)
+      (let ((decoded (coin-v2-shares-decode
+                       (bytevector-append #u8(1) share-bytes))))
+        (and (coin-ok? decoded) (car (coin-result-value decoded)))))
+
+    (test-group "sigilcoin commit and reveal"
+      (test "puzzle and mine use the wallet-personalized consensus task"
+        (let* ((args (fixed-share-args))
+               (puzzle-text
+                 (run-text (append (list "puzzle" "--share") args)))
+               (result (run (append (list "mine" "--share" "--solution"
+                                          %v2-share-best)
+                                    args)))
+               (score (car result))
+               (mine-text (cdr result)))
+          (assert-true (string-contains? puzzle-text
+                                         "personalized-pubkey:"))
+          (assert-true (string-contains? puzzle-text %v2-share-anchor))
+          (assert-true (string-contains? mine-text "share-eligible: yes"))
+          (assert-true (> (cdr (assq 'quality score)) 0))))
+
+      (test "consensus decodes and verifies the emitted blinded reveal"
+        (let* ((args (fixed-share-args))
+               (data-dir (cli-data-dir args))
+               (record (commit-solution args %v2-share-best))
+               (secret-hex (hex-encode %v2-share-key)))
+          (fast-forward args 1)
+          (let* ((result (run (append (list "reveal" "--height" "1") args)))
+                 (share-bytes (car result))
+                 (text (cdr result))
+                 (share (decoded-share share-bytes))
+                 (context (height-one-share-context
+                            (list (cli-v2-commit-record-commitment record))))
+                 (quality (coin-v2-share-quality context share)))
+            (assert-true (coin-v2-share? share))
+            (assert-equal coin-v2-share-blind-bytes
+                          (bytevector-length (coin-v2-share-blind share)))
+            (assert-equal (+ coin-v2-share-fixed-bytes
+                             (string-length %v2-share-best))
+                          (bytevector-length share-bytes))
+            (assert-equal (cli-v2-commit-record-commitment record)
+                          (coin-v2-share-commitment context share))
+            (assert-true (coin-v2-share-signature-ok? context share))
+            (assert-true (coin-ok?
+                           (coin-v2-check-share-solution context share)))
+            (assert-true (<= 1 quality 4))
+            (assert-true (string-contains?
+                           text (string-append "quality: "
+                                               (number->string quality))))
+            (assert-true (not (string-contains? text "blind:")))
+            (assert-true (not (string-contains? text secret-hex))))))
+
+      (test "recommit keeps the first candidate and exact save is idempotent"
+        (let* ((args (fixed-share-args))
+               (data-dir (cli-data-dir args))
+               (first (commit-solution args %v2-share-worse))
+               (again (cli-v2-commit-save data-dir first))
+               (second (commit-solution args %v2-share-best))
+               (records (cli-v2-commit-records data-dir)))
+          (assert-equal (cli-v2-commit-record-commitment first)
+                        (cli-v2-commit-record-commitment again))
+          (assert-equal 2 (length records))
+          (assert-true (member (cli-v2-commit-record-commitment first)
+                               (map cli-v2-commit-record-commitment records)))
+          (assert-true (member (cli-v2-commit-record-commitment second)
+                               (map cli-v2-commit-record-commitment records)))))
+
+      (test "permission drift refuses recommit without changing store bytes"
+        (let* ((args (fixed-share-args))
+               (data-dir (cli-data-dir args))
+               (path (cli-v2-commit-file data-dir))
+               (first (commit-solution args %v2-share-worse))
+               (before (read-file-string path))
+               (before-hash (hash256 before)))
+          (assert-true (cli-v2-commit-record? first))
+          (assert-equal 0 (process-run "chmod" "0644" path))
+          (let ((message
+                  (failure-message
+                    (append (list "commit" "--solution" %v2-share-best)
+                            args))))
+            (assert-true (string-contains? message
+                                           "readable by other accounts"))
+            (assert-true (string-contains? message "chmod 0600")))
+          (let ((after (read-file-string path)))
+            (assert-equal before after)
+            (assert-equal before-hash (hash256 after)))))
+
+      (test "expired commit height is refused without pruning the store"
+        (let* ((args (fixed-share-args))
+               (data-dir (cli-data-dir args))
+               (path (cli-v2-commit-file data-dir)))
+          (commit-solution args %v2-share-best)
+          (fast-forward args 2)
+          (let* ((before (read-file-string path))
+                 (before-hash (hash256 before))
+                 (message
+                   (failure-message
+                     (append (list "commit" "--height" "1"
+                                   "--solution" %v2-share-worse)
+                             args)))
+                 (after (read-file-string path)))
+            (assert-true (string-contains? message "commit-expired"))
+            (assert-true (string-contains? message "next block (height 3)"))
+            (assert-equal before after)
+            (assert-equal before-hash (hash256 after)))))
+
+      (test "default picks best score while --commitment picks explicitly"
+        (let* ((args (fixed-share-args))
+               (worse (commit-solution args %v2-share-worse))
+               (best (commit-solution args %v2-share-best)))
+          (fast-forward args 1)
+          (let* ((default-share
+                   (decoded-share
+                     (run-value (append (list "reveal" "--height" "1")
+                                        args))))
+                 (context (height-one-share-context
+                            (map cli-v2-commit-record-commitment
+                                 (list worse best)))))
+            (assert-equal (cli-v2-commit-record-commitment best)
+                          (coin-v2-share-commitment context default-share))
+            (let ((explicit-share
+                    (decoded-share
+                      (run-value
+                        (append
+                          (list "reveal" "--height" "1"
+                                "--commitment"
+                                (hex-encode
+                                  (cli-v2-commit-record-commitment worse)))
+                          args)))))
+              (assert-equal (cli-v2-commit-record-commitment worse)
+                            (coin-v2-share-commitment context
+                                                      explicit-share))))))
+
+      (test "equal scores break deterministically on commitment bytes"
+        (let* ((args (fixed-share-args))
+               (a (commit-solution args %v2-share-best))
+               (b (commit-solution args %v2-share-tied))
+               (expected
+                 (if (cli-v2-bytes<?
+                       (cli-v2-commit-record-commitment a)
+                       (cli-v2-commit-record-commitment b))
+                     a b)))
+          (fast-forward args 1)
+          (let* ((share (decoded-share
+                          (run-value
+                            (append (list "reveal" "--height" "1") args))))
+                 (context (height-one-share-context
+                            (map cli-v2-commit-record-commitment (list a b)))))
+            (assert-equal (cli-v2-commit-record-commitment expected)
+                          (coin-v2-share-commitment context share)))))
+
+      (test "missing expired and invalid commitments are refused"
+        (let ((missing (fixed-share-args)))
+          (fast-forward missing 1)
+          (assert-true
+            (string-contains?
+              (failure-message
+                (append (list "reveal" "--height" "1") missing))
+              "nothing was committed"))
+          (assert-true
+            (string-contains?
+              (failure-message
+                (append (list "reveal" "--height" "1"
+                              "--commitment" "00") missing))
+              "exactly 32 bytes")))
+        (let* ((expired (fixed-share-args))
+               (data-dir (cli-data-dir expired)))
+          (commit-solution expired %v2-share-best)
+          (fast-forward expired 2)
+          (assert-true
+            (string-contains?
+              (failure-message
+                (append (list "reveal" "--height" "1") expired))
+              "expired"))
+          (assert-equal '() (cli-v2-commit-records data-dir)))
+        (let* ((invalid (fixed-share-args))
+               (data-dir (cli-data-dir invalid))
+               (good (commit-solution invalid %v2-share-best))
+               (bad (cli-v2-commit-record
+                      height: 1 complexity: 128
+                      parent: %regtest-genesis-hash
+                      pubkey: (wallet-public-key %v2-share-key)
+                      blind: (make-bytevector 32 9)
+                      commitment: (make-bytevector 32 0)
+                      solution: %v2-share-best)))
+          ;; Keep only malformed record so default cannot fall back to good.
+          (wallet-write-private-file (cli-v2-commit-file data-dir) "")
+          (cli-v2-commit-save data-dir bad)
+          (fast-forward invalid 1)
+          (assert-true
+            (string-contains?
+              (failure-message
+                (append (list "reveal" "--height" "1") invalid))
+              "invalid"))))
+
+      (test "one slot set is capped at the sixteen protocol commitments"
+        (let* ((args (fixed-share-args))
+               (data-dir (cli-data-dir args))
+               (pubkey (wallet-public-key %v2-share-key))
+               (preimage (coin-v2-share-preimage
+                           %regtest-genesis-hash 1 128
+                           %v2-share-best pubkey)))
+          (let loop ((n 1))
+            (when (<= n coin-v2-max-commitments)
+              (let* ((blind (make-bytevector 32 n))
+                     (commitment (coin-v2-commitment preimage blind)))
+                (cli-v2-commit-save
+                  data-dir
+                  (cli-v2-commit-record
+                    height: 1 complexity: 128
+                    parent: %regtest-genesis-hash pubkey: pubkey
+                    blind: blind commitment: commitment
+                    solution: %v2-share-best))
+                (loop (+ n 1)))))
+          (assert-equal coin-v2-max-commitments
+                        (length (cli-v2-commit-records data-dir)))
+          (let* ((blind (make-bytevector 32 99))
+                 (overflow (cli-v2-commit-record
+                             height: 1 complexity: 128
+                             parent: %regtest-genesis-hash pubkey: pubkey
+                             blind: blind
+                             commitment: (coin-v2-commitment preimage blind)
+                             solution: %v2-share-best)))
+            (assert-true
+              (string-contains?
+                (raises-message
+                  (lambda () (cli-v2-commit-save data-dir overflow)))
+                "sixteen")))))
+
+      (test "the private store leaves the data directory traversable"
+        (let* ((args (fixed-share-args))
+               (data-dir (cli-data-dir args)))
+          (assert-equal 0 (process-run "chmod" "0750" data-dir))
+          (commit-solution args %v2-share-best)
+          (commit-solution args %v2-share-worse)
+          (assert-equal #o600
+                        (bitwise-and
+                          (stat-mode
+                            (file-stat (cli-v2-commit-file data-dir)))
+                          #o777))
+          (assert-equal #o700
+                        (bitwise-and
+                          (stat-mode
+                            (file-stat (path-join data-dir "wallet")))
+                          #o777))
+          (assert-equal #o750
+                        (bitwise-and (stat-mode (file-stat data-dir))
+                                     #o777))))
+
+      (test "commitment preimages bind branch height complexity and key"
+        (let* ((pubkey (wallet-public-key %v2-share-key))
+               (base (coin-v2-share-preimage %regtest-genesis-hash 1 128
+                                              %v2-share-best pubkey)))
+          (assert-equal 32 (bytevector-length base))
+          (assert-true
+            (not (equal? base
+                         (coin-v2-share-preimage %regtest-genesis-hash 2 128
+                                                 %v2-share-best pubkey))))
+          (assert-true
+            (not (equal? base
+                         (coin-v2-share-preimage %regtest-genesis-hash 1 129
+                                                 %v2-share-best pubkey))))
+          (assert-true
+            (not (equal? base
+                         (coin-v2-share-preimage (make-bytevector 32 7) 1 128
+                                                 %v2-share-best pubkey)))))))
 
     (test-group "sigilcoin wallet addresses"
       (test "the wallet's address is derived from its own key"
