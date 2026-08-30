@@ -129,8 +129,8 @@
     ;;; Maximum program-by-example solution source size, in bytes.
     ;;;
     ;;; v2 solutions are functions, so the liveness escape is a `k`-branch
-    ;;; lookup table (see `(sigil coin puzzle examples)`), which does not fit
-    ;;; 256 bytes at `k = 10`. Only `puzzle-run-examples` and
+    ;;; lookup table (see `(sigil coin puzzle examples)`). Its exact `k = 8`
+    ;;; personalized bound is 458 bytes. Only `puzzle-run-examples` and
     ;;; `puzzle-parse/limit` honour this cap; the v1 entry points keep
     ;;; `puzzle-max-source-bytes`, so nothing about v1 moves.
     (define puzzle-v2-max-source-bytes 512)

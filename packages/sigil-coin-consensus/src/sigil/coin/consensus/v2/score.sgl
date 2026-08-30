@@ -1,11 +1,11 @@
 ;;; (sigil coin consensus v2 score) — the 32-bit composite score word
 ;;;
-;;; v2 ranks siblings by the tuple `(L, MB, SB, 8-R)` in that order, and
+;;; v2 ranks siblings by the tuple `(L, MB, SB, 15-Q)` in that order, and
 ;;; packs the whole tuple into the header's `nonce`:
 ;;;
 ;;;   bit  31              22 21     15 14      8 7    4 3    0
 ;;;       +------------------+---------+---------+------+------+
-;;;       |      L - 1       |   MB    |   SB    | 8-R  | 0000 |
+;;;       |      L - 1       |   MB    |   SB    |15-Q  | 0000 |
 ;;;       +------------------+---------+---------+------+------+
 ;;;          10 bits           7 bits    7 bits   4 bits 4 bits
 ;;;
@@ -13,29 +13,28 @@
 ;;;       fits ten bits
 ;;;   MB  bucket of the cells the producer's solution charged
 ;;;   SB  bucket of the steps it spent
-;;;   R   accepted revealed shares, 0..8, stored as `8-R` so that MORE
-;;;       shares is a LOWER word
+;;;   Q   aggregate verified share quality, 0..15, stored as `15-Q` so
+;;;       that more aggregate personalized work is a LOWER word
 ;;;
 ;;; WHY UNSIGNED `<` IS THE RANKING ORDER. The fields are laid out
 ;;; most-significant-first in ranking priority, each in a fixed-width slot
 ;;; that its domain cannot overflow: `L-1` in 0..511 fits 10 bits, both
-;;; buckets in 0..127 fit 7, and `8-R` in 0..8 fits 4. A packing of
+;;; buckets in 0..127 fit 7, and `15-Q` in 0..15 fits 4. A packing of
 ;;; disjoint fixed-width fields is exactly the base-2^width positional
 ;;; numeral of the tuple, and comparison of positional numerals of equal
 ;;; width IS lexicographic comparison of their digit sequences. So
-;;; `W(a) < W(b)` iff `(L,MB,SB,8-R)(a) < (...)(b)` lexicographically, with
+;;; `W(a) < W(b)` iff `(L,MB,SB,15-Q)(a) < (...)(b)` lexicographically, with
 ;;; no case analysis anywhere on the hot path. The low nibble is reserved
 ;;; zero: it makes every field derived from the block body, so the header
 ;;; carries no free entropy and there is no nonce to grind.
 ;;;
-;;; Share count is last on purpose. It must break ties without ever
-;;; outranking a genuinely better program, so it occupies strictly
-;;; lower-order bits than every producer field: it decides exactly the
-;;; comparisons the producer's own solution leaves tied, and nothing else.
+;;; Aggregate verified quality is last on purpose. It breaks ties without
+;;; ever outranking a genuinely better producer program, so it occupies
+;;; strictly lower-order bits than every producer field.
 ;;;
 ;;; THE BUCKETED VALUE IS THE CONSENSUS VALUE. Fork choice compares header
 ;;; words and never body integers, so two solutions in one bucket are
-;;; exactly tied and fall through to share count. Precision loss is
+;;; exactly tied and fall through to aggregate quality. Precision loss is
 ;;; deliberate: there is no second, finer order to keep consistent with.
 ;;;
 ;;; The bucketing is integer-only — six buckets per octave, ~12.2%
@@ -58,6 +57,7 @@
     coin-v2-score-length
     coin-v2-score-memory
     coin-v2-score-steps
+    coin-v2-score-quality
     coin-v2-score-shares
     coin-v2-score-encode
     coin-v2-score-pack
@@ -130,7 +130,7 @@
     (define %length-shift 22)
     (define %memory-shift 15)
     (define %steps-shift 8)
-    (define %shares-shift 4)
+    (define %quality-shift 4)
     (define %length-mask #x3ff)
     (define %bucket-mask #x7f)
     (define %nibble-mask #xf)
@@ -143,8 +143,8 @@
     ;;;
     ;;; `length` is the producer's solution length in bytes, `memory` and
     ;;; `steps` are BUCKET indices rather than raw counts — the raw numbers
-    ;;; are not recoverable and are not consensus — and `shares` is the
-    ;;; accepted reveal count `R`, decoded back from the stored `8-R`.
+    ;;; are not recoverable and are not consensus — and `quality` is `Q`,
+    ;;; decoded back from the stored `15-Q`.
     ;;;
     ;;; ```scheme
     ;;; (coin-v2-score-length (coin-v2-score-decode
@@ -155,7 +155,12 @@
       (length)
       (memory)
       (steps)
-      (shares))
+      (quality))
+
+    ;; Compatibility accessor for callers not yet renamed. Low field is Q,
+    ;; never raw share count.
+    (define (coin-v2-score-shares score)
+      (coin-v2-score-quality score))
 
     (define (require-range who what x lo hi)
       (if (not (and (number? x) (exact? x) (integer? x)
@@ -166,15 +171,15 @@
     ;;; Pack already-bucketed fields into a score word.
     ;;;
     ;;; `length` is 1..512, `memory` and `steps` are bucket indices 0..127,
-    ;;; and `shares` is `R` in 0..8. Raises on anything outside those
+    ;;; and `quality` is `Q` in 0..15. Raises on anything outside those
     ;;; domains: every caller packs values it has already validated, so an
     ;;; out-of-range field is a node bug and must not be mistaken for a bad
     ;;; block. Use `coin-v2-score-check` for words that came off the wire.
     ;;;
     ;;; ```scheme
-    ;;; (coin-v2-score-pack 1 0 0 8) ; => 0
+    ;;; (coin-v2-score-pack 1 0 0 15) ; => 0
     ;;; ```
-    (define (coin-v2-score-pack length memory steps shares)
+    (define (coin-v2-score-pack length memory steps quality)
       (: integer? integer? integer? integer? -> integer?)
       (require-range "coin-v2-score-pack" "length" length
                      1 coin-v2-max-solution-bytes)
@@ -182,13 +187,12 @@
                      0 coin-v2-max-bucket)
       (require-range "coin-v2-score-pack" "step bucket" steps
                      0 coin-v2-max-bucket)
-      (require-range "coin-v2-score-pack" "share count" shares
-                     0 coin-v2-max-shares)
+      (require-range "coin-v2-score-pack" "aggregate quality" quality 0 15)
       (bitwise-ior
         (arithmetic-shift (- length 1) %length-shift)
         (arithmetic-shift memory %memory-shift)
         (arithmetic-shift steps %steps-shift)
-        (arithmetic-shift (- coin-v2-max-shares shares) %shares-shift)))
+        (arithmetic-shift (- 15 quality) %quality-shift)))
 
     ;;; Compute the score word from a validated body.
     ;;;
@@ -197,21 +201,21 @@
     ;;; bucketed here, and only the buckets reach the header.
     ;;;
     ;;; ```scheme
-    ;;; (coin-v2-score-shares (coin-v2-score-decode
-    ;;;                         (coin-v2-score-encode 40 80 300 3)))
-    ;;; ; => 3
+    ;;; (coin-v2-score-quality (coin-v2-score-decode
+    ;;;                          (coin-v2-score-encode 40 80 300 12)))
+    ;;; ; => 12
     ;;; ```
-    (define (coin-v2-score-encode length cells steps shares)
+    (define (coin-v2-score-encode length cells steps quality)
       (: integer? integer? integer? integer? -> integer?)
       (require-count "coin-v2-score-encode" cells)
       (require-count "coin-v2-score-encode" steps)
       (coin-v2-score-pack length
                           (coin-v2-bucket7 cells)
                           (coin-v2-bucket7 steps)
-                          shares))
+                          quality))
 
     ;;; True when `w` is a legal score word: a 32-bit unsigned integer whose
-    ;;; low nibble is zero and whose `8-R` field is at most 8.
+    ;;; low nibble is zero. Every 4-bit `15-Q` value is legal.
     ;;;
     ;;; ```scheme
     ;;; (coin-v2-score-valid? (coin-v2-score-pack 1 0 0 0)) ; => #t
@@ -221,10 +225,7 @@
       (: any? -> boolean?)
       (and (number? w) (exact? w) (integer? w)
            (<= 0 w) (< w coin-v2-max-score-word)
-           (= 0 (bitwise-and w %nibble-mask))
-           (<= (bitwise-and (arithmetic-shift w (- %shares-shift))
-                            %nibble-mask)
-               coin-v2-max-shares)))
+           (= 0 (bitwise-and w %nibble-mask))))
 
     ;;; Unpack a legal score word.
     ;;;
@@ -247,17 +248,16 @@
                              %bucket-mask)
         steps: (bitwise-and (arithmetic-shift w (- %steps-shift))
                             %bucket-mask)
-        shares: (- coin-v2-max-shares
-                   (bitwise-and (arithmetic-shift w (- %shares-shift))
-                                %nibble-mask))))
+        quality: (- 15
+                    (bitwise-and (arithmetic-shift w (- %quality-shift))
+                                 %nibble-mask))))
 
     ;;; Check a score word read out of a header.
     ;;;
     ;;; Total: never raises, whatever the header carries. Rejection reasons
     ;;; are `malformed-header` (not a 32-bit unsigned integer at all),
-    ;;; `score-reserved-nonzero` (the low nibble is not zero) and
-    ;;; `score-share-count` (the `8-R` field is 9..15, so `R` would be
-    ;;; negative). On success the value is the decoded `coin-v2-score`.
+    ;;; `score-reserved-nonzero` (the low nibble is not zero). On success
+    ;;; the value is the decoded `coin-v2-score`.
     ;;;
     ;;; This is a header-level field-range check only. Whether the word
     ;;; describes the block it rides in is `score-mismatch`, and is decided
@@ -277,9 +277,6 @@
         ((not (= 0 (bitwise-and w %nibble-mask)))
          (coin-error 'score-reserved-nonzero
                      "the reserved low nibble is not zero"))
-        ((> (bitwise-and (arithmetic-shift w (- %shares-shift)) %nibble-mask)
-            coin-v2-max-shares)
-         (coin-error 'score-share-count "the share field exceeds eight"))
         (else (coin-ok (coin-v2-score-decode w)))))
 
     ;; ============================================================
@@ -289,12 +286,12 @@
     ;;; Rank two score words. Lower is better.
     ;;;
     ;;; Returns -1 when `a` is the better block, 1 when `b` is, and 0 when
-    ;;; the two are incomparable — same length, same buckets, same share
-    ;;; count — in which case fork choice keeps the incumbent tip.
+    ;;; the two are incomparable — same length, same buckets, same aggregate
+    ;;; quality — in which case fork choice keeps the incumbent tip.
     ;;;
     ;;; This is plain unsigned comparison, which is the whole point of the
     ;;; packing: see the module header for why it equals the lexicographic
-    ;;; order on `(L, MB, SB, 8-R)`.
+    ;;; order on `(L, MB, SB, 15-Q)`.
     ;;;
     ;;; ```scheme
     ;;; (coin-v2-score-compare (coin-v2-score-pack 24 0 0 0)

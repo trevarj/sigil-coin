@@ -62,6 +62,9 @@
     puzzle-complexity-genesis
     puzzle-max-k
     puzzle-production-count
+    pbe-anchor-input
+    pbe-anchor-output-bytes
+    pbe-anchor-output?
 
     ;; Derived complexity knobs
     puzzle-complexity-tier
@@ -83,10 +86,14 @@
 
     ;; Generation
     pbe-for
+    pbe-for/constraint
+    pbe-for/constraint/anchor
     pbe-attempt
     pbe-attempt/constraint
     pbe-constraint-for
     pbe-fallback
+    pbe-fallback/constraint
+    pbe-fallback/constraint/anchor
     pbe-compose
     pbe-table-solution
     pbe-quote-free-expression
@@ -130,13 +137,31 @@
     ;;; Largest canonical literal, in bytes, an example input may print to.
     (define puzzle-max-input-literal-bytes 8)
 
-    ;;; Largest canonical literal, in bytes, an example output may print to.
-    ;;;
-    ;;; With the input cap this is what sizes the table solution: at `k = 10`
-    ;;; the table is `11 + 9 * (18 + 8 + 24) + 25 = 486` bytes against a
-    ;;; 512-byte cap. The generator measures the real string rather than
-    ;;; trusting that sum.
+    ;;; Largest canonical literal, in bytes, an ordinary example output may
+    ;;; print to. A personalized puzzle's final key anchor is separately fixed
+    ;;; at `pbe-anchor-output-bytes` and printed self-evaluating.
     (define puzzle-max-output-literal-bytes 24)
+
+    ;;; Reserved input shared by every personalized puzzle.
+    ;;;
+    ;;; `"@"` is compact, digit-free and self-evaluating. Ordinary generation
+    ;;; rejects it, so its meaning is exclusively the exact key anchor.
+    (define pbe-anchor-input "@")
+
+    ;;; Characters in the injective `a`..`p` encoding of a 33-byte pubkey.
+    (define pbe-anchor-output-bytes 66)
+
+    ;;; True only for a full compressed-pubkey nibble string.
+    (define (pbe-anchor-output? value)
+      (: any? -> boolean?)
+      (and (string? value)
+           (= (string-length value) pbe-anchor-output-bytes)
+           (let loop ((i 0))
+             (or (= i pbe-anchor-output-bytes)
+                 (let ((c (char->integer (string-ref value i))))
+                   (and (<= (char->integer #\a) c)
+                        (<= c (char->integer #\p))
+                        (loop (+ i 1))))))))
 
     ;;; Floor of the complexity parameter `C`.
     (define puzzle-complexity-min 16)
@@ -191,8 +216,10 @@
     ;;; The ceiling is 8 and not 10 because 10 does not fit. Measured at the
     ;;; literal caps, the table runs 515 bytes under the `letrec` repair and
     ;;; 510 under `fold`, against a 512-byte limit: one is already infeasible
-    ;;; and the other leaves two bytes. At `k = 8` the worst case is 415
-    ;;; bytes, 97 spare. The generator would reject an oversized table rather
+    ;;; and the other leaves two bytes. At `k = 8` the global worst case is
+    ;;; 415 bytes; a personalized table's 66-character full-key anchor raises
+    ;;; its exact bound to 458 bytes, leaving 54 spare. The generator rejects
+    ;;; an oversized table rather
     ;;; than publish an unsolvable puzzle, so the old ceiling did not risk a
     ;;; stall -- it risked burning retries at high complexity and leaving the
     ;;; scheme with no margin for another repair wrapper.
@@ -518,12 +545,24 @@
             (and expr (puzzle-print-expression expr)))
           (string-append "'" (puzzle-print-value value))))
 
+    (define (anchor-input? value)
+      (and (string? value) (string=? value pbe-anchor-input)))
+
+    (define (anchor-pair? pair)
+      (and (pair? pair)
+           (anchor-input? (car pair))
+           (pbe-anchor-output? (cdr pair))))
+
     ;; The if-chain, tightest legal spelling: `k` pairs produce `k - 1`
-    ;; tests, because the last output is the default branch.
+    ;; tests, because the last output is the default branch. Personalized
+    ;; puzzles put their anchor last, where its string output needs no quote.
     (define (table-body pairs quote-free?)
       (cond
         ((null? pairs) #f)
-        ((null? (cdr pairs)) (render-literal (cdr (car pairs)) quote-free?))
+        ((null? (cdr pairs))
+         (if (anchor-pair? (car pairs))
+             (puzzle-print-value (cdr (car pairs)))
+             (render-literal (cdr (car pairs)) quote-free?)))
         (else
           (let ((input (render-literal (car (car pairs)) quote-free?))
                 (output (render-literal (cdr (car pairs)) quote-free?))
@@ -591,6 +630,17 @@
           (let ((text (render-literal value #t)))
             (and text (string-length text)))
           (literal-size value)))
+
+    ;; An anchor, when present, occurs exactly once as the final pair. This
+    ;; reserves the input from every ordinary generated example.
+    (define (valid-anchor-layout? pairs)
+      (let loop ((ps pairs))
+        (cond
+          ((null? ps) #t)
+          ((not (pair? (car ps))) #f)
+          ((anchor-input? (car (car ps)))
+           (and (null? (cdr ps)) (anchor-pair? (car ps))))
+          (else (loop (cdr ps))))))
 
     ;; Do all `k` outputs collapse to one value? Then the constant function
     ;; wins the height instantly.
@@ -670,6 +720,7 @@
             (quote-free? (= ci 2)))
         (cond
           ((not (= k (length pairs))) 'k-mismatch)
+          ((not (valid-anchor-layout? pairs)) 'anchor-invalid)
           ;; Input and output literals, in the spelling the table will use.
           ;; Both sides go through `measured-size`, so both are counted in the
           ;; quote-free spelling under `ci 2`. Today that spelling matches the
@@ -692,10 +743,13 @@
            'output-invalid)
           ((not (every-pair? pairs
                              (lambda (input output)
-                               (let ((size (measured-size output quote-free?)))
-                                 (or (not size)
-                                     (<= size
-                                         puzzle-max-output-literal-bytes))))))
+                               (if (anchor-input? input)
+                                   (pbe-anchor-output? output)
+                                   (let ((size (measured-size output
+                                                              quote-free?)))
+                                     (or (not size)
+                                         (<= size
+                                             puzzle-max-output-literal-bytes)))))))
            'output-oversize)
           ((all-equal-outputs? pairs) 'constant-outputs)
           ((builtin-solves? pairs budget) 'builtin-trivial)
@@ -802,6 +856,10 @@
                         (loop (cdr xs)
                               (cons (cons (car xs) value) acc)))))))))
 
+    (define (anchor-body body output)
+      (string-append "(if(equal? x " (puzzle-print-value pbe-anchor-input)
+                     ")" (puzzle-print-value output) body ")"))
+
     ;;; Run one generation attempt against an explicit constraint.
     ;;;
     ;;; Returns a `pbe-spec`, or the symbol naming the check that rejected
@@ -812,13 +870,16 @@
     ;;; ```scheme
     ;;; (pbe-spec? (pbe-attempt/constraint seed 1 128 0 0)) ; => #t
     ;;; ```
-    (define (pbe-attempt/constraint seed height complexity ci retry)
-      (: bytevector? integer? integer? integer? integer? -> any?)
+    (define (pbe-attempt/constraint* seed height complexity ci retry
+                                     anchor-output)
       (check-generator-inputs seed height retry)
       (check-complexity complexity)
+      (if (and anchor-output (not (pbe-anchor-output? anchor-output)))
+          (error "puzzle examples: malformed anchor output"))
       (let* ((tier (puzzle-complexity-tier complexity))
              (d (puzzle-constraint-builtin-cap tier))
              (k (puzzle-complexity-k complexity))
+             (ordinary-k (if anchor-output (- k 1) k))
              (width (puzzle-complexity-width complexity))
              (budget (pbe-budget-open))
              (g (puzzle-prng-open seed height retry))
@@ -832,8 +893,11 @@
                                      (production-kinds entry)
                                      (kinds-for-constraint ci))))
                    (body ((production-builder entry) g))
+                   (body-source (puzzle-print-expression body))
                    (hidden (puzzle-constraint-wrap
-                             ci (puzzle-print-expression body)))
+                             ci (if anchor-output
+                                    (anchor-body body-source anchor-output)
+                                    body-source)))
                    (parsed (puzzle-parse/limit hidden
                                                puzzle-v2-max-source-bytes)))
               (cond
@@ -844,16 +908,33 @@
                                              (puzzle-result-value parsed) d))
                  'constraint-violated)
                 (else
-                  (let ((inputs (draw-inputs g kind ci k)))
-                    (if (not inputs)
-                        'inputs-exhausted
-                        (let ((pairs (hidden-outputs
-                                       (puzzle-result-value parsed)
-                                       inputs budget)))
+                  (let ((ordinary-inputs
+                          (draw-inputs g kind ci ordinary-k)))
+                    (cond
+                      ((not ordinary-inputs) 'inputs-exhausted)
+                      ((member pbe-anchor-input ordinary-inputs)
+                       'reserved-input)
+                      (else
+                        (let* ((inputs (if anchor-output
+                                           (append ordinary-inputs
+                                                   (list pbe-anchor-input))
+                                           ordinary-inputs))
+                               (pairs (hidden-outputs
+                                        (puzzle-result-value parsed)
+                                        inputs budget)))
                           (if (symbol? pairs)
                               pairs
                               (pbe-compose height complexity ci pairs hidden
-                                           retry budget)))))))))))
+                                           retry budget))))))))))))
+
+    (define (pbe-attempt/constraint seed height complexity ci retry)
+      (: bytevector? integer? integer? integer? integer? -> any?)
+      (pbe-attempt/constraint* seed height complexity ci retry #f))
+
+    (define (pbe-attempt/constraint/anchor seed height complexity ci retry
+                                           anchor-output)
+      (: bytevector? integer? integer? integer? integer? string? -> any?)
+      (pbe-attempt/constraint* seed height complexity ci retry anchor-output))
 
     ;;; Run one generation attempt for a height.
     ;;;
@@ -873,6 +954,19 @@
     (define %fallback-body "(list x (* x x))")
 
     (define %fallback-inputs '(3 5 8 11 14 17 20 23 26 29))
+
+    ;; Explicit-constraint generation needs a fallback that keeps that
+    ;; constraint. This body is total on every input domain and long enough
+    ;; to clear the par floor after every repair wrapper.
+    (define %constraint-fallback-body "(list x (list x))")
+
+    (define (constraint-fallback-inputs seed height ci k)
+      (draw-from-pool
+        (puzzle-prng-open seed height puzzle-max-generator-retries)
+        (cond ((= ci 1) %symbol-pool)
+              ((or (= ci 2) (= ci 6)) %small-integer-pool)
+              (else %fallback-inputs))
+        k))
 
     ;;; The fallback puzzle, used only when every attempt is rejected.
     ;;;
@@ -904,6 +998,104 @@
             (if (not (pbe-spec? spec))
                 (error "puzzle examples: the fallback puzzle fails a check"))
             spec))))
+
+    ;;; The fallback for bounded explicit-constraint generation.
+    ;;;
+    ;;; Unlike `pbe-fallback`, this preserves `ci`. Both the repaired hidden
+    ;;; function and its table solution are verified by `pbe-compose`, so
+    ;;; every personalized puzzle retains the public liveness escape.
+    ;;;
+    ;;; ```scheme
+    ;;; (pbe-spec-constraint
+    ;;;   (pbe-fallback/constraint seed 3 4095 7)) ; => 7
+    ;;; ```
+    (define (pbe-fallback/constraint* seed height complexity ci anchor-output)
+      (check-generator-inputs seed height 0)
+      (check-complexity complexity)
+      (puzzle-constraint-name ci)
+      (if (and anchor-output (not (pbe-anchor-output? anchor-output)))
+          (error "puzzle examples: malformed anchor output"))
+      (let* ((budget (pbe-budget-open))
+             (body (if anchor-output
+                       (anchor-body %constraint-fallback-body anchor-output)
+                       %constraint-fallback-body))
+             (hidden (puzzle-constraint-wrap ci body))
+             (parsed (puzzle-parse/limit hidden puzzle-v2-max-source-bytes)))
+        (if (not (puzzle-ok? parsed))
+            (error "puzzle examples: the constrained fallback source does not parse"))
+        (let* ((k (puzzle-complexity-k complexity))
+               (ordinary-k (if anchor-output (- k 1) k))
+               (ordinary-inputs
+                 (constraint-fallback-inputs seed height ci ordinary-k))
+               (inputs (if anchor-output
+                           (append ordinary-inputs (list pbe-anchor-input))
+                           ordinary-inputs))
+               (pairs (hidden-outputs (puzzle-result-value parsed)
+                                      inputs budget)))
+          (if (or (member pbe-anchor-input ordinary-inputs) (symbol? pairs))
+              (error "puzzle examples: the constrained fallback function does not run"))
+          (let ((spec (pbe-compose height complexity ci pairs hidden
+                                   puzzle-max-generator-retries budget)))
+            (if (not (pbe-spec? spec))
+                (error (string-append
+                         "puzzle examples: the constrained fallback failed: "
+                         (symbol->string spec))))
+            spec))))
+
+    (define (pbe-fallback/constraint seed height complexity ci)
+      (: bytevector? integer? integer? integer? -> pbe-spec?)
+      (pbe-fallback/constraint* seed height complexity ci #f))
+
+    ;;; Verified fallback for a personalized puzzle, preserving its anchor.
+    (define (pbe-fallback/constraint/anchor seed height complexity ci
+                                            anchor-output)
+      (: bytevector? integer? integer? integer? string? -> pbe-spec?)
+      (pbe-fallback/constraint* seed height complexity ci anchor-output))
+
+    ;;; Generate a bounded puzzle while preserving an explicit constraint.
+    ;;;
+    ;;; This is the public entry point for personalized tasks. It uses the
+    ;;; same 64-attempt bound as global generation, then a verified fallback
+    ;;; carrying `ci` instead of silently changing the day's rule.
+    ;;;
+    ;;; ```scheme
+    ;;; (pbe-spec-constraint (pbe-for/constraint seed 1 128 0)) ; => 0
+    ;;; ```
+    (define (pbe-for/constraint seed height complexity ci)
+      (: bytevector? integer? integer? integer? -> pbe-spec?)
+      (check-generator-inputs seed height 0)
+      (check-complexity complexity)
+      (puzzle-constraint-name ci)
+      (let loop ((retry 0))
+        (if (>= retry puzzle-max-generator-retries)
+            (pbe-fallback/constraint seed height complexity ci)
+            (let ((spec (pbe-attempt/constraint seed height complexity ci
+                                                retry)))
+              (if (pbe-spec? spec)
+                  spec
+                  (loop (+ retry 1)))))))
+
+    ;;; Generate a personalized puzzle with one exact final anchor pair.
+    ;;;
+    ;;; `k` remains the total pair count: generation draws `k - 1` ordinary
+    ;;; inputs and appends `("@" . anchor-output)`. Every accepted hidden
+    ;;; source and fallback table is constructed and run against that pair.
+    (define (pbe-for/constraint/anchor seed height complexity ci anchor-output)
+      (: bytevector? integer? integer? integer? string? -> pbe-spec?)
+      (check-generator-inputs seed height 0)
+      (check-complexity complexity)
+      (puzzle-constraint-name ci)
+      (if (not (pbe-anchor-output? anchor-output))
+          (error "puzzle examples: malformed anchor output"))
+      (let loop ((retry 0))
+        (if (>= retry puzzle-max-generator-retries)
+            (pbe-fallback/constraint/anchor seed height complexity ci
+                                            anchor-output)
+            (let ((spec (pbe-attempt/constraint/anchor
+                          seed height complexity ci retry anchor-output)))
+              (if (pbe-spec? spec)
+                  spec
+                  (loop (+ retry 1)))))))
 
     ;;; Generate the program-by-example puzzle for a seed, height and
     ;;; complexity.

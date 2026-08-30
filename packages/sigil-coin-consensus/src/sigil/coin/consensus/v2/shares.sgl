@@ -3,8 +3,8 @@
 ;;; A block's producer solves puzzle `H` alone, but he is not the only
 ;;; miner who solved it. §6 lets up to eight other miners publish their own
 ;;; solutions to the PREVIOUS puzzle as signed "shares" inside his coinbase,
-;;; and pays them for it. Two things fall out: a losing solver is paid
-;;; instead of discarding his work, and the block's share count `R` breaks
+;;; and pays them for it. A losing solver is paid instead of discarding work,
+;;; while aggregate quality `Q` from verified personalized tasks breaks
 ;;; fork-choice ties that the producer's own solution leaves (§5.3).
 ;;;
 ;;; THE PIPELINE (§7.2). Puzzle `H` is not knowable until block `H-1`
@@ -73,6 +73,7 @@
           (sigil coin puzzle examples)
           (sigil coin consensus result)
           (sigil coin consensus v2 rules)
+          (sigil coin consensus v2 seed)
           (sigil coin consensus v2 solution))
   (export
     ;; Wire sizes
@@ -89,7 +90,12 @@
 
     ;; Preimages
     coin-v2-share-tag
+    coin-v2-share-puzzle-tag
     coin-v2-commit-tag
+    coin-v2-share-puzzle-seed
+    coin-v2-pubkey-anchor-output
+    coin-v2-anchor-output-pubkey
+    coin-v2-share-puzzle
     coin-v2-share-preimage
     coin-v2-commitment
     coin-v2-share-commitment
@@ -119,6 +125,12 @@
     coin-v2-coop-context-spec
     coin-v2-coop-context-commits
     coin-v2-share-signature-ok?
+    coin-v2-share-margin-milli
+    coin-v2-share-contribution
+    coin-v2-quality
+    coin-v2-share-quality
+    coin-v2-shares-quality
+    coin-v2-check-share-solution
     coin-v2-check-shares
 
     ;; The reward split
@@ -237,11 +249,16 @@
     ;;; Domain tag of a share signature preimage. 18 ASCII bytes.
     (define coin-v2-share-tag "SigilCoin/share/v2")
 
+    ;;; Domain tag of a personalized share puzzle seed.
+    (define coin-v2-share-puzzle-tag "SigilCoin/share-puzzle/v2")
+
     ;;; Domain tag of a commitment preimage. 19 ASCII bytes.
     (define coin-v2-commit-tag "SigilCoin/commit/v2")
 
     (define %share-tag-bytes (ascii->bytes coin-v2-share-tag))
+    (define %share-puzzle-tag-bytes (ascii->bytes coin-v2-share-puzzle-tag))
     (define %commit-tag-bytes (ascii->bytes coin-v2-commit-tag))
+    (define %anchor-alphabet "abcdefghijklmnop")
 
     (define %max-height #xffffffff)
 
@@ -258,6 +275,58 @@
                     (<= complexity puzzle-complexity-max)))
           (error (string-append who ": complexity out of range")))
       complexity)
+
+    ;;; Derive one pubkey-personalized puzzle seed.
+    ;;;
+    ;;; `global-seed` is the unchanged producer puzzle seed. No including
+    ;;; block field, block hash, graffiti or reveal data enters this digest.
+    ;;;
+    ;;; ```scheme
+    ;;; (bytevector-length
+    ;;;   (coin-v2-share-puzzle-seed (make-bytevector 32 0) pubkey)) ; => 32
+    ;;; ```
+    (define (coin-v2-share-puzzle-seed global-seed pubkey)
+      (: bytevector? bytevector? -> bytevector?)
+      (require-bytevector-length "coin-v2-share-puzzle-seed" global-seed 32)
+      (require-bytevector-length "coin-v2-share-puzzle-seed" pubkey
+                                 coin-v2-share-pubkey-bytes)
+      (hash256 (bytevector-append %share-puzzle-tag-bytes global-seed pubkey)))
+
+    ;;; Encode a full compressed pubkey injectively as 66 `a`..`p` nibbles.
+    ;;;
+    ;;; The result is digit-free and self-evaluating as a string literal, so
+    ;;; every rotating constraint can carry it without quote or truncation.
+    (define (coin-v2-pubkey-anchor-output pubkey)
+      (: bytevector? -> string?)
+      (require-bytevector-length "coin-v2-pubkey-anchor-output" pubkey
+                                 coin-v2-share-pubkey-bytes)
+      (let loop ((i 0) (out ""))
+        (if (= i coin-v2-share-pubkey-bytes)
+            out
+            (let ((b (bytevector-u8-ref pubkey i)))
+              (loop (+ i 1)
+                    (string-append
+                      out
+                      (substring %anchor-alphabet (quotient b 16)
+                                 (+ 1 (quotient b 16)))
+                      (substring %anchor-alphabet (modulo b 16)
+                                 (+ 1 (modulo b 16)))))))))
+
+    ;;; Decode the exact anchor form back to its compressed pubkey bytes.
+    (define (coin-v2-anchor-output-pubkey encoded)
+      (: string? -> bytevector?)
+      (if (not (pbe-anchor-output? encoded))
+          (error "coin-v2-anchor-output-pubkey: malformed anchor output"))
+      (let ((out (make-bytevector coin-v2-share-pubkey-bytes 0)))
+        (let loop ((i 0))
+          (if (= i coin-v2-share-pubkey-bytes)
+              out
+              (let ((hi (- (char->integer (string-ref encoded (* i 2)))
+                           (char->integer #\a)))
+                    (lo (- (char->integer (string-ref encoded (+ (* i 2) 1)))
+                           (char->integer #\a))))
+                (bytevector-u8-set! out i (+ (* hi 16) lo))
+                (loop (+ i 1)))))))
 
     ;;; The 32 bytes a co-op share's signature covers (§6.3).
     ;;;
@@ -600,6 +669,39 @@
       (spec)
       (commits default: '()))
 
+    ;;; Derive one share's personalized puzzle from validated parent context.
+    ;;;
+    ;;; Height, complexity, `k`, grammar width and rotating constraint match
+    ;;; the global producer puzzle. The personalized seed changes its examples.
+    ;;; Generation stays bounded and retains a verified table solution.
+    ;;;
+    ;;; ```scheme
+    ;;; (pbe-spec? (coin-v2-share-puzzle context pubkey)) ; => #t
+    ;;; ```
+    (define (coin-v2-share-puzzle context pubkey)
+      (: coin-v2-coop-context? bytevector? -> pbe-spec?)
+      (if (not (coin-v2-coop-context? context))
+          (error "coin-v2-share-puzzle: expected a co-op context"))
+      (let ((global (coin-v2-coop-context-spec context)))
+        (if (not (pbe-spec? global))
+            (error "coin-v2-share-puzzle: context has no global puzzle"))
+        (if (not (and (= (pbe-spec-height global)
+                         (coin-v2-coop-context-puzzle-height context))
+                      (= (pbe-spec-complexity global)
+                         (coin-v2-coop-context-complexity context))))
+            (error "coin-v2-share-puzzle: global puzzle does not match context"))
+        (pbe-for/constraint/anchor
+          (coin-v2-share-puzzle-seed
+            (coin-v2-puzzle-seed
+              (coin-v2-coop-context-parent-prev-hash context)
+              (coin-v2-coop-context-puzzle-height context)
+              (coin-v2-coop-context-complexity context))
+            pubkey)
+          (coin-v2-coop-context-puzzle-height context)
+          (coin-v2-coop-context-complexity context)
+          (pbe-spec-constraint global)
+          (coin-v2-pubkey-anchor-output pubkey))))
+
     ;;; True when `share`'s signature verifies against its §6.3 preimage.
     ;;;
     ;;; Standard ECDSA with the share's own key. libsecp256k1 rejects
@@ -660,6 +762,91 @@
           (coin-v2-share-pubkey share))
         (coin-v2-share-blind share)))
 
+    ;;; Relative improvement below personalized par, in milli-units.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-v2-share-margin-milli 100 95) ; => 50
+    ;;; ```
+    (define (coin-v2-share-margin-milli par length)
+      (: integer? integer? -> integer?)
+      (if (not (and (number? par) (exact? par) (integer? par) (> par 0)
+                    (number? length) (exact? length) (integer? length)
+                    (> length 0) (< length par)))
+          (error "coin-v2-share-margin-milli: share must be strictly under par"))
+      (quotient (* 1000 (- par length)) par))
+
+    ;;; Contribution of one valid under-par share: 1..4.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-v2-share-contribution 49) ; => 1
+    ;;; (coin-v2-share-contribution 150) ; => 4
+    ;;; ```
+    (define (coin-v2-share-contribution margin-milli)
+      (: integer? -> integer?)
+      (if (not (and (number? margin-milli) (exact? margin-milli)
+                    (integer? margin-milli) (> margin-milli 0)))
+          (error "coin-v2-share-contribution: margin must be positive"))
+      (+ 1 (min 3 (quotient margin-milli 50))))
+
+    ;;; Aggregate quality `Q`, saturated at 15.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-v2-quality '(4 4 4 4)) ; => 15
+    ;;; ```
+    (define (coin-v2-quality contributions)
+      (: list? -> integer?)
+      (if (not (list? contributions))
+          (error "coin-v2-quality: expected contributions"))
+      (let loop ((xs contributions) (total 0))
+        (if (null? xs)
+            (min 15 total)
+            (let ((x (car xs)))
+              (if (not (and (number? x) (exact? x) (integer? x)
+                            (<= 1 x 4)))
+                  (error "coin-v2-quality: contribution out of range"))
+              (loop (cdr xs) (+ total x))))))
+
+    ;;; Quality contribution of one already-validated share.
+    (define (coin-v2-share-quality context share)
+      (: coin-v2-coop-context? coin-v2-share? -> integer?)
+      (let* ((spec (coin-v2-share-puzzle context
+                                         (coin-v2-share-pubkey share)))
+             (source-size
+               (bytevector-length (coin-v2-share-solution share))))
+        (coin-v2-share-contribution
+          (coin-v2-share-margin-milli (pbe-spec-par spec) source-size))))
+
+    ;;; Aggregate quality of an already-validated share list.
+    (define (coin-v2-shares-quality context shares)
+      (: coin-v2-coop-context? list? -> integer?)
+      (coin-v2-quality
+        (map (lambda (share) (coin-v2-share-quality context share)) shares)))
+
+    ;;; Validate one share's source against its personalized puzzle.
+    ;;;
+    ;;; This excludes signature and commitment checks, which remain block-level
+    ;;; breadth-first passes. It is public so miners can verify candidate work
+    ;;; before signing it.
+    (define (coin-v2-check-share-solution context share)
+      (: coin-v2-coop-context? coin-v2-share? -> coin-result?)
+      (guard (e (#t (coin-error 'internal-error
+                                "the personalized share check raised")))
+        (let* ((personalized
+                 (coin-v2-share-puzzle context
+                                       (coin-v2-share-pubkey share)))
+               (source-size
+                 (bytevector-length (coin-v2-share-solution share))))
+          (if (>= source-size (pbe-spec-par personalized))
+              (coin-error 'share-not-under-par
+                          "share is not strictly below personalized par")
+              (let ((checked (coin-v2-check-solution
+                               personalized
+                               (coin-v2-share-solution share))))
+                (if (coin-failed? checked)
+                    (coin-error (share-reason (coin-result-reason checked))
+                                (coin-result-detail checked))
+                    checked))))))
+
     ;; Run `check` over each share in turn, ascending, first failure wins.
     ;; The passes are separate so the whole block clears a cheap check
     ;; before any share pays for an expensive one (§11).
@@ -674,8 +861,8 @@
     ;;;
     ;;; `producer-solution` is the block's own SOLUTION push, which the
     ;;; shares must all differ from; `shares` is the decoded SHARES list.
-    ;;; On success the value is that same list, whose length is the `R` the
-    ;;; score word packs and the split pays.
+    ;;; On success the value is that same list. Its length is `R` for the
+    ;;; reward split; `coin-v2-shares-quality` derives ranking value `Q`.
     ;;;
     ;;; The checks run in §6.4's order, but BREADTH-FIRST — every share
     ;;; clears check `n` before any share attempts check `n+1`:
@@ -779,18 +966,13 @@
                              (loop (cdr xs)
                                    (cons (coin-v2-share-solution (car xs))
                                          seen)))))
-                       ;; 7. and only now, the programs.
+                       ;; 7. and only now, each pubkey-personalized task.
                        (each-share
                          shares
                          (lambda (share previous)
-                           (let ((checked (coin-v2-check-solution
-                                            spec
-                                            (coin-v2-share-solution share))))
-                             (and (coin-failed? checked)
-                                  (coin-error
-                                    (share-reason
-                                      (coin-result-reason checked))
-                                    (coin-result-detail checked)))))))))
+                           (let ((checked (coin-v2-check-share-solution
+                                            context share)))
+                             (and (coin-failed? checked) checked)))))))
               (or failure (coin-ok shares)))))))
 
     ;; ============================================================

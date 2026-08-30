@@ -75,10 +75,10 @@
 
 ;; Words built from an explicit tuple, for the ordering proofs.
 (define %tuples
-  '((1 0 0 0) (1 0 0 8) (1 0 1 0) (1 1 0 0) (2 0 0 0)
-    (24 50 51 0) (24 50 51 1) (24 50 51 8) (24 50 52 0) (24 51 0 0)
-    (25 0 0 8) (300 127 127 0) (512 127 127 0) (512 127 127 8)
-    (511 0 0 0) (100 64 64 4)))
+  '((1 0 0 0) (1 0 0 15) (1 0 1 0) (1 1 0 0) (2 0 0 0)
+    (24 50 51 0) (24 50 51 1) (24 50 51 8) (24 50 51 15)
+    (24 50 52 0) (24 51 0 0) (25 0 0 15) (300 127 127 0)
+    (512 127 127 0) (512 127 127 15) (511 0 0 0) (100 64 64 12)))
 
 (define %words
   (map (lambda (t)
@@ -86,12 +86,12 @@
                              (list-ref t 2) (list-ref t 3)))
        %tuples))
 
-;; Lexicographic order on the ranking tuple `(L, MB, SB, 8-R)`, written out
+;; Lexicographic order on the ranking tuple `(L, MB, SB, 15-Q)`, written out
 ;; the slow, obvious way. If the packing is right, unsigned `<` on the word
 ;; agrees with this on every pair.
 (define (rank-tuple t)
   (list (list-ref t 0) (list-ref t 1) (list-ref t 2)
-        (- coin-v2-max-shares (list-ref t 3))))
+        (- 15 (list-ref t 3))))
 
 (define (lex-compare a b)
   (cond
@@ -298,6 +298,108 @@
       (assert-equal (pbe-spec-par a) (pbe-spec-par b))
       (assert-equal 1 (pbe-spec-height a))
       (assert-equal 128 (pbe-spec-complexity a)))))
+
+(define %share-global
+  (coin-v2-puzzle-for (filled 32 7) 1 128))
+
+(define %share-context
+  (coin-v2-coop-context parent-prev-hash: (filled 32 7)
+                        puzzle-height: 1
+                        complexity: 128
+                        spec: %share-global
+                        commits: '()))
+
+(define (share-key n) (filled 33 n))
+
+(define (share-source pk source)
+  (coin-v2-share pubkey: pk
+                 signature: (filled 64 0)
+                 blind: (filled 32 0)
+                 solution: (string->bytes source)))
+
+(define (all-distinct-values? values)
+  (let loop ((xs values))
+    (cond
+      ((null? xs) #t)
+      ((member (car xs) (cdr xs)) #f)
+      (else (loop (cdr xs))))))
+
+(test-group "sigil-coin personalized share puzzles"
+  (test "eight pubkeys derive eight tasks under one global constraint"
+    (let ((specs (map (lambda (n)
+                        (coin-v2-share-puzzle %share-context (share-key n)))
+                      '(1 2 3 4 5 6 7 8))))
+      (assert-true (all-distinct-values? (map pbe-spec-examples specs)))
+      (assert-true
+        (let loop ((xs specs))
+          (if (null? xs)
+              #t
+              (and (= (pbe-spec-height (car xs)) 1)
+                   (= (pbe-spec-complexity (car xs)) 128)
+                   (= (pbe-spec-k (car xs)) (pbe-spec-k %share-global))
+                   (= (puzzle-complexity-width
+                        (pbe-spec-complexity (car xs)))
+                      (puzzle-complexity-width
+                        (pbe-spec-complexity %share-global)))
+                   (= (pbe-spec-constraint (car xs))
+                      (pbe-spec-constraint %share-global))
+                   (loop (cdr xs))))))))
+
+  (test "share seed is double-SHA256 over global seed and pubkey"
+    (let* ((global (coin-v2-puzzle-seed (filled 32 7) 1 128))
+           (pk (share-key 1)))
+      (assert-equal 25 (string-length coin-v2-share-puzzle-tag))
+      (assert-equal (hash256
+                      (bytevector-append
+                        (string->bytes coin-v2-share-puzzle-tag) global pk))
+                    (coin-v2-share-puzzle-seed global pk))))
+
+  (test "a solution for one key fails under every other key"
+    (let* ((a (coin-v2-share-puzzle %share-context (share-key 1)))
+           (source (pbe-spec-hidden-source a)))
+      (assert-true (coin-ok? (coin-v2-check-solution a source)))
+      (assert-true
+        (let loop ((n 2))
+          (if (> n 8)
+              #t
+              (and (coin-failed?
+                     (coin-v2-check-solution
+                       (coin-v2-share-puzzle %share-context (share-key n))
+                       source))
+                   (loop (+ n 1))))))))
+
+  (test "eight personalized at-par solutions are all refused"
+    (assert-true
+      (let loop ((n 1))
+        (if (> n 8)
+            #t
+            (let* ((pk (share-key n))
+                   (spec (coin-v2-share-puzzle %share-context pk))
+                   (hidden (pbe-spec-hidden-source spec))
+                   (table (pbe-spec-table-solution spec))
+                   (source (if (= (string-length hidden) (pbe-spec-par spec))
+                               hidden table)))
+              (and (= (string-length source) (pbe-spec-par spec))
+                   (eq? 'share-not-under-par
+                        (coin-result-reason
+                          (coin-v2-check-share-solution
+                            %share-context (share-source pk source))))
+                   (loop (+ n 1))))))))
+
+  (test "uncommitted block fields cannot move a task"
+    (let* ((pk (share-key 3))
+           (other-context
+             (coin-v2-coop-context parent-prev-hash: (filled 32 7)
+                                   puzzle-height: 1
+                                   complexity: 128
+                                   spec: %share-global
+                                   commits: (list (filled 32 99))))
+           (a (coin-v2-share-puzzle %share-context pk))
+           (b (coin-v2-share-puzzle other-context pk)))
+      ;; Context has no including hash or graffiti field; changing its only
+      ;; unrelated field, commitments, also leaves derivation unchanged.
+      (assert-equal (pbe-spec-examples a) (pbe-spec-examples b))
+      (assert-equal (pbe-spec-par a) (pbe-spec-par b)))))
 
 (test-group "sigil-coin v2 puzzle cache"
   (test "an empty cache holds nothing and derives nothing"
@@ -551,15 +653,68 @@
     (assert-error (coin-v2-bucket7 -1))
     (assert-error (coin-v2-bucket7 "3"))))
 
+(test-group "sigil-coin aggregate share quality"
+  (test "quality contribution boundaries are frozen"
+    (assert-equal 1 (coin-v2-share-contribution 1))
+    (assert-equal 1 (coin-v2-share-contribution 49))
+    (assert-equal 2 (coin-v2-share-contribution 50))
+    (assert-equal 2 (coin-v2-share-contribution 99))
+    (assert-equal 3 (coin-v2-share-contribution 100))
+    (assert-equal 3 (coin-v2-share-contribution 149))
+    (assert-equal 4 (coin-v2-share-contribution 150)))
+
+  (test "margin uses exact floor arithmetic"
+    (assert-equal 1 (coin-v2-share-margin-milli 1000 999))
+    (assert-equal 49 (coin-v2-share-margin-milli 1000 951))
+    (assert-equal 150 (coin-v2-share-margin-milli 1000 850))
+    (assert-error (coin-v2-share-margin-milli 1000 1000)))
+
+  (test "aggregate quality saturates at fifteen"
+    (assert-equal 0 (coin-v2-quality '()))
+    (assert-equal 8 (coin-v2-quality '(1 1 1 1 1 1 1 1)))
+    (assert-equal 12 (coin-v2-quality '(4 4 4)))
+    (assert-equal 15 (coin-v2-quality '(4 4 4 4)))
+    (assert-equal 15 (coin-v2-quality '(4 4 4 4 4 4 4 4))))
+
+  (test "three fifteen-percent shares outrank eight sub-five-percent shares"
+    (let ((strong (coin-v2-quality '(4 4 4)))
+          (weak (coin-v2-quality '(1 1 1 1 1 1 1 1))))
+      (assert-equal 12 strong)
+      (assert-equal 8 weak)
+      (assert-true
+        (coin-v2-score-better? (coin-v2-score-pack 40 50 51 strong)
+                               (coin-v2-score-pack 40 50 51 weak)))))
+
+  (test "unrelated block data cannot move a share puzzle or quality"
+    ;; Graffiti, including-block hash and including block are absent from
+    ;; both derivation APIs. Parent commitments are present but irrelevant.
+    (let* ((pk (share-key 3))
+           (other-context
+             (coin-v2-coop-context parent-prev-hash: (filled 32 7)
+                                   puzzle-height: 1
+                                   complexity: 128
+                                   spec: %share-global
+                                   commits: (list (filled 32 99))))
+           (a (coin-v2-share-puzzle %share-context pk))
+           (b (coin-v2-share-puzzle other-context pk))
+           (source (filled (- (pbe-spec-par a) 1) #x78))
+           (share (coin-v2-share pubkey: pk
+                                 signature: (filled 64 0)
+                                 blind: (filled 32 0)
+                                 solution: source)))
+      (assert-equal (pbe-spec-examples a) (pbe-spec-examples b))
+      (assert-equal (coin-v2-share-quality %share-context share)
+                    (coin-v2-share-quality other-context share)))))
+
 (test-group "sigil-coin v2 score word"
   (test "the bit layout is frozen"
-    ;; L-1 at 22, MB at 15, SB at 8, 8-R at 4, low nibble reserved zero.
-    (assert-equal 0 (coin-v2-score-pack 1 0 0 8))
-    (assert-equal (arithmetic-shift 1 22) (coin-v2-score-pack 2 0 0 8))
-    (assert-equal (arithmetic-shift 1 15) (coin-v2-score-pack 1 1 0 8))
-    (assert-equal (arithmetic-shift 1 8) (coin-v2-score-pack 1 0 1 8))
-    (assert-equal (arithmetic-shift 1 4) (coin-v2-score-pack 1 0 0 7))
-    (assert-equal (arithmetic-shift 8 4) (coin-v2-score-pack 1 0 0 0)))
+    ;; L-1 at 22, MB at 15, SB at 8, 15-Q at 4, low nibble reserved zero.
+    (assert-equal 0 (coin-v2-score-pack 1 0 0 15))
+    (assert-equal (arithmetic-shift 1 22) (coin-v2-score-pack 2 0 0 15))
+    (assert-equal (arithmetic-shift 1 15) (coin-v2-score-pack 1 1 0 15))
+    (assert-equal (arithmetic-shift 1 8) (coin-v2-score-pack 1 0 1 15))
+    (assert-equal (arithmetic-shift 1 4) (coin-v2-score-pack 1 0 0 14))
+    (assert-equal (arithmetic-shift 15 4) (coin-v2-score-pack 1 0 0 0)))
 
   (test "the widest legal word still fits 32 bits"
     (assert-equal 4294967296 coin-v2-max-score-word)
@@ -587,7 +742,7 @@
               (if (and (= (list-ref t 0) (coin-v2-score-length s))
                        (= (list-ref t 1) (coin-v2-score-memory s))
                        (= (list-ref t 2) (coin-v2-score-steps s))
-                       (= (list-ref t 3) (coin-v2-score-shares s)))
+                       (= (list-ref t 3) (coin-v2-score-quality s)))
                   (loop (cdr ts))
                   #f)))))))
 
@@ -596,6 +751,7 @@
       (assert-equal 25 (coin-v2-score-length s))
       (assert-equal (coin-v2-bucket7 80) (coin-v2-score-memory s))
       (assert-equal (coin-v2-bucket7 300) (coin-v2-score-steps s))
+      (assert-equal 3 (coin-v2-score-quality s))
       (assert-equal 3 (coin-v2-score-shares s))))
 
   (test "out-of-domain fields raise rather than pack wrong"
@@ -603,7 +759,7 @@
     (assert-error (coin-v2-score-pack 513 0 0 0))
     (assert-error (coin-v2-score-pack 1 128 0 0))
     (assert-error (coin-v2-score-pack 1 0 128 0))
-    (assert-error (coin-v2-score-pack 1 0 0 9))
+    (assert-error (coin-v2-score-pack 1 0 0 16))
     (assert-error (coin-v2-score-encode 1 -1 0 0))
     (assert-error (coin-v2-score-decode 1))))
 
@@ -612,7 +768,7 @@
     (let ((result (coin-v2-score-check (coin-v2-score-pack 24 50 51 2))))
       (assert-true (coin-ok? result))
       (assert-equal 24 (coin-v2-score-length (coin-result-value result)))
-      (assert-equal 2 (coin-v2-score-shares (coin-result-value result)))))
+      (assert-equal 2 (coin-v2-score-quality (coin-result-value result)))))
 
   (test "the reserved nibble must be zero"
     (assert-equal 'score-reserved-nonzero
@@ -620,15 +776,14 @@
     (assert-equal 'score-reserved-nonzero
                   (coin-result-reason (coin-v2-score-check #xf))))
 
-  (test "a share field above eight is invalid"
-    ;; Field values 9..15 would decode to a negative share count.
-    (assert-equal 'score-share-count
-                  (coin-result-reason
-                    (coin-v2-score-check (arithmetic-shift 9 4))))
-    (assert-equal 'score-share-count
-                  (coin-result-reason
-                    (coin-v2-score-check (arithmetic-shift 15 4))))
-    (assert-true (coin-ok? (coin-v2-score-check (arithmetic-shift 8 4)))))
+  (test "every aggregate-quality nibble is valid"
+    (assert-true
+      (let loop ((stored 0))
+        (if (> stored 15)
+            #t
+            (and (coin-ok? (coin-v2-score-check
+                             (arithmetic-shift stored 4)))
+                 (loop (+ stored 1)))))))
 
   (test "a word that is not a 32-bit unsigned integer is malformed"
     (assert-equal 'malformed-header
@@ -655,7 +810,7 @@
                (coin-v2-score-pack (list-ref b 0) (list-ref b 1)
                                    (list-ref b 2) (list-ref b 3))))))))
 
-  (test "length dominates memory dominates steps dominates share count"
+  (test "length dominates memory dominates steps dominates aggregate quality"
     (assert-true (coin-v2-score-better? (coin-v2-score-pack 24 127 127 0)
                                         (coin-v2-score-pack 25 0 0 8)))
     (assert-true (coin-v2-score-better? (coin-v2-score-pack 24 50 127 0)
@@ -663,8 +818,8 @@
     (assert-true (coin-v2-score-better? (coin-v2-score-pack 24 50 51 0)
                                         (coin-v2-score-pack 24 50 52 8))))
 
-  (test "share count breaks ties and only ties"
-    ;; A producer cannot buy a win by collecting shares, only a tie.
+  (test "aggregate quality breaks ties and only ties"
+    ;; Verified share work cannot outrank a better producer program.
     (assert-true (coin-v2-score-better? (coin-v2-score-pack 24 50 51 1)
                                         (coin-v2-score-pack 24 50 51 0)))
     (assert-false (coin-v2-score-better? (coin-v2-score-pack 25 50 51 8)

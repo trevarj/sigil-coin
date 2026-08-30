@@ -106,6 +106,7 @@
     coin-v2-score-length
     coin-v2-score-memory
     coin-v2-score-steps
+    coin-v2-score-quality
     coin-v2-score-shares
     coin-v2-score-encode
     coin-v2-score-pack
@@ -148,7 +149,12 @@
     coin-v2-empty-shares
     coin-v2-empty-commits
     coin-v2-share-tag
+    coin-v2-share-puzzle-tag
     coin-v2-commit-tag
+    coin-v2-share-puzzle-seed
+    coin-v2-pubkey-anchor-output
+    coin-v2-anchor-output-pubkey
+    coin-v2-share-puzzle
     coin-v2-share-preimage
     coin-v2-commitment
     coin-v2-share-commitment
@@ -172,6 +178,12 @@
     coin-v2-coop-context-spec
     coin-v2-coop-context-commits
     coin-v2-share-signature-ok?
+    coin-v2-share-margin-milli
+    coin-v2-share-contribution
+    coin-v2-quality
+    coin-v2-share-quality
+    coin-v2-shares-quality
+    coin-v2-check-share-solution
     coin-v2-check-shares
     coin-v2-producer-weight
     coin-v2-split-weight-total

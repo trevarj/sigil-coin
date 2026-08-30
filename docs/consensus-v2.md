@@ -39,11 +39,11 @@ resource caps, because every node re-evaluates every solution.
    node derives them.
 2. **Rotating constraints.** The seed selects one of eight syntactic rules for
    the height, checked over the parsed AST and the raw source bytes.
-3. **Co-op blocks.** Up to 8 signed shares from other miners ride in the
-   coinbase alongside the producer's own solution, each with a mandatory payout
-   output.
-4. **Composite score.** `(length, memory, steps)` lexicographically, then share
-   count, packed into a single 32-bit header word.
+3. **Co-op blocks.** Up to 8 signed shares ride in the coinbase alongside the
+   producer's own solution. Each share solves a task personalized by its payout
+   pubkey and receives a mandatory payout output.
+4. **Composite score.** `(length, memory, steps)` lexicographically, then
+   aggregate verified share quality, packed into a single 32-bit header word.
 5. **Margin retargeting.** A 12-bit complexity parameter `C` lives in `bits`,
    retargeted every 16 blocks on the median *relative* margin between par and
    achieved length. `C` moves grammar width, example count, and constraint
@@ -60,7 +60,7 @@ resource caps, because every node re-evaluates every solution.
 | Constant | v1 | v2 | Justification |
 |---|---|---|---|
 | `puzzle-language-version` | 1 | 2 | split marker |
-| `puzzle-max-source-bytes` | 256 | **512** | the liveness escape (§8) is a `k`-branch lookup table plus a constraint repair wrapper; at `k=10` it does not fit in 256 B |
+| `puzzle-max-source-bytes` | 256 | **512** | the liveness escape (§8) is a `k`-branch lookup table plus a constraint repair wrapper; at `k=8` it reaches 415 B globally and 458 B with a full-key share anchor |
 | `puzzle-max-fuel` | 1000000 | **200000** | observed peak 300 steps (0.03% of 1e6); 200000 is 660x observed peak and cuts the hostile per-solution cost from ~5.5 s to ~1.1 s, which matters because v2 validates up to 9 solutions per block |
 | `puzzle-max-allocations` | 100000 | **400000** | charging became honest (environment frames, boxes, closures and argument lists are counted, and `append`/`map`/`filter`/`fold` charge what they really cons), so the old number no longer meant the same thing; 400000 restores comparable headroom for real programs |
 | `puzzle-max-string-bytes` | 65536 | 65536 | unchanged |
@@ -133,7 +133,7 @@ puzzle-spec-v2 :=
   height          integer
   complexity      C, 16..4095
   constraint      constraint-id, 0..7
-  k               example count, 3..10
+  k               example count, 3..8
   examples        list of k (input . output) pairs, in draw order
   hidden-source   canonical source of the generator's own function
   par             min(|hidden-source|, |table-solution|), >= 24
@@ -148,7 +148,7 @@ at one height are validated against the same puzzle.
 ### 3.3 Derived complexity knobs
 
 ```
-k(C)     = clamp(3 + floor(C / 512), 3, 10)
+k(C)     = clamp(3 + floor(C / 512), 3, 8)
 w(C)     = min(24, 6 + floor(C / 205))      ; enabled prefix of the frozen
                                             ; 24-entry production list
 tier(C)  = 0 if C <  256
@@ -156,7 +156,7 @@ tier(C)  = 0 if C <  256
            2 otherwise
 ```
 
-At `C = 128` (genesis): `k = 3`, `w = 6`, tier 0. At `C = 4095`: `k = 10`,
+At `C = 128` (genesis): `k = 3`, `w = 6`, tier 0. At `C = 4095`: `k = 8`,
 `w = 24`, tier 2.
 
 `C` never touches `puzzle-max-fuel`, `puzzle-max-allocations`,
@@ -313,7 +313,7 @@ Lower `W` is better. Plain unsigned 32-bit comparison *is* the composite order.
 ```
 bit  31              22 21     15 14      8 7    4 3    0
     +------------------+---------+---------+------+------+
-    |      L - 1       |   MB    |   SB    | 8-R  | 0000 |
+    |      L - 1       |   MB    |   SB    |15-Q  | 0000 |
     +------------------+---------+---------+------+------+
        10 bits           7 bits    7 bits   4 bits 4 bits
 ```
@@ -323,16 +323,21 @@ bit  31              22 21     15 14      8 7    4 3    0
 | `L-1` | 10 | 0..511 | producer solution length in bytes, 1..512 |
 | `MB` | 7 | 0..127 | bucket of `cells` charged by the producer's solution |
 | `SB` | 7 | 0..127 | bucket of `steps` spent by the producer's solution |
-| `8-R` | 4 | 0..8 | `R` = accepted revealed shares in this block, 0..8; field values 9..15 are invalid |
+| `15-Q` | 4 | 0..15 | `Q` = aggregate verified share quality, 0..15 |
 | reserved | 4 | 0 | MUST be zero |
+
+```
+W = (L - 1) << 22 | MB << 15 | SB << 8 | (15 - Q) << 4
+```
 
 Reserving the low nibble and deriving every other field from the body means the
 header nonce carries **zero free entropy**. There is no nonce to grind.
 
-Field order is the ranking: length dominates memory dominates steps dominates
-share count. Share count is last because it must break ties without ever
-outranking a genuinely better program — a producer cannot buy a win by
-collecting shares, only by winning a tie.
+Field order is the ranking: producer length dominates memory dominates steps,
+then aggregate verified share quality. Quality is last because co-op work may
+break producer ties but never outrank a genuinely better producer program.
+`R` remains separately capped at 8 and controls only the reward split; it is not
+encoded in `W`.
 
 ### 5.4 Bucketing
 
@@ -355,7 +360,7 @@ bits with headroom. `bucket7` is monotone non-decreasing.
 
 **The bucketed value is the consensus value.** Fork choice compares header words
 and never body integers, so two solutions in one bucket are exactly tied and
-fall through to share count. There is no second, finer order to keep consistent
+fall through to aggregate share quality. There is no second, finer order to keep consistent
 with the header. Precision loss is deliberate.
 
 At the survey's observed magnitudes (~300 steps, ~80 cells) the buckets are
@@ -400,7 +405,7 @@ lexicographic order, which is a strict total order on Z x Z.
 
 `W` is a 32-bit unsigned integer with all fields packed most-significant-first
 in ranking order, so unsigned `<` on `W` equals lexicographic `<` on
-`(L, MB, SB, 8-R)`. The aggregate co-op quality composes with the producer's own
+`(L, MB, SB, 15-Q)`. The aggregate co-op quality composes with the producer's own
 solution by occupying strictly lower-order bits than every producer field: it
 decides exactly the comparisons the producer's own solution leaves tied, and
 nothing else.
@@ -489,7 +494,47 @@ is canonical (one encoding per set), it forces distinct payout keys, and it
 makes duplicate detection a linear scan. Out of order or repeated key is
 `shares-unordered`.
 
-### 6.3 Signature preimage
+### 6.3 Personalized share puzzle and signature preimage
+
+The producer still solves the one unchanged global puzzle for height `P`. Each
+share instead solves a public task personalized by its compressed payout key:
+
+```
+global_seed = seed(P)
+share_seed  = SHA256d( "SigilCoin/share-puzzle/v2"
+                     || global_seed
+                     || pubkey )
+```
+
+Run bounded PBE generation with `(share_seed, P, C(P))`, forcing the constraint
+id selected by the global puzzle. Height, `C`, `k`, grammar width and rotating
+constraint are therefore identical to the producer puzzle. The global producer
+puzzle is unchanged. A personalized puzzle has `k-1` seed-generated examples
+followed by this mandatory anchor pair:
+
+```
+input  = "@"
+output = encode_ap(pubkey)
+```
+
+`"@"` is reserved: no ordinary generated example may use it. `encode_ap`
+encodes each nibble of the full 33-byte compressed pubkey as `a` through `p`
+(`a=0`, ..., `p=15`), producing exactly 66 characters. The output is digit-free
+and self-evaluating as a string literal without `quote`, so every constraint can
+carry it. Encoding is injective and untruncated. Since every deterministic
+function has one output for `"@"`, no source can solve personalized puzzles for
+two distinct compressed pubkeys, regardless of alpha-renaming or wrappers.
+
+The explicit-constraint generator uses the same 64-attempt bound and, on
+exhaustion, a constraint-preserving fallback with seed-specific ordinary
+examples plus the same anchor. Its real table solution is parsed,
+constraint-checked and evaluated before publication.
+
+Neither graffiti, any block hash after `global_seed`, nor the including block
+enters `share_seed`. Distinct compressed pubkeys therefore receive distinct
+seeded tasks, while changing unrelated block fields cannot move a task.
+
+The signature preimage remains:
 
 ```
 share_preimage = SHA256d( "SigilCoin/share/v2"        (18 ASCII bytes)
@@ -535,7 +580,9 @@ For a block at height `H` with `R` shares, per share `i`, first failure wins:
 | 4 | `SHA256d(commitment_preimage)` for this share is in block `H-1`'s COMMITS | `share-uncommitted` |
 | 5 | signature verifies against `share_preimage` | `share-bad-signature` |
 | 6 | `solution` differs byte-wise from the producer's SOLUTION and from every earlier share's solution | `share-duplicate-solution` |
-| 7 | `coin-check-solution(spec(H-1), solution)` passes | inherits §4.3 tags, prefixed `share-` |
+| 7 | derive the pubkey-personalized puzzle using the global puzzle's constraint | `internal-error` only on implementation failure |
+| 8 | `L < personalized_par`; equality or excess is invalid | `share-not-under-par` |
+| 9 | `coin-check-solution(personalized_spec, solution)` passes | inherits §4.3 tags, prefixed `share-` |
 
 Checks are ordered cheapest-first: a 32-byte set membership before a signature
 verification before a puzzle evaluation.
@@ -543,13 +590,35 @@ verification before a puzzle evaluation.
 **Dedup.** Duplicates are rejected at the block level, not silently dropped,
 because "reject" is total and "drop" needs a re-ordering rule. The producer
 controls what he includes, so he simply includes one of any identical pair. The
-canonical form for dedup is the **raw solution bytes**, not a normalized AST:
-AST normalization is a large new consensus surface for no gain, and the
-survey's grindable family (`(and 1 Q)`, `(and 2 Q)`, ...) is already distinct
-under byte comparison. That family is now *paid* rather than arbitrated, which
-is the point.
+canonical form for dedup remains the **raw solution bytes**, not a normalized
+AST. AST normalization is a large new consensus surface for no gain. Raw-byte
+dedup is only a canonical block rule; personalized tasks plus under-par quality
+prevent **free source reuse**, not self-dealing. Same-score wrappers under
+several keys do not solve those keys' distinct example sets and contribute
+nothing. One actor may still control all eight keys, but must solve eight
+distinct personalized puzzles strictly under par; consensus proves work, not
+ownership.
 
 **Count.** `R <= 8`. Sizing in §6.6. A block with `R > 8` is `shares-oversize`.
+`R` remains the number of accepted reveals and is used by reward splitting only.
+
+**Aggregate quality.** For each accepted share:
+
+```
+margin_milli = floor(1000 * (personalized_par - L) / personalized_par)
+contribution = 1 + min(3, floor(margin_milli / 50))
+Q            = min(15, sum(contribution for every accepted share))
+```
+
+`margin_milli` is positive because at-par shares are rejected. Contributions
+are 1 for margins 1..49, 2 for 50..99, 3 for 100..149, and 4 for 150 or more.
+Ranking therefore measures aggregate verified work, not raw reveal count. Three
+shares at least 15% below their personalized pars contribute `Q=12` and outrank
+eight shares below 5%, which contribute `Q=8`, when producer fields tie.
+
+“Independent shares” means distinct pubkey-personalized tasks. It does not claim
+or require independent owners: one owner may control several keys, but each key
+must solve its own derived task and cannot reuse one wrapper eight times.
 
 ### 6.5 Reward split
 
@@ -727,7 +796,7 @@ nothing because nobody can reveal them.
   with no commitment, and no commitment is possible, because puzzle `H` is
   unknown before block `H-1` exists. See §10.5 for what protects the producer.
 - *Censor commitments and reveals.* A producer chooses what his block carries.
-  He forfeits the carrier output and the share-count tie-break by doing so, and
+  He forfeits the carrier output and aggregate-quality tie-break by doing so, and
   he only controls one height. There is no in-protocol defence beyond that; see
   Open Question 1.
 - *Withhold a reveal.* Costs the withholder his own payout.
@@ -780,19 +849,23 @@ reachable table is not 486 bytes:
 ```
 ci 3, k = 10 : 40 + 9 * (18 + 8 + 24) + 25 = 515   > 512, INFEASIBLE
 ci 7, k = 10 : 35 + 9 * 50 + 25            = 510   fits, 2 bytes spare
-ci 3, k =  8 : 40 + 7 * 50 + 25            = 415   fits, 97 bytes spare
+ci 3, k =  8, global : 40 + 7 * 50 + 25    = 415   fits, 97 bytes spare
+ci 3, k =  8, share  : 40 + 7 * 50 + 68    = 458   fits, 54 bytes spare
 ```
 
-`ci 3` at `k = 10` does not fit at all, and is survivable today only because
-`ci 3` is drawn from the tier-1 catalogue where `k <= 4`. The reachable tier-2
-maximum is 510 bytes — two bytes of headroom, which is not a margin.
+`k = 10` is therefore unreachable: `k` is frozen at a maximum of 8. Global
+puzzles retain the 415-byte bound. Personalized puzzles replace the final
+ordinary 25-byte quoted output with the exact 68-byte self-evaluating anchor
+string (66 encoded characters plus delimiters), giving an exact worst case of
+458 bytes and 54 bytes of headroom. The anchor is last, so it is the default and
+adds no test branch or input literal to the table.
 
-**`k` is therefore frozen at a maximum of 8**, giving a proven worst case of
-415 bytes and 97 bytes (19%) of headroom, enough to absorb one further repair
-wrapper. Difficulty above that point grows through grammar width `w`, which
-does not lengthen the table. This bound is exact rather than sampled: the
-generator enforces `|i| <= 8` and `|o| <= 24` before building the table, so
-the expression above is a true maximum over all inputs.
+**`k` is therefore frozen at a maximum of 8.** Difficulty above that point
+grows through grammar width `w`, which does not lengthen the table. These bounds
+are exact rather than sampled: ordinary pairs enforce `|i| <= 8` and
+`|o| <= 24`; personalized puzzles enforce one final `("@" . encode_ap(pubkey))`
+pair with an exactly 66-character output. The expression above is therefore a
+true maximum over all accepted inputs.
 
 The generator does not trust any of this arithmetic: §3.4 step 8 constructs the
 actual table solution, prints it, parses it, constraint-checks it, and runs it
@@ -820,8 +893,8 @@ solution against all `k` pairs. Every published puzzle is provably solvable by
 anyone who can read the chain. The chain cannot stall.
 
 Overfitting is self-punishing: the table solution is by construction the longest
-thing anybody would submit (415 bytes at the frozen `k = 8`), so any structural
-program beats it on the primary ranking key.
+thing anybody would submit (415 bytes globally or 458 bytes personalized at the
+frozen `k = 8`), so any structural program beats it on the primary ranking key.
 
 ---
 
@@ -863,7 +936,7 @@ C' = clamp( floor(C * f / 1000), 16, 4095 )
   in `[-0.1, 1.9]`; the lower clamp is what stops a negative or collapsing
   factor, and it is load-bearing, not decorative.
 - Absolute bounds `[16, 4095]` fit the 12-bit field. `C = 16` is tier 0, `k = 3`,
-  `w = 6`: still a real puzzle. `C = 4095` is tier 2, `k = 10`, `w = 24`.
+  `w = 6`: still a real puzzle. `C = 4095` is tier 2, `k = 8`, `w = 24`.
 
 Retarget fires at heights where `H mod 16 = 0` and `H >= 16`. Between retargets
 `C(H) = C(H-1)`.
@@ -1010,14 +1083,15 @@ block `H-1` does. Three things together make copying it unprofitable:
    until his block hash was lower and take the tip with certainty. In v2 an
    equal `W` never displaces an incumbent (§5.6, §5.7), so the grind buys
    nothing.
-2. **Share count.** To get a strictly lower `W` at equal `(L, MB, SB)` the thief
-   must carry *more* reveals than the producer — reveals he must pay for, from
-   commitments in block `H-1` that he does not control. A producer carrying even
-   one share strictly beats every zero-share thief.
+2. **Aggregate verified work.** To get a strictly lower `W` at equal
+   `(L, MB, SB)` the thief must carry greater `Q`: under-par solutions to
+   pubkey-personalized tasks, from commitments in block `H-1`, with every
+   accepted reveal paid by the unchanged reward split. Extra keys or
+   same-score wrappers alone contribute nothing.
 3. **`extended?` hysteresis.** Once any taller header exists, height `H` is
    settled and no sibling displaces it at all.
 
-What remains: a thief who copies the solution *and* matches the share count
+What remains: a thief who copies the solution *and* matches aggregate quality
 produces an incomparable sibling. Nodes that saw the producer's block first keep
 it; nodes syncing from scratch may adopt either; the next block settles it. That
 is Bitcoin's equal-work race, unchanged, and it is the honest limit of what a
@@ -1034,7 +1108,8 @@ Per block, worst case, with the frozen v2 caps:
 | header checks | O(1) | version, bits, `W` field ranges, MTP, drift, spacing |
 | block size | one serialization | first body rule, bounds everything after |
 | coinbase decode | O(6588) bytes | five pushes + one re-encode |
-| puzzle derivation | 64 x 20000 = 1.28 M steps | `puzzle-generator-max-fuel` per attempt, shared across all evaluations in the attempt; **cached per `(prev_hash, H)`** so siblings pay once |
+| global puzzle derivation | 64 x 20000 = 1.28 M steps | cached per `(prev_hash, H)` so siblings pay once |
+| personalized puzzle derivation | 8 x 64 x 20000 = 10.24 M steps | one bounded explicit-constraint derivation per distinct share pubkey; cacheable by `(global_seed, pubkey)` |
 | producer solution | 200000 steps | one machine across all `k` applications |
 | share solutions | 8 x 200000 = 1.6 M steps | same, per share |
 | signature verification | 8 ECDSA | ~0.5 ms total |
@@ -1046,10 +1121,12 @@ Puzzle-language steps calibrate at ~5.5 microseconds per step under hostile
 programs (5.5 s per 1e6 steps, measured in v1). So:
 
 ```
-solutions   : 1.8 M steps  ~=  9.9 s
-derivation  : 1.28 M steps ~=  7.0 s   (once per height, not per sibling)
-             ------------------------
-worst case  : ~17 s for the first block at a height, ~10 s per sibling after
+solutions      : 1.8 M steps   ~=  9.9 s
+producer puzzle: 1.28 M steps  ~=  7.0 s   (once per height)
+share puzzles  : 10.24 M steps ~= 56.3 s   (eight worst-case derivations)
+                ------------------------
+worst case     : ~73 s before caching; personalized specs are cacheable by
+                 `(global_seed, pubkey)` across sibling blocks
 ```
 
 Against 72000 s mainnet spacing that is 0.024% duty. Typical cost is
@@ -1068,10 +1145,11 @@ size, payload decode, and header-commitment checks. Recommended order:
 7. parse all `R+1` solutions
 8. commitment membership for all shares
 9. signature verification for all shares
-10. producer solution evaluation
-11. share solution evaluations
-12. recompute `W`, require equality with the header
-13. Bitcoin's connector
+10. derive personalized specs and reject every `L >= personalized_par`
+11. producer solution evaluation
+12. personalized share solution evaluations and aggregate `Q`
+13. recompute `W`, require equality with the header
+14. Bitcoin's connector
 
 A node SHOULD additionally bound the number of siblings at one height it will
 validate bodies for concurrently. That is policy, not consensus.
@@ -1124,9 +1202,10 @@ plus any test asserting `puzzle-result` field arity.
   replaced by `coin-score-compare` over 32-bit words. `coin-hash-compare` stays
   but leaves consensus. `coin-replaces-tip?` requires a strictly lower `W`.
 - New `score.sgl`: `bucket7`, `coin-score-encode`, `coin-score-decode`,
-  `coin-score-from-block`.
-- New `shares.sgl`: share preimage, verification, ordering, dedup, split
-  arithmetic.
+  `coin-score-from-block`; its low field commits `(15-Q)`, not raw `R`.
+- New `shares.sgl`: personalized share seed and PBE derivation, under-par
+  validation, contribution and `Q`, share preimage, verification, ordering,
+  dedup, and unchanged split arithmetic.
 - New `retarget.sgl`: margin, median, clamp, `bits` codec.
 - `rules.sgl`: `coin-max-block-bytes` 16384. Timestamp rules unchanged.
 - `emission.sgl`: **unchanged**. The split is an output-shape rule; total
@@ -1191,8 +1270,8 @@ format all change.
    merkle root.
 6. Update `LAUNCH.md`.
 
-Genesis carries `R = 0`, so its `W` low nibble region is `8-0 = 8` in bits
-[7:4] and zero in [3:0].
+Genesis carries no shares, so `Q = 0` and its `W` quality field is `15-Q = 15`
+in bits [7:4], with zero in [3:0].
 
 ---
 
@@ -1208,11 +1287,11 @@ Genesis carries `R = 0`, so its `W` low nibble region is `8-0 = 8` in bits
 | `solution-not-a-procedure` | solution check | result is not a 1-arity procedure |
 | `solution-mismatch` | solution check | detail is the failing example index |
 | `constraint-violated` | constraint check | detail names the rule |
-| `share-bad-pubkey`, `share-bad-signature`, `share-uncommitted`, `share-duplicate-solution` | share check | |
+| `share-bad-pubkey`, `share-bad-signature`, `share-uncommitted`, `share-duplicate-solution`, `share-not-under-par` | share check | personalized task or share binding failed |
 | `share-solution-*` | share check | the solution tags above, prefixed |
 | `coinbase-output-shape`, `coinbase-output-value` | split check | |
 | `score-mismatch` | header commitment | recomputed `W` differs from the header |
-| `score-reserved-nonzero`, `score-share-count` | header field check | low nibble non-zero; `8-R` field > 8 |
+| `score-reserved-nonzero` | header field check | low nibble non-zero; every `15-Q` nibble is legal |
 | `bits-prefix`, `bits-reserved-nonzero`, `complexity-mismatch`, `complexity-range` | `bits` check | |
 | `height-mismatch`, `missing-coinbase`, `block-oversize`, `malformed-block` | as v1 | |
 | `internal-error` | anywhere | a check raised; always a bug |
@@ -1233,22 +1312,19 @@ observed.
 
 **2. The producer/share weight split (2 vs 1) is a guess.**
 At `R = 8` the producer keeps 18.2%. If that is too little, producers will carry
-fewer shares than the tie-break rewards; if too much, sharing is not worth the
+less share work than the quality tie-break rewards; if too much, sharing is not worth the
 sharer's effort. There is no survey data on this, because v1 had no shares.
 *Recommendation:* start at 2/1/1 and treat it as the first constant to revisit
 after a month of mainnet. It is a pure output-shape rule, so changing it is a
 one-line consensus change with no structural consequences.
 
-**3. Byte-level dedup versus AST-level dedup.**
-§6.4 dedups on raw solution bytes. That means `(and 1 Q)` and `(and 2 Q)` are
-distinct shares and both get paid, which is the intended defusing of the tie
-family — but it also means a single miner can commit under several keys with
-trivially-varied programs and collect several shares. He pays for it in the
-producer's 8 slots and in split reward, and he cannot exceed 8 either way.
-*Recommendation:* keep byte-level dedup. AST normalization is a large new
-consensus surface with its own divergence risk, and the exploit's ceiling is
-"one miner takes several of eight slots in a block he does not control", which
-is not worth an interpreter-adjacent canonicalizer.
+**3. Aggregate-quality bands are launch constants.**
+The 5%, 10%, and 15% contribution steps prevent raw-key multiplication from
+ranking like deep work, but no live co-op margin distribution exists yet.
+*Recommendation:* ship the four frozen bands and measure. Distinct shares mean
+distinct personalized tasks, not distinct owners; ownership identity is neither
+observable nor required by consensus. Revisit bands only in a future chain
+version if observed margins cluster pathologically around a boundary.
 
 **4. Retarget window of 16 is short.**
 At mainnet spacing that is ~13 days, but the margin distribution is heavy-tailed
@@ -1262,8 +1338,9 @@ more than 2x in opposite directions.
 Raising `k` makes overfitting more expensive (good) but also makes the table
 solution longer, which pushes against the 512-byte cap. This was measured and
 resolved: `k = 10` reaches 515 bytes under the `letrec` repair and does not
-fit at all, so `k` is frozen at a maximum of 8 (worst case 415 bytes, 97
-spare) and difficulty above that point climbs through grammar width, which
+fit at all, so `k` is frozen at a maximum of 8 (global worst case 415 bytes;
+personalized full-key-anchor worst case 458 bytes, 54 spare) and difficulty
+above that point climbs through grammar width, which
 does not lengthen the table. Widening the grammar raises the hidden function's
 complexity independently.
 *Recommendation:* as specified, with the generator's explicit `|T| <= 512`

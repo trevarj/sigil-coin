@@ -89,6 +89,13 @@
                                            (number->string (+ 10 i)))))
                     acc)))))
 
+(define %max-anchor-output (make-string pbe-anchor-output-bytes #\p))
+
+;; Seven cap-sized ordinary pairs plus final exact key anchor: k remains 8.
+(define %worst-anchored-pairs
+  (append (worst-pairs 7)
+          (list (cons pbe-anchor-input %max-anchor-output))))
+
 ;; The sweep: every puzzle generated once, then asserted over from several
 ;; angles. 20 seeds x 2 heights x 4 complexities = 160 puzzles.
 (define %sweep-seeds 20)
@@ -137,7 +144,12 @@
     (assert-equal 16 puzzle-complexity-min)
     (assert-equal 4095 puzzle-complexity-max)
     (assert-equal 128 puzzle-complexity-genesis)
-    (assert-equal 24 puzzle-production-count))
+    (assert-equal 24 puzzle-production-count)
+    (assert-equal "@" pbe-anchor-input)
+    (assert-equal 66 pbe-anchor-output-bytes)
+    (assert-true (pbe-anchor-output? %max-anchor-output))
+    (assert-false (pbe-anchor-output? (make-string 65 #\p)))
+    (assert-false (pbe-anchor-output? (make-string 66 #\q))))
 
   (test "the v2 interpreter caps are frozen"
     (assert-equal 512 puzzle-v2-max-source-bytes)
@@ -521,6 +533,39 @@
             (assert-true (pbe-spec? (car specs)))
             (loop (cdr specs))))))
 
+  (test "bounded public generation preserves every explicit constraint"
+    (let loop ((ci 0))
+      (if (> ci 7)
+          (assert-true #t)
+          (let ((spec (pbe-for/constraint (seed-of ci) 11 4095 ci)))
+            (assert-equal ci (pbe-spec-constraint spec))
+            (assert-true (< (pbe-spec-retries spec)
+                            puzzle-max-generator-retries))
+            (loop (+ ci 1))))))
+
+  (test "every constrained fallback preserves liveness"
+    (let loop ((ci 0))
+      (if (> ci 7)
+          (assert-true #t)
+          (let ((spec (pbe-fallback/constraint (seed-of ci) 11 4095 ci)))
+            (assert-equal ci (pbe-spec-constraint spec))
+            (assert-equal puzzle-max-generator-retries
+                          (pbe-spec-retries spec))
+            (assert-true (solves? spec (pbe-spec-table-solution spec)))
+            (assert-true (solves? spec (pbe-spec-hidden-source spec)))
+            (loop (+ ci 1))))))
+
+  (test "personalized constrained fallbacks retain seed-specific examples"
+    (assert-true
+      (let loop ((n 0) (seen '()))
+        (if (> n 7)
+            #t
+            (let ((examples
+                    (pbe-spec-examples
+                      (pbe-fallback/constraint (seed-of n) 11 4095 0))))
+              (and (not (member examples seen))
+                   (loop (+ n 1) (cons examples seen))))))))
+
   (test "both published solutions satisfy the constraint and run"
     (let loop ((specs %forced))
       (if (null? specs)
@@ -610,7 +655,11 @@
     (assert-error (pbe-for (make-bytevector 16 0) 0 128))
     (assert-error (pbe-for (seed-of 0) -1 128))
     (assert-error (pbe-attempt (seed-of 0) 0 128 -1))
-    (assert-error (pbe-constraint-for (seed-of 0) 0 4096))))
+    (assert-error (pbe-constraint-for (seed-of 0) 0 4096))
+    (assert-error (pbe-for/constraint (seed-of 0) 0 128 8))
+    (assert-error (pbe-fallback/constraint (seed-of 0) 0 128 -1))
+    (assert-error
+      (pbe-for/constraint/anchor (seed-of 0) 0 128 0 "short"))))
 
 ;; ============================================================
 ;; Table sizing
@@ -640,7 +689,41 @@
     ;; 515-byte case above cannot be drawn.
     (assert-false (memv 3 (puzzle-constraint-tier-catalogue 2)))
     (assert-equal 4 (puzzle-complexity-k 1023))
-    (assert-equal 215 (string-length (pbe-table-solution 3 (worst-pairs 4))))))
+    (assert-equal 215 (string-length (pbe-table-solution 3 (worst-pairs 4)))))
+
+  (test "the anchored k=8 bound is exact"
+    ;; 40-byte letrec wrapper/base + seven 50-byte ordinary branches +
+    ;; 68-byte self-evaluating full-key output = 458.
+    (let ((table (pbe-table-solution 3 %worst-anchored-pairs)))
+      (assert-equal 458 (string-length table))
+      (assert-equal 54 (- puzzle-v2-max-source-bytes (string-length table)))
+      (assert-true (solves?
+                     (pbe-spec height: 1 complexity: 4095 constraint: 3 k: 8
+                               examples: %worst-anchored-pairs
+                               hidden-source: table table-solution: table
+                               par: 458 retries: 0)
+                     table))))
+
+  (test "real anchored fallbacks pass every constraint at k=8"
+    (assert-true
+      (let loop ((ci 0))
+        (if (> ci 7)
+            #t
+            (let* ((spec (pbe-fallback/constraint/anchor
+                           (seed-of ci) 11 4095 ci %max-anchor-output))
+                   (pairs (pbe-spec-examples spec))
+                   (anchor (list-ref pairs 7)))
+              (and (= 8 (pbe-spec-k spec))
+                   (= 8 (length pairs))
+                   (string=? pbe-anchor-input (car anchor))
+                   (string=? %max-anchor-output (cdr anchor))
+                   (not (member pbe-anchor-input (map car
+                                                       (reverse (cdr (reverse pairs))))))
+                   (solves? spec (pbe-spec-hidden-source spec))
+                   (solves? spec (pbe-spec-table-solution spec))
+                   (<= (string-length (pbe-spec-table-solution spec))
+                       puzzle-v2-max-source-bytes)
+                   (loop (+ ci 1)))))))))
 
 ;; ============================================================
 ;; The program-by-example interpreter entry point

@@ -61,6 +61,12 @@
             (bytevector-u8-set! bv i (char->integer (string-ref s i)))
             (loop (+ i 1)))))))
 
+(define (all-distinct? values)
+  (let loop ((xs values))
+    (or (null? xs)
+        (and (not (member (car xs) (cdr xs)))
+             (loop (cdr xs))))))
+
 ;; A puzzle spec built by hand: verification reads only `constraint`,
 ;; `complexity` and `examples`, so a synthetic spec is both more precise
 ;; and far faster than a generated one.
@@ -115,6 +121,29 @@
                    signature: (secp256k1-ecdsa-sign sk preimage)
                    blind: (filled 32 (+ n 100))
                    solution: (string->bytes source))))
+
+;; Fixed golfed bodies for keys 1..8. Each source adds that key's exact
+;; anchor output; alpha-renaming can change bytes but cannot change binding.
+(define %personalized-bodies
+  '(("x" "(list x(list x))")
+    ("x" "(list x(* x x))")
+    ("y" "(list y(list y))")
+    ("z" "(list z(list z))")
+    ("x" "(list x'up x)")
+    ("x" "(cons x(list x x))")
+    ("y" "(cons y(list y y))")
+    ("x" "(+(* x 5)20)")))
+
+(define (personalized-source n)
+  (let* ((entry (list-ref %personalized-bodies (- n 1)))
+         (x (car entry))
+         (body (list-ref entry 1))
+         (output (coin-v2-pubkey-anchor-output (pubkey-of n))))
+    (string-append "(lambda(" x ")(if(equal? " x " \"@\")\""
+                   output "\"" body "))")))
+
+(define (valid-share-of n)
+  (share-of n (personalized-source n)))
 
 (define (bytes<? a b)
   (let ((na (bytevector-length a)) (nb (bytevector-length b)))
@@ -1029,7 +1058,7 @@
                     (coin-v2-check-split 42 %subsidy '() #f)))))
 
 ;; ============================================================
-;; Aggregate fork choice (§5.6, §5.7)
+;; Aggregate-quality fork choice (§5.6, §5.7)
 ;; ============================================================
 
 (define (word length memory steps shares)
@@ -1085,8 +1114,8 @@
     (assert-true (not (coin-v2-replaces-tip? (word 24 50 51 0) #f
                                              (word 25 50 51 0))))))
 
-(test-group "fork choice: share count breaks exactly the right ties"
-  (test "more shares wins when the producer's solution is tied"
+(test-group "fork choice: aggregate quality breaks exactly the right ties"
+  (test "greater quality wins when the producer's solution is tied"
     (assert-true (coin-v2-better-block? 5 (word 24 50 51 3)
                                         5 (word 24 50 51 1)))
     (assert-true (coin-v2-better-block? 5 (word 24 50 51 8)
@@ -1119,9 +1148,9 @@
            (loop (+ r 1)))
           (else #f)))))
 
-  (test "share count is inert wherever a producer field differs"
-    ;; For every pair of distinct producer tuples and every pair of share
-    ;; counts, the ranking is the one the producer tuples alone give.
+  (test "quality is inert wherever a producer field differs"
+    ;; For distinct producer tuples and sampled quality values, producer
+    ;; fields alone determine ranking.
     (assert-true
       (let a-loop ((as '((24 50 51) (24 50 52) (24 51 0) (25 0 0) (1 0 0))))
         (cond
@@ -1363,6 +1392,92 @@
 (if %native-secp256k1?
     (begin
 
+      (test-group "personalized puzzles with valid compressed keys"
+        (test "full key encoding round-trips and is injective"
+          (let* ((keys (map pubkey-of '(1 2 3 4 5 6 7 8)))
+                 (encoded (map coin-v2-pubkey-anchor-output keys)))
+            (assert-true (all-distinct? encoded))
+            (assert-true
+              (let loop ((ks keys) (es encoded))
+                (or (null? ks)
+                    (and (= 66 (string-length (car es)))
+                         (pbe-anchor-output? (car es))
+                         (equal? (car ks)
+                                 (coin-v2-anchor-output-pubkey (car es)))
+                         (loop (cdr ks) (cdr es))))))))
+
+        (test "eight keys share one anchor input and nothing else"
+          (let* ((specs
+                   (map (lambda (n)
+                          (coin-v2-share-puzzle %bare-context (pubkey-of n)))
+                        '(1 2 3 4 5 6 7 8)))
+                 (anchors
+                   (map (lambda (spec)
+                          (list-ref (pbe-spec-examples spec)
+                                    (- (pbe-spec-k spec) 1)))
+                        specs))
+                 (ordinary
+                   (map (lambda (spec)
+                          (reverse (cdr (reverse (pbe-spec-examples spec)))))
+                        specs)))
+            (assert-true (all-distinct? ordinary))
+            (assert-true (all-distinct? (map cdr anchors)))
+            (assert-true
+              (let loop ((ss specs) (as anchors))
+                (or (null? ss)
+                    (and (string=? "@" (car (car as)))
+                         (string=?
+                           (coin-v2-pubkey-anchor-output
+                             (pubkey-of (- 9 (length ss))))
+                           (cdr (car as)))
+                         (= %puzzle-height (pbe-spec-height (car ss)))
+                         (= %complexity (pbe-spec-complexity (car ss)))
+                         (= (pbe-spec-k %spec) (pbe-spec-k (car ss)))
+                         (= (puzzle-complexity-width %complexity)
+                            (puzzle-complexity-width
+                              (pbe-spec-complexity (car ss))))
+                         (= (pbe-spec-constraint %spec)
+                            (pbe-spec-constraint (car ss)))
+                         (loop (cdr ss) (cdr as))))))))
+
+        (test "key A source fails key B exactly on the anchor"
+          (let* ((a (coin-v2-share-puzzle %bare-context (pubkey-of 1)))
+                 (b (coin-v2-share-puzzle %bare-context (pubkey-of 3)))
+                 (source (personalized-source 1))
+                 (cross (puzzle-run-examples source (pbe-spec-examples b))))
+            (assert-true (coin-ok? (coin-v2-check-solution a source)))
+            (assert-false (puzzle-report-ok? cross))
+            (assert-equal 'solution-mismatch
+                          (puzzle-report-error-kind cross))
+            (assert-equal (- (pbe-spec-k b) 1)
+                          (puzzle-report-index cross))))
+
+        (test "alpha-renaming and trivial wrappers stay key-bound"
+          (let* ((a-output (coin-v2-pubkey-anchor-output (pubkey-of 1)))
+                 (a (coin-v2-share-puzzle %bare-context (pubkey-of 1)))
+                 (b (coin-v2-share-puzzle %bare-context (pubkey-of 3)))
+                 (variants
+                   (list
+                     (personalized-source 1)
+                     (string-append
+                       "(lambda(y)(if(equal? y \"@\")\"" a-output
+                       "\"(list y(list y))))")
+                     (string-append
+                       "(lambda(x)(if(equal? x \"@\")\"" a-output
+                       "\"((lambda(y)(list y(list y)))x)))"))))
+            (assert-true
+              (let loop ((xs variants))
+                (or (null? xs)
+                    (let ((own (puzzle-run-examples
+                                 (car xs) (pbe-spec-examples a)))
+                          (cross (puzzle-run-examples
+                                   (car xs) (pbe-spec-examples b))))
+                      (and (puzzle-report-ok? own)
+                           (not (puzzle-report-ok? cross))
+                           (= (- (pbe-spec-k b) 1)
+                              (puzzle-report-index cross))
+                           (loop (cdr xs))))))))))
+
       (test-group "share signatures bind"
         (test "an honest share verifies"
           (let ((share (share-of 1 %sol-a)))
@@ -1431,21 +1546,22 @@
                                                            junk))))))
 
       (test-group "share validation: the happy path"
-        (test "one committed, signed, solving share is accepted"
-          (let ((shares (list (share-of 1 %sol-a))))
+        (test "one committed, signed, personalized solution is accepted"
+          (let ((shares (list (valid-share-of 1))))
+            (assert-true
+              (coin-ok? (coin-v2-check-share-solution
+                          %bare-context (car shares))))
             (assert-true (coin-ok? (check shares)))
-            (assert-equal 1 (length (coin-result-value (check shares))))))
+            (assert-equal 1 (length (coin-result-value (check shares))))
+            (assert-true (> (coin-v2-shares-quality %bare-context shares) 0))))
 
-        (test "three shares are accepted and returned in order"
-          (let ((shares (in-share-order (list (share-of 1 %sol-a)
-                                              (share-of 2 %sol-b)
-                                              (share-of 3 %sol-c)))))
+        (test "three personalized shares are accepted and returned in order"
+          (let ((shares (in-share-order (map valid-share-of '(1 2 3)))))
             (assert-true (coin-ok? (check shares)))
             (assert-equal 3 (length (coin-result-value (check shares))))))
 
         (test "the accepted shares survive a wire round trip"
-          (let* ((shares (in-share-order (list (share-of 1 %sol-a)
-                                               (share-of 2 %sol-b))))
+          (let* ((shares (in-share-order (map valid-share-of '(1 2))))
                  (back (coin-v2-shares-decode
                          (coin-v2-shares-encode shares))))
             (assert-true (coin-ok? back))
@@ -1530,10 +1646,8 @@
                                               (share-of 2 %sol-a)))))
             (assert-equal 'share-duplicate-solution (check-reason shares))))
 
-        (test "byte-wise distinct programs are distinct shares"
-          ;; %sol-a and %sol-d differ by one space and both double.
-          (let ((shares (in-share-order (list (share-of 1 %sol-a)
-                                              (share-of 2 %sol-c)))))
+        (test "distinct personalized programs are distinct shares"
+          (let ((shares (in-share-order (map valid-share-of '(1 2)))))
             (assert-true
               (coin-ok? (coin-v2-check-shares (context-for shares)
                                               (string->bytes %sol-d)
@@ -1553,16 +1667,9 @@
             (assert-equal 'share-solution-not-a-procedure
                           (check-reason shares))))
 
-        (test "eight shares is the ceiling and it is reachable"
+        (test "eight personalized shares is the reachable ceiling"
           (let ((shares (in-share-order
-                          (list (share-of 1 "(lambda(x)(* x 2))")
-                                (share-of 2 "(lambda(x)(* 2 x))")
-                                (share-of 3 "(lambda(x)(+ x x))")
-                                (share-of 4 "(lambda(x)(+ x  x))")
-                                (share-of 5 "(lambda(x)(*  x 2))")
-                                (share-of 6 "(lambda(x) (* x 2))")
-                                (share-of 7 "(lambda(x)(* x  2))")
-                                (share-of 8 "(lambda(x)(*  2 x))")))))
+                          (map valid-share-of '(1 2 3 4 5 6 7 8)))))
             (assert-true (coin-ok? (check shares)))
             (assert-equal 8 (length (coin-result-value (check shares)))))))
 
@@ -1582,7 +1689,7 @@
 
         (test "a thief cannot redirect a share he does include"
           ;; Including it obliges him to pay the signed key.
-          (let* ((share (share-of 1 %sol-a))
+          (let* ((share (valid-share-of 1))
                  (shares (list share))
                  (plan (coin-v2-split-plan %subsidy shares %burn))
                  (honest (planned-outputs plan)))
@@ -1626,7 +1733,7 @@
 
       (test-group "commit-reveal round trip"
         (test "a commitment made at H opens exactly once at H+1"
-          (let* ((share (share-of 1 %sol-a))
+          (let* ((share (valid-share-of 1))
                  (commitment (coin-v2-share-commitment %bare-context share))
                  ;; Block H-1 publishes the commitment ...
                  (parent-commits (coin-v2-commits-encode (list commitment)))
@@ -1648,7 +1755,7 @@
                                               (context-with carried)))))))
 
         (test "the whole thing survives the coinbase codec"
-          (let* ((share (share-of 1 %sol-a))
+          (let* ((share (valid-share-of 1))
                  (carried (list (coin-v2-share-commitment %bare-context
                                                           share)))
                  (script (coin-v2-coinbase-payload-encode
@@ -1666,8 +1773,8 @@
           ;; §7.3: no penalty, no refund, and no state kept past one block.
           ;; A block whose parent carried two commitments and which reveals
           ;; one is exactly as valid as one that reveals both.
-          (let* ((a (share-of 1 %sol-a))
-                 (b (share-of 2 %sol-b))
+          (let* ((a (valid-share-of 1))
+                 (b (valid-share-of 2))
                  (carried (commits-for (list a b)))
                  (one (payload 2 (string->bytes %sol-d)
                                (coin-v2-shares-encode (list a))
@@ -1710,7 +1817,7 @@
                                       (list (share-of 1 %sol-a)))))))
 
         (test "the carrier is paid exactly when a reveal is accepted"
-          (let* ((shares (list (share-of 1 %sol-a)))
+          (let* ((shares (list (valid-share-of 1)))
                  (with-shares (coin-v2-split-plan %subsidy shares %burn))
                  (without (coin-v2-split-plan %subsidy '() #f)))
             (assert-true (coin-ok? (check shares)))

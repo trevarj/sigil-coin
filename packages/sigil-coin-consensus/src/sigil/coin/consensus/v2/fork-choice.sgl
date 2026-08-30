@@ -8,14 +8,13 @@
 ;;; where "<" means "is the better tip". Height dominates, so this is
 ;;; longest-chain first; `W` only ever decides between siblings.
 ;;;
-;;; HOW SHARE COUNT COMPOSES. `W` packs `(L-1, MB, SB, 8-R)` into disjoint
-;;; fixed-width fields, most significant first, so unsigned `<` on `W` is
-;;; lexicographic `<` on that tuple (see `(sigil coin consensus v2 score)`
-;;; for why). `8-R` occupies the four bits BELOW every producer field.
-;;; Therefore `R` changes the comparison of two blocks if and only if their
-;;; `(L, MB, SB)` are equal: it decides exactly the comparisons the
-;;; producer's own solution leaves tied, and nothing else. A producer cannot
-;;; buy a win by collecting shares — only a tie.
+;;; HOW AGGREGATE QUALITY COMPOSES. `W` packs
+;;; `(L-1, MB, SB, 15-Q)` into disjoint fixed-width fields, most significant
+;;; first, so unsigned `<` on `W` is lexicographic `<` on that tuple (see
+;;; `(sigil coin consensus v2 score)` for why). `15-Q` occupies the four bits
+;;; BELOW every producer field. Therefore verified co-op work changes two
+;;; blocks' order only when `(L, MB, SB)` tie. Raw reveal count `R` remains a
+;;; separate reward-split input and cannot buy ranking.
 ;;;
 ;;; STRICT WEAK ORDERING. Let `f(b) = (-height(b), W(b))` in Z x Z under the
 ;;; lexicographic order, which is a strict total order because both

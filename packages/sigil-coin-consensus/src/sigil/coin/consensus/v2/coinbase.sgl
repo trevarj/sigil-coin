@@ -367,8 +367,8 @@
     ;;; block that has no parent, which is genesis and only genesis.
     ;;;
     ;;; On success the value is the list of accepted shares. Its length is
-    ;;; the `R` the score word packs (§5.3) and the split pays (§6.5), and
-    ;;; its pubkeys are the payout scripts, so a caller never recomputes it.
+    ;;; `R` for the split (§6.5); aggregate ranking quality `Q` is derived
+    ;;; from their personalized margins. Pubkeys determine payout scripts.
     ;;;
     ;;; This block's own COMMITS are decoded and canonicality-checked here
     ;;; but are not otherwise consensus until the CHILD reveals against
