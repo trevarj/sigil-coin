@@ -56,7 +56,9 @@
           (sigil coin puzzle)
           (sigil coin puzzle generator)
           (sigil coin consensus)
-          (sigil coin node))
+          (sigil coin consensus v2)
+          (sigil coin node)
+          (sigil coin explorer v2))
   (export
     ;; Addresses
     explorer-address-hrp
@@ -95,6 +97,58 @@
     explorer-block-problem
     explorer-block-under-par
 
+    ;; Blocks, v2
+    explorer-block-version
+    explorer-block-v2?
+    explorer-block-complexity
+    explorer-block-constraint
+    explorer-block-constraint-text
+    explorer-block-k
+    explorer-block-examples
+    explorer-block-score-word
+    explorer-block-score-length
+    explorer-block-score-memory
+    explorer-block-score-steps
+    explorer-block-score-quality
+    explorer-block-share-count
+    explorer-block-shares
+    explorer-block-commit-count
+    explorer-block-outputs
+    explorer-block-total-output
+    explorer-block-author
+    explorer-block-margin
+
+    ;; Co-op shares
+    explorer-share
+    explorer-share?
+    explorer-share-index
+    explorer-share-pubkey-hex
+    explorer-share-signature-hex
+    explorer-share-blind-hex
+    explorer-share-address
+    explorer-share-solution
+    explorer-share-solution-source
+    explorer-share-solution-length
+    explorer-share-par
+    explorer-share-margin
+    explorer-share-contribution
+    explorer-share-steps
+    explorer-share-cells
+    explorer-share-memory-bucket
+    explorer-share-step-bucket
+    explorer-share-payout
+    explorer-share-problem
+
+    ;; Coinbase outputs
+    explorer-output
+    explorer-output?
+    explorer-output-index
+    explorer-output-role
+    explorer-output-value
+    explorer-output-script
+    explorer-output-address
+    explorer-output-expected
+
     ;; Chain summary
     explorer-summary
     explorer-summary?
@@ -114,9 +168,18 @@
     explorer-summary-puzzle-par
     explorer-summary-puzzle-seed
     explorer-summary-empty
+    explorer-summary-version
+    explorer-summary-complexity
+    explorer-summary-next-complexity
+    explorer-summary-next-retarget-height
+    explorer-summary-puzzle-constraint
+    explorer-summary-puzzle-constraint-text
+    explorer-summary-puzzle-k
+    explorer-summary-puzzle-examples
 
     ;; Queries
     explorer-default-page-size
+    explorer-difficulty-window
     explorer-chain-summary
     explorer-recent-blocks
     explorer-block-by-height
@@ -138,6 +201,11 @@
 
     ;;; How many blocks a list page shows by default.
     (define explorer-default-page-size 25)
+
+    ;;; How many blocks the difficulty history covers: four retarget
+    ;;; windows, so a reader can see whether `C` is oscillating rather than
+    ;;; adapting (Open Question 4).
+    (define explorer-difficulty-window 64)
 
     ;; The most blocks any single walk of the chain will visit. An address
     ;; view has to scan the chain to find the blocks it mined, and this is
@@ -339,7 +407,80 @@
       (payout-address default: #f)
       (transaction-count default: #f)
       (size default: #f)
+      (problem default: #f)
+      ;; v2. Every one of these is `#f` or empty on a v1 block, so a chain
+      ;; that has not split renders exactly as it did before.
+      (version default: #f)
+      (complexity default: #f)
+      (constraint default: #f)
+      (constraint-text default: #f)
+      (k default: #f)
+      (examples default: '())
+      (score-word default: #f)
+      (score-length default: #f)
+      (score-memory default: #f)
+      (score-steps default: #f)
+      (score-quality default: #f)
+      (share-count default: #f)
+      (shares default: '())
+      (commit-count default: #f)
+      (outputs default: '())
+      (total-output default: #f)
+      (author default: #f)
+      (margin default: #f))
+
+    ;;; One co-op share, as a block claims it (§6.2).
+    ;;;
+    ;;; `steps` and `cells` are what the share's program actually cost when
+    ;;; the explorer re-ran it against the puzzle, and are only filled in on
+    ;;; a block DETAIL view; a list page evaluates nothing. `problem` names
+    ;;; why when they are missing.
+    ;;;
+    ;;; The signature is decoded but never verified: the node verified every
+    ;;; share in a block it stored, and re-running ECDSA on a page load
+    ;;; would spend a validator's budget re-deciding a settled question.
+    (define-struct explorer-share
+      (index integer?)
+      (pubkey-hex string?)
+      (signature-hex string?)
+      (blind-hex string?)
+      (address default: #f)
+      (solution default: #f)
+      (solution-source default: #f)
+      (solution-length default: #f)
+      (par default: #f)
+      (margin default: #f)
+      (contribution default: #f)
+      (steps default: #f)
+      (cells default: #f)
+      (memory-bucket default: #f)
+      (step-bucket default: #f)
+      (payout default: #f)
       (problem default: #f))
+
+    ;;; One coinbase output, with the role §6.5 gives it and the value that
+    ;;; section says it should carry.
+    ;;;
+    ;;; `expected` is the split arithmetic's own answer; when it disagrees
+    ;;; with `value` the page says so rather than hiding it, because a block
+    ;;; whose outputs do not match the split is a block a node should have
+    ;;; rejected.
+    (define-struct explorer-output
+      (index integer?)
+      (role default: #f)
+      (value default: 0)
+      (script default: #f)
+      (address default: #f)
+      (expected default: #f))
+
+    ;;; True when a block's header declares consensus v2.
+    ;;;
+    ;;; ```scheme
+    ;;; (explorer-block-v2? b) ; => #f on a v1 chain
+    ;;; ```
+    (define (explorer-block-v2? b)
+      (: explorer-block? -> boolean?)
+      (explorer-v2-header? (explorer-block-version b)))
 
     ;;; How many bytes under par a block's solution came in, or `#f` when
     ;;; either number is unknown. Negative means the miner published a
@@ -379,15 +520,276 @@
                           (hex-encode (coin-puzzle-seed parent-hash
                                                         height))))))))
 
+    ;; The header a row carries, or #f. Version, `bits` and `nonce` all live
+    ;; here rather than in the body, so a header-only row still says which
+    ;; consensus version it belongs to and what score it claims.
+    (define (row-header hrow)
+      (guard (e (#t #f))
+        (let ((hex (row-ref hrow 'header_hex)))
+          (and (string? hex) (block-header-parse (hex-decode hex))))))
+
+    ;; The scriptSig of a parsed block's coinbase, or #f.
+    (define (coinbase-script parsed)
+      (guard (e (#t #f))
+        (let ((coinbase (coin-block-coinbase parsed)))
+          (and coinbase
+               (txin-script-sig (car (transaction-inputs coinbase)))))))
+
+    (define (coinbase-outputs parsed)
+      (guard (e (#t '()))
+        (let ((coinbase (coin-block-coinbase parsed)))
+          (if coinbase (transaction-outputs coinbase) '()))))
+
+    ;; Parse a validated block row by hash, absorbing corrupt database bytes.
+    (define (stored-block store hash)
+      (guard (e (#t #f))
+        (and (bytevector? hash)
+             (let ((hex (block-hex store (hex-encode hash))))
+               (and hex (block-parse (hex-decode hex)))))))
+
+    ;; Context for shares revealed at `height`. It derives the personalized
+    ;; puzzle only; page loads deliberately do not verify commitments or ECDSA.
+    (define (share-context store height parent-hash)
+      (guard (e (#t #f))
+        (and (> height 1)
+             (let* ((row (header-row store (hex-encode parent-hash)))
+                    (header (and row (row-header row)))
+                    (parent-prev (and row (hex-decode (row-ref row 'prev_hash))))
+                    (complexity (and header
+                                     (explorer-v2-complexity
+                                       (block-header-bits header))))
+                    (spec (and complexity
+                               (explorer-v2-puzzle parent-prev
+                                                   (- height 1)
+                                                   complexity))))
+               (and spec
+                    (coin-v2-coop-context
+                      parent-prev-hash: parent-prev
+                      puzzle-height: (- height 1)
+                      complexity: complexity
+                      spec: spec
+                      commits: '()))))))
+
+    ;; One consensus share flattened for display. Signature and blind are
+    ;; decoded as hex, never verified or interpreted by the explorer.
+    (define (make-share index share payout context detail?)
+      (let* ((pubkey (coin-v2-share-pubkey share))
+             (solution (coin-v2-share-solution share))
+             (personalized (and detail? context
+                                (guard (e (#t #f))
+                                  (coin-v2-share-puzzle context pubkey))))
+             (personalized-view
+               (and personalized (explorer-v2-puzzle-view personalized)))
+             (par (and personalized-view (car personalized-view)))
+             (length-used (bytevector-length solution))
+             (margin (and par (< length-used par)
+                          (guard (e (#t #f))
+                            (coin-v2-share-margin-milli par length-used))))
+             (contribution (and margin
+                                (guard (e (#t #f))
+                                  (coin-v2-share-contribution margin))))
+             (cost (and personalized
+                        (explorer-v2-check-solution personalized solution)))
+             (script (guard (e (#t #f)) (coin-v2-share-script pubkey))))
+        (explorer-share
+          index: index
+          pubkey-hex: (hex-encode pubkey)
+          signature-hex: (hex-encode (coin-v2-share-signature share))
+          blind-hex: (hex-encode (coin-v2-share-blind share))
+          address: (explorer-script->address script)
+          solution: solution
+          solution-source: (solution-source solution)
+          solution-length: length-used
+          par: par
+          margin: margin
+          contribution: contribution
+          steps: (and cost (car cost))
+          cells: (and cost (cdr cost))
+          memory-bucket: (and cost (explorer-v2-bucket (cdr cost)))
+          step-bucket: (and cost (explorer-v2-bucket (car cost)))
+          payout: payout
+          problem: (cond ((not detail?) 'not-evaluated)
+                         ((not personalized) 'puzzle-unknown)
+                         ((not margin) 'share-not-under-par)
+                         (cost #f)
+                         (else 'not-a-solution)))))
+
+    (define (output-role index share-count)
+      (cond ((not (number? share-count)) 'unexpected)
+            ((= index 0) 'producer)
+            ((<= index share-count) 'share)
+            ((and (> share-count 0) (= index (+ share-count 1))) 'carrier)
+            (else 'unexpected)))
+
+    ;; Label actual outputs against consensus's exact split plan.
+    (define (make-outputs outputs shares carrier-script)
+      (let* ((total (let loop ((xs outputs) (sum 0))
+                      (if (null? xs)
+                          sum
+                          (loop (cdr xs) (+ sum (txout-value (car xs)))))))
+             (share-count (and (list? shares) (length shares)))
+             (plan (and (list? shares)
+                        (guard (e (#t #f))
+                          (coin-v2-split-plan total shares carrier-script)))))
+        (let loop ((xs outputs) (i 0) (expected plan) (out '()))
+          (if (null? xs)
+              (reverse out)
+              (let ((script (txout-script-pubkey (car xs))))
+                (loop (cdr xs)
+                      (+ i 1)
+                      (if (pair? expected) (cdr expected) '())
+                      (cons (explorer-output
+                              index: i
+                              role: (output-role i share-count)
+                              value: (txout-value (car xs))
+                              script: script
+                              address: (explorer-script->address script)
+                              expected: (and (pair? expected)
+                                             (car (car expected))))
+                            out)))))))
+
+    ;; Everything a v2 body adds to the record. Wire payloads and nested
+    ;; SHARES/COMMITS fields are decoded only by consensus-owned codecs.
+    (define (v2-fields store base header parsed parent-hash detail?)
+      (let* ((height (explorer-block-height base))
+             (complexity (explorer-v2-complexity (block-header-bits header)))
+             (score-result (coin-v2-score-check (block-header-nonce header)))
+             (score (and (coin-ok? score-result)
+                         (explorer-v2-score (block-header-nonce header))))
+             (spec (and (> height 0)
+                        (explorer-v2-puzzle parent-hash height complexity)))
+             (view (explorer-v2-puzzle-view spec))
+             (decoded (and parsed
+                           (coin-v2-coinbase-payload-decode
+                             (coinbase-script parsed))))
+             (payload (and decoded (coin-ok? decoded)
+                           (coin-result-value decoded)))
+             (shares-result (and payload
+                                 (coin-v2-shares-decode
+                                   (coin-v2-coinbase-payload-shares payload))))
+             (commits-result (and payload
+                                  (coin-v2-commits-decode
+                                    (coin-v2-coinbase-payload-commits payload))))
+             (shares (and shares-result (coin-ok? shares-result)
+                          (coin-result-value shares-result)))
+             (commits (and commits-result (coin-ok? commits-result)
+                           (coin-result-value commits-result)))
+             (share-count (and shares (length shares)))
+             (parent-block (and (pair? shares)
+                                (stored-block store parent-hash)))
+             (carrier-script (and parent-block
+                                  (coin-v2-carrier-script parent-block)))
+             (outputs (if parsed
+                          (make-outputs (coinbase-outputs parsed)
+                                        shares carrier-script)
+                          '()))
+             (graffiti (and payload
+                            (coin-v2-coinbase-payload-graffiti payload)))
+             (solution (and payload
+                            (coin-v2-coinbase-payload-solution payload)))
+             (par (and view (car view)))
+             (length-used (and solution (bytevector-length solution)))
+             (context (and detail? (pair? shares)
+                           (share-context store height parent-hash))))
+        (explorer-block
+          height: height
+          id: (explorer-block-id base)
+          hash-text: (explorer-block-hash-text base)
+          time: (explorer-block-time base)
+          parent-id: (explorer-block-parent-id base)
+          solution: solution
+          solution-source: (and solution (solution-source solution))
+          solution-length: length-used
+          graffiti: graffiti
+          par: par
+          seed: (and (> height 0)
+                     (explorer-v2-seed parent-hash height complexity))
+          reward: (explorer-block-reward base)
+          payout-script: (and (pair? outputs)
+                              (explorer-output-script (car outputs)))
+          payout-address: (and (pair? outputs)
+                               (explorer-output-address (car outputs)))
+          transaction-count: (and parsed
+                                  (guard (e (#t #f))
+                                    (length (block-transactions parsed))))
+          size: (and parsed (coin-block-size parsed))
+          problem: (cond
+                     ((not parsed) (explorer-block-problem base))
+                     ((coin-failed? score-result)
+                      (coin-result-reason score-result))
+                     ((and decoded (coin-failed? decoded))
+                      (coin-result-reason decoded))
+                     ((and payload
+                           (not (= height
+                                   (coin-v2-coinbase-payload-height payload))))
+                      'coinbase-height-mismatch)
+                     ((and shares-result (coin-failed? shares-result))
+                      (coin-result-reason shares-result))
+                     ((and commits-result (coin-failed? commits-result))
+                      (coin-result-reason commits-result))
+                     (else #f))
+          version: (block-header-version header)
+          complexity: complexity
+          constraint: (and view (car (cdr view)))
+          constraint-text: (and view (car (cdr (cdr view))))
+          k: (and view (car (cdr (cdr (cdr view)))))
+          examples: (if view (car (cdr (cdr (cdr (cdr view))))) '())
+          score-word: (block-header-nonce header)
+          score-length: (and score (list-ref score 0))
+          score-memory: (and score (list-ref score 1))
+          score-steps: (and score (list-ref score 2))
+          score-quality: (and score (list-ref score 3))
+          share-count: share-count
+          shares: (let loop ((xs (if shares shares '()))
+                             (i 0)
+                             (payouts (share-payouts outputs))
+                             (out '()))
+                    (if (null? xs)
+                        (reverse out)
+                        (loop (cdr xs)
+                              (+ i 1)
+                              (if (pair? payouts) (cdr payouts) '())
+                              (cons (make-share i
+                                                (car xs)
+                                                (and (pair? payouts)
+                                                     (car payouts))
+                                                context
+                                                detail?)
+                                    out))))
+          commit-count: (and commits (length commits))
+          outputs: outputs
+          total-output: (let loop ((xs outputs) (sum 0))
+                          (if (null? xs)
+                              (and (pair? outputs) sum)
+                              (loop (cdr xs)
+                                    (+ sum (explorer-output-value (car xs))))))
+          author: (explorer-v2-author-tag graffiti)
+          margin: (explorer-v2-margin par length-used))))
+
+    ;; The values of outputs 1..R, which are the share payouts.
+    (define (share-payouts outputs)
+      (let loop ((xs outputs) (out '()))
+        (cond ((null? xs) (reverse out))
+              ((eq? 'share (explorer-output-role (car xs)))
+               (loop (cdr xs)
+                     (cons (explorer-output-value (car xs)) out)))
+              (else (loop (cdr xs) out)))))
+
     ;; Build the record from the header row plus, when it has arrived, the
     ;; body. Every step is guarded: a block row is bytes a peer sent.
-    (define (make-block store hrow)
+    ;;
+    ;; `detail?` is what a block PAGE passes and a list page does not: it
+    ;; re-runs each co-op share's program to report what it cost. Nothing on
+    ;; a list page evaluates anything.
+    (define (make-block store hrow detail?)
       (let* ((hash-text (row-ref hrow 'hash))
              (prev-text (row-ref hrow 'prev_hash))
              (height (row-ref hrow 'height))
              (time (row-ref hrow 'time))
+             (header (row-header hrow))
              (hex (block-hex store hash-text))
              (parsed (and hex (guard (e (#t #f)) (block-parse (hex-decode hex)))))
+             (parent-hash (guard (e (#t #f)) (hex-decode prev-text)))
              (base (explorer-block
                      height: height
                      id: (hash-text->id hash-text)
@@ -396,6 +798,7 @@
                      parent-id: (and (string? prev-text)
                                      (hash-text->id prev-text))
                      reward: (guard (e (#t 0)) (coin-block-reward height))
+                     version: (and header (block-header-version header))
                      ;; A node stores the genesis HEADER and no genesis
                      ;; body, so genesis is permanently body-less. Saying
                      ;; so is honest; calling it "not downloaded yet" is
@@ -403,17 +806,21 @@
                      problem: (cond (hex #f)
                                     ((= height 0) 'genesis)
                                     (else 'body-not-downloaded)))))
-        (if (not parsed)
-            (if hex
-                (explorer-block-with-problem base 'block-unparsable)
-                base)
+        (cond
+          ;; A v2 header is rendered by the v2 path whether or not its body
+          ;; has arrived: the complexity and the score word are in the
+          ;; header, so a mid-sync v2 block still says what it claims.
+          ((and header (explorer-v2-header? (block-header-version header)))
+           (guard (e (#t (explorer-block-with-problem base 'block-unreadable)))
+             (v2-fields store base header parsed parent-hash detail?)))
+          ((not parsed)
+           (if hex (explorer-block-with-problem base 'block-unparsable) base))
+          (else
             (let* ((payload (coin-block-coinbase-payload parsed))
-                   (parent-hash (guard (e (#t #f)) (hex-decode prev-text)))
                    (puzzle (puzzle-fields height parent-hash))
-                   (coinbase (coin-block-coinbase parsed))
-                   (outputs (guard (e (#t '()))
-                              (if coinbase (transaction-outputs coinbase) '())))
-                   (script (and (pair? outputs) (txout-script-pubkey (car outputs)))))
+                   (outputs (coinbase-outputs parsed))
+                   (script (and (pair? outputs)
+                                (txout-script-pubkey (car outputs)))))
               (explorer-block
                 height: height
                 id: (explorer-block-id base)
@@ -443,9 +850,23 @@
                 transaction-count: (guard (e (#t #f))
                                      (length (block-transactions parsed)))
                 size: (coin-block-size parsed)
+                version: (explorer-block-version base)
+                ;; §9.1's relative margin is well defined for any
+                ;; (par, length) pair, so a v1 chain gets an honest
+                ;; difficulty history even though v1 never retargeted on it.
+                margin: (explorer-v2-margin
+                          (car puzzle)
+                          (and (coin-ok? payload)
+                               (bytevector-length
+                                 (coin-coinbase-payload-solution
+                                   (coin-result-value payload)))))
+                author: (and (coin-ok? payload)
+                             (explorer-v2-author-tag
+                               (coin-coinbase-payload-graffiti
+                                 (coin-result-value payload))))
                 problem: (if (coin-ok? payload)
                              #f
-                             (coin-result-reason payload)))))))
+                             (coin-result-reason payload))))))))
 
     ;; A copy of `b` carrying `reason` instead of its current problem.
     (define (explorer-block-with-problem b reason)
@@ -456,6 +877,7 @@
         time: (explorer-block-time b)
         parent-id: (explorer-block-parent-id b)
         reward: (explorer-block-reward b)
+        version: (explorer-block-version b)
         problem: reason))
 
     ;; ============================================================
@@ -479,7 +901,16 @@
       (puzzle-target default: #f)
       (puzzle-par default: #f)
       (puzzle-seed default: #f)
-      (empty default: #f))
+      (empty default: #f)
+      ;; v2, all `#f` or empty on a v1 chain.
+      (version default: #f)
+      (complexity default: #f)
+      (next-complexity default: #f)
+      (next-retarget-height default: #f)
+      (puzzle-constraint default: #f)
+      (puzzle-constraint-text default: #f)
+      (puzzle-k default: #f)
+      (puzzle-examples default: '()))
 
     ;;; The next height at which the block reward halves, or `#f` once the
     ;;; schedule has decayed to zero and no later halving changes anything.
@@ -519,7 +950,26 @@
              (tip-time (if tip-row (row-ref tip-row 'time) 0))
              (next-height (+ tip-height 1))
              (tip-hash (guard (e (#t #f)) (hex-decode tip-text)))
-             (puzzle (puzzle-fields next-height tip-hash)))
+             (tip-header (and tip-row (row-header tip-row)))
+             (version (and tip-header (block-header-version tip-header)))
+             (v2? (explorer-v2-header? version))
+             (complexity (and v2?
+                              (explorer-v2-complexity
+                                (block-header-bits tip-header))))
+             ;; Only a v2 chain pays for the margin window, and only then
+             ;; because the NEXT puzzle depends on where the retarget lands.
+             (next-complexity
+              (and v2?
+                   (explorer-v2-next-complexity
+                     next-height
+                     complexity
+                     (margin-window store))))
+             (puzzle (if v2? '(#f #f . #f) (puzzle-fields next-height tip-hash)))
+             (spec (and v2?
+                        (explorer-v2-puzzle tip-hash
+                                            next-height
+                                            next-complexity)))
+             (view (explorer-v2-puzzle-view spec)))
         (explorer-summary
           chain-name: (chain-config-name config)
           tip-height: tip-height
@@ -539,10 +989,46 @@
           next-height: next-height
           next-reward: (guard (e (#t 0)) (coin-block-reward next-height))
           next-halving-height: (explorer-next-halving-height tip-height)
-          puzzle-par: (car puzzle)
+          puzzle-par: (if view (car view) (car puzzle))
           puzzle-target: (car (cdr puzzle))
-          puzzle-seed: (cdr (cdr puzzle))
+          puzzle-seed: (if v2?
+                           (explorer-v2-seed tip-hash
+                                             next-height
+                                             next-complexity)
+                           (cdr (cdr puzzle)))
+          version: version
+          complexity: complexity
+          next-complexity: next-complexity
+          next-retarget-height: (and v2? (next-retarget-height next-height))
+          puzzle-constraint: (and view (car (cdr view)))
+          puzzle-constraint-text: (and view (car (cdr (cdr view))))
+          puzzle-k: (and view (car (cdr (cdr (cdr view)))))
+          puzzle-examples: (if view (car (cdr (cdr (cdr (cdr view))))) '())
           empty: (= header-count 0))))
+
+    ;; The first height at or after `height` where a retarget fires.
+    (define (next-retarget-height height)
+      (let loop ((h (max height coin-v2-retarget-window)))
+        (if (explorer-v2-retarget-height? h) h (loop (+ h 1)))))
+
+    ;; The margins for the 16 heights below the tip, oldest first, or `'()`
+    ;; when any of them is unknown. `coin-v2-complexity-for` wants a full
+    ;; window or nothing: a partial window is a different rule, and §9.4 has
+    ;; none.
+    (define (margin-window store)
+      (let ((out '()))
+        (walk-chain store
+                    coin-v2-retarget-window
+                    (lambda (b)
+                      (set! out (cons (explorer-block-margin b) out))
+                      #t))
+        (if (or (not (= coin-v2-retarget-window (length out)))
+                (let loop ((xs out))
+                  (cond ((null? xs) #f)
+                        ((not (number? (car xs))) #t)
+                        (else (loop (cdr xs))))))
+            '()
+            out)))
 
     ;; ============================================================
     ;; Block queries
@@ -557,7 +1043,7 @@
             (let ((hrow (header-row store hash-text)))
               (if (not hrow)
                   #t
-                  (let ((b (make-block store hrow)))
+                  (let ((b (make-block store hrow #f)))
                     (if (not (visit b))
                         #t
                         (loop (row-ref hrow 'prev_hash) (+ seen 1)))))))))
@@ -597,7 +1083,14 @@
                                  #f)
                                 ((< (explorer-block-height b) height) #f)
                                 (else #t))))
-            found)))
+            (and found (detail-block store found)))))
+
+    ;; Re-read a block with the detail work done. The walk that found it
+    ;; deliberately did none, so a list of 25 blocks never evaluates a
+    ;; single co-op share's program.
+    (define (detail-block store b)
+      (let ((hrow (header-row store (explorer-block-hash-text b))))
+        (if hrow (make-block store hrow #t) b)))
 
     ;;; The block whose display id is `id`, or `#f`.
     ;;;
@@ -616,7 +1109,7 @@
                               (hex-encode (reverse-bytevector (hex-decode id)))))))
         (and hash-text
              (let ((hrow (header-row store hash-text)))
-               (and hrow (make-block store hrow))))))
+               (and hrow (make-block store hrow #t))))))
 
     ;;; Blocks on the active chain whose coinbase paid `script`, newest
     ;;; first, at most `limit` of them.

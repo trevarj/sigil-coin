@@ -1,6 +1,7 @@
 ;;; (sigil coin explorer) — the read-only SigilCoin chain explorer
 ;;;
-;;; Facade over the three modules the explorer is made of:
+;;; Facade over the explorer's modules. Consensus v2 owns all wire codecs;
+;;; `(sigil coin explorer v2)` contains presentation helpers only.
 ;;;
 ;;;   (sigil coin explorer store)   read-only reads from a node's database
 ;;;   (sigil coin explorer render)  escaping, HTML pages, JSON bodies
@@ -74,6 +75,58 @@
     explorer-block-problem
     explorer-block-under-par
 
+    ;; Store: blocks, v2
+    explorer-block-version
+    explorer-block-v2?
+    explorer-block-complexity
+    explorer-block-constraint
+    explorer-block-constraint-text
+    explorer-block-k
+    explorer-block-examples
+    explorer-block-score-word
+    explorer-block-score-length
+    explorer-block-score-memory
+    explorer-block-score-steps
+    explorer-block-score-quality
+    explorer-block-share-count
+    explorer-block-shares
+    explorer-block-commit-count
+    explorer-block-outputs
+    explorer-block-total-output
+    explorer-block-author
+    explorer-block-margin
+
+    ;; Store: co-op shares
+    explorer-share
+    explorer-share?
+    explorer-share-index
+    explorer-share-pubkey-hex
+    explorer-share-signature-hex
+    explorer-share-blind-hex
+    explorer-share-address
+    explorer-share-solution
+    explorer-share-solution-source
+    explorer-share-solution-length
+    explorer-share-par
+    explorer-share-margin
+    explorer-share-contribution
+    explorer-share-steps
+    explorer-share-cells
+    explorer-share-memory-bucket
+    explorer-share-step-bucket
+    explorer-share-payout
+    explorer-share-problem
+
+    ;; Store: coinbase outputs
+    explorer-output
+    explorer-output?
+    explorer-output-index
+    explorer-output-role
+    explorer-output-value
+    explorer-output-script
+    explorer-output-address
+    explorer-output-expected
+
     ;; Store: chain summary
     explorer-summary
     explorer-summary?
@@ -93,9 +146,18 @@
     explorer-summary-puzzle-par
     explorer-summary-puzzle-seed
     explorer-summary-empty
+    explorer-summary-version
+    explorer-summary-complexity
+    explorer-summary-next-complexity
+    explorer-summary-next-retarget-height
+    explorer-summary-puzzle-constraint
+    explorer-summary-puzzle-constraint-text
+    explorer-summary-puzzle-k
+    explorer-summary-puzzle-examples
 
     ;; Store: queries
     explorer-default-page-size
+    explorer-difficulty-window
     explorer-chain-summary
     explorer-recent-blocks
     explorer-block-by-height
@@ -114,12 +176,16 @@
     explorer-sigil-amount
     explorer-format-time
     explorer-under-par-text
+    explorer-margin-text
+    explorer-author-tally
+    explorer-author-window
 
     ;; Render: pages
     explorer-page
     explorer-summary-page
     explorer-blocks-page
     explorer-block-page
+    explorer-difficulty-page
     explorer-address-page
     explorer-missing-page
     explorer-no-database-page
@@ -128,6 +194,7 @@
     explorer-summary-json
     explorer-blocks-json
     explorer-block-json
+    explorer-difficulty-json
     explorer-address-json
     explorer-error-json
 

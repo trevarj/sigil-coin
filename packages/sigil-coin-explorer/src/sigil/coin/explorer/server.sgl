@@ -17,10 +17,12 @@
 ;;;
 ;;;   GET /                    chain summary and recent blocks
 ;;;   GET /blocks              the recent block list
+;;;   GET /difficulty          complexity and achieved margin over time
 ;;;   GET /block/<height|id>   one block in full
 ;;;   GET /address/<sgl1...>   blocks mined by an address, and its balance
 ;;;   GET /api/summary         summary and recent blocks, as JSON
 ;;;   GET /api/blocks          the block list, as JSON
+;;;   GET /api/difficulty      the difficulty history, as JSON
 ;;;   GET /api/block/<h|id>    one block, as JSON
 ;;;   GET /api/address/<a>     one address, as JSON
 ;;;
@@ -179,6 +181,13 @@
                       (explorer-chain-summary store)
                       (explorer-recent-blocks store
                                               explorer-default-page-size))))
+          ;; Difficulty history
+          ((equal? segments '("difficulty"))
+           (respond 200 %html
+                    (explorer-difficulty-page
+                      (explorer-chain-summary store)
+                      (explorer-recent-blocks store
+                                              explorer-difficulty-window))))
           ;; Block detail
           ((and (= 2 (length segments)) (string=? (car segments) "block"))
            (let ((b (lookup-block store (car (cdr segments)))))
@@ -210,6 +219,13 @@
                     (explorer-blocks-json
                       (explorer-recent-blocks store
                                               explorer-default-page-size))))
+          ;; JSON: difficulty history
+          ((equal? segments '("api" "difficulty"))
+           (respond 200 %json
+                    (explorer-difficulty-json
+                      (explorer-chain-summary store)
+                      (explorer-recent-blocks store
+                                              explorer-difficulty-window))))
           ;; JSON: one block
           ((and (= 3 (length segments))
                 (string=? (car segments) "api")

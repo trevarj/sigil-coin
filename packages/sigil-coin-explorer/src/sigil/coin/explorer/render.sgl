@@ -58,12 +58,16 @@
     explorer-sigil-amount
     explorer-format-time
     explorer-under-par-text
+    explorer-margin-text
+    explorer-author-tally
+    explorer-author-window
 
     ;; Pages
     explorer-page
     explorer-summary-page
     explorer-blocks-page
     explorer-block-page
+    explorer-difficulty-page
     explorer-address-page
     explorer-missing-page
     explorer-no-database-page
@@ -72,6 +76,7 @@
     explorer-summary-json
     explorer-blocks-json
     explorer-block-json
+    explorer-difficulty-json
     explorer-address-json
     explorer-error-json)
 
@@ -264,6 +269,89 @@
             ((= delta 0) "at par")
             (else (string-append (number->string (- delta)) " over"))))
 
+    ;;; How a retarget margin reads: milli-units of par, as a percentage
+    ;;; with the sign that says which way the field is going (§9.1).
+    ;;;
+    ;;; ```scheme
+    ;;; (explorer-margin-text 100)  ; => "+10.0% (under par)"
+    ;;; (explorer-margin-text -23)  ; => "-2.3% (over par)"
+    ;;; (explorer-margin-text 0)    ; => "0.0% (at par)"
+    ;;; ```
+    (define (explorer-margin-text milli)
+      (: any? -> string?)
+      (if (not (and (number? milli) (exact? milli) (integer? milli)))
+          "unknown"
+          (let* ((magnitude (abs milli))
+                 (whole (quotient magnitude 10))
+                 (tenth (remainder magnitude 10)))
+            (string-append (cond ((> milli 0) "+")
+                                 ((< milli 0) "-")
+                                 (else ""))
+                           (number->string whole) "." (number->string tenth)
+                           "% "
+                           (cond ((> milli 0) "(under par)")
+                                 ((< milli 0) "(over par)")
+                                 (else "(at par)"))))))
+
+    ;;; Seconds of history the author tally covers: one week.
+    (define explorer-author-window 604800)
+
+    ;; Bump a name's count, keeping first-seen order.
+    (define (bump-author tally name)
+      (cond ((null? tally) (list (cons name 1)))
+            ((string=? (car (car tally)) name)
+             (cons (cons name (+ 1 (cdr (car tally)))) (cdr tally)))
+            (else (cons (car tally) (bump-author (cdr tally) name)))))
+
+    ;; Insertion sort: most blocks first, then by name. The list is one
+    ;; entry per distinct author in a page's worth of blocks.
+    ;;
+    ;; ponytail: O(n^2) on a list of a handful of names. Reach for a real
+    ;; sort the day an explorer page shows thousands of authors.
+    (define (sort-tally tally)
+      (let insert ((rest tally) (out '()))
+        (if (null? rest)
+            out
+            (insert (cdr rest)
+                    (let place ((xs out))
+                      (cond
+                        ((null? xs) (list (car rest)))
+                        ((or (> (cdr (car rest)) (cdr (car xs)))
+                             (and (= (cdr (car rest)) (cdr (car xs)))
+                                  (string<? (car (car rest)) (car (car xs)))))
+                         (cons (car rest) xs))
+                        (else (cons (car xs) (place (cdr xs))))))))))
+
+    ;;; Which self-declared authors mined the given blocks, and how many
+    ;;; each, most first.
+    ;;;
+    ;;; A block counts when its graffiti carries the `/name/` convention and
+    ;;; its timestamp is at or after `since`; pass `#f` for `since` to count
+    ;;; every block given. The name is SANITIZED here and nowhere else: it
+    ;;; is attacker-chosen bytes, so it reaches this list already stripped of
+    ;;; ill-formed sequences and control characters, and the callers escape
+    ;;; it on the way into markup like any other block text.
+    ;;;
+    ;;; ```scheme
+    ;;; (explorer-author-tally blocks #f) ; => (("opus-5" . 3) ("fable-5" . 1))
+    ;;; ```
+    (define (explorer-author-tally blocks since)
+      (: list? any? -> list?)
+      (sort-tally
+        (let loop ((xs blocks) (tally '()))
+          (if (null? xs)
+              tally
+              (let ((author (explorer-block-author (car xs)))
+                    (time (explorer-block-time (car xs))))
+                (if (or (not author)
+                        (and (number? since)
+                             (number? time)
+                             (< time since)))
+                    (loop (cdr xs) tally)
+                    (loop (cdr xs)
+                          (bump-author tally
+                                       (explorer-safe-text author)))))))))
+
     ;; ============================================================
     ;; HTML scaffolding
     ;; ============================================================
@@ -312,6 +400,7 @@
               "</head><body>"
               "<nav><a href=\"/\">summary</a>"
               "<a href=\"/blocks\">blocks</a>"
+              "<a href=\"/difficulty\">difficulty</a>"
               "<a href=\"/api/summary\">api</a></nav>"
               body
               "</body></html>\n")))
@@ -379,6 +468,287 @@
     (define %block-headings
       '("height" "time" "miner" "bytes" "par" "margin" "reward" "quote"))
 
+    ;; ============================================================
+    ;; v2 sections
+    ;;
+    ;; Every one of these renders nothing at all on a v1 block, so a chain
+    ;; that has not split shows exactly the page it showed before.
+    ;; ============================================================
+
+    (define (hex-word n)
+      (if (number? n)
+          (string-append "0x" (number->string n 16))
+          "&mdash;"))
+
+    (define (amount-cell value)
+      (if (number? value)
+          (explorer-escape (explorer-sigil-amount value))
+          "&mdash;"))
+
+    ;; The k input/output pairs, canonically printed and escaped. They come
+    ;; from the generator rather than from a miner, and they still go
+    ;; through `explorer-text`: the day a puzzle draws a string literal, the
+    ;; difference between "trusted" and "escaped anyway" is a page.
+    (define (examples-table pairs)
+      (if (null? pairs)
+          "<p class=\"q\">No examples for this height.</p>"
+          (string-append
+            "<table><tr>" (headings '("input" "output")) "</tr>"
+            (join (map (lambda (pair)
+                         (string-append
+                           "<tr><td><pre>" (explorer-text (car pair))
+                           "</pre></td><td><pre>" (explorer-text (cdr pair))
+                           "</pre></td></tr>"))
+                       pairs))
+            "</table>")))
+
+    (define (v2-puzzle-section b)
+      (if (not (explorer-block-v2? b))
+          ""
+          (join (list
+                  "<h2>Puzzle</h2>"
+                  "<p class=\"q\">A solution is a one-argument function that"
+                  " reproduces every pair below, under the day's constraint."
+                  " Nothing here is stored in the block: every node derives"
+                  " it from the parent hash, the height and C.</p>"
+                  "<table>"
+                  (field "complexity C"
+                         (optional-number (explorer-block-complexity b)))
+                  (field "constraint"
+                         (let ((ci (explorer-block-constraint b))
+                               (text (explorer-block-constraint-text b)))
+                           (if (number? ci)
+                               (string-append (number->string ci)
+                                              " &mdash; "
+                                              (explorer-escape
+                                                (if (string? text) text "")))
+                               "&mdash;")))
+                  (field "examples (k)" (optional-number (explorer-block-k b)))
+                  (field "par" (optional-number (explorer-block-par b)))
+                  "</table>"
+                  (examples-table (explorer-block-examples b))))))
+
+    (define (v2-score-section b)
+      (if (not (explorer-block-v2? b))
+          ""
+          (join (list
+                  "<h2>Producer score</h2>"
+                  "<p class=\"q\">Lower is better. Length dominates memory,"
+                  " memory dominates steps, and aggregate personalized-share"
+                  " quality Q breaks remaining ties. Memory and steps are"
+                  " 7-bit buckets: raw counts are not recoverable from a"
+                  " header.</p>"
+                  "<table><tr>"
+                  (headings '("field" "value" "against par"))
+                  "</tr>"
+                  "<tr>"
+                  (rows (list "length L"
+                              (string-append
+                                (optional-number
+                                  (explorer-block-score-length b))
+                                " bytes")
+                              (explorer-escape
+                                (explorer-margin-text
+                                  (explorer-block-margin b)))))
+                  "</tr><tr>"
+                  (rows (list "memory MB"
+                              (optional-number
+                                (explorer-block-score-memory b))
+                              "<span class=\"q\">bucket</span>"))
+                  "</tr><tr>"
+                  (rows (list "steps SB"
+                              (optional-number
+                                (explorer-block-score-steps b))
+                              "<span class=\"q\">bucket</span>"))
+                  "</tr><tr>"
+                  (rows (list "aggregate Q"
+                              (optional-number
+                                (explorer-block-score-quality b))
+                              "<span class=\"q\">breaks ties only</span>"))
+                  "</tr><tr>"
+                  (rows (list "score word W"
+                              (explorer-escape
+                                (hex-word (explorer-block-score-word b)))
+                              "<span class=\"q\">the header nonce</span>"))
+                  "</tr></table>"))))
+
+    (define (share-source-text s)
+      (let ((source (explorer-share-solution-source s))
+            (raw (explorer-share-solution s)))
+        (cond ((string? source) (explorer-text source))
+              ((bytevector? raw) (explorer-text raw))
+              (else "&mdash;"))))
+
+    (define (share-address-cell s)
+      (let ((address (explorer-share-address s)))
+        (if (string? address)
+            (string-append "<a href=\"/address/" (explorer-escape address)
+                           "\">" (explorer-escape address) "</a>")
+            "<span class=\"q\">unrecognised key</span>")))
+
+    (define (share-row s)
+      (string-append
+        "<tr>"
+        (rows (list (number->string (explorer-share-index s))
+                    (share-address-cell s)
+                    (optional-number (explorer-share-solution-length s))
+                    (optional-number (explorer-share-par s))
+                    (explorer-escape
+                      (explorer-margin-text (explorer-share-margin s)))
+                    (optional-number (explorer-share-contribution s))
+                    (optional-number (explorer-share-steps s))
+                    (optional-number (explorer-share-cells s))
+                    (optional-number (explorer-share-step-bucket s))
+                    (optional-number (explorer-share-memory-bucket s))
+                    (amount-cell (explorer-share-payout s))))
+        "</tr>"
+        "<tr><td colspan=\"11\"><span class=\"q\">pubkey "
+        (explorer-escape (explorer-share-pubkey-hex s))
+        " &middot; signature "
+        (explorer-escape (explorer-share-signature-hex s))
+        " &middot; blind "
+        (explorer-escape (explorer-share-blind-hex s))
+        "</span><pre>" (share-source-text s) "</pre></td></tr>"))
+
+    (define %share-headings
+      '("#" "miner" "bytes" "personal par" "margin" "Q+" "steps"
+        "cells" "SB" "MB" "payout"))
+
+    (define (v2-shares-section b)
+      (if (not (explorer-block-v2? b))
+          ""
+          (let ((shares (explorer-block-shares b)))
+            (join (list
+                    "<h2>Co-op shares</h2>"
+                    (if (null? shares)
+                        (string-append
+                          "<p class=\"q\">No shares. The producer took the"
+                          " whole reward."
+                          "</p>")
+                        (join (list
+                                "<p class=\"q\">Each share solves its own"
+                                " pubkey-personalized version of the parent"
+                                " height's puzzle. Par, margin and Q+ come"
+                                " from that task. Signatures are decoded but"
+                                " not re-verified on page load; node validation"
+                                " already settled them.</p>"
+                                "<table><tr>" (headings %share-headings)
+                                "</tr>"
+                                (join (map share-row shares))
+                                "</table>")))
+                    "<p>commitments carried: "
+                    (optional-number (explorer-block-commit-count b))
+                    "</p>")))))
+
+    (define (role-text role)
+      (cond ((eq? role 'producer) "producer")
+            ((eq? role 'share) "share")
+            ((eq? role 'carrier) "carrier (the previous producer)")
+            (else "unexpected")))
+
+    (define (output-row o)
+      (let ((value (explorer-output-value o))
+            (expected (explorer-output-expected o)))
+        (string-append
+          "<tr>"
+          (rows (list (number->string (explorer-output-index o))
+                      (explorer-escape (role-text (explorer-output-role o)))
+                      (let ((address (explorer-output-address o)))
+                        (if (string? address)
+                            (string-append "<a href=\"/address/"
+                                           (explorer-escape address) "\">"
+                                           (explorer-escape address) "</a>")
+                            "<span class=\"q\">unrecognised script</span>"))
+                      (amount-cell value)
+                      (amount-cell expected)
+                      (if (and (number? value) (number? expected))
+                          (if (= value expected)
+                              "ok"
+                              "<span class=\"q\">disagrees</span>")
+                          "<span class=\"q\">&mdash;</span>")))
+          "</tr>")))
+
+    (define %output-headings
+      '("#" "role" "paid to" "value" "split says" ""))
+
+    (define (v2-split-section b)
+      (if (not (explorer-block-v2? b))
+          ""
+          (let ((outputs (explorer-block-outputs b)))
+            (if (null? outputs)
+                ""
+                (join (list
+                        "<h2>Reward split</h2>"
+                        "<p class=\"q\">Weights are producer 2, each share 1,"
+                        " carrier 1; the floor's remainder goes to the"
+                        " producer, so the outputs sum to the reward"
+                        " exactly and nothing is burned.</p>"
+                        "<table><tr>" (headings %output-headings) "</tr>"
+                        (join (map output-row outputs))
+                        "<tr>"
+                        (rows (list "" "<b>total</b>" ""
+                                    (amount-cell
+                                      (explorer-block-total-output b))
+                                    (amount-cell (explorer-block-reward b))
+                                    "<span class=\"q\">subsidy</span>"))
+                        "</tr></table>"))))))
+
+    (define %difficulty-headings
+      '("height" "C" "par" "bytes" "margin" ""))
+
+    ;; Blocks arrive newest first, so a row's "previous" complexity is the
+    ;; row below it. Marking a retarget by comparing the two needs no
+    ;; schedule constant and stays right if the window ever moves.
+    (define (difficulty-rows blocks)
+      (let loop ((xs blocks) (out '()))
+        (if (null? xs)
+            (join (reverse out))
+            (let* ((b (car xs))
+                   (current (explorer-block-complexity b))
+                   (previous (and (pair? (cdr xs))
+                                  (explorer-block-complexity (car (cdr xs)))))
+                   (moved (and (number? current) (number? previous)
+                               (not (= current previous)))))
+              (loop (cdr xs)
+                    (cons (string-append
+                            "<tr>"
+                            (rows (list
+                                    (block-link b)
+                                    (optional-number current)
+                                    (optional-number (explorer-block-par b))
+                                    (optional-number
+                                      (explorer-block-solution-length b))
+                                    (explorer-escape
+                                      (explorer-margin-text
+                                        (explorer-block-margin b)))
+                                    (if moved
+                                        (string-append
+                                          "retarget "
+                                          (number->string previous)
+                                          " &rarr; "
+                                          (number->string current))
+                                        "")))
+                            "</tr>")
+                          out))))))
+
+    (define (author-table tally)
+      (if (null? tally)
+          ""
+          (join (list
+                  "<h2>Authors</h2>"
+                  "<p class=\"q\">Self-declared, from the <code>/name/</code>"
+                  " graffiti convention. Anyone may claim any name; this is"
+                  " a signature of nothing.</p>"
+                  "<table><tr>" (headings '("author" "blocks")) "</tr>"
+                  (join (map (lambda (entry)
+                               (string-append
+                                 "<tr>"
+                                 (rows (list (explorer-escape (car entry))
+                                             (number->string (cdr entry))))
+                                 "</tr>"))
+                             tally))
+                  "</table>"))))
+
     (define (block-table blocks)
       (if (null? blocks)
           "<p>No blocks yet.</p>"
@@ -445,6 +815,25 @@
                          (if (number? height)
                              (string-append "height " (number->string height))
                              "never (reward has decayed to zero)")))
+                (let ((complexity (explorer-summary-complexity summary)))
+                  (if (number? complexity)
+                      (join (list
+                              (field "complexity C"
+                                     (number->string complexity))
+                              (field "next complexity"
+                                     (optional-number
+                                       (explorer-summary-next-complexity
+                                         summary)))
+                              (field "next retarget"
+                                     (let ((height
+                                             (explorer-summary-next-retarget-height
+                                               summary)))
+                                       (if (number? height)
+                                           (string-append
+                                             "height "
+                                             (number->string height))
+                                           "&mdash;")))))
+                      ""))
                 "</table>"
                 "<h2>Puzzle for height "
                 (number->string (explorer-summary-next-height summary))
@@ -453,16 +842,62 @@
                 (field "par"
                        (optional-number
                          (explorer-summary-puzzle-par summary)))
+                (let ((ci (explorer-summary-puzzle-constraint summary)))
+                  (if (number? ci)
+                      (join (list
+                              (field "constraint"
+                                     (string-append
+                                       (number->string ci) " &mdash; "
+                                       (explorer-escape
+                                         (let ((text
+                                                 (explorer-summary-puzzle-constraint-text
+                                                   summary)))
+                                           (if (string? text) text "")))))
+                              (field "examples (k)"
+                                     (optional-number
+                                       (explorer-summary-puzzle-k summary)))))
+                      ""))
                 (field "seed"
                        (let ((seed (explorer-summary-puzzle-seed summary)))
                          (if (string? seed) (explorer-escape seed) "&mdash;")))
                 "</table>"
-                "<pre>"
                 (let ((target (explorer-summary-puzzle-target summary)))
-                  (if (string? target) (explorer-text target) "&mdash;"))
-                "</pre>"
+                  (if (string? target)
+                      (string-append "<pre>" (explorer-text target) "</pre>")
+                      ""))
+                (examples-table (explorer-summary-puzzle-examples summary))
+                (author-table
+                  (explorer-author-tally
+                    blocks
+                    (let ((tip (explorer-summary-tip-time summary)))
+                      (and (number? tip) (- tip explorer-author-window)))))
                 "<h2>Recent blocks</h2>"
                 (block-table blocks)))))
+
+    ;;; The difficulty history page: complexity and achieved margin over
+    ;;; time, which is the chain's own record of how fast the field is
+    ;;; getting better at writing programs.
+    ;;;
+    ;;; ```scheme
+    ;;; (explorer-difficulty-page summary blocks)
+    ;;; ```
+    (define (explorer-difficulty-page summary blocks)
+      (: explorer-summary? list? -> string?)
+      (explorer-page
+        (string-append (explorer-summary-chain-name summary) " difficulty")
+        (join (list
+                "<h1>Difficulty</h1>"
+                "<p class=\"q\">C is the complexity parameter: it widens the"
+                " grammar, the example count and the constraint tier, and it"
+                " never touches an evaluator cap. It retargets every 16"
+                " blocks on the median relative margin, aiming for the"
+                " median block to come in 10.0% under par.</p>"
+                (if (null? blocks)
+                    "<p>No blocks yet.</p>"
+                    (string-append
+                      "<table><tr>" (headings %difficulty-headings) "</tr>"
+                      (difficulty-rows blocks)
+                      "</table>"))))))
 
     ;;; The block list page.
     ;;;
@@ -504,6 +939,13 @@
                                             "</a>")
                              "<span class=\"q\">none (genesis)</span>")))
                 (field "miner" (address-cell b))
+                (field "author"
+                       (let ((author (explorer-block-author b)))
+                         (if (bytevector? author)
+                             (string-append "<span class=\"q\">"
+                                            (explorer-text author)
+                                            " (self-declared)</span>")
+                             "<span class=\"q\">none declared</span>")))
                 (field "reward"
                        (string-append
                          (explorer-sigil-amount (explorer-block-reward b))
@@ -532,11 +974,16 @@
                              (explorer-escape (symbol->string problem)))
                       ""))
                 "</table>"
+                (v2-puzzle-section b)
                 "<h2>Solution</h2><pre>" (solution-text b) "</pre>"
-                "<h2>Target</h2><pre>"
+                (v2-score-section b)
+                (v2-shares-section b)
+                (v2-split-section b)
                 (let ((target (explorer-block-target b)))
-                  (if (string? target) (explorer-text target) "&mdash;"))
-                "</pre>"
+                  (if (string? target)
+                      (string-append "<h2>Target</h2><pre>"
+                                     (explorer-text target) "</pre>")
+                      ""))
                 "<h2>Quote</h2><pre>"
                 (let ((graffiti (explorer-block-graffiti b)))
                   (if (and (bytevector? graffiti)
@@ -631,7 +1078,87 @@
         (cons "size" (json-number (explorer-block-size b)))
         (cons "problem"
               (let ((problem (explorer-block-problem b)))
-                (if problem (symbol->string problem) 'null)))))
+                (if problem (symbol->string problem) 'null)))
+        (cons "author" (json-text (explorer-block-author b)))
+        (cons "margin" (json-number (explorer-block-margin b)))
+        (cons "version" (json-number (explorer-block-version b)))
+        (cons "complexity" (json-number (explorer-block-complexity b)))
+        (cons "constraint"
+              (if (number? (explorer-block-constraint b))
+                  (list (cons "id" (explorer-block-constraint b))
+                        (cons "text"
+                              (json-text
+                                (explorer-block-constraint-text b))))
+                  'null))
+        (cons "k" (json-number (explorer-block-k b)))
+        (cons "examples" (map example-alist (explorer-block-examples b)))
+        (cons "score"
+              (if (explorer-block-v2? b)
+                  (list (cons "word" (json-number
+                                       (explorer-block-score-word b)))
+                        (cons "length" (json-number
+                                         (explorer-block-score-length b)))
+                        (cons "memory" (json-number
+                                         (explorer-block-score-memory b)))
+                        (cons "steps" (json-number
+                                        (explorer-block-score-steps b)))
+                        (cons "quality" (json-number
+                                          (explorer-block-score-quality b))))
+                  'null))
+        (cons "share_count" (json-number (explorer-block-share-count b)))
+        (cons "shares" (map share-alist (explorer-block-shares b)))
+        (cons "commitments" (json-number (explorer-block-commit-count b)))
+        (cons "outputs" (map output-alist (explorer-block-outputs b)))
+        (cons "total_output" (json-number (explorer-block-total-output b)))))
+
+    (define (example-alist pair)
+      (list (cons "input" (json-text (car pair)))
+            (cons "output" (json-text (cdr pair)))))
+
+    (define (share-alist s)
+      (list (cons "index" (explorer-share-index s))
+            (cons "pubkey" (explorer-share-pubkey-hex s))
+            (cons "signature" (explorer-share-signature-hex s))
+            (cons "blind" (explorer-share-blind-hex s))
+            (cons "miner" (or (explorer-share-address s) 'null))
+            (cons "solution" (json-text (or (explorer-share-solution-source s)
+                                            (explorer-share-solution s))))
+            (cons "solution_bytes"
+                  (json-number (explorer-share-solution-length s)))
+            (cons "personal_par" (json-number (explorer-share-par s)))
+            (cons "margin" (json-number (explorer-share-margin s)))
+            (cons "contribution"
+                  (json-number (explorer-share-contribution s)))
+            (cons "steps" (json-number (explorer-share-steps s)))
+            (cons "cells" (json-number (explorer-share-cells s)))
+            (cons "step_bucket" (json-number (explorer-share-step-bucket s)))
+            (cons "memory_bucket"
+                  (json-number (explorer-share-memory-bucket s)))
+            (cons "payout" (json-number (explorer-share-payout s)))
+            (cons "problem"
+                  (let ((problem (explorer-share-problem s)))
+                    (if problem (symbol->string problem) 'null)))))
+
+    (define (output-alist o)
+      (list (cons "index" (explorer-output-index o))
+            (cons "role"
+                  (let ((role (explorer-output-role o)))
+                    (if (symbol? role) (symbol->string role) 'null)))
+            (cons "value" (explorer-output-value o))
+            (cons "expected" (json-number (explorer-output-expected o)))
+            (cons "address" (or (explorer-output-address o) 'null))))
+
+    (define (author-alist entry)
+      (list (cons "author" (car entry))
+            (cons "blocks" (cdr entry))))
+
+    (define (difficulty-alist b)
+      (list (cons "height" (explorer-block-height b))
+            (cons "complexity" (json-number (explorer-block-complexity b)))
+            (cons "par" (json-number (explorer-block-par b)))
+            (cons "solution_bytes"
+                  (json-number (explorer-block-solution-length b)))
+            (cons "margin" (json-number (explorer-block-margin b)))))
 
     (define (summary-alist summary)
       (list
@@ -648,11 +1175,31 @@
         (cons "next_reward" (explorer-summary-next-reward summary))
         (cons "next_halving_height"
               (json-number (explorer-summary-next-halving-height summary)))
+        (cons "version" (json-number (explorer-summary-version summary)))
+        (cons "complexity" (json-number (explorer-summary-complexity summary)))
+        (cons "next_complexity"
+              (json-number (explorer-summary-next-complexity summary)))
+        (cons "next_retarget_height"
+              (json-number (explorer-summary-next-retarget-height summary)))
         (cons "puzzle"
               (list
                 (cons "par" (json-number (explorer-summary-puzzle-par summary)))
                 (cons "target" (json-text (explorer-summary-puzzle-target summary)))
-                (cons "seed" (json-text (explorer-summary-puzzle-seed summary)))))
+                (cons "seed" (json-text (explorer-summary-puzzle-seed summary)))
+                (cons "constraint"
+                      (if (number? (explorer-summary-puzzle-constraint summary))
+                          (list (cons "id"
+                                      (explorer-summary-puzzle-constraint
+                                        summary))
+                                (cons "text"
+                                      (json-text
+                                        (explorer-summary-puzzle-constraint-text
+                                          summary))))
+                          'null))
+                (cons "k" (json-number (explorer-summary-puzzle-k summary)))
+                (cons "examples"
+                      (map example-alist
+                           (explorer-summary-puzzle-examples summary)))))
         (cons "empty" (explorer-summary-empty summary))))
 
     ;;; The summary endpoint's body, with the recent blocks alongside it.
@@ -662,8 +1209,34 @@
     ;;; ```
     (define (explorer-summary-json summary blocks)
       (: explorer-summary? list? -> string?)
-      (json-encode (append (summary-alist summary)
-                           (list (cons "blocks" (map block-alist blocks))))))
+      (json-encode
+        (append (summary-alist summary)
+                (list (cons "authors"
+                            (map author-alist
+                                 (explorer-author-tally
+                                   blocks
+                                   (let ((tip (explorer-summary-tip-time
+                                                summary)))
+                                     (and (number? tip)
+                                          (- tip explorer-author-window))))))
+                      (cons "blocks" (map block-alist blocks))))))
+
+    ;;; The difficulty endpoint's body: the same rows the page shows.
+    ;;;
+    ;;; ```scheme
+    ;;; (explorer-difficulty-json summary blocks)
+    ;;; ```
+    (define (explorer-difficulty-json summary blocks)
+      (: explorer-summary? list? -> string?)
+      (json-encode
+        (list (cons "complexity"
+                    (json-number (explorer-summary-complexity summary)))
+              (cons "next_complexity"
+                    (json-number (explorer-summary-next-complexity summary)))
+              (cons "next_retarget_height"
+                    (json-number
+                      (explorer-summary-next-retarget-height summary)))
+              (cons "history" (map difficulty-alist blocks)))))
 
     ;;; The block-list endpoint's body.
     ;;;
