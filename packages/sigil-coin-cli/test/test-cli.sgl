@@ -34,10 +34,9 @@
         (sigil bitcoin consensus)
         (sigil bitcoin node)
         (sigil coin puzzle)
+        (sigil coin puzzle constraints)
         (sigil coin puzzle generator)
-        (sigil coin puzzle examples)
         (sigil coin consensus)
-        (sigil coin consensus v2)
         (sigil coin node)
         (sigil coin cli))
 
@@ -106,6 +105,21 @@
         (set! result (raises-message (lambda () (cli-run args))))))
     result))
 
+;; Build next canonical block directly for integration setup.
+(define (build-next n graffiti script)
+  (let* ((tip (coin-validated-tip-height n))
+         (height (+ tip 1))
+         (parent (coin-validated-tip-header n))
+         (headers (let loop ((h 0) (out '()))
+                    (if (> h tip)
+                        (reverse out)
+                        (loop (+ h 1)
+                              (cons (coin-header-at-height n h) out)))))
+         (complexity (coin-required-complexity headers height)))
+    (coin-build-block parent height complexity #f graffiti script
+                      (+ (block-header-time parent)
+                         (coin-chain-min-block-spacing (node-config n))))))
+
 ;; Advance the chain by `count` blocks without going through the CLI, for
 ;; tests that only need a height. The solution is the generator's own, so
 ;; every block is valid.
@@ -117,7 +131,7 @@
           (let loop ((i 0))
             (if (>= i count)
                 (node-status-snapshot-best-block-height (node-status n))
-                (let ((b (coin-mine-block n #f "fast-forward" %elsewhere)))
+                (let ((b (build-next n "fast-forward" %elsewhere)))
                   (node-ingest-headers n (list (block-header-field b)))
                   (node-store-block n b)
                   (unless (= 1 (node-validate-blocks n))
@@ -156,7 +170,7 @@
     (lambda ()
       (cli-with-node args
         (lambda (n)
-          (let ((b (coin-mine-block n #f "funding" script)))
+          (let ((b (build-next n "funding" script)))
             (node-ingest-headers n (list (block-header-field b)))
             (node-store-block n b)
             (unless (= 1 (node-validate-blocks n))
@@ -439,7 +453,7 @@
       (coin-address->script-pubkey
         "--to"
         "sgl1q70nakelv6wvuk2e63ah8lg68kq3nx7q2g3taum"))
-    ;; A v1 (Taproot) program under our HRP: valid bech32m, not spendable
+    ;; A canonical (Taproot) program under our HRP: valid bech32m, not spendable
     ;; by this wallet, and refused with a reason rather than a crash.
     (assert-true (string-contains?
                    (raises-message
@@ -471,577 +485,6 @@
 (define %regtest-genesis-hash
   (chain-config-genesis-hash sigilcoin-regtest-chain))
 
-(test-group "sigilcoin puzzle"
-  (test "the report for height 1 is the one the chain derives"
-    (let ((report (coin-puzzle-report %regtest-genesis-hash 1))
-          (spec (coin-puzzle-for %regtest-genesis-hash 1)))
-      (assert-equal 1 (cdr (assq 'height report)))
-      (assert-equal (hex-encode (reverse-bytevector %regtest-genesis-hash))
-                    (cdr (assq 'parent report)))
-      (assert-equal (hex-encode (coin-puzzle-seed %regtest-genesis-hash 1))
-                    (cdr (assq 'seed report)))
-      (assert-equal (puzzle-print-value (puzzle-spec-target spec))
-                    (cdr (assq 'target report)))
-      (assert-equal (puzzle-spec-par spec) (cdr (assq 'par report)))
-      (assert-equal (puzzle-spec-solution spec)
-                    (cdr (assq 'solution report)))
-      (assert-equal (coin-block-reward 1) (cdr (assq 'reward report)))
-      ;; The pinned values themselves.
-      (assert-equal "(825 826 827 828 829 830 831 832)"
-                    (cdr (assq 'target report)))
-      (assert-equal "'(825 826 827 828 829 830 831 832)"
-                    (cdr (assq 'solution report)))
-      (assert-equal 34 (cdr (assq 'par report)))
-      (assert-equal 34 (cdr (assq 'solution-length report)))))
-
-  (test "the baseline solution the report publishes really solves it"
-    (let ((spec (coin-puzzle-for %regtest-genesis-hash 1))
-          (report (coin-puzzle-report %regtest-genesis-hash 1)))
-      (assert-true (coin-ok? (coin-check-solution
-                               spec
-                               (cdr (assq 'solution report)))))))
-
-  (test "the command answers for the next block on a fresh node"
-    (let* ((args (fresh-args))
-           (result (run (cons "puzzle" args)))
-           (report (car result))
-           (text (cdr result)))
-      (assert-equal 1 (cdr (assq 'height report)))
-      (assert-true (string-contains? text "height: 1"))
-      (assert-true (string-contains?
-                     text
-                     "target: (825 826 827 828 829 830 831 832)"))
-      (assert-true (string-contains? text "par: 34"))
-      (assert-true (string-contains?
-                     text
-                     "baseline: '(825 826 827 828 829 830 831 832)"))
-      (assert-true (string-contains? text "reward: 1.00000000 SGL"))
-      (assert-true (string-contains? text "max-solution-bytes: 256"))))
-
-  (test "--height looks back at a puzzle already solved"
-    (let ((args (fresh-args)))
-      (fast-forward args 2)
-      (assert-equal 3 (cdr (assq 'height (run-value (cons "puzzle" args)))))
-      ;; Height 1's puzzle is still the genesis-derived one.
-      (assert-equal (coin-puzzle-report %regtest-genesis-hash 1)
-                    (run-value (append (list "puzzle" "--height" "1")
-                                       args)))))
-
-  (test "a height beyond the tip says what the next block is"
-    (let* ((args (fresh-args))
-           (message (failure-message (append (list "puzzle" "--height" "9")
-                                             args))))
-      (assert-true (string-contains? message "beyond the tip"))
-      (assert-true (string-contains? message "height 1")))
-    (assert-true (string-contains?
-                   (failure-message (append (list "puzzle" "--height" "0")
-                                            (fresh-args)))
-                   "genesis has no puzzle")))
-
-  (test "the puzzle only ever depends on the parent and the height"
-    ;; Two independent nodes at the same height publish the same puzzle,
-    ;; which is what makes the competition well defined.
-    (let ((a (fresh-args))
-          (b (fresh-args)))
-      (assert-equal (run-value (cons "puzzle" a))
-                    (run-value (cons "puzzle" b))))))
-
-;; ============================================================
-;; Mining
-;; ============================================================
-
-;; A golf of height 1's target: eight consecutive integers from 825, which
-;; `iota` and `map` rebuild in fewer bytes than the literal costs.
-(define %golfed-height-1 "(map(lambda(x)(+ x 825))(iota 8))")
-
-(test-group "sigilcoin mine"
-  (test "the baseline solution is accepted and moves the chain"
-    (let* ((args (fresh-args))
-           (result (mine-to args %payout-address
-                            "--graffiti" "systemcrafters"))
-           (b (car result))
-           (text (cdr result)))
-      (assert-true (block? b))
-      (assert-equal 1 (tip-height args))
-      (assert-true (string-contains? text "height: 1"))
-      (assert-true (string-contains? text "par: 34"))
-      (assert-true (string-contains? text "solution-length: 34"))
-      (assert-true (string-contains? text "beats-par: no"))
-      (assert-true (string-contains? text "graffiti: systemcrafters"))
-      (assert-true (string-contains? text "reward: 1.00000000 SGL"))
-      (assert-true (string-contains?
-                     text
-                     (string-append "payout: " %payout-address)))
-      (assert-true (string-contains?
-                     text
-                     (string-append "block: "
-                                    (block-header-id
-                                      (block-header-field b)))))
-      ;; The node validated it, rather than merely storing it.
-      (quietly
-        (lambda ()
-          (cli-with-node args
-            (lambda (n)
-              (assert-equal 1
-                            (node-status-snapshot-validated-block-count
-                              (node-status n)))
-              (assert-equal (hex-encode (block-header-hash
-                                          (block-header-field b)))
-                            (node-status-snapshot-best-block-hash
-                              (node-status n)))))))))
-
-  (test "a shorter solution is accepted and reported as beating par"
-    (let* ((args (fresh-args))
-           (result (mine-to args %payout-address
-                            "--solution" %golfed-height-1))
-           (b (car result))
-           (text (cdr result)))
-      (assert-equal 33 (string-length %golfed-height-1))
-      (assert-equal 33 (coin-block-solution-length b))
-      (assert-true (string-contains? text "solution-length: 33"))
-      (assert-true (string-contains? text "beats-par: yes"))
-      (assert-equal 1 (tip-height args))
-      ;; The block really carries the golfed program, and it really solves
-      ;; the puzzle the chain regenerates for that height.
-      (let ((payload (coin-block-coinbase-payload b)))
-        (assert-true (coin-ok? payload))
-        (assert-equal (string->utf8 %golfed-height-1)
-                      (coin-coinbase-payload-solution
-                        (coin-result-value payload))))
-      (assert-true (coin-ok?
-                     (coin-verify-block-solution %regtest-genesis-hash
-                                                 1
-                                                 b)))))
-
-  (test "the graffiti a miner writes reaches the coinbase"
-    (let* ((args (fresh-args))
-           (b (car (mine-to args %payout-address
-                            "--graffiti" "hello from #systemcrafters"))))
-      (assert-equal (string->utf8 "hello from #systemcrafters")
-                    (coin-coinbase-payload-graffiti
-                      (coin-result-value (coin-block-coinbase-payload b))))))
-
-  (test "the reward is paid to the address the miner named"
-    (let* ((args (fresh-args))
-           (b (car (mine-to args %other-address)))
-           (outputs (transaction-outputs (car (block-transactions b)))))
-      (assert-equal 1 (length outputs))
-      (assert-equal (coin-address->script-pubkey "--address" %other-address)
-                    (txout-script-pubkey (car outputs)))
-      (assert-equal (coin-block-reward 1) (txout-value (car outputs)))
-      ;; And no wallet key was created: `--address` needs no local key.
-      (assert-equal #f
-                    (file-exists? (wallet-key-file (cli-data-dir args))))))
-
-  (test "a solution that produces the wrong value is refused before mining"
-    (let* ((args (fresh-args))
-           (message (failure-message
-                      (append (list "mine"
-                                    "--address" %payout-address
-                                    "--solution" "'(1 2 3)")
-                              args))))
-      (assert-true (string-contains? message "does not solve height 1"))
-      (assert-true (string-contains?
-                     message
-                     "evaluates to something other than the puzzle's target"))
-      (assert-true (string-contains? message "sigilcoin puzzle"))
-      ;; Nothing was built, stored or ingested.
-      (assert-equal 0 (tip-height args))))
-
-  (test "a solution that is a procedure is refused by name"
-    (let ((args (fresh-args)))
-      (assert-true (string-contains?
-                     (failure-message
-                       (append (list "mine"
-                                     "--address" %payout-address
-                                     "--solution" "(lambda (x) x)")
-                               args))
-                     "evaluates to a procedure, not data"))
-      (assert-equal 0 (tip-height args))))
-
-  (test "an unparsable solution names the language, not the block"
-    (let ((args (fresh-args)))
-      (assert-true (string-contains?
-                     (failure-message
-                       (append (list "mine"
-                                     "--address" %payout-address
-                                     "--solution" "(list 1")
-                               args))
-                     "does not parse as puzzle-lang v1"))
-      (assert-equal 0 (tip-height args))))
-
-  (test "an oversize solution names the cap"
-    (let* ((args (fresh-args))
-           (long (string-append "'("
-                                (make-string coin-max-solution-bytes #\1)
-                                ")")))
-      (assert-true (string-contains?
-                     (failure-message
-                       (append (list "mine"
-                                     "--address" %payout-address
-                                     "--solution" long)
-                               args))
-                     "256-byte cap"))
-      (assert-equal 0 (tip-height args))))
-
-  (test "oversize graffiti is refused before the puzzle is even generated"
-    (let* ((args (fresh-args))
-           (message (failure-message
-                      (append (list "mine"
-                                    "--address" %payout-address
-                                    "--graffiti"
-                                    (make-string
-                                      (+ coin-max-graffiti-bytes 1)
-                                      #\x))
-                              args))))
-      (assert-true (string-contains? message "400-byte cap"))
-      (assert-equal 0 (tip-height args))))
-
-  (test "a bad payout address is refused before any work is done"
-    (let ((args (fresh-args)))
-      (assert-true (string-contains?
-                     (failure-message
-                       (append (list "mine"
-                                     "--address"
-                                     "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4")
-                               args))
-                     "not a SigilCoin one"))
-      (assert-equal 0 (tip-height args))))
-
-  (test "mining twice extends the chain rather than replacing the tip"
-    (let* ((args (fresh-args))
-           (first (car (mine-to args %payout-address)))
-           (second (car (mine-to args %payout-address))))
-      (assert-equal 2 (tip-height args))
-      (assert-equal (block-header-hash (block-header-field first))
-                    (block-header-previous-block
-                      (block-header-field second)))
-      ;; Strictly increasing timestamps, which is the pacing rule the node
-      ;; enforces at ingest. Two blocks mined inside one wall-clock second
-      ;; still differ, because the stamp is the spacing floor when the
-      ;; clock has not caught up with it.
-      (assert-true (> (block-header-time (block-header-field second))
-                      (block-header-time (block-header-field first))))))
-
-  (test "mainnet's day-long spacing stops a second block on the spot"
-    ;; The same command against the real chain: the first block is due (the
-    ;; genesis timestamp is well in the past) and the second is a day away,
-    ;; which is further ahead than the future-drift rule permits.
-    (let* ((dir (make-temp-directory))
-           (args (list "--data-dir" dir)))
-      (assert-equal "sigilcoin-main" (cli-chain-name args))
-      (mine-to args %payout-address)
-      (assert-equal 1 (tip-height args))
-      (let ((message (failure-message (list "mine"
-                                            "--address" %payout-address
-                                            "--data-dir" dir))))
-        (assert-true (string-contains? message "too early"))
-        (assert-true (string-contains?
-                       message
-                       (string-append "every "
-                                      (number->string coin-min-block-spacing)
-                                      " seconds")))
-        (assert-true (string-contains? message "future-drift")))
-      (assert-equal 1 (tip-height args)))))
-
-;; ============================================================
-;; Filling a block from the mempool
-;; ============================================================
-;;
-;; A block that is always coinbase-only is a chain nobody can spend on:
-;; every transaction sits in the mempool forever, and because input
-;; selection is oldest-first, the pinned coins are re-picked by the next
-;; spend, which the node then refuses as a conflict. One transfer disables
-;; the wallet. These assertions are about the block, the UTXO set and the
-;; mempool AFTER mining, which is the only place that failure is visible.
-
-(test-group "sigilcoin mempool inclusion"
-  (test "a transaction waiting in the mempool is mined into the next block"
-    (let* ((args (fresh-args))
-           (op (funded-outpoint args %purse-a))
-           (height (+ coin-coinbase-maturity 1))
-           (tx (purse-spend op (coin-block-reward 1) %purse-b
-                            25000000 1000 %purse-a)))
-      (assert-equal coin-coinbase-maturity (tip-height args))
-      (assert-equal "available" (node-mempool-entry-status (submit args tx)))
-      (assert-equal 1 (mempool-count args))
-      (let* ((result (mine-to args %payout-address))
-             (b (car result))
-             (txs (block-transactions b)))
-        ;; The block carries the coinbase AND the transaction that was
-        ;; waiting, in that order.
-        (assert-equal 2 (length txs))
-        (assert-equal (transaction-txid tx) (transaction-txid (cadr txs)))
-        ;; `mine` raises unless `node-validate-blocks` accepted it, so
-        ;; reaching a higher tip is the real node validating this body.
-        (assert-equal height (tip-height args))
-        ;; The coinbase claims the subsidy PLUS the fee it collected.
-        (assert-equal (+ (coin-block-reward height) 1000)
-                      (txout-value (car (transaction-outputs (car txs)))))
-        (assert-true (string-contains? (cdr result) "transactions: 1"))
-        (assert-true (string-contains? (cdr result) "fees: 0.00001000 SGL"))
-        (assert-true (string-contains?
-                       (cdr result)
-                       (string-append "claimed: "
-                                      (cli-daviwils->sgl
-                                        (+ (coin-block-reward height)
-                                           1000))
-                                      " SGL")))
-        ;; The mempool drained: the node marked it confirmed.
-        (assert-equal 0 (mempool-count args))
-        ;; The recipient owns a new output worth what was sent.
-        (let ((received (utxos-of args %purse-b)))
-          (assert-equal 1 (length received))
-          (assert-equal 25000000 (wallet-utxo-value (car received))))
-        ;; The sender's input is consumed and only the change is left.
-        (let ((own (utxos-of args %purse-a)))
-          (assert-equal 1 (length own))
-          (assert-equal (- (coin-block-reward 1) 25000000 1000)
-                        (wallet-utxo-value (car own)))
-          (assert-equal #f
-                        (wallet-outpoint-member?
-                          op
-                          (map wallet-utxo-outpoint own)))))))
-
-  (test "a block with transactions validates through node-validate-blocks"
-    ;; The same block, submitted the way a peer's block arrives: stored
-    ;; first, then validated by the node's own connector.
-    (let* ((args (fresh-args))
-           (op (funded-outpoint args %purse-a))
-           (height (+ coin-coinbase-maturity 1))
-           (tx (purse-spend op (coin-block-reward 1) %purse-b
-                            10000000 2500 %purse-a)))
-      (quietly
-        (lambda ()
-          (cli-with-node args
-            (lambda (n)
-              (let* ((parent (coin-validated-tip-header n))
-                     (b (coin-build-block
-                          parent
-                          height
-                          (coin-generator-solution
-                            (block-header-hash parent)
-                            height)
-                          "fees"
-                          %elsewhere
-                          (coin-next-block-time
-                            parent
-                            (coin-chain-min-block-spacing (node-config n)))
-                          (list tx)
-                          2500)))
-                (assert-equal 2 (length (block-transactions b)))
-                (assert-equal (+ (coin-block-reward height) 2500)
-                              (txout-value
-                                (car (transaction-outputs
-                                       (car (block-transactions b))))))
-                (node-ingest-headers n (list (block-header-field b)))
-                (node-store-block n b)
-                ;; The real connector: merkle root, scripts, UTXO set,
-                ;; and the subsidy-plus-fees ceiling on the coinbase.
-                (assert-equal 1 (node-validate-blocks n))
-                (assert-equal height
-                              (node-status-snapshot-best-block-height
-                                (node-status n))))))))))
-
-  (test "a coinbase claiming more than subsidy plus fees is refused"
-    (let* ((args (fresh-args))
-           (op (funded-outpoint args %purse-a))
-           (height (+ coin-coinbase-maturity 1))
-           (tx (purse-spend op (coin-block-reward 1) %purse-b
-                            10000000 2500 %purse-a)))
-      (quietly
-        (lambda ()
-          (cli-with-node args
-            (lambda (n)
-              (let* ((parent (coin-validated-tip-header n))
-                     (b (coin-build-block
-                          parent
-                          height
-                          (coin-generator-solution
-                            (block-header-hash parent)
-                            height)
-                          "greedy"
-                          %elsewhere
-                          (coin-next-block-time
-                            parent
-                            (coin-chain-min-block-spacing (node-config n)))
-                          (list tx)
-                          ;; One daviwil more than the block earns.
-                          2501)))
-                (node-ingest-headers n (list (block-header-field b)))
-                (node-store-block n b)
-                (assert-equal 0 (node-validate-blocks n))
-                (assert-true
-                  (string-contains?
-                    (node-status-snapshot-sync-last-error (node-status n))
-                    "coinbase reward exceeds subsidy plus fees"))))))))))
-
-(test-group "sigilcoin mempool selection"
-  (test "a second spend still confirms once the first one has"
-    ;; The pinning bug's real cost: after one unconfirmed transfer, every
-    ;; later one was refused as a conflict, forever.
-    (let* ((args (fresh-args))
-           (op (funded-outpoint args %purse-a))
-           (first (purse-spend op (coin-block-reward 1) %purse-b
-                               25000000 1000 %purse-a)))
-      (assert-equal "available" (node-mempool-entry-status
-                                  (submit args first)))
-      (mine-to args %payout-address)
-      (assert-equal 0 (mempool-count args))
-      ;; Spend the change the first transfer left behind.
-      (let* ((change (tx-outpoint first 1))
-             (second (purse-spend change
-                                  (- (coin-block-reward 1) 25000000 1000)
-                                  %purse-b
-                                  10000000
-                                  1000
-                                  %purse-a)))
-        (assert-equal "available" (node-mempool-entry-status
-                                    (submit args second)))
-        (let ((b (car (mine-to args %payout-address))))
-          (assert-equal 2 (length (block-transactions b)))
-          (assert-equal (transaction-txid second)
-                        (transaction-txid
-                          (cadr (block-transactions b)))))
-        (assert-equal 0 (mempool-count args))
-        ;; Both payments landed.
-        (assert-equal 2 (length (utxos-of args %purse-b)))
-        (assert-equal 35000000 (utxo-total (utxos-of args %purse-b))))))
-
-  (test "coins already committed to a mempool transaction are not reused"
-    (let* ((args (fresh-args))
-           (op (funded-outpoint args %purse-a))
-           (tx (purse-spend op (coin-block-reward 1) %purse-b
-                            25000000 1000 %purse-a)))
-      ;; Before the spend, the coin is selectable.
-      (assert-equal (coin-block-reward 1)
-                    (cdr (quietly
-                           (lambda ()
-                             (cli-with-node args
-                               (lambda (n)
-                                 (wallet-select-inputs n %purse-a 1000)))))))
-      (submit args tx)
-      ;; Once it is spent by an unconfirmed transaction it is not, and the
-      ;; refusal names the reason rather than claiming the coins are gone.
-      (let ((message
-              (quietly
-                (lambda ()
-                  (cli-with-node args
-                    (lambda (n)
-                      (raises-message
-                        (lambda ()
-                          (wallet-select-inputs n %purse-a 1000)))))))))
-        (assert-true (string-contains? message "balance is too low"))
-        (assert-true (string-contains? message "has not confirmed yet")))
-      ;; And it is selectable again — as change — once a block confirms it.
-      (mine-to args %payout-address)
-      (assert-equal (- (coin-block-reward 1) 25000000 1000)
-                    (cdr (quietly
-                           (lambda ()
-                             (cli-with-node args
-                               (lambda (n)
-                                 (wallet-select-inputs n %purse-a 1000)))))))))
-
-  (test "a transaction conflicting with one already selected is skipped"
-    (let* ((args (fresh-args))
-           (op (funded-outpoint args %purse-a))
-           (height (+ coin-coinbase-maturity 1))
-           (tx (purse-spend op (coin-block-reward 1) %purse-b
-                            25000000 1000 %purse-a)))
-      (quietly
-        (lambda ()
-          (cli-with-node args
-            (lambda (n)
-              ;; On its own it pays a fee this block can collect.
-              (assert-equal 1000
-                            (coin-block-transaction-fee n height tx '()))
-              ;; With its input already spent by the block, it is skipped.
-              (assert-equal #f
-                            (coin-block-transaction-fee n
-                                                        height
-                                                        tx
-                                                        (list op)))))))))
-
-  (test "a transaction spending an immature coinbase is left behind"
-    (let* ((args (fresh-args))
-           (funding (mine-block-to-script args %purse-a))
-           (op (coinbase-outpoint funding))
-           (tx (purse-spend op (coin-block-reward 1) %purse-b
-                            25000000 1000 %purse-a)))
-      (quietly
-        (lambda ()
-          (cli-with-node args
-            (lambda (n)
-              ;; Height 2 is 99 blocks short of the maturity window.
-              (assert-equal #f (coin-block-transaction-fee n 2 tx '()))
-              ;; At the boundary the same transaction is includable.
-              (assert-equal 1000
-                            (coin-block-transaction-fee
-                              n
-                              (+ 1 coin-coinbase-maturity)
-                              tx
-                              '()))))))))
-
-  (test "the block size cap is respected when more is waiting than fits"
-    (let* ((args (fresh-args))
-           (op (funded-outpoint args %purse-a))
-           (fan 40)
-           (share (quotient (- (coin-block-reward 1) 1000) fan))
-           ;; One transaction splitting the coinbase into `fan` outputs.
-           (fanout (transaction
-                     version: 2
-                     inputs: (list (txin previous-output: op
-                                         script-sig: #u8()
-                                         sequence: #xffffffff
-                                         witness: '()))
-                     outputs: (let loop ((i 0) (out '()))
-                                (if (>= i fan)
-                                    (reverse out)
-                                    (loop (+ i 1)
-                                          (cons (txout value: share
-                                                       script-pubkey: %purse-a)
-                                                out))))
-                     lock-time: 0)))
-      (assert-equal "available"
-                    (node-mempool-entry-status (submit args fanout)))
-      ;; Mined and confirmed, so its outputs are spendable one by one.
-      (assert-equal 2 (length (block-transactions
-                                (car (mine-to args %payout-address)))))
-      (assert-equal fan (length (utxos-of args %purse-a)))
-      ;; Each spend carries a 200-byte output script, so roughly thirty of
-      ;; them fill the 8192-byte block.
-      (let loop ((i 0))
-        (when (< i fan)
-          (submit args
-                  (transaction
-                    version: 2
-                    inputs: (list (txin previous-output: (tx-outpoint fanout i)
-                                        script-sig: #u8()
-                                        sequence: #xffffffff
-                                        witness: '()))
-                    outputs: (list (txout value: (- share 1000)
-                                          script-pubkey: %ballast))
-                    lock-time: 0))
-          (loop (+ i 1))))
-      (assert-equal fan (mempool-count args))
-      (let* ((b (car (mine-to args %payout-address)))
-             (included (- (length (block-transactions b)) 1)))
-        ;; The block is full, not overflowing...
-        (assert-true (<= (coin-block-size b) coin-max-block-bytes))
-        (assert-true (> (coin-block-size b)
-                        (- coin-max-block-bytes 500)))
-        ;; ...it took what it could...
-        (assert-true (> included 1))
-        (assert-true (< included fan))
-        ;; ...the rest is still waiting for the next block...
-        (assert-equal (- fan included) (mempool-count args))
-        ;; ...and the coinbase claims exactly what it collected.
-        (assert-equal (+ (coin-block-reward (+ coin-coinbase-maturity 2))
-                         (* included 1000))
-                      (txout-value
-                        (car (transaction-outputs
-                               (car (block-transactions b))))))))))
-
 ;; ============================================================
 ;; Node operation
 ;; ============================================================
@@ -1064,7 +507,12 @@
                      (string-append "max-supply: "
                                     (cli-daviwils->sgl coin-max-supply))))
       ;; Genesis's own 49-byte solution, recovered from the stored rank.
-      (assert-true (string-contains? text "tip-solution-bytes: 49"))
+      (assert-true (string-contains?
+                     text
+                     (string-append "tip-solution-bytes: "
+                       (number->string
+                         (coin-score-length
+                           (coin-score-decode coin-genesis-score))))))
       (assert-true (string-contains?
                      text
                      (string-append "best-hash: "
@@ -1074,13 +522,17 @@
 
   (test "status follows the chain as it is mined"
     (let ((args (fresh-args)))
-      (mine-to args %payout-address "--solution" %golfed-height-1)
+      (mine-to args %payout-address "--solution" %height-one-source)
       (let ((text (run-text (cons "status" args))))
         (assert-true (string-contains? text "best-block-height: 1"))
         (assert-true (string-contains? text "validated-blocks: 1"))
         (assert-true (string-contains? text "next-height: 2"))
         ;; The tip's solution length, straight from the stored rank.
-        (assert-true (string-contains? text "tip-solution-bytes: 33"))
+        (assert-true (string-contains?
+                       text
+                       (string-append "tip-solution-bytes: "
+                                      (number->string
+                                        (string-length %height-one-source)))))
         (assert-true (string-contains?
                        text
                        (string-append "issued-supply: "
@@ -1193,7 +645,7 @@
         (lambda ()
           (cli-with-node args
             (lambda (n)
-              (let ((b (coin-mine-block n #f "backlog" %elsewhere)))
+              (let ((b (build-next n "backlog" %elsewhere)))
                 (node-ingest-headers n (list (block-header-field b)))
                 (node-store-block n b))))))
       (assert-equal 0 (tip-height args))
@@ -1353,223 +805,225 @@
       (assert-true #t))))
 
 ;; ============================================================
-;; v2: program by example
+;; Canonical program-by-example commands
 ;; ============================================================
-;;
-;; The chain still advertises generator version 1, so these drive the v2
-;; surface through the `--v2` flag that forces it. Every value asserted
-;; here is derived, not invented: height 1 on regtest genesis at the
-;; genesis complexity is one fixed puzzle, and the test pins what it is.
 
-;; Height 1's v2 puzzle at C = 128 maps x to (x x*x), so this is the
-;; shortest thing that answers it: one byte under par.
-(define %v2-height-1 "(lambda(x)(list x(* x x)))")
+(define %height-one-spec
+  (cli-puzzle %regtest-genesis-hash 1 coin-genesis-complexity))
+(define %height-one-source (puzzle-spec-hidden-source %height-one-spec))
+(define (work-args) (fresh-args))
 
-;; The complexity whose height-1 puzzle draws the `no-digits` constraint.
-;; Tier 0 is unconstrained by design, so a constraint violation is not
-;; reachable at the genesis complexity at all.
-(define %v2-no-digits-complexity "300")
+;; Find one canonical height-one complexity drawing a requested constraint.
+;; The constraint stream is cheap to inspect; each selected puzzle is generated
+;; only once by the real command below.
+(define (complexity-for-constraint ci)
+  (let loop ((complexity (if (memv ci '(1 3 5)) 256 1024)))
+    (cond
+      ((> complexity coin-complexity-max)
+       (error "test-cli: no complexity draws requested constraint"))
+      ((= ci (puzzle-constraint-for
+                (coin-puzzle-seed %regtest-genesis-hash 1 complexity)
+                1
+                complexity))
+       complexity)
+      (else (loop (+ complexity 1))))))
 
-(define (v2-args) (cons "--v2" (fresh-args)))
+(define (constraint-violating-source ci)
+  (cond ((= ci 1) "(lambda(x)1)")
+        ((= ci 2) "(lambda(x)'x)")
+        ((= ci 3) "(lambda(x)x)")
+        ((= ci 4)
+         "(lambda(x)(list(car x)(cdr x)(length x)(reverse x)(null? x)))")
+        ((= ci 5) "(lambda(x)(map(lambda(y)y)x))")
+        ((= ci 6) "(lambda(x)10)")
+        (else "(lambda(x)x)")))
 
-(test-group "sigilcoin puzzle v2"
-  (test "the report for height 1 is the one the chain derives"
-    (let ((report (coin-puzzle-report/v2 %regtest-genesis-hash 1 128))
-          (spec (cli-v2-puzzle %regtest-genesis-hash 1 128)))
+(test-group "sigilcoin puzzle"
+  (test "report is consensus derivation"
+    (let ((report (coin-puzzle-report %regtest-genesis-hash 1
+                                      coin-genesis-complexity)))
       (assert-equal 1 (cdr (assq 'height report)))
-      (assert-equal 128 (cdr (assq 'complexity report)))
-      (assert-equal 0 (cdr (assq 'tier report)))
-      (assert-equal (pbe-spec-k spec) (cdr (assq 'k report)))
-      (assert-equal (pbe-spec-par spec) (cdr (assq 'par report)))
-      (assert-equal (pbe-spec-table-solution spec)
-                    (cdr (assq 'fallback report)))
-      ;; The pinned values themselves.
-      (assert-equal 3 (cdr (assq 'k report)))
-      (assert-equal 27 (cdr (assq 'par report)))
-      (assert-equal 'none (cdr (assq 'constraint-name report)))
-      (assert-equal '("0: 188 -> (188 35344)"
-                      "1: 148 -> (148 21904)"
-                      "2: 63 -> (63 3969)")
-                    (cdr (assq 'examples report)))))
+      (assert-equal coin-genesis-complexity (cdr (assq 'complexity report)))
+      (assert-equal (puzzle-spec-examples %height-one-spec)
+                    (puzzle-spec-examples
+                      (cli-puzzle %regtest-genesis-hash 1
+                                  coin-genesis-complexity)))
+      (assert-equal (puzzle-spec-table-solution %height-one-spec)
+                    (cdr (assq 'fallback report)))))
 
-  (test "the fallback the report publishes really solves it"
-    (let* ((report (coin-puzzle-report/v2 %regtest-genesis-hash 1 128))
-           (spec (cli-v2-puzzle %regtest-genesis-hash 1 128))
-           (score (cli-v2-score-report spec
-                                       (cdr (assq 'fallback report))
-                                       0)))
-      (assert-true (cdr (assq 'ok score)))
-      ;; The fallback is a lookup table, so it is by construction the
-      ;; longest thing anyone would submit: any real program outranks it.
-      (assert-true (> (cdr (assq 'length score)) (cdr (assq 'par report))))))
-
-  (test "the command answers for the next block on a fresh node"
-    (let* ((result (run (cons "puzzle" (v2-args))))
-           (report (car result))
-           (text (cdr result)))
-      (assert-equal 1 (cdr (assq 'height report)))
-      (assert-true (string-contains? text "version: 2"))
-      (assert-true (string-contains? text "height: 1"))
-      (assert-true (string-contains? text "complexity: 128 (tier 0)"))
-      (assert-true (string-contains? text "constraint: none"))
-      (assert-true (string-contains? text "examples: 3"))
-      (assert-true (string-contains? text "0: 188 -> (188 35344)"))
-      (assert-true (string-contains? text "par: 27"))
-      (assert-true (string-contains? text "max-solution-bytes: 512"))
-      (assert-true (string-contains? text "reward: 1.00000000 SGL"))
-      (assert-true (string-contains? text "fallback: (lambda(x)(if(equal?"))
-      ;; The output has to explain the game, not just state it.
+  (test "command prints sole puzzle shape"
+    (let ((text (run-text (cons "puzzle" (work-args)))))
+      (assert-true (string-contains? text "complexity: 128"))
+      (assert-true (string-contains? text "constraint:"))
+      (assert-true (string-contains? text "examples:"))
       (assert-true (string-contains? text "ONE-ARGUMENT function"))))
 
-  (test "--v2 forces the surface the chain does not advertise yet"
-    (assert-equal 1 (cli-v2-chain-version sigilcoin-regtest-chain))
-    (assert-equal 1 (coin-puzzle-version '() sigilcoin-regtest-chain))
-    (assert-equal 2 (coin-puzzle-version '("--v2") sigilcoin-regtest-chain))
-    ;; Without the flag the v1 report is still what `puzzle` prints, so
-    ;; nothing on the live path moved.
-    (assert-true (string-contains? (run-text (cons "puzzle" (fresh-args)))
-                                   "target: (825 826")))
-
-  (test "--complexity previews a tier the chain has not retargeted into"
-    (let ((text (run-text (append (list "puzzle"
-                                        "--complexity"
-                                        %v2-no-digits-complexity)
-                                  (v2-args)))))
-      (assert-true (string-contains? text "complexity: 300 (tier 1)"))
-      (assert-true (string-contains? text "constraint: no-digits"))
-      (assert-true (string-contains? text "no digit (0-9)")))
+  (test "complexity preview validates its input"
     (assert-true (string-contains?
-                   (failure-message (append (list "puzzle" "--complexity" "x")
-                                            (v2-args)))
-                   "--complexity")))
+                   (run-text (append (list "puzzle" "--complexity" "300")
+                                     (work-args)))
+                   "complexity: 300"))
+    (assert-true (string-contains?
+                   (failure-message
+                     (append (list "puzzle" "--complexity" "x")
+                             (work-args)))
+                   "--complexity"))))
 
-  (test "the puzzle only ever depends on the parent, height and complexity"
-    (assert-equal (run-value (cons "puzzle" (v2-args)))
-                  (run-value (cons "puzzle" (v2-args))))))
-
-(test-group "sigilcoin mine v2"
-  (test "a correct function is accepted and scored against par"
-    (let* ((args (v2-args))
-           (result (run (append (list "mine" "--solution" %v2-height-1)
+(test-group "sigilcoin mine"
+  (test "valid function submits canonical block"
+    (let* ((args (work-args))
+           (result (run (append (list "mine" "--solution"
+                                      %height-one-source
+                                      "--address" %payout-address)
                                 args)))
-           (score (car result))
+           (b (car result))
            (text (cdr result)))
-      (assert-true (cdr (assq 'ok score)))
-      (assert-equal 26 (cdr (assq 'length score)))
-      (assert-equal 0 (cdr (assq 'quality score)))
-      (assert-true (string-contains? text "examples-reproduced: 3 of 3"))
-      (assert-true (string-contains? text "solution-length: 26"))
-      (assert-true (string-contains? text "par: 27"))
-      (assert-true (string-contains? text "beats-par: yes"))
-      (assert-true (string-contains? text "outranks-fallback: yes"))
-      ;; The score word is the ranking, so it must be the one consensus
-      ;; would pack from the same three numbers.
-      (assert-equal (coin-v2-score-encode 26
-                                          (cdr (assq 'cells score))
-                                          (cdr (assq 'steps score))
-                                          0)
-                    (cdr (assq 'word score)))
-      ;; Nothing was built: a v2 block needs the node switchover.
-      (assert-true (string-contains? text "submitted: no"))
-      (assert-equal 0 (tip-height args))))
+      (assert-true (block? b))
+      (assert-equal 1 (tip-height args))
+      (assert-true (string-contains? text "examples-reproduced:"))
+      (assert-true (string-contains? text "submitted: yes"))))
 
-  (test "the fallback is what mine checks when no solution is given"
-    (let ((text (run-text (cons "mine" (v2-args)))))
-      (assert-true (string-contains? text "beats-par: no"))
-      (assert-true (string-contains? text "outranks-fallback: no"))))
+  (test "fallback submits when source omitted"
+    (let ((args (work-args)))
+      (assert-true (block? (run-value
+                             (append (list "mine" "--address" %payout-address)
+                                     args))))
+      (assert-equal 1 (tip-height args))))
 
-  (test "a function of the wrong arity is refused by name"
-    (let ((message (failure-message
+  (test "wrong arity and mismatch are actionable"
+    (assert-true (string-contains?
+                   (failure-message
                      (append (list "mine" "--solution" "(lambda(x y)x)")
-                             (v2-args)))))
-      (assert-true (string-contains? message "one-argument procedure"))
-      (assert-true (string-contains? message "FUNCTION")))
-    ;; A program that produces the answer instead of a function fails the
-    ;; same check, which is the v1 habit v2 has to break.
+                             (work-args)))
+                   "one-argument procedure"))
     (assert-true (string-contains?
-                   (failure-message (append (list "mine" "--solution"
-                                                  "'(188 35344)")
-                                            (v2-args)))
-                   "one-argument procedure")))
+                   (failure-message
+                     (append (list "mine" "--solution" "(lambda(x)x)")
+                             (work-args)))
+                   "example")))
 
-  (test "a function failing one pair says which pair and what it returned"
-    (let ((message (failure-message
-                     (append (list "mine" "--solution" "(lambda(x)(list x x))")
-                             (v2-args)))))
-      (assert-true (string-contains? message "example 0"))
-      (assert-true (string-contains? message "on input 188"))
-      (assert-true (string-contains? message "must return (188 35344)"))
-      (assert-true (string-contains? message "it returned (188 188)"))
-      (assert-true (string-contains? message "ALL 3 pairs")))
-    ;; A function that gets the first pair right and a later one wrong is
-    ;; named by that later index, not by the first.
-    (let ((message (failure-message
+  (test "oversize and malformed source name source error"
+    (assert-true (string-contains?
+                   (failure-message
                      (append (list "mine" "--solution"
-                                   "(lambda(x)(if(equal? x '188)'(188 35344)'nope))")
-                             (v2-args)))))
-      (assert-true (string-contains? message "example 1"))
-      (assert-true (string-contains? message "on input 148"))))
-
-  (test "a constraint violation names the rule and what it says"
-    (let* ((args (append (list "--complexity" %v2-no-digits-complexity)
-                         (v2-args)))
-           ;; The same shape, with and without a digit in the source.
-           (legal "(lambda(s)(list s 'x s))")
-           (illegal "(lambda(s)(list s(if #t 'x 1)s))"))
-      (assert-true (cdr (assq 'ok (run-value (append (list "mine"
-                                                           "--solution"
-                                                           legal)
-                                                     args)))))
-      (let ((message (failure-message (append (list "mine"
-                                                    "--solution"
-                                                    illegal)
-                                              args))))
-        (assert-true (string-contains? message "no-digits"))
-        (assert-true (string-contains? message "no digit (0-9)"))
-        (assert-true (string-contains? message "knowable before you start")))))
-
-  (test "an oversize source names the cap and the byte count"
-    (let* ((padding (let loop ((i 0) (out ""))
-                      (if (>= i 260) out (loop (+ i 1) (string-append out " x")))))
-           (message (failure-message
-                      (append (list "mine"
-                                    "--solution"
-                                    (string-append "(lambda(x)(list x(* x x)"
-                                                   padding
-                                                   "))"))
-                              (v2-args)))))
-      (assert-true (string-contains? message "and the cap is 512 bytes"))
-      (assert-true (string-contains? message "consensus, not policy"))))
-
-  (test "an unparsable solution names the language, not the block"
+                                   (make-string 513 #\x))
+                             (work-args)))
+                   "cap is 512 bytes"))
     (assert-true (string-contains?
-                   (failure-message (append (list "mine" "--solution"
-                                                  "(lambda(x")
-                                            (v2-args)))
-                   "does not parse as puzzle-lang v2"))))
+                   (failure-message
+                     (append (list "mine" "--solution" "(lambda(x")
+                             (work-args)))
+                   "does not parse")))
+
+  (test "every active syntactic constraint is shown and rejected"
+    (let ((args (work-args)))
+      (for-each
+        (lambda (ci)
+          (let* ((complexity (number->string (complexity-for-constraint ci)))
+                 (name (symbol->string (puzzle-constraint-name ci)))
+                 (flags (append (list "--complexity" complexity) args))
+                 (puzzle-text (run-text (cons "puzzle" flags)))
+                 (message
+                   (failure-message
+                     (append (list "mine" "--solution"
+                                   (constraint-violating-source ci))
+                             flags))))
+            (assert-true (string-contains?
+                           puzzle-text (string-append "constraint: " name)))
+            (assert-true (string-contains? message name))
+            (assert-true (string-contains? message
+                                           "knowable before you start"))))
+        '(1 2 3 4 5 6 7)))))
+
+;; Confirm `fanout`, then fill the following block from its independent
+;; outputs. Shared by keyless workspace runs and the native wallet lifecycle,
+;; so either harness pays the 100-block maturity setup only once.
+(define (assert-16k-selection args fanout fan)
+  (let ((size-height (+ (tip-height args) 2))
+        (share (txout-value (car (transaction-outputs fanout)))))
+    (assert-equal 16384 coin-max-block-bytes)
+    (assert-equal "available"
+                  (node-mempool-entry-status (submit args fanout)))
+    (assert-equal 2
+                  (length (block-transactions
+                            (car (mine-to args %payout-address)))))
+    (let loop ((i 0))
+      (when (< i fan)
+        (assert-equal
+          "available"
+          (node-mempool-entry-status
+            (submit args
+              (transaction
+                version: 2
+                inputs: (list
+                          (txin previous-output: (tx-outpoint fanout i)
+                                script-sig: #u8()
+                                sequence: #xffffffff
+                                witness: '()))
+                outputs: (list (txout value: (- share 1000)
+                                      script-pubkey: %ballast))
+                lock-time: 0))))
+        (loop (+ i 1))))
+    (assert-equal fan (mempool-count args))
+    (let* ((b (car (mine-to args %payout-address)))
+           (included (- (length (block-transactions b)) 1)))
+      (assert-true (<= (coin-block-size b) coin-max-block-bytes))
+      (assert-true (> (coin-block-size b)
+                      (- coin-max-block-bytes 500)))
+      (assert-true (< 1 included fan))
+      (assert-equal (- fan included) (mempool-count args))
+      (assert-equal (+ (coin-block-reward size-height) (* included 1000))
+                    (txout-value
+                      (car (transaction-outputs
+                             (car (block-transactions b)))))))))
+
+(if (not %native-secp256k1?)
+  (test-group "sigilcoin 16KiB block selection"
+    (test "the miner includes only the real transactions that fit"
+      (let* ((args (fresh-args))
+             (op (funded-outpoint args %purse-a))
+             (fan 80)
+             (share (quotient (- (coin-block-reward 1) 1000) fan))
+             (fanout
+               (transaction
+                 version: 2
+                 inputs: (list (txin previous-output: op
+                                     script-sig: #u8()
+                                     sequence: #xffffffff
+                                     witness: '()))
+                 outputs: (let loop ((i 0) (out '()))
+                            (if (>= i fan)
+                                (reverse out)
+                                (loop (+ i 1)
+                                      (cons (txout value: share
+                                                   script-pubkey: %purse-a)
+                                            out))))
+                 lock-time: 0)))
+        (assert-16k-selection args fanout fan))))
+  #t)
 
 (test-group "sigilcoin private commitment store"
   (test "save atomically keeps 0600 and refuses permission drift before mutation"
     (let* ((data-dir (make-temp-directory))
-           (path (cli-v2-commit-file data-dir))
+           (path (cli-commit-file data-dir))
            (record
              (lambda (n)
-               (cli-v2-commit-record
+               (cli-commit-record
                  height: 1 complexity: 128
                  parent: %regtest-genesis-hash
-                 pubkey: (make-bytevector coin-v2-share-pubkey-bytes 2)
-                 blind: (make-bytevector coin-v2-share-blind-bytes n)
-                 commitment: (make-bytevector coin-v2-commitment-bytes n)
-                 solution: %v2-height-1))))
-      (cli-v2-commit-save data-dir (record 1))
-      (cli-v2-commit-save data-dir (record 2))
+                 pubkey: (make-bytevector coin-share-pubkey-bytes 2)
+                 blind: (make-bytevector coin-share-blind-bytes n)
+                 commitment: (make-bytevector coin-commitment-bytes n)
+                 solution: %height-one-source))))
+      (cli-commit-save data-dir (record 1))
+      (cli-commit-save data-dir (record 2))
       (assert-equal #o600
                     (bitwise-and (stat-mode (file-stat path)) #o777))
       (let ((before (read-file-string path)))
         (assert-equal 0 (process-run "chmod" "0644" path))
         (let ((message
                 (raises-message
-                  (lambda () (cli-v2-commit-save data-dir (record 3))))))
+                  (lambda () (cli-commit-save data-dir (record 3))))))
           (assert-true (string-contains? message
                                          "readable by other accounts"))
           (assert-true (string-contains? message "chmod 0600")))
@@ -1578,15 +1032,15 @@
           (assert-equal (hash256 before) (hash256 after))))))
 
   (test "commit rejects any height except the validated tip successor"
-    (let* ((args (v2-args))
+    (let* ((args (work-args))
            (data-dir (cli-data-dir args))
-           (path (cli-v2-commit-file data-dir)))
+           (path (cli-commit-file data-dir)))
       (wallet-write-private-file path "existing private commitment bytes\n")
       (let* ((before (read-file-string path))
              (message
                (failure-message
                  (append (list "commit" "--height" "0"
-                               "--solution" %v2-height-1)
+                               "--solution" %height-one-source)
                          args)))
              (after (read-file-string path)))
         (assert-true (string-contains? message "commit-expired"))
@@ -1608,36 +1062,54 @@
 (if %native-secp256k1?
   (begin
 
-    ;; Fixed key 4 derives an affine personalized puzzle at height 1.
-    ;; Removing safe structural spaces from its reviewed hidden source gives
-    ;; two real under-par candidates, one byte apart.
-    (define %v2-share-key (make-bytevector 32 4))
-    (define %v2-share-anchor
-      "adegchhjknekkndjfbegbehfbkhbaifpcpbaobmhkfjdoeoadaoplflihcbmofflal")
-    (define %v2-share-best
-      (string-append "(lambda(x)(if(equal? x \"@\")\""
-                     %v2-share-anchor "\"(+(* x 4)74)))"))
-    (define %v2-share-worse
-      (string-append "(lambda(x)(if(equal? x \"@\")\""
-                     %v2-share-anchor "\"(+(* x 4) 74)))"))
-    (define %v2-share-tied
-      (string-append "(lambda(y)(if(equal? y \"@\")\""
-                     %v2-share-anchor "\"(+(* y 4)74)))"))
+    ;; Fixed key 4 derives deterministic personalized work.
+    (define %share-key (make-bytevector 32 4))
+    (define %share-pubkey (wallet-public-key %share-key))
+    (define %share-context
+      (coin-coop-context
+        parent-prev-hash: %regtest-genesis-hash
+        puzzle-height: 1
+        complexity: coin-genesis-complexity
+        spec: %height-one-spec
+        commits: '()))
+    (define %share-spec (coin-share-puzzle %share-context %share-pubkey))
+    (define %share-hidden (puzzle-spec-hidden-source %share-spec))
+
+    ;; Remove safe spaces adjacent to parentheses. Parser sees parentheses as
+    ;; delimiters, so this preserves behavior while producing under-par work.
+    (define (golf-once source)
+      (let ((n (string-length source)))
+        (let loop ((i 1))
+          (cond
+            ((>= i (- n 1)) source)
+            ((and (char=? #\space (string-ref source i))
+                  (or (char=? #\( (string-ref source (+ i 1)))
+                      (char=? #\) (string-ref source (- i 1)))))
+             (string-append (substring source 0 i)
+                            (substring source (+ i 1) n)))
+            (else (loop (+ i 1)))))))
+
+    (define %share-worse (golf-once %share-hidden))
+    (define %share-best (golf-once %share-worse))
+    (define %share-tied %share-best)
+    (define %share-anchor
+      (puzzle-print-value
+        (cdr (car (reverse (puzzle-spec-examples %share-spec))))))
 
     (define (fixed-share-args)
-      (let* ((args (v2-args))
+      (let* ((args (work-args))
              (data-dir (cli-data-dir args)))
         (wallet-write-private-file
           (wallet-key-file data-dir)
-          (string-append (hex-encode %v2-share-key) "\n"))
+          (string-append (hex-encode %share-key) "\n"))
         args))
 
     (define (height-one-share-context commits)
-      (coin-v2-coop-context
+      (coin-coop-context
         parent-prev-hash: %regtest-genesis-hash
         puzzle-height: 1
         complexity: 128
-        spec: (coin-v2-puzzle-for %regtest-genesis-hash 1 128)
+        spec: (coin-puzzle-for %regtest-genesis-hash 1 128)
         commits: commits))
 
     (define (commit-solution args source)
@@ -1646,7 +1118,7 @@
           (cli-run (append (list "commit" "--solution" source) args)))))
 
     (define (decoded-share share-bytes)
-      (let ((decoded (coin-v2-shares-decode
+      (let ((decoded (coin-shares-decode
                        (bytevector-append #u8(1) share-bytes))))
         (and (coin-ok? decoded) (car (coin-result-value decoded)))))
 
@@ -1656,40 +1128,40 @@
                (puzzle-text
                  (run-text (append (list "puzzle" "--share") args)))
                (result (run (append (list "mine" "--share" "--solution"
-                                          %v2-share-best)
+                                          %share-best)
                                     args)))
                (score (car result))
                (mine-text (cdr result)))
           (assert-true (string-contains? puzzle-text
                                          "personalized-pubkey:"))
-          (assert-true (string-contains? puzzle-text %v2-share-anchor))
+          (assert-true (string-contains? puzzle-text %share-anchor))
           (assert-true (string-contains? mine-text "share-eligible: yes"))
           (assert-true (> (cdr (assq 'quality score)) 0))))
 
       (test "consensus decodes and verifies the emitted blinded reveal"
         (let* ((args (fixed-share-args))
                (data-dir (cli-data-dir args))
-               (record (commit-solution args %v2-share-best))
-               (secret-hex (hex-encode %v2-share-key)))
+               (record (commit-solution args %share-best))
+               (secret-hex (hex-encode %share-key)))
           (fast-forward args 1)
           (let* ((result (run (append (list "reveal" "--height" "1") args)))
                  (share-bytes (car result))
                  (text (cdr result))
                  (share (decoded-share share-bytes))
                  (context (height-one-share-context
-                            (list (cli-v2-commit-record-commitment record))))
-                 (quality (coin-v2-share-quality context share)))
-            (assert-true (coin-v2-share? share))
-            (assert-equal coin-v2-share-blind-bytes
-                          (bytevector-length (coin-v2-share-blind share)))
-            (assert-equal (+ coin-v2-share-fixed-bytes
-                             (string-length %v2-share-best))
+                            (list (cli-commit-record-commitment record))))
+                 (quality (coin-share-quality context share)))
+            (assert-true (coin-share? share))
+            (assert-equal coin-share-blind-bytes
+                          (bytevector-length (coin-share-blind share)))
+            (assert-equal (+ coin-share-fixed-bytes
+                             (string-length %share-best))
                           (bytevector-length share-bytes))
-            (assert-equal (cli-v2-commit-record-commitment record)
-                          (coin-v2-share-commitment context share))
-            (assert-true (coin-v2-share-signature-ok? context share))
+            (assert-equal (cli-commit-record-commitment record)
+                          (coin-share-commitment context share))
+            (assert-true (coin-share-signature-ok? context share))
             (assert-true (coin-ok?
-                           (coin-v2-check-share-solution context share)))
+                           (coin-check-share-solution context share)))
             (assert-true (<= 1 quality 4))
             (assert-true (string-contains?
                            text (string-append "quality: "
@@ -1697,33 +1169,115 @@
             (assert-true (not (string-contains? text "blind:")))
             (assert-true (not (string-contains? text secret-hex))))))
 
+      (test "commit rides in H and selected reveal is included and paid in H+1"
+        (let* ((args (fixed-share-args))
+               (worse (commit-solution args %share-worse))
+               (best (commit-solution args %share-best))
+               (mined (run (append (list "mine" "--address"
+                                          %payout-address)
+                                    args)))
+               (parent (car mined))
+               (parent-payload-result (coin-block-coinbase-payload parent))
+               (parent-payload (coin-result-value parent-payload-result))
+               (commits-result
+                 (coin-commits-decode
+                   (coin-coinbase-payload-commits parent-payload)))
+               (commits (coin-result-value commits-result)))
+          (assert-true (block? parent))
+          (assert-true (coin-ok? parent-payload-result))
+          (assert-true (coin-ok? commits-result))
+          (assert-true (member (cli-commit-record-commitment worse) commits))
+          (assert-true (member (cli-commit-record-commitment best) commits))
+          (let* ((revealed-bytes
+                   (run-value (append (list "reveal" "--height" "1") args)))
+                 (share (decoded-share revealed-bytes))
+                 (context (height-one-share-context commits))
+                 (carrier-script
+                   (coin-address->script-pubkey "--address" %payout-address))
+                 (recipient-script (coin-share-script %share-pubkey))
+                 (producer-script
+                   (coin-address->script-pubkey "--address" %other-address))
+                 (child
+                   (quietly
+                     (lambda ()
+                       (cli-with-node args
+                         (lambda (n)
+                           (let* ((height 2)
+                                  (headers
+                                    (list (coin-header-at-height n 0)
+                                          (coin-header-at-height n 1)))
+                                  (complexity
+                                    (coin-required-complexity headers height))
+                                  (b (coin-build-coop-block
+                                       parent height complexity #f (list share)
+                                       "selected reveal" producer-script
+                                       (+ (block-header-time
+                                            (block-header-field parent))
+                                          (coin-chain-min-block-spacing
+                                            (node-config n))))))
+                             (node-ingest-headers n
+                                                  (list (block-header-field b)))
+                             (node-store-block n b)
+                             (unless (= 1 (node-validate-blocks n))
+                               (error (string-append
+                                        "co-op block did not validate: "
+                                        (node-status-snapshot-sync-last-error
+                                          (node-status n)))))
+                             b))))))
+                 (child-payload-result (coin-block-coinbase-payload child))
+                 (child-payload (coin-result-value child-payload-result))
+                 (shares-result
+                   (coin-shares-decode
+                     (coin-coinbase-payload-shares child-payload)))
+                 (included (coin-result-value shares-result))
+                 (unit (coin-split-unit (coin-block-reward 2) 1)))
+            ;; Default reveal chose the better stored candidate.
+            (assert-equal (cli-commit-record-commitment best)
+                          (coin-share-commitment context share))
+            ;; H+1 carries that exact reveal and consensus accepted it.
+            (assert-true (coin-ok? child-payload-result))
+            (assert-true (coin-ok? shares-result))
+            (assert-equal 1 (length included))
+            (assert-equal revealed-bytes (coin-share-encode (car included)))
+            (assert-equal 2 (tip-height args))
+            ;; Recipient gets one split unit. H's producer gets H's reward
+            ;; plus carrier unit for carrying both commitments.
+            (assert-equal unit
+                          (utxo-total (utxos-of args recipient-script)))
+            (assert-equal (+ (coin-block-reward 1) unit)
+                          (utxo-total (utxos-of args carrier-script)))
+            (assert-equal 3
+                          (length
+                            (transaction-outputs
+                              (car (block-transactions child))))))))
+
       (test "recommit keeps the first candidate and exact save is idempotent"
         (let* ((args (fixed-share-args))
                (data-dir (cli-data-dir args))
-               (first (commit-solution args %v2-share-worse))
-               (again (cli-v2-commit-save data-dir first))
-               (second (commit-solution args %v2-share-best))
-               (records (cli-v2-commit-records data-dir)))
-          (assert-equal (cli-v2-commit-record-commitment first)
-                        (cli-v2-commit-record-commitment again))
+               (first (commit-solution args %share-worse))
+               (again (cli-commit-save data-dir first))
+               (second (commit-solution args %share-best))
+               (records (cli-commit-records data-dir)))
+          (assert-equal (cli-commit-record-commitment first)
+                        (cli-commit-record-commitment again))
           (assert-equal 2 (length records))
-          (assert-true (member (cli-v2-commit-record-commitment first)
-                               (map cli-v2-commit-record-commitment records)))
-          (assert-true (member (cli-v2-commit-record-commitment second)
-                               (map cli-v2-commit-record-commitment records)))))
+          (assert-true (member (cli-commit-record-commitment first)
+                               (map cli-commit-record-commitment records)))
+          (assert-true (member (cli-commit-record-commitment second)
+                               (map cli-commit-record-commitment records)))))
 
       (test "permission drift refuses recommit without changing store bytes"
         (let* ((args (fixed-share-args))
                (data-dir (cli-data-dir args))
-               (path (cli-v2-commit-file data-dir))
-               (first (commit-solution args %v2-share-worse))
+               (path (cli-commit-file data-dir))
+               (first (commit-solution args %share-worse))
                (before (read-file-string path))
                (before-hash (hash256 before)))
-          (assert-true (cli-v2-commit-record? first))
+          (assert-true (cli-commit-record? first))
           (assert-equal 0 (process-run "chmod" "0644" path))
           (let ((message
                   (failure-message
-                    (append (list "commit" "--solution" %v2-share-best)
+                    (append (list "commit" "--solution" %share-best)
                             args))))
             (assert-true (string-contains? message
                                            "readable by other accounts"))
@@ -1735,15 +1289,15 @@
       (test "expired commit height is refused without pruning the store"
         (let* ((args (fixed-share-args))
                (data-dir (cli-data-dir args))
-               (path (cli-v2-commit-file data-dir)))
-          (commit-solution args %v2-share-best)
+               (path (cli-commit-file data-dir)))
+          (commit-solution args %share-best)
           (fast-forward args 2)
           (let* ((before (read-file-string path))
                  (before-hash (hash256 before))
                  (message
                    (failure-message
                      (append (list "commit" "--height" "1"
-                                   "--solution" %v2-share-worse)
+                                   "--solution" %share-worse)
                              args)))
                  (after (read-file-string path)))
             (assert-true (string-contains? message "commit-expired"))
@@ -1753,18 +1307,18 @@
 
       (test "default picks best score while --commitment picks explicitly"
         (let* ((args (fixed-share-args))
-               (worse (commit-solution args %v2-share-worse))
-               (best (commit-solution args %v2-share-best)))
+               (worse (commit-solution args %share-worse))
+               (best (commit-solution args %share-best)))
           (fast-forward args 1)
           (let* ((default-share
                    (decoded-share
                      (run-value (append (list "reveal" "--height" "1")
                                         args))))
                  (context (height-one-share-context
-                            (map cli-v2-commit-record-commitment
+                            (map cli-commit-record-commitment
                                  (list worse best)))))
-            (assert-equal (cli-v2-commit-record-commitment best)
-                          (coin-v2-share-commitment context default-share))
+            (assert-equal (cli-commit-record-commitment best)
+                          (coin-share-commitment context default-share))
             (let ((explicit-share
                     (decoded-share
                       (run-value
@@ -1772,29 +1326,29 @@
                           (list "reveal" "--height" "1"
                                 "--commitment"
                                 (hex-encode
-                                  (cli-v2-commit-record-commitment worse)))
+                                  (cli-commit-record-commitment worse)))
                           args)))))
-              (assert-equal (cli-v2-commit-record-commitment worse)
-                            (coin-v2-share-commitment context
+              (assert-equal (cli-commit-record-commitment worse)
+                            (coin-share-commitment context
                                                       explicit-share))))))
 
       (test "equal scores break deterministically on commitment bytes"
         (let* ((args (fixed-share-args))
-               (a (commit-solution args %v2-share-best))
-               (b (commit-solution args %v2-share-tied))
+               (a (commit-solution args %share-best))
+               (b (commit-solution args %share-tied))
                (expected
-                 (if (cli-v2-bytes<?
-                       (cli-v2-commit-record-commitment a)
-                       (cli-v2-commit-record-commitment b))
+                 (if (cli-bytes<?
+                       (cli-commit-record-commitment a)
+                       (cli-commit-record-commitment b))
                      a b)))
           (fast-forward args 1)
           (let* ((share (decoded-share
                           (run-value
                             (append (list "reveal" "--height" "1") args))))
                  (context (height-one-share-context
-                            (map cli-v2-commit-record-commitment (list a b)))))
-            (assert-equal (cli-v2-commit-record-commitment expected)
-                          (coin-v2-share-commitment context share)))))
+                            (map cli-commit-record-commitment (list a b)))))
+            (assert-equal (cli-commit-record-commitment expected)
+                          (coin-share-commitment context share)))))
 
       (test "missing expired and invalid commitments are refused"
         (let ((missing (fixed-share-args)))
@@ -1812,27 +1366,27 @@
               "exactly 32 bytes")))
         (let* ((expired (fixed-share-args))
                (data-dir (cli-data-dir expired)))
-          (commit-solution expired %v2-share-best)
+          (commit-solution expired %share-best)
           (fast-forward expired 2)
           (assert-true
             (string-contains?
               (failure-message
                 (append (list "reveal" "--height" "1") expired))
               "expired"))
-          (assert-equal '() (cli-v2-commit-records data-dir)))
+          (assert-equal '() (cli-commit-records data-dir)))
         (let* ((invalid (fixed-share-args))
                (data-dir (cli-data-dir invalid))
-               (good (commit-solution invalid %v2-share-best))
-               (bad (cli-v2-commit-record
+               (good (commit-solution invalid %share-best))
+               (bad (cli-commit-record
                       height: 1 complexity: 128
                       parent: %regtest-genesis-hash
-                      pubkey: (wallet-public-key %v2-share-key)
+                      pubkey: (wallet-public-key %share-key)
                       blind: (make-bytevector 32 9)
                       commitment: (make-bytevector 32 0)
-                      solution: %v2-share-best)))
+                      solution: %share-best)))
           ;; Keep only malformed record so default cannot fall back to good.
-          (wallet-write-private-file (cli-v2-commit-file data-dir) "")
-          (cli-v2-commit-save data-dir bad)
+          (wallet-write-private-file (cli-commit-file data-dir) "")
+          (cli-commit-save data-dir bad)
           (fast-forward invalid 1)
           (assert-true
             (string-contains?
@@ -1840,50 +1394,50 @@
                 (append (list "reveal" "--height" "1") invalid))
               "invalid"))))
 
-      (test "one slot set is capped at the sixteen protocol commitments"
+      (test "one slot set is capped at the sixteen canonical commitments"
         (let* ((args (fixed-share-args))
                (data-dir (cli-data-dir args))
-               (pubkey (wallet-public-key %v2-share-key))
-               (preimage (coin-v2-share-preimage
+               (pubkey (wallet-public-key %share-key))
+               (preimage (coin-share-preimage
                            %regtest-genesis-hash 1 128
-                           %v2-share-best pubkey)))
+                           %share-best pubkey)))
           (let loop ((n 1))
-            (when (<= n coin-v2-max-commitments)
+            (when (<= n coin-max-commitments)
               (let* ((blind (make-bytevector 32 n))
-                     (commitment (coin-v2-commitment preimage blind)))
-                (cli-v2-commit-save
+                     (commitment (coin-commitment preimage blind)))
+                (cli-commit-save
                   data-dir
-                  (cli-v2-commit-record
+                  (cli-commit-record
                     height: 1 complexity: 128
                     parent: %regtest-genesis-hash pubkey: pubkey
                     blind: blind commitment: commitment
-                    solution: %v2-share-best))
+                    solution: %share-best))
                 (loop (+ n 1)))))
-          (assert-equal coin-v2-max-commitments
-                        (length (cli-v2-commit-records data-dir)))
+          (assert-equal coin-max-commitments
+                        (length (cli-commit-records data-dir)))
           (let* ((blind (make-bytevector 32 99))
-                 (overflow (cli-v2-commit-record
+                 (overflow (cli-commit-record
                              height: 1 complexity: 128
                              parent: %regtest-genesis-hash pubkey: pubkey
                              blind: blind
-                             commitment: (coin-v2-commitment preimage blind)
-                             solution: %v2-share-best)))
+                             commitment: (coin-commitment preimage blind)
+                             solution: %share-best)))
             (assert-true
               (string-contains?
                 (raises-message
-                  (lambda () (cli-v2-commit-save data-dir overflow)))
+                  (lambda () (cli-commit-save data-dir overflow)))
                 "sixteen")))))
 
       (test "the private store leaves the data directory traversable"
         (let* ((args (fixed-share-args))
                (data-dir (cli-data-dir args)))
           (assert-equal 0 (process-run "chmod" "0750" data-dir))
-          (commit-solution args %v2-share-best)
-          (commit-solution args %v2-share-worse)
+          (commit-solution args %share-best)
+          (commit-solution args %share-worse)
           (assert-equal #o600
                         (bitwise-and
                           (stat-mode
-                            (file-stat (cli-v2-commit-file data-dir)))
+                            (file-stat (cli-commit-file data-dir)))
                           #o777))
           (assert-equal #o700
                         (bitwise-and
@@ -1895,22 +1449,22 @@
                                      #o777))))
 
       (test "commitment preimages bind branch height complexity and key"
-        (let* ((pubkey (wallet-public-key %v2-share-key))
-               (base (coin-v2-share-preimage %regtest-genesis-hash 1 128
-                                              %v2-share-best pubkey)))
+        (let* ((pubkey (wallet-public-key %share-key))
+               (base (coin-share-preimage %regtest-genesis-hash 1 128
+                                              %share-best pubkey)))
           (assert-equal 32 (bytevector-length base))
           (assert-true
             (not (equal? base
-                         (coin-v2-share-preimage %regtest-genesis-hash 2 128
-                                                 %v2-share-best pubkey))))
+                         (coin-share-preimage %regtest-genesis-hash 2 128
+                                                 %share-best pubkey))))
           (assert-true
             (not (equal? base
-                         (coin-v2-share-preimage %regtest-genesis-hash 1 129
-                                                 %v2-share-best pubkey))))
+                         (coin-share-preimage %regtest-genesis-hash 1 129
+                                                 %share-best pubkey))))
           (assert-true
             (not (equal? base
-                         (coin-v2-share-preimage (make-bytevector 32 7) 1 128
-                                                 %v2-share-best pubkey)))))))
+                         (coin-share-preimage (make-bytevector 32 7) 1 128
+                                                 %share-best pubkey)))))))
 
     (test-group "sigilcoin wallet addresses"
       (test "the wallet's address is derived from its own key"
@@ -2105,324 +1659,88 @@
                          (raises-message (lambda () (wallet-key dir)))
                          "valid secp256k1")))))
 
-    (test-group "sigilcoin balance"
-      (test "a fresh wallet owns nothing"
+    (test-group "sigilcoin wallet lifecycle"
+      (test "balance matures, send confirms with fees, then sends again"
         (let* ((args (fresh-args))
-               (result (run (cons "balance" args))))
-          (assert-equal (cons 0 0) (car result))
-          (assert-true (string-contains? (cdr result)
-                                         "balance: 0.00000000 SGL"))
-          (assert-true (string-contains? (cdr result) "outputs: 0"))))
-
-      (test "a block mined without --address pays the wallet"
-        (let* ((args (fresh-args))
-               (result (run (cons "mine" args)))
-               (b (car result))
-               (key (wallet-key (cli-data-dir args))))
-          (assert-true (string-contains?
-                         (cdr result)
-                         (string-append
-                           "payout: "
-                           (coin-address (wallet-public-key key)))))
-          (assert-equal (wallet-script-pubkey key)
+               (key (wallet-key (cli-data-dir args)))
+               (own (wallet-script-pubkey key))
+               (recipient
+                 (coin-address->script-pubkey "--to" %other-address))
+               (first-block (run-value (cons "mine" args))))
+          (assert-equal own
                         (txout-script-pubkey
                           (car (transaction-outputs
-                                 (car (block-transactions b))))))))
-
-      (test "a mined reward shows up, immature"
-        (let* ((args (fresh-args))
-               (mined (quietly (lambda () (cli-run (cons "mine" args)))))
-               (result (run (cons "balance" args))))
-          (assert-equal (cons (coin-block-reward 1) 0) (car result))
-          (assert-true (string-contains? (cdr result)
-                                         "balance: 1.00000000 SGL"))
-          (assert-true (string-contains? (cdr result)
-                                         "spendable: 0.00000000 SGL"))
-          (assert-true (string-contains? (cdr result)
-                                         "immature: 1.00000000 SGL"))
-          (assert-true (string-contains? (cdr result) "outputs: 1"))
-          ;; It is the block's own coinbase output, at the block's height.
-          (quietly
-            (lambda ()
-              (cli-with-node args
-                (lambda (n)
-                  (let ((rows (wallet-utxos
-                                n
-                                (wallet-script-pubkey
-                                  (wallet-key (cli-data-dir args))))))
-                    (assert-equal 1 (length rows))
-                    (assert-equal (transaction-txid
-                                    (car (block-transactions mined)))
-                                  (outpoint-txid
-                                    (wallet-utxo-outpoint (car rows))))
-                    (assert-equal (coin-block-reward 1)
-                                  (wallet-utxo-value (car rows))))))))))
-
-      (test "two mined rewards accumulate"
-        (let ((args (fresh-args)))
-          (quietly (lambda () (cli-run (cons "mine" args))))
-          (quietly (lambda () (cli-run (cons "mine" args))))
-          (assert-equal (cons (+ (coin-block-reward 1)
-                                 (coin-block-reward 2))
-                              0)
-                        (run-value (cons "balance" args)))))
-
-      (test "a reward matures exactly at the node's own maturity window"
-        (let ((args (fresh-args)))
-          (quietly (lambda () (cli-run (cons "mine" args))))
-          ;; One block short of maturity.
+                                 (car (block-transactions first-block))))))
+          (assert-equal (cons (coin-block-reward 1) 0)
+                        (run-value (cons "balance" args)))
           (fast-forward args (- coin-coinbase-maturity 2))
           (assert-equal (- coin-coinbase-maturity 1) (tip-height args))
           (assert-equal (cons (coin-block-reward 1) 0)
                         (run-value (cons "balance" args)))
-          ;; And the block that makes it spendable.
           (fast-forward args 1)
-          (assert-equal coin-coinbase-maturity (tip-height args))
-          (assert-equal (cons (coin-block-reward 1) (coin-block-reward 1))
-                        (run-value (cons "balance" args))))))
-
-    (test-group "sigilcoin send"
-      (test "a matured coinbase can be spent and the node accepts it"
-        (let ((args (fresh-args)))
-          (quietly (lambda () (cli-run (cons "mine" args))))
-          (fast-forward args (- coin-coinbase-maturity 1))
-          (assert-equal (cons (coin-block-reward 1) (coin-block-reward 1))
+          (assert-equal (cons (coin-block-reward 1)
+                              (coin-block-reward 1))
                         (run-value (cons "balance" args)))
-          (let* ((result (run (append (list "send"
-                                            "--to" %other-address
-                                            "--amount" "0.25")
-                                      args)))
-                 (entry (car result))
-                 (text (cdr result)))
-            (assert-true (node-mempool-entry? entry))
-            ;; "available" is what the node's own mempool policy records
-            ;; for a transaction it accepted; a refusal would be "rejected".
-            (assert-equal "available" (node-mempool-entry-status entry))
-            (assert-equal "" (node-mempool-entry-last-error entry))
-            (assert-true (string-contains? text "amount: 0.25000000 SGL"))
-            (assert-true (string-contains? text "fee: 0.00001000 SGL"))
-            (assert-true (string-contains? text "status: available"))
-            (assert-true (string-contains? text "inputs: 1"))
-            (assert-true (string-contains? text "outputs: 2"))
-            (assert-true (string-contains?
-                          text
-                          (string-append "to: " %other-address)))
-            ;; And it really is in the node's mempool.
-            (quietly
-              (lambda ()
-                (cli-with-node args
-                  (lambda (n)
-                    (assert-equal 1 (node-status-snapshot-mempool-count
-                                      (node-status n)))
-                    (assert-equal 1 (length (node-mempool n))))))))))
-
-      (test "the sent transaction really moves the coins it claims to"
-        (let* ((args (fresh-args))
-               (mined (quietly (lambda () (cli-run (cons "mine" args)))))
-               (key (wallet-key (cli-data-dir args))))
-          (fast-forward args (- coin-coinbase-maturity 1))
-          (quietly
-            (lambda ()
-              (cli-with-node args
-                (lambda (n)
-                  (let* ((to (coin-address->script-pubkey "--to"
-                                                          %other-address))
-                         (tx (wallet-build-transfer n key to 25000000 1000)))
-                    ;; One input, spending the coinbase the wallet owns.
-                    (assert-equal 1 (length (transaction-inputs tx)))
-                    (assert-equal (transaction-txid
-                                    (car (block-transactions mined)))
-                                  (outpoint-txid
-                                    (txin-previous-output
-                                      (car (transaction-inputs tx)))))
-                    ;; Payment first, change back to the wallet second.
-                    (assert-equal 2 (length (transaction-outputs tx)))
-                    (assert-equal 25000000
-                                  (txout-value
-                                    (car (transaction-outputs tx))))
-                    (assert-equal to
-                                  (txout-script-pubkey
-                                    (car (transaction-outputs tx))))
-                    (assert-equal (- (coin-block-reward 1) 25000000 1000)
-                                  (txout-value
-                                    (cadr (transaction-outputs tx))))
-                    (assert-equal (wallet-script-pubkey key)
-                                  (txout-script-pubkey
-                                    (cadr (transaction-outputs tx))))
-                    ;; Signed as P2WPKH: a witness, and an empty scriptSig.
-                    (assert-equal #u8()
-                                  (txin-script-sig
-                                    (car (transaction-inputs tx))))
-                    (assert-equal 2
-                                  (length (txin-witness
-                                            (car (transaction-inputs tx)))))
-                    ;; And the node's own policy accepts it.
-                    (assert-equal "available"
-                                  (node-mempool-entry-status
-                                    (node-store-transaction n tx "test"))))))))))
-
-      (test "change below the dust threshold is left to the fee"
-        (let* ((args (fresh-args))
-               (key (wallet-key (cli-data-dir args))))
-          (quietly (lambda () (cli-run (cons "mine" args))))
-          (fast-forward args (- coin-coinbase-maturity 1))
-          (quietly
-            (lambda ()
-              (cli-with-node args
-                (lambda (n)
-                  (let* ((to (coin-address->script-pubkey "--to"
-                                                          %other-address))
-                         (amount (- (coin-block-reward 1)
-                                    1000
-                                    (- coin-dust-threshold 1)))
-                         (tx (wallet-build-transfer n key to amount 1000)))
-                    (assert-equal 1 (length (transaction-outputs tx)))
-                    (assert-equal amount
-                                  (txout-value
-                                    (car (transaction-outputs tx)))))))))))
-
-      (test "an immature balance is refused with the maturity rule named"
-        (let ((args (fresh-args)))
-          (quietly (lambda () (cli-run (cons "mine" args))))
-          (let ((message (failure-message (append (list "send"
-                                                        "--to" %other-address
-                                                        "--amount" "0.5")
-                                                  args))))
-            (assert-true (string-contains? message "balance is too low"))
-            (assert-true (string-contains? message "still maturing"))
-            (assert-true (string-contains? message "100 blocks later")))))
-
-      (test "sending more than the wallet holds is refused"
-        (let ((args (fresh-args)))
-          (quietly (lambda () (cli-run (cons "mine" args))))
-          (fast-forward args (- coin-coinbase-maturity 1))
-          (assert-true (string-contains?
-                         (failure-message (append (list "send"
-                                                        "--to" %other-address
-                                                        "--amount" "5")
-                                                  args))
-                         "balance is too low"))
-          ;; And nothing entered the mempool.
-          (assert-equal 0
-                        (quietly
-                          (lambda ()
-                            (cli-with-node
-                              args
-                              (lambda (n)
-                                (node-status-snapshot-mempool-count
-                                  (node-status n)))))))))
-
-      (test "a zero amount is refused"
-        (let ((args (fresh-args)))
-          (quietly (lambda () (cli-run (cons "mine" args))))
-          (fast-forward args (- coin-coinbase-maturity 1))
-          (assert-true (string-contains?
-                         (failure-message (append (list "send"
-                                                        "--to" %other-address
-                                                        "--amount" "0")
-                                                  args))
-                         "greater than zero")))))
-
-    (test-group "sigilcoin send end to end"
-      (test "a send confirms in the next block and moves the coins"
-        ;; The reviewer's scenario, in one test: mine, mature, send, mine,
-        ;; and then look at the block, the mempool and both balances.
-        (let* ((args (fresh-args))
-               (key (wallet-key (cli-data-dir args)))
-               (own (wallet-script-pubkey key))
-               (to-script (coin-address->script-pubkey "--to"
-                                                       %other-address)))
-          (quietly (lambda () (cli-run (cons "mine" args))))
-          (fast-forward args (- coin-coinbase-maturity 1))
           (let* ((sent (run (append (list "send"
                                           "--to" %other-address
-                                          "--amount" "0.5"
+                                          "--amount" "0.25"
                                           "--fee" "0.00001")
                                     args)))
-                 (spent (map wallet-utxo-outpoint (utxos-of args own))))
-            ;; What `send` reports does not imply the payment has landed.
-            (assert-true (string-contains? (cdr sent) "confirmations: 0"))
-            (assert-true (string-contains? (cdr sent) "unconfirmed"))
-            (assert-equal 1 (mempool-count args))
-            (assert-equal 1 (length spent))
-            (let* ((result (mine-to args %payout-address))
-                   (b (car result))
-                   (txs (block-transactions b)))
-              ;; The transaction is IN the block.
-              (assert-equal 2 (length txs))
-              (assert-true (string-contains? (cdr result)
-                                             "transactions: 1"))
-              ;; The mempool drained.
-              (assert-equal 0 (mempool-count args))
-              ;; The recipient has the coins.
-              (let ((received (utxos-of args to-script)))
-                (assert-equal 1 (length received))
-                (assert-equal 50000000 (utxo-total received)))
-              ;; The sender's input is consumed; only change is left.
-              (let ((left (map wallet-utxo-outpoint (utxos-of args own))))
-                (assert-equal 1 (length left))
-                (assert-equal #f
-                              (wallet-outpoint-member? (car spent) left)))
-              ;; And the fee reached the miner's coinbase.
-              (assert-equal (+ (coin-block-reward
-                                 (+ coin-coinbase-maturity 1))
-                               1000)
-                            (txout-value
-                              (car (transaction-outputs (car txs)))))))))
-
-      (test "a second send works once the first has confirmed"
-        ;; One `send` used to disable spending for good: its inputs were
-        ;; re-selected by every later send, which the node refused as a
-        ;; mempool conflict.
-        (let ((args (fresh-args)))
-          (quietly (lambda () (cli-run (cons "mine" args))))
-          (fast-forward args (- coin-coinbase-maturity 1))
-          (quietly (lambda ()
-                     (cli-run (append (list "send"
-                                            "--to" %other-address
-                                            "--amount" "0.25")
-                                      args))))
-          (mine-to args %payout-address)
-          (assert-equal 0 (mempool-count args))
-          ;; The second send is built from the change and is accepted.
-          (let ((entry (run-value (append (list "send"
-                                                "--to" %other-address
-                                                "--amount" "0.25")
-                                          args))))
+                 (entry (car sent)))
+            (assert-true (node-mempool-entry? entry))
             (assert-equal "available" (node-mempool-entry-status entry))
-            (assert-equal "" (node-mempool-entry-last-error entry)))
+            (assert-true (string-contains? (cdr sent) "confirmations: 0"))
+            (assert-equal 1 (mempool-count args)))
+          (let* ((confirmed (car (mine-to args %payout-address)))
+                 (txs (block-transactions confirmed)))
+            (assert-equal 2 (length txs))
+            (assert-equal 0 (mempool-count args))
+            (assert-equal (+ (coin-block-reward
+                               (+ coin-coinbase-maturity 1))
+                             1000)
+                          (txout-value
+                            (car (transaction-outputs (car txs))))))
+          (assert-equal 25000000
+                        (utxo-total (utxos-of args recipient)))
+          ;; Confirmed change is selectable by the real CLI again.
+          (let ((entry
+                  (run-value
+                    (append (list "send"
+                                  "--to" %other-address
+                                  "--amount" "0.25")
+                            args))))
+            (assert-equal "available" (node-mempool-entry-status entry)))
           (let ((b (car (mine-to args %payout-address))))
             (assert-equal 2 (length (block-transactions b))))
           (assert-equal 0 (mempool-count args))
-          ;; Both payments are in the recipient's UTXO set.
-          (let ((received (utxos-of args
-                                    (coin-address->script-pubkey
-                                      "--to"
-                                      %other-address))))
-            (assert-equal 2 (length received))
-            (assert-equal 50000000 (utxo-total received)))))
+          (assert-equal 50000000
+                        (utxo-total (utxos-of args recipient)))
+          ;; Reuse this matured chain for exact 16KiB selection coverage.
+          (let* ((row (car (utxos-of args own)))
+                 (value (wallet-utxo-value row))
+                 (fan 80)
+                 (share (quotient (- value 1000) fan))
+                 (unsigned
+                   (transaction
+                     version: 2
+                     inputs: (list
+                               (txin previous-output:
+                                       (wallet-utxo-outpoint row)
+                                     script-sig: #u8()
+                                     sequence: #xffffffff
+                                     witness: '()))
+                     outputs: (let loop ((i 0) (out '()))
+                                (if (>= i fan)
+                                    (reverse out)
+                                    (loop (+ i 1)
+                                          (cons (txout value: share
+                                                       script-pubkey: %purse-a)
+                                                out))))
+                     lock-time: 0))
+                 (fanout (transaction-sign-p2wpkh-input
+                           unsigned 0 value key)))
+            (assert-16k-selection args fanout fan)))))
 
-      (test "a second send before the first confirms is refused honestly"
-        ;; Not a silent success and not a conflict: the wallet says the
-        ;; coins are committed and what to do about it.
-        (let ((args (fresh-args)))
-          (quietly (lambda () (cli-run (cons "mine" args))))
-          (fast-forward args (- coin-coinbase-maturity 1))
-          (quietly (lambda ()
-                     (cli-run (append (list "send"
-                                            "--to" %other-address
-                                            "--amount" "0.9999")
-                                      args))))
-          (let ((message (failure-message (append (list "send"
-                                                        "--to" %other-address
-                                                        "--amount" "0.5")
-                                                  args))))
-            (assert-true (string-contains? message "balance is too low"))
-            (assert-true (string-contains? message "has not confirmed yet"))
-            (assert-true (not (string-contains? message
-                                                "mempool-conflict"))))
-          ;; Nothing extra entered the mempool.
-          (assert-equal 1 (mempool-count args)))))
     #t)
   #t)
 

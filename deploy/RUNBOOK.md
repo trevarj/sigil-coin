@@ -215,14 +215,14 @@ verified output from a fresh mainnet data directory:
 ```
 chain: sigilcoin-main
 best-height: 0
-best-hash: 210ca3a6564da8187b4f935daad4e1ed809ef6db7faef3ed4e46ae78007dee9d
-best-work: 53872
+best-hash: a4db344771ff4af14b854e9cf0ed348c7199268d1f82f2c2782380f425dca5fb
+best-work: 16837369189484508192
 best-header-time: 1785542400
 headers: 1
 blocks: 0
 validated-blocks: 0
 best-block-height: 0
-best-block-hash: 210ca3a6564da8187b4f935daad4e1ed809ef6db7faef3ed4e46ae78007dee9d
+best-block-hash: a4db344771ff4af14b854e9cf0ed348c7199268d1f82f2c2782380f425dca5fb
 mempool: 0
 peers: 0
 peer-successes: 0
@@ -230,7 +230,7 @@ peer-failures: 0
 pending-blocks: 0
 sync-stage: idle
 sync-last-error:
-tip-solution-bytes: 49
+tip-solution-bytes: 44
 next-height: 1
 next-reward: 1.00000000 SGL
 issued-supply: 0.00000000 SGL
@@ -238,9 +238,10 @@ max-supply: 143029.99991970 SGL
 ```
 
 `best-hash` is the internal byte order. The display id humans quote is that
-string reversed: `9dee7d0078ae464eedf3ae7fdbf69e80ede1d4aa5d934f7b18a84d56a6a30c21`.
-Both are the launch values, derived from the genesis quote
-`Sigil - Practical Symbolic Power`; see `../LAUNCH.md`.
+string reversed: `fba5dc25f4802378c2f2821f8d2699718c34edf09c4e854bf14aff714734dba4`.
+Both are current coherent placeholders, derived from genesis quote
+`Sigil - Practical Symbolic Power`; mainnet timestamp remains non-final until
+launch day. See `../LAUNCH.md`.
 
 Creating the node's own address writes the wallet key:
 
@@ -450,9 +451,9 @@ switch --rollback`; the data directory is untouched by either direction.
 generator, emission, the solution rules and fork choice are consensus. A
 release that changes any of them is a hard fork, not an upgrade: every node
 must run it, and a node left behind will diverge silently rather than error.
-`sigilcoin status` does not report a consensus version, so this check is
-manual — read the release notes, and if the puzzle generator's version number
-moved, treat it as a fork.
+`sigilcoin status` cannot prove consensus compatibility, so this check is
+manual: compare consensus changes against `../docs/consensus.md`. Any change to
+frozen puzzle or consensus rules is a fork.
 
 ## When the chain stalls
 
@@ -484,11 +485,11 @@ Work through it in this order:
 ### Reorgs
 
 A reorg here is routine, not an incident. Fork choice is: greater height
-wins; at equal height the shorter winning program wins; at equal height and
-equal length the lower block hash wins. Because the optimal program for a
-puzzle is often unique, ties are the normal case rather than the rare one,
-and the tie-break is decided by a hash a miner can grind with up to 400 bytes
-of graffiti. Expect the tip to change hands.
+wins; at equal height the lower composite score wins. Equal-height,
+equal-score blocks are incomparable, so the incumbent remains the tip and
+first-seen wins locally. There is no block-hash tie-break. Nodes can briefly
+keep different siblings, then converge when a child gives one branch greater
+height.
 
 What that means operationally:
 

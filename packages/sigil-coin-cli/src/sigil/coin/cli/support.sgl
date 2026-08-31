@@ -1,18 +1,15 @@
-;;; (sigil coin cli v2) — CLI presentation and private commitment storage
+;;; (sigil coin cli support) — CLI presentation and private commitment storage
 ;;;
-;;; Consensus v2 owns puzzle derivation, personalized shares, preimages,
-;;; commitments and both wire codecs. This module only presents those APIs
-;;; and stores unrevealed local commitments beside the wallet key.
-;;;
-;;; `--v2` remains a temporary dispatch override while configured chains
-;;; still advertise v1. Wave 3 removes it with the old facade.
+;;; Consensus owns puzzle derivation, personalized shares, preimages,
+;;; commitments and wire codecs. This module presents those APIs and stores
+;;; unrevealed local commitments beside the wallet key.
 ;;;
 ;;; ```scheme
-;;; (define spec (cli-v2-puzzle parent-hash 1 128))
-;;; (cli-v2-score-report spec "car" 0)
+;;; (define spec (cli-puzzle parent-hash 1 128))
+;;; (cli-score-report spec "car" 0)
 ;;; ```
 
-(define-library (sigil coin cli v2)
+(define-library (sigil coin cli support)
   (import (sigil fs)
           (sigil io)
           (sigil math)
@@ -23,110 +20,82 @@
           (sigil bitcoin encoding)
           (sigil coin puzzle)
           (sigil coin puzzle constraints)
-          (sigil coin puzzle examples)
-          (sigil coin consensus v2)
+          (sigil coin puzzle generator)
+          (sigil coin consensus)
           (sigil coin cli wallet))
   (export
-    ;; Version selection
-    cli-v2-chain-version
-    cli-v2-complexity
-    cli-v2-puzzle
+    cli-complexity
+    cli-puzzle
 
     ;; Explaining a puzzle
-    cli-v2-constraint-rule
-    cli-v2-constraint-detail
-    cli-v2-example-lines
+    cli-constraint-rule
+    cli-constraint-detail
+    cli-example-lines
 
     ;; Checking and scoring a candidate
-    cli-v2-score-report
-    cli-v2-mismatch-actual
-    cli-v2-solution-advice
+    cli-score-report
+    cli-mismatch-actual
+    cli-solution-advice
 
     ;; The miner's own commitment store
-    cli-v2-commit-file
-    cli-v2-commit-record
-    cli-v2-commit-record?
-    cli-v2-commit-record-height
-    cli-v2-commit-record-complexity
-    cli-v2-commit-record-parent
-    cli-v2-commit-record-pubkey
-    cli-v2-commit-record-blind
-    cli-v2-commit-record-commitment
-    cli-v2-commit-record-solution
-    cli-v2-commit-records
-    cli-v2-commit-records-for
-    cli-v2-commit-save
-    cli-v2-commit-prune
-    cli-v2-bytes<?
-    cli-v2-sort-bytes)
+    cli-commit-file
+    cli-commit-record
+    cli-commit-record?
+    cli-commit-record-height
+    cli-commit-record-complexity
+    cli-commit-record-parent
+    cli-commit-record-pubkey
+    cli-commit-record-blind
+    cli-commit-record-commitment
+    cli-commit-record-solution
+    cli-commit-records
+    cli-commit-records-for
+    cli-commit-save
+    cli-commit-prune
+    cli-bytes<?
+    cli-sort-bytes)
 
   (begin
 
-    ;; ============================================================
-    ;; Which rules a chain is playing by
-    ;; ============================================================
-
-    ;;; The puzzle generator version a chain config advertises.
-    ;;;
-    ;;; The node publishes it under the `mining` extension, so the CLI does
-    ;;; not have to guess and does not need a flag day: the v2 surface goes
-    ;;; live for a chain on the same commit that flips this number.
-    ;;;
-    ;;; ```scheme
-    ;;; (cli-v2-chain-version sigilcoin-regtest-chain) ; => 1
-    ;;; ```
-    (define (cli-v2-chain-version chain)
-      (: any? -> integer?)
-      (let ((entry (assq 'puzzle-generator-version
-                         (chain-config-extension chain 'mining '()))))
-        (if (pair? entry) (cdr entry) 1)))
-
     ;;; The complexity `C` a puzzle at `height` is generated at.
     ;;;
-    ;;; ADAPTER. §9 derives `C` from the median relative margin over the
-    ;;; parent chain's last 16 blocks, which needs 16 v2 blocks to exist. On
-    ;;; a chain that has not switched over there are none, so `C` is read
-    ;;; from the parent header's `bits` when that header already carries the
-    ;;; v2 encoding, and is the genesis complexity otherwise. `override`
-    ;;; wins over both, and is how a miner previews a harder tier before the
-    ;;; chain has retargeted into it.
+    ;;; `C` is read from the parent header's canonical `bits` field.
+    ;;; `override` is only for previewing another configured complexity.
     ;;;
     ;;; ```scheme
-    ;;; (cli-v2-complexity parent #f) ; => 128
+    ;;; (cli-complexity parent #f) ; => 128
     ;;; ```
-    (define (cli-v2-complexity parent-bits override)
+    (define (cli-complexity parent-bits override)
       (: any? any? -> integer?)
       (if override
           (begin
             (unless (and (number? override)
                          (exact? override)
                          (integer? override)
-                         (<= coin-v2-complexity-min override)
-                         (<= override coin-v2-complexity-max))
+                         (<= coin-complexity-min override)
+                         (<= override coin-complexity-max))
               (error (string-append
                        "--complexity: expected a whole number in ["
-                       (number->string coin-v2-complexity-min)
+                       (number->string coin-complexity-min)
                        ", "
-                       (number->string coin-v2-complexity-max)
+                       (number->string coin-complexity-max)
                        "].")))
             override)
-          (let ((decoded (coin-v2-bits-decode parent-bits)))
+          (let ((decoded (coin-bits-decode parent-bits)))
             (if (coin-ok? decoded)
                 (coin-result-value decoded)
-                coin-v2-complexity-genesis))))
+                coin-complexity-genesis))))
 
     ;;; Derive the program-by-example puzzle for a height.
     ;;;
-    ;;; LIVE: this is `coin-v2-puzzle-for` with nothing added. It is
-    ;;; forwarded rather than imported directly by the commands so the
-    ;;; switchover has one call site to move.
+    ;;; This is `coin-puzzle-for` with nothing added.
     ;;;
     ;;; ```scheme
-    ;;; (pbe-spec-k (cli-v2-puzzle parent-hash 1 128)) ; => 3
+    ;;; (puzzle-spec-k (cli-puzzle parent-hash 1 128)) ; => 3
     ;;; ```
-    (define (cli-v2-puzzle previous-hash height complexity)
-      (: bytevector? integer? integer? -> pbe-spec?)
-      (coin-v2-puzzle-for previous-hash height complexity))
+    (define (cli-puzzle previous-hash height complexity)
+      (: bytevector? integer? integer? -> puzzle-spec?)
+      (coin-puzzle-for previous-hash height complexity))
 
     ;; ============================================================
     ;; Explaining the day's rule
@@ -138,10 +107,10 @@
     ;;; The day's constraint as an English rule.
     ;;;
     ;;; ```scheme
-    ;;; (cli-v2-constraint-rule 1 6)
+    ;;; (cli-constraint-rule 1 6)
     ;;; ; => "no digit (0-9) may appear anywhere in the source"
     ;;; ```
-    (define (cli-v2-constraint-rule ci d)
+    (define (cli-constraint-rule ci d)
       (: integer? integer? -> string?)
       (cond
         ((= ci 0) "anything goes; there is no syntactic rule today")
@@ -164,22 +133,22 @@
     ;;; The constraint's consensus name and its rule, as one line.
     ;;;
     ;;; ```scheme
-    ;;; (cli-v2-constraint-detail 0 6) ; => "none — anything goes; ..."
+    ;;; (cli-constraint-detail 0 6) ; => "none — anything goes; ..."
     ;;; ```
-    (define (cli-v2-constraint-detail ci d)
+    (define (cli-constraint-detail ci d)
       (: integer? integer? -> string?)
       (string-append (symbol->string (puzzle-constraint-name ci))
                      " — "
-                     (cli-v2-constraint-rule ci d)))
+                     (cli-constraint-rule ci d)))
 
     ;;; The puzzle's example pairs, rendered one line each.
     ;;;
     ;;; ```scheme
-    ;;; (car (cli-v2-example-lines spec)) ; => "0: 3 -> 9"
+    ;;; (car (cli-example-lines spec)) ; => "0: 3 -> 9"
     ;;; ```
-    (define (cli-v2-example-lines spec)
-      (: pbe-spec? -> list?)
-      (let loop ((pairs (pbe-spec-examples spec)) (i 0) (out '()))
+    (define (cli-example-lines spec)
+      (: puzzle-spec? -> list?)
+      (let loop ((pairs (puzzle-spec-examples spec)) (i 0) (out '()))
         (if (null? pairs)
             (reverse out)
             (loop (cdr pairs)
@@ -207,27 +176,27 @@
     ;;; their consensus contribution so selection uses the real score word.
     ;;;
     ;;; ```scheme
-    ;;; (cdr (assq 'ok (cli-v2-score-report spec "car" 0))) ; => #f
+    ;;; (cdr (assq 'ok (cli-score-report spec "car" 0))) ; => #f
     ;;; ```
-    (define (cli-v2-score-report spec solution quality)
-      (: pbe-spec? any? integer? -> list?)
-      (let ((checked (coin-v2-check-solution spec solution)))
+    (define (cli-score-report spec solution quality)
+      (: puzzle-spec? any? integer? -> list?)
+      (let ((checked (coin-check-solution spec solution)))
         (if (coin-failed? checked)
             (list (cons 'ok #f)
                   (cons 'reason (coin-result-reason checked))
                   (cons 'detail (coin-result-detail checked)))
             (let* ((report (coin-result-value checked))
-                   (length (coin-v2-solution-length solution))
+                   (length (coin-solution-length solution))
                    (cells (puzzle-report-cells report))
                    (steps (puzzle-report-steps report)))
               (list (cons 'ok #t)
                     (cons 'length length)
                     (cons 'cells cells)
                     (cons 'steps steps)
-                    (cons 'memory-bucket (coin-v2-bucket7 cells))
-                    (cons 'step-bucket (coin-v2-bucket7 steps))
+                    (cons 'memory-bucket (coin-bucket7 cells))
+                    (cons 'step-bucket (coin-bucket7 steps))
                     (cons 'quality quality)
-                    (cons 'word (coin-v2-score-encode length cells steps
+                    (cons 'word (coin-score-encode length cells steps
                                                       quality)))))))
 
     ;;; What a mismatching solution actually produced for one example.
@@ -238,11 +207,11 @@
     ;;; value, or `#f` when the application itself failed.
     ;;;
     ;;; ```scheme
-    ;;; (cli-v2-mismatch-actual "car" '(1 2 3)) ; => "1"
+    ;;; (cli-mismatch-actual "car" '(1 2 3)) ; => "1"
     ;;; ```
-    (define (cli-v2-mismatch-actual solution input)
+    (define (cli-mismatch-actual solution input)
       (: any? any? -> any?)
-      (let ((parsed (puzzle-parse/limit solution coin-v2-max-solution-bytes)))
+      (let ((parsed (puzzle-parse/limit solution coin-max-solution-bytes)))
         (and (puzzle-ok? parsed)
              (let ((ran (puzzle-eval (list (puzzle-result-value parsed)
                                            (list 'quote input)))))
@@ -271,7 +240,7 @@
             ((= index 0) (car pairs))
             (else (nth-pair (cdr pairs) (- index 1)))))
 
-    ;;; Turn a v2 rejection into a sentence naming the next move.
+    ;;; Turn a canonical rejection into a sentence naming the next move.
     ;;;
     ;;; The consensus layer answers in reason symbols, which are exactly
     ;;; right for a validator and useless to someone golfing at 2am. Every
@@ -280,24 +249,24 @@
     ;;; broke and what that rule says, or which cap it went over.
     ;;;
     ;;; ```scheme
-    ;;; (cli-v2-solution-advice spec 'solution-oversize "" "x")
+    ;;; (cli-solution-advice spec 'solution-oversize "" "x")
     ;;; ; => "it is 1 byte, and the cap is 512 bytes. ..."
     ;;; ```
-    (define (cli-v2-solution-advice spec reason detail solution)
-      (: pbe-spec? any? any? any? -> string?)
+    (define (cli-solution-advice spec reason detail solution)
+      (: puzzle-spec? any? any? any? -> string?)
       (let ((extra (if (and (string? detail) (not (string=? "" detail)))
                        (string-append " (" detail ")")
                        "")))
         (cond
           ((eq? reason 'solution-mismatch)
            (let* ((index (detail-index detail))
-                  (pair (nth-pair (pbe-spec-examples spec) index)))
+                  (pair (nth-pair (puzzle-spec-examples spec) index)))
              (if (not pair)
                  (string-append
                    "it does not reproduce every published example"
                    extra
                    ". Run `sigilcoin puzzle` to see the pairs.")
-                 (let ((actual (cli-v2-mismatch-actual solution (car pair))))
+                 (let ((actual (cli-mismatch-actual solution (car pair))))
                    (string-append
                      "example "
                      (number->string index)
@@ -309,44 +278,44 @@
                          (string-append ", and it returned " actual)
                          ", and the application itself failed")
                      ". A solution has to reproduce ALL "
-                     (number->string (pbe-spec-k spec))
+                     (number->string (puzzle-spec-k spec))
                      " pairs, not just the first ones.")))))
           ((eq? reason 'solution-not-a-procedure)
-           "it does not evaluate to a one-argument procedure. A v2 solution is a FUNCTION of the puzzle's input — `(lambda(x) ...)` or a bare builtin such as `car` — not the answer itself, and a lambda taking two arguments or none is refused for the same reason.")
+           "it does not evaluate to a one-argument procedure. A canonical solution is a FUNCTION of the puzzle's input — `(lambda(x) ...)` or a bare builtin such as `car` — not the answer itself, and a lambda taking two arguments or none is refused for the same reason.")
           ((eq? reason 'constraint-violated)
            (string-append
              "it breaks today's constraint, `"
              (symbol->string (puzzle-constraint-name
-                               (pbe-spec-constraint spec)))
+                               (puzzle-spec-constraint spec)))
              "`: "
-             (cli-v2-constraint-rule (pbe-spec-constraint spec)
-                                     (coin-v2-spec-builtin-cap spec))
+             (cli-constraint-rule (puzzle-spec-constraint spec)
+                                     (coin-spec-builtin-cap spec))
              ". The constraint rotates with the seed, so it is the same for"
              " everyone at this height and is knowable before you start."))
           ((eq? reason 'solution-oversize)
            (string-append
              "it is "
-             (number->string (or (coin-v2-solution-length solution) 0))
+             (number->string (or (coin-solution-length solution) 0))
              " bytes, and the cap is "
-             (number->string coin-v2-max-solution-bytes)
+             (number->string coin-max-solution-bytes)
              " bytes. The cap is consensus, not policy; the guaranteed"
              " fallback in `sigilcoin puzzle` always fits inside it."))
           ((eq? reason 'solution-malformed)
            "it is empty or not text. Pass the program source with --solution.")
           ((eq? reason 'solution-parse-failed)
            (string-append
-             "it does not parse as puzzle-lang v2"
+             "it does not parse as puzzle-lang canonical"
              extra
              ". Check the parentheses and that every name is in"
              " `puzzle-builtin-names`."))
           ((eq? reason 'solution-eval-failed)
            (string-append
-             "it did not finish inside the v2 limits"
+             "it did not finish inside the canonical limits"
              extra
              ". One machine runs the program and all "
-             (number->string (pbe-spec-k spec))
+             (number->string (puzzle-spec-k spec))
              " applications on a shared "
-             (number->string puzzle-v2-max-fuel)
+             (number->string puzzle-max-fuel)
              "-step budget, so a loop that is fine on one input can still"
              " run the block out of fuel across the whole set."))
           (else
@@ -361,9 +330,9 @@
     ;;
     ;; One record per line. Blinds and source stay under wallet/ at mode 0600.
     ;; Records remain until their reveal height expires. Whole-file rewrites
-    ;; are bounded by the protocol's sixteen slots per puzzle and key.
+    ;; are bounded by consensus's sixteen slots per puzzle and key.
 
-    (define-struct cli-v2-commit-record
+    (define-struct cli-commit-record
       (height)
       (complexity)
       (parent)
@@ -373,7 +342,7 @@
       (solution))
 
     ;;; Where a data directory keeps unrevealed commitments.
-    (define (cli-v2-commit-file data-dir)
+    (define (cli-commit-file data-dir)
       (: string? -> string?)
       (path-join data-dir "wallet" "commitments"))
 
@@ -381,7 +350,7 @@
       (if (bytevector? solution) solution (string->utf8 solution)))
 
     ;;; Lexicographic byte comparison used by canonical consensus encoders.
-    (define (cli-v2-bytes<? a b)
+    (define (cli-bytes<? a b)
       (: bytevector? bytevector? -> boolean?)
       (let ((na (bytevector-length a)) (nb (bytevector-length b)))
         (let loop ((i 0))
@@ -393,7 +362,7 @@
             (else (loop (+ i 1)))))))
 
     ;;; Sort bytevectors for consensus' strictly ascending wire order.
-    (define (cli-v2-sort-bytes values)
+    (define (cli-sort-bytes values)
       (: list? -> list?)
       (let loop ((xs values) (out '()))
         (if (null? xs)
@@ -403,19 +372,19 @@
               (let insert ((ys out))
                 (cond
                   ((null? ys) (list (car xs)))
-                  ((cli-v2-bytes<? (car xs) (car ys)) (cons (car xs) ys))
+                  ((cli-bytes<? (car xs) (car ys)) (cons (car xs) ys))
                   (else (cons (car ys) (insert (cdr ys))))))))))
 
     (define (record->line record)
       (string-append
-        (number->string (cli-v2-commit-record-height record)) " "
-        (number->string (cli-v2-commit-record-complexity record)) " "
-        (hex-encode (cli-v2-commit-record-parent record)) " "
-        (hex-encode (cli-v2-commit-record-pubkey record)) " "
-        (hex-encode (cli-v2-commit-record-blind record)) " "
-        (hex-encode (cli-v2-commit-record-commitment record)) " "
+        (number->string (cli-commit-record-height record)) " "
+        (number->string (cli-commit-record-complexity record)) " "
+        (hex-encode (cli-commit-record-parent record)) " "
+        (hex-encode (cli-commit-record-pubkey record)) " "
+        (hex-encode (cli-commit-record-blind record)) " "
+        (hex-encode (cli-commit-record-commitment record)) " "
         (hex-encode (solution-bytes
-                      (cli-v2-commit-record-solution record)))))
+                      (cli-commit-record-solution record)))))
 
     (define (line->record line)
       (let ((fields (string-split (string-trim line) " ")))
@@ -434,16 +403,16 @@
                       (number? complexity) (exact? complexity)
                       (integer? complexity)
                       (= 32 (bytevector-length parent))
-                      (= coin-v2-share-pubkey-bytes
+                      (= coin-share-pubkey-bytes
                          (bytevector-length pubkey))
-                      (= coin-v2-share-blind-bytes
+                      (= coin-share-blind-bytes
                          (bytevector-length blind))
-                      (= coin-v2-commitment-bytes
+                      (= coin-commitment-bytes
                          (bytevector-length commitment))
                       (<= 1 (bytevector-length (solution-bytes solution)))
                       (<= (bytevector-length (solution-bytes solution))
-                          coin-v2-max-solution-bytes)
-                      (cli-v2-commit-record
+                          coin-max-solution-bytes)
+                      (cli-commit-record
                         height: height
                         complexity: complexity
                         parent: parent
@@ -453,9 +422,9 @@
                         solution: solution)))))))
 
     ;;; Every parseable stored commitment, oldest first.
-    (define (cli-v2-commit-records data-dir)
+    (define (cli-commit-records data-dir)
       (: string? -> list?)
-      (let ((path (cli-v2-commit-file data-dir)))
+      (let ((path (cli-commit-file data-dir)))
         (if (not (file-exists? path))
             '()
             (let loop ((lines (string-split
@@ -471,32 +440,32 @@
                           (if record (cons record out) out)))))))))
 
     (define (same-slot? a b)
-      (and (= (cli-v2-commit-record-height a)
-              (cli-v2-commit-record-height b))
-           (= (cli-v2-commit-record-complexity a)
-              (cli-v2-commit-record-complexity b))
-           (equal? (cli-v2-commit-record-parent a)
-                   (cli-v2-commit-record-parent b))
-           (equal? (cli-v2-commit-record-pubkey a)
-                   (cli-v2-commit-record-pubkey b))))
+      (and (= (cli-commit-record-height a)
+              (cli-commit-record-height b))
+           (= (cli-commit-record-complexity a)
+              (cli-commit-record-complexity b))
+           (equal? (cli-commit-record-parent a)
+                   (cli-commit-record-parent b))
+           (equal? (cli-commit-record-pubkey a)
+                   (cli-commit-record-pubkey b))))
 
     (define (write-records data-dir records)
       (wallet-write-private-file
-        (cli-v2-commit-file data-dir)
+        (cli-commit-file data-dir)
         (if (null? records)
             ""
             (string-append (string-join (map record->line records) "\n")
                            "\n"))))
 
     ;;; Stored candidates for one `(height,parent,C,pubkey)` slot set.
-    (define (cli-v2-commit-records-for data-dir height parent complexity
+    (define (cli-commit-records-for data-dir height parent complexity
                                        pubkey)
       (: string? integer? bytevector? integer? bytevector? -> list?)
-      (let ((wanted (cli-v2-commit-record
+      (let ((wanted (cli-commit-record
                       height: height complexity: complexity parent: parent
                       pubkey: pubkey blind: #u8() commitment: #u8()
                       solution: "")))
-        (let loop ((xs (cli-v2-commit-records data-dir)) (out '()))
+        (let loop ((xs (cli-commit-records data-dir)) (out '()))
           (cond
             ((null? xs) (reverse out))
             ((same-slot? (car xs) wanted)
@@ -505,39 +474,39 @@
 
     ;;; Save one candidate without replacing another still-live candidate.
     ;;; Re-saving an identical commitment is idempotent.
-    (define (cli-v2-commit-save data-dir record)
-      (: string? cli-v2-commit-record? -> cli-v2-commit-record?)
-      (let* ((records (cli-v2-commit-records data-dir))
+    (define (cli-commit-save data-dir record)
+      (: string? cli-commit-record? -> cli-commit-record?)
+      (let* ((records (cli-commit-records data-dir))
              (same (let loop ((xs records))
                      (cond
                        ((null? xs) #f)
                        ((and (same-slot? (car xs) record)
-                             (equal? (cli-v2-commit-record-commitment (car xs))
-                                     (cli-v2-commit-record-commitment record)))
+                             (equal? (cli-commit-record-commitment (car xs))
+                                     (cli-commit-record-commitment record)))
                         (car xs))
                        (else (loop (cdr xs)))))))
         (if same
             same
             (begin
-              (when (>= (length (cli-v2-commit-records-for
+              (when (>= (length (cli-commit-records-for
                                   data-dir
-                                  (cli-v2-commit-record-height record)
-                                  (cli-v2-commit-record-parent record)
-                                  (cli-v2-commit-record-complexity record)
-                                  (cli-v2-commit-record-pubkey record)))
-                         coin-v2-max-commitments)
-                (error "commit: all sixteen protocol commitment slots are already stored for this puzzle and key"))
+                                  (cli-commit-record-height record)
+                                  (cli-commit-record-parent record)
+                                  (cli-commit-record-complexity record)
+                                  (cli-commit-record-pubkey record)))
+                         coin-max-commitments)
+                (error "commit: all sixteen canonical commitment slots are already stored for this puzzle and key"))
               (write-records data-dir (append records (list record)))
               record))))
 
     ;;; Drop commitments whose one-block reveal window has closed.
-    (define (cli-v2-commit-prune data-dir tip-height)
+    (define (cli-commit-prune data-dir tip-height)
       (: string? integer? -> list?)
-      (let* ((records (cli-v2-commit-records data-dir))
+      (let* ((records (cli-commit-records data-dir))
              (kept (let loop ((xs records) (out '()))
                      (cond
                        ((null? xs) (reverse out))
-                       ((< (cli-v2-commit-record-height (car xs)) tip-height)
+                       ((< (cli-commit-record-height (car xs)) tip-height)
                         (loop (cdr xs) out))
                        (else (loop (cdr xs) (cons (car xs) out)))))))
         (when (not (= (length records) (length kept)))

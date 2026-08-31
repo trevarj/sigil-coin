@@ -1,4 +1,4 @@
-;;; Golden vectors for the v2 rotating constraint catalogue.
+;;; Golden vectors for the canonical rotating constraint catalogue.
 ;;;
 ;;; The catalogue, the ids and what each rule accepts are consensus. Drift
 ;;; here changes which blocks nodes accept, so these expectations must fail
@@ -17,7 +17,7 @@
   (puzzle-constraint-walk (puzzle-result-value (puzzle-parse source))))
 
 (define (ast-of source)
-  (puzzle-result-value (puzzle-parse/limit source puzzle-v2-max-source-bytes)))
+  (puzzle-result-value (puzzle-parse/limit source puzzle-max-source-bytes)))
 
 (define (ok? ci source d)
   (puzzle-constraint-ok? ci source (ast-of source) d))
@@ -120,7 +120,7 @@
                               (facts-of "(list (car x) (car (car x)))")))))
 
   (test "a bound name is a local, not a builtin"
-    ;; Rule 4 hangs on this: builtin names are shadowable in v1/v2 semantics.
+    ;; Rule 4 hangs on this: builtin names are shadowable in canonical semantics.
     (assert-equal '() (puzzle-facts-free-builtins
                         (facts-of "(lambda (car) (car 1))")))
     (assert-equal '() (puzzle-facts-free-builtins
@@ -259,7 +259,7 @@
 
   (test "the wrappers cost what the size budget assumes"
     ;; The table solution is sized against these, so a wrapper that grew
-    ;; would silently eat the headroom under `puzzle-v2-max-source-bytes`.
+    ;; would silently eat the headroom under `puzzle-max-source-bytes`.
     (assert-equal 11 (- (string-length (puzzle-constraint-wrap 0 ""))
                         0))
     (assert-equal 29 (- (string-length (puzzle-constraint-wrap 3 ""))

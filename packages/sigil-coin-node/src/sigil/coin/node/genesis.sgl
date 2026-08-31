@@ -1,40 +1,40 @@
-;;; (sigil coin node genesis) — the deterministic genesis builder
+;;; (sigil coin node genesis) — the deterministic canonical genesis builder
 ;;;
 ;;; Genesis is not mined: nobody competes for it, because there is no parent
 ;;; hash to derive a puzzle from until it exists. It is BUILT, from two
 ;;; inputs and nothing else — a graffiti quote and a timestamp — so anyone
 ;;; can rebuild the chain's first block and check it byte for byte against
-;;; the constants a chain config carries.
+;;; the constants below.
 ;;;
 ;;; What is fixed rather than chosen:
 ;;;
-;;;   * the SOLUTION is `puzzle-spec-solution` of the genesis puzzle, the one
-;;;     `coin-puzzle-for` derives from the frozen `coin-genesis-seed`. Genesis
-;;;     is therefore a real, verifiable SigilCoin block: it carries a solution
-;;;     that `coin-verify-block-solution` accepts at height 0.
-;;;   * the REWARD is nothing. `coin-block-reward` pays 0 at height 0, and the
-;;;     single output is a 0-value `OP_RETURN`. There is no premine, and the
-;;;     output is provably unspendable rather than merely unspent — no key
-;;;     exists that could ever move it, so the emission schedule starts at
-;;;     height 1 with an empty UTXO set.
-;;;   * the HEADER fields SigilCoin constrains: `version` and `bits` come
-;;;     from `(sigil coin node rules)`, and the solution-length commitment is
-;;;     the length of the genesis solution, so genesis satisfies the same
-;;;     `accept?` every later header does and ranks by the same rule.
+;;;   * the SOLUTION is the table solution of the genesis puzzle, the one
+;;;     derived from the frozen `seed(0) = SHA256d("SigilCoin/genesis/puzzle/1")`
+;;;     at `C = 128`. Genesis is therefore a real, verifiable canonical block: it
+;;;     carries a program that reproduces every published example pair.
+;;;   * `bits` is `0x207F0080` — the canonical prefix over
+;;;     `puzzle-complexity-genesis`, 128 — which is what `C(0)` is by rule.
+;;;   * `nonce` is genesis's own score word, computed by running its
+;;;     solution. Genesis carries no shares, so aggregate quality is `Q = 0`
+;;;     and the stored low score field is `15-Q = 15`.
+;;;   * the REWARD is nothing. `coin-block-reward` pays 0 at height 0 and the
+;;;     single output is a 0-value `OP_RETURN`: no premine, and provably
+;;;     unspendable rather than merely unspent.
 ;;;
 ;;; Only the quote and the timestamp vary, which is what lets one builder
-;;; serve mainnet and a local test chain.
+;;; serve mainnet and a local test chain — and what keeps setting the launch
+;;; date later a one-argument change rather than a rewrite.
 ;;;
-;;; REGENERATING THE CONSTANTS is one call:
+;;; REGENERATING THE CONSTANTS IS ONE CALL:
 ;;;
 ;;; ```scheme
 ;;; (coin-genesis-header-hex coin-genesis-quote coin-genesis-time)
-;;; ; => the 160-character header hex to paste into the chain config
+;;; ; => the 160-character header hex to paste in below
 ;;; ```
 ;;;
-;;; The chain config stores that hex, and a test rebuilds genesis from the
-;;; quote and asserts it reproduces the stored bytes, so the constants and
-;;; the builder cannot drift apart.
+;;; The constants are checked in rather than computed at load so they are
+;;; inspectable without running the generator, and a test rebuilds genesis
+;;; from the quote and asserts it reproduces them, so the two cannot drift.
 
 (define-library (sigil coin node genesis)
   (import (sigil math)
@@ -45,82 +45,102 @@
           (sigil bitcoin encoding)
           (sigil bitcoin tx)
           (sigil bitcoin consensus)
-          (sigil coin puzzle generator)
           (sigil coin consensus)
-          (sigil coin node rules))
+          (sigil coin node rules)
+          (sigil coin node body)
+          (sigil coin node miner))
   (export
+    coin-genesis-complexity
+    coin-genesis-bits
     coin-genesis-solution
+    coin-genesis-score
     coin-genesis-script-pubkey
     coin-genesis-coinbase
     coin-genesis-block
     coin-genesis-header
     coin-genesis-hash
-    coin-genesis-header-hex)
+    coin-genesis-header-hex
+    coin-genesis-header-constant
+    coin-regtest-genesis-header-constant
+    coin-genesis-id-constant
+    coin-regtest-genesis-id-constant)
 
   (begin
 
     (define %zero32 (make-bytevector 32 0))
-    (define %coinbase-index #xffffffff)
-    (define %sequence-final #xffffffff)
 
-    ;; A bare `OP_RETURN`. Any script beginning with it fails immediately when
-    ;; evaluated, so the output can never be spent by anyone, including us.
+    ;; A bare `OP_RETURN`. Any script beginning with it fails immediately
+    ;; when evaluated, so the output can never be spent by anyone.
     (define %op-return #u8(#x6a))
+
+    ;;; `C(0)`, by rule: the frozen `puzzle-complexity-genesis`. Tier 0,
+    ;;; `k = 3`, `w = 6` — a gentle launch.
+    ;;;
+    ;;; ```scheme
+    ;;; coin-genesis-complexity ; => 128
+    ;;; ```
+    (define coin-genesis-complexity coin-complexity-genesis)
+
+    ;;; The `bits` field of the genesis header.
+    ;;;
+    ;;; ```scheme
+    ;;; coin-genesis-bits ; => #x207f0080
+    ;;; ```
+    (define coin-genesis-bits
+      (coin-bits-encode coin-genesis-complexity))
 
     ;;; The genesis puzzle's solution, as the coinbase carries it.
     ;;;
-    ;;; Derived, never written down: it is the generator's own solution to
-    ;;; the puzzle `coin-genesis-seed` produces, so a change to the puzzle
-    ;;; language or the generator changes genesis and is visible as a changed
+    ;;; Derived, never written down: the table solution of the puzzle the
+    ;;; frozen genesis seed produces. A change to the puzzle language or the
+    ;;; generator therefore changes genesis and is visible as a changed
     ;;; genesis hash rather than as a silent divergence.
-    ;;;
-    ;;; ```scheme
-    ;;; (coin-ok? (coin-check-solution (coin-puzzle-for (make-bytevector 32 0) 0)
-    ;;;                                coin-genesis-solution))
-    ;;; ; => #t
-    ;;; ```
     (define coin-genesis-solution
-      (string->utf8 (puzzle-spec-solution (coin-puzzle-for %zero32 0))))
+      (coin-table-solution %zero32 0 coin-genesis-complexity))
+
+    ;;; The genesis block's own score word, computed by running its solution.
+    ;;;
+    ;;; Raises at load if the genesis solution does not solve the genesis
+    ;;; puzzle, which would be a bug in the generator rather than a bad
+    ;;; block.
+    (define coin-genesis-score
+      (let ((scored (coin-score-for-solution %zero32
+                                                0
+                                                coin-genesis-complexity
+                                                coin-genesis-solution
+                                                0)))
+        (if (coin-failed? scored)
+            (error (string-append
+                     "coin-genesis-score: the genesis table solution does"
+                     " not solve the genesis puzzle ("
+                     (symbol->string (coin-result-reason scored))
+                     ")"))
+            (coin-result-value scored))))
 
     ;;; The genesis output script: an unspendable `OP_RETURN`.
-    ;;;
-    ;;; ```scheme
-    ;;; coin-genesis-script-pubkey ; => #u8(#x6a)
-    ;;; ```
     (define coin-genesis-script-pubkey %op-return)
 
     ;;; Build the genesis coinbase transaction carrying `quote-text`.
     ;;;
-    ;;; The scriptSig is the ordinary SigilCoin coinbase payload — height 0,
-    ;;; the genesis solution, the quote as graffiti — so genesis is decoded
-    ;;; by the same `coin-block-coinbase-payload` every other block is.
+    ;;; The ordinary canonical mining coinbase at height 0: five pushes with empty
+    ;;; SHARES and COMMITS, and a single output paying `coin-block-reward`
+    ;;; of height 0, which is zero.
     ;;;
     ;;; ```scheme
     ;;; (coin-ok? (coin-coinbase-payload-decode
     ;;;             (txin-script-sig
-    ;;;               (car (transaction-inputs (coin-genesis-coinbase "hi"))))))
+    ;;;               (car (transaction-inputs
+    ;;;                      (coin-genesis-coinbase "hi"))))))
     ;;; ; => #t
     ;;; ```
     (define (coin-genesis-coinbase quote-text)
       (: string? -> transaction?)
       (if (not (string? quote-text))
           (error "coin-genesis-coinbase: expected a quote string"))
-      (transaction
-        version: 1
-        inputs: (list
-                  (txin previous-output: (outpoint txid: %zero32
-                                                   index: %coinbase-index)
-                        script-sig: (coin-coinbase-payload-encode
-                                      (coin-coinbase-payload
-                                        height: 0
-                                        solution: coin-genesis-solution
-                                        graffiti: (string->utf8 quote-text)))
-                        sequence: %sequence-final
-                        witness: '()))
-        ;; Zero premine: the only output pays nothing and cannot be spent.
-        outputs: (list (txout value: (coin-block-reward 0)
-                             script-pubkey: coin-genesis-script-pubkey))
-        lock-time: 0))
+      (coin-mining-coinbase 0
+                               coin-genesis-solution
+                               (string->utf8 quote-text)
+                               coin-genesis-script-pubkey))
 
     ;;; Build the whole genesis block from `quote-text` and `time`.
     ;;;
@@ -136,28 +156,16 @@
                                previous-block: %zero32
                                merkle-root: root
                                time: time
-                               bits: coin-header-bits
-                               ;; The solution-length commitment; see
-                               ;; `coin-header-solution-length`.
-                               nonce: (bytevector-length
-                                        coin-genesis-solution))
+                               bits: coin-genesis-bits
+                               nonce: coin-genesis-score)
                transactions: (list coinbase))))
 
     ;;; The genesis header for `quote-text` and `time`.
-    ;;;
-    ;;; ```scheme
-    ;;; (block-header-time (coin-genesis-header "hello" 1787788800))
-    ;;; ; => 1787788800
-    ;;; ```
     (define (coin-genesis-header quote-text time)
       (: string? integer? -> block-header?)
       (block-header-field (coin-genesis-block quote-text time)))
 
-    ;;; The internal 32-byte genesis header hash for `quote-text` and `time`.
-    ;;;
-    ;;; ```scheme
-    ;;; (bytevector-length (coin-genesis-hash "hello" 1787788800)) ; => 32
-    ;;; ```
+    ;;; The internal 32-byte genesis header hash.
     (define (coin-genesis-hash quote-text time)
       (: string? integer? -> bytevector?)
       (block-header-hash (coin-genesis-header quote-text time)))
@@ -166,9 +174,32 @@
     ;;; stores. This is the whole regeneration procedure.
     ;;;
     ;;; ```scheme
-    ;;; (string-length (coin-genesis-header-hex "hello" 1787788800)) ; => 160
+    ;;; (string-length (coin-genesis-header-hex "hello" 1787788800))
+    ;;; ; => 160
     ;;; ```
     (define (coin-genesis-header-hex quote-text time)
       (: string? integer? -> string?)
       (hex-encode
-        (block-header-serialize (coin-genesis-header quote-text time))))))
+        (block-header-serialize (coin-genesis-header quote-text time))))
+
+    ;;; Serialized canonical mainnet genesis header, as hex.
+    ;;;
+    ;;; Built from `coin-genesis-quote` and `coin-genesis-time` in
+    ;;; `(sigil coin node chain)`. The launch date replaces that timestamp
+    ;;; later, which is one argument and one regenerated constant.
+    (define coin-genesis-header-constant
+      "050000000000000000000000000000000000000000000000000000000000000000000000b4a701bee9f07241ca026ac90bd801e769d5ca4024be0fe3fd18b7ebd26f7d6500376d6a80007f20f0a55516")
+
+    ;;; Serialized canonical regtest genesis header, as hex. Same provenance, from
+    ;;; `coin-regtest-genesis-quote` and `coin-regtest-genesis-time`.
+    (define coin-regtest-genesis-header-constant
+      "050000000000000000000000000000000000000000000000000000000000000000000000501a3316bcdc30940c8720722052a2099403d4987ed8c59adb437863bbc7331700b9556980007f20f0a55516")
+
+    ;;; Display id (reversed hash) of the canonical mainnet genesis block, for
+    ;;; humans. No leading zeros: there is no proof-of-work to produce them.
+    (define coin-genesis-id-constant
+      "fba5dc25f4802378c2f2821f8d2699718c34edf09c4e854bf14aff714734dba4")
+
+    ;;; Display id of the canonical regtest genesis block.
+    (define coin-regtest-genesis-id-constant
+      "634fda21bb7b414a77e90c6ba55e6b4e202527935f1b0e93ef083c258beab1fe")))

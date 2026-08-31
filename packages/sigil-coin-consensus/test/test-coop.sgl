@@ -1,4 +1,4 @@
-;;; Consensus v2 part B: the coinbase codec, co-op shares, commit-reveal,
+;;; Consensus coinbase codec, co-op shares, commit-reveal,
 ;;; the reward split and aggregate fork choice.
 ;;;
 ;;; Every rule here is applied by every node to a block someone else
@@ -23,8 +23,8 @@
         (sigil bitcoin consensus)
         (sigil secp256k1)
         (sigil coin puzzle)
-        (sigil coin puzzle examples)
-        (sigil coin consensus v2))
+        (sigil coin puzzle generator)
+        (sigil coin consensus))
 
 ;; ============================================================
 ;; Helpers
@@ -73,7 +73,7 @@
 (define %doubling '((1 . 2) (2 . 4) (3 . 6)))
 
 (define %spec
-  (pbe-spec height: 1
+  (puzzle-spec height: 1
             complexity: 128
             constraint: 0
             k: 3
@@ -98,7 +98,7 @@
 (define %complexity 128)
 
 (define (context-with commits)
-  (coin-v2-coop-context parent-prev-hash: %prev
+  (coin-coop-context parent-prev-hash: %prev
                         puzzle-height: %puzzle-height
                         complexity: %complexity
                         spec: %spec
@@ -115,32 +115,32 @@
 (define (share-of n source)
   (let* ((sk (seckey n))
          (pk (secp256k1-pubkey-create sk))
-         (preimage (coin-v2-share-preimage %prev %puzzle-height %complexity
+         (preimage (coin-share-preimage %prev %puzzle-height %complexity
                                            source pk)))
-    (coin-v2-share pubkey: pk
+    (coin-share pubkey: pk
                    signature: (secp256k1-ecdsa-sign sk preimage)
                    blind: (filled 32 (+ n 100))
                    solution: (string->bytes source))))
 
-;; Fixed golfed bodies for keys 1..8. Each source adds that key's exact
-;; anchor output; alpha-renaming can change bytes but cannot change binding.
-(define %personalized-bodies
-  '(("x" "(list x(list x))")
-    ("x" "(list x(* x x))")
-    ("y" "(list y(list y))")
-    ("z" "(list z(list z))")
-    ("x" "(list x'up x)")
-    ("x" "(cons x(list x x))")
-    ("y" "(cons y(list y y))")
-    ("x" "(+(* x 5)20)")))
+;; Remove safe spaces adjacent to parentheses. Parentheses remain token
+;; delimiters, so result is equivalent and strictly shorter than hidden par.
+(define (golf-source source)
+  (let loop ((text source) (i 1))
+    (if (>= i (- (string-length text) 1))
+        text
+        (if (and (char=? #\space (string-ref text i))
+                 (or (char=? #\( (string-ref text (+ i 1)))
+                     (char=? #\) (string-ref text (- i 1)))))
+            (loop (string-append (substring text 0 i)
+                                 (substring text (+ i 1)
+                                            (string-length text)))
+                  i)
+            (loop text (+ i 1))))))
 
 (define (personalized-source n)
-  (let* ((entry (list-ref %personalized-bodies (- n 1)))
-         (x (car entry))
-         (body (list-ref entry 1))
-         (output (coin-v2-pubkey-anchor-output (pubkey-of n))))
-    (string-append "(lambda(" x ")(if(equal? " x " \"@\")\""
-                   output "\"" body "))")))
+  (golf-source
+    (puzzle-spec-hidden-source
+      (coin-share-puzzle %bare-context (pubkey-of n)))))
 
 (define (valid-share-of n)
   (share-of n (personalized-source n)))
@@ -171,24 +171,24 @@
                   (else (cons (car ys) (insert (cdr ys))))))))))
 
 (define (in-share-order shares)
-  (sort-by shares coin-v2-share-pubkey))
+  (sort-by shares coin-share-pubkey))
 
 (define (commits-for shares)
-  (sort-by (map (lambda (s) (coin-v2-share-commitment %bare-context s)) shares)
+  (sort-by (map (lambda (s) (coin-share-commitment %bare-context s)) shares)
            (lambda (x) x)))
 
 ;; A context that carries exactly the commitments these shares open.
 (define (context-for shares) (context-with (commits-for shares)))
 
 (define (check shares)
-  (coin-v2-check-shares (context-for shares) (string->bytes %sol-d) shares))
+  (coin-check-shares (context-for shares) (string->bytes %sol-d) shares))
 
 (define (check-reason shares) (coin-result-reason (check shares)))
 
 ;; --- coinbase payloads ---
 
 (define (payload height solution shares commits graffiti)
-  (coin-v2-coinbase-payload height: height
+  (coin-coinbase-payload height: height
                             solution: solution
                             shares: shares
                             commits: commits
@@ -196,26 +196,26 @@
 
 (define (simple-payload height solution graffiti)
   (payload height solution
-           coin-v2-empty-shares coin-v2-empty-commits graffiti))
+           coin-empty-shares coin-empty-commits graffiti))
 
-(define (decode script) (coin-v2-coinbase-payload-decode script))
+(define (decode script) (coin-coinbase-payload-decode script))
 
 (define (decode-reason script) (coin-result-reason (decode script)))
 
 (define (round-trips? p)
-  (let ((back (decode (coin-v2-coinbase-payload-encode p))))
+  (let ((back (decode (coin-coinbase-payload-encode p))))
     (and (coin-ok? back)
          (let ((got (coin-result-value back)))
-           (and (= (coin-v2-coinbase-payload-height p)
-                   (coin-v2-coinbase-payload-height got))
-                (equal? (coin-v2-coinbase-payload-solution p)
-                        (coin-v2-coinbase-payload-solution got))
-                (equal? (coin-v2-coinbase-payload-shares p)
-                        (coin-v2-coinbase-payload-shares got))
-                (equal? (coin-v2-coinbase-payload-commits p)
-                        (coin-v2-coinbase-payload-commits got))
-                (equal? (coin-v2-coinbase-payload-graffiti p)
-                        (coin-v2-coinbase-payload-graffiti got)))))))
+           (and (= (coin-coinbase-payload-height p)
+                   (coin-coinbase-payload-height got))
+                (equal? (coin-coinbase-payload-solution p)
+                        (coin-coinbase-payload-solution got))
+                (equal? (coin-coinbase-payload-shares p)
+                        (coin-coinbase-payload-shares got))
+                (equal? (coin-coinbase-payload-commits p)
+                        (coin-coinbase-payload-commits got))
+                (equal? (coin-coinbase-payload-graffiti p)
+                        (coin-coinbase-payload-graffiti got)))))))
 
 ;; A five-push script built from raw pieces, so a test can push something
 ;; the encoder would have refused.
@@ -257,40 +257,39 @@
 ;; The coinbase codec (§6.1)
 ;; ============================================================
 
-(test-group "v2 coinbase codec: sizes"
+(test-group "canonical coinbase codec: sizes"
   (test "the minimum scriptSig is eight bytes"
-    (assert-equal 8 coin-v2-min-coinbase-script-bytes))
+    (assert-equal 8 coin-min-coinbase-script-bytes))
 
   (test "the maximum scriptSig is 6588 bytes"
-    ;; §6.6 quotes 6332 for a share record without the commitment blind;
-    ;; the blind has to be published for §6.4 check 4 to be checkable at
-    ;; all. See the deviation note in (sigil coin consensus v2 shares).
-    (assert-equal 6588 coin-v2-max-coinbase-script-bytes))
+    ;; Includes each share's 32-byte blind, revealed so validators can check
+    ;; the parent commitment and carrier payment.
+    (assert-equal 6588 coin-max-coinbase-script-bytes))
 
   (test "the bounds pair is the two of them"
-    (assert-equal 8 (car coin-v2-coinbase-script-bounds))
-    (assert-equal 6588 (cdr coin-v2-coinbase-script-bounds)))
+    (assert-equal 8 (car coin-coinbase-script-bounds))
+    (assert-equal 6588 (cdr coin-coinbase-script-bounds)))
 
   (test "a maximal payload encodes to exactly the maximum"
     (assert-equal
-      coin-v2-max-coinbase-script-bytes
+      coin-max-coinbase-script-bytes
       (bytevector-length
-        (coin-v2-coinbase-payload-encode
+        (coin-coinbase-payload-encode
           (payload #xffffffff
-                   (filled coin-v2-max-solution-bytes 49)
-                   (filled coin-v2-max-shares-bytes 0)
-                   (filled coin-v2-max-commits-bytes 0)
-                   (filled coin-v2-max-graffiti-bytes 49))))))
+                   (filled coin-max-solution-bytes 49)
+                   (filled coin-max-shares-bytes 0)
+                   (filled coin-max-commits-bytes 0)
+                   (filled coin-max-graffiti-bytes 49))))))
 
   (test "the worst case still leaves room for transactions"
     ;; §6.6's real constraint: coinbase under 7 KB against a 16384-byte
     ;; block. Ten outputs at ~34 B plus ~50 B of transaction overhead.
-    (assert-true (< (+ coin-v2-max-coinbase-script-bytes (* 10 34) 50)
+    (assert-true (< (+ coin-max-coinbase-script-bytes (* 10 34) 50)
                     7168))
-    (assert-true (< (+ coin-v2-max-coinbase-script-bytes (* 10 34) 50)
-                    coin-v2-max-block-bytes))))
+    (assert-true (< (+ coin-max-coinbase-script-bytes (* 10 34) 50)
+                    coin-max-block-bytes))))
 
-(test-group "v2 coinbase codec: round trips"
+(test-group "canonical coinbase codec: round trips"
   (test "the smallest payload round-trips"
     (assert-true (round-trips? (simple-payload 0 (bytes-of 49) #u8()))))
 
@@ -307,10 +306,10 @@
     (assert-true
       (round-trips?
         (payload #xffffffff
-                 (filled coin-v2-max-solution-bytes 49)
-                 (filled coin-v2-max-shares-bytes 0)
-                 (filled coin-v2-max-commits-bytes 0)
-                 (filled coin-v2-max-graffiti-bytes 49)))))
+                 (filled coin-max-solution-bytes 49)
+                 (filled coin-max-shares-bytes 0)
+                 (filled coin-max-commits-bytes 0)
+                 (filled coin-max-graffiti-bytes 49)))))
 
   (test "the height survives every script-number width"
     (assert-true (round-trips? (simple-payload 0 (bytes-of 49) #u8())))
@@ -320,7 +319,7 @@
     (assert-true (round-trips? (simple-payload 65535 (bytes-of 49) #u8())))
     (assert-true (round-trips? (simple-payload 16777216 (bytes-of 49) #u8())))))
 
-(test-group "v2 coinbase codec: hostile input"
+(test-group "canonical coinbase codec: hostile input"
   (test "a non-bytevector is not a script"
     (assert-equal 'not-bytevector (decode-reason 42))
     (assert-equal 'not-bytevector (decode-reason "01")))
@@ -329,7 +328,7 @@
     (assert-equal 'malformed-script (decode-reason (bytes-of #x02 #x01)))
     (assert-equal 'malformed-script (decode-reason (bytes-of #x4c))))
 
-  (test "three pushes is the v1 format and is refused"
+  (test "three pushes is the canonical format and is refused"
     (assert-equal 'wrong-field-count
                   (decode-reason
                     (script-append (script-push-data (bytes-of))
@@ -341,15 +340,15 @@
                   (decode-reason
                     (script-append (script-push-data (bytes-of))
                                    (script-push-data (bytes-of 49))
-                                   (script-push-data coin-v2-empty-shares)
-                                   (script-push-data coin-v2-empty-commits)))))
+                                   (script-push-data coin-empty-shares)
+                                   (script-push-data coin-empty-commits)))))
 
   (test "six pushes is extra trailing data"
     (assert-equal 'wrong-field-count
                   (decode-reason
                     (bytevector-append
                       (raw-script (bytes-of) (bytes-of 49)
-                                  coin-v2-empty-shares coin-v2-empty-commits
+                                  coin-empty-shares coin-empty-commits
                                   (bytes-of))
                       (script-push-data (bytes-of 7))))))
 
@@ -360,23 +359,23 @@
                     (bytevector-append
                       (script-push-data (bytes-of))
                       (script-push-data (bytes-of 49))
-                      (script-push-data coin-v2-empty-shares)
-                      (script-push-data coin-v2-empty-commits)
+                      (script-push-data coin-empty-shares)
+                      (script-push-data coin-empty-commits)
                       (bytes-of #x51)))))
 
   (test "an empty solution is refused"
     (assert-equal 'solution-empty
                   (decode-reason (raw-script (bytes-of) (bytes-of)
-                                             coin-v2-empty-shares
-                                             coin-v2-empty-commits
+                                             coin-empty-shares
+                                             coin-empty-commits
                                              (bytes-of)))))
 
   (test "an oversize solution is refused"
     (assert-equal 'solution-oversize
                   (decode-reason
                     (raw-script (bytes-of)
-                                (filled (+ coin-v2-max-solution-bytes 1) 49)
-                                coin-v2-empty-shares coin-v2-empty-commits
+                                (filled (+ coin-max-solution-bytes 1) 49)
+                                coin-empty-shares coin-empty-commits
                                 (bytes-of)))))
 
   (test "a zero-length shares push is malformed, not empty shares"
@@ -385,20 +384,20 @@
     (assert-equal 'shares-malformed
                   (decode-reason (raw-script (bytes-of) (bytes-of 49)
                                              (bytes-of)
-                                             coin-v2-empty-commits
+                                             coin-empty-commits
                                              (bytes-of)))))
 
   (test "an oversize shares push is refused"
     (assert-equal 'shares-oversize
                   (decode-reason
                     (raw-script (bytes-of) (bytes-of 49)
-                                (filled (+ coin-v2-max-shares-bytes 1) 0)
-                                coin-v2-empty-commits (bytes-of)))))
+                                (filled (+ coin-max-shares-bytes 1) 0)
+                                coin-empty-commits (bytes-of)))))
 
   (test "a zero-length commits push is malformed"
     (assert-equal 'commits-malformed
                   (decode-reason (raw-script (bytes-of) (bytes-of 49)
-                                             coin-v2-empty-shares
+                                             coin-empty-shares
                                              (bytes-of)
                                              (bytes-of)))))
 
@@ -406,16 +405,16 @@
     (assert-equal 'commits-oversize
                   (decode-reason
                     (raw-script (bytes-of) (bytes-of 49)
-                                coin-v2-empty-shares
-                                (filled (+ coin-v2-max-commits-bytes 1) 0)
+                                coin-empty-shares
+                                (filled (+ coin-max-commits-bytes 1) 0)
                                 (bytes-of)))))
 
   (test "oversize graffiti is refused"
     (assert-equal 'graffiti-oversize
                   (decode-reason
                     (raw-script (bytes-of) (bytes-of 49)
-                                coin-v2-empty-shares coin-v2-empty-commits
-                                (filled (+ coin-v2-max-graffiti-bytes 1) 49)))))
+                                coin-empty-shares coin-empty-commits
+                                (filled (+ coin-max-graffiti-bytes 1) 49)))))
 
   (test "a non-minimal push is not the canonical encoding"
     ;; OP_PUSHDATA1 for one byte of graffiti, where a bare length byte
@@ -425,38 +424,38 @@
                     (bytevector-append
                       (script-push-data (bytes-of))
                       (script-push-data (bytes-of 49))
-                      (script-push-data coin-v2-empty-shares)
-                      (script-push-data coin-v2-empty-commits)
+                      (script-push-data coin-empty-shares)
+                      (script-push-data coin-empty-commits)
                       (bytes-of #x4c #x01 #x41)))))
 
   (test "a non-minimal height encoding is not canonical"
     ;; Height 0 pushed as the single byte #x00 rather than as OP_0.
     (assert-equal 'non-canonical
                   (decode-reason (raw-script (bytes-of 0) (bytes-of 49)
-                                             coin-v2-empty-shares
-                                             coin-v2-empty-commits
+                                             coin-empty-shares
+                                             coin-empty-commits
                                              (bytes-of)))))
 
   (test "the encoder refuses what the decoder would reject"
-    (assert-error (coin-v2-coinbase-payload-encode
+    (assert-error (coin-coinbase-payload-encode
                      (simple-payload -1 (bytes-of 49) #u8())))
-    (assert-error (coin-v2-coinbase-payload-encode
+    (assert-error (coin-coinbase-payload-encode
                      (simple-payload 0 (bytes-of) #u8())))
-    (assert-error (coin-v2-coinbase-payload-encode
+    (assert-error (coin-coinbase-payload-encode
                      (payload 0 (bytes-of 49) (bytes-of)
-                              coin-v2-empty-commits #u8())))
-    (assert-error (coin-v2-coinbase-payload-encode
-                     (payload 0 (bytes-of 49) coin-v2-empty-shares
+                              coin-empty-commits #u8())))
+    (assert-error (coin-coinbase-payload-encode
+                     (payload 0 (bytes-of 49) coin-empty-shares
                               (bytes-of) #u8())))
-    (assert-error (coin-v2-coinbase-payload-encode 42))))
+    (assert-error (coin-coinbase-payload-encode 42))))
 
-(test-group "v2 coinbase codec: from a block"
+(test-group "canonical coinbase codec: from a block"
   (test "a non-block has no coinbase"
     (assert-equal 'missing-coinbase (coin-result-reason
-                                      (coin-v2-block-coinbase-payload 42))))
+                                      (coin-block-coinbase-payload 42))))
 
   (test "a block's coinbase payload decodes"
-    (let* ((script (coin-v2-coinbase-payload-encode
+    (let* ((script (coin-coinbase-payload-encode
                      (simple-payload 3 (string->bytes %sol-a) #u8())))
            (b (block header-field: (block-header version: 5
                                                  previous-block: %zero32
@@ -467,13 +466,13 @@
                      transactions: (list (coinbase-tx
                                            script
                                            (outs (list (cons 50 %burn))))))))
-      (assert-true (coin-ok? (coin-v2-block-coinbase-payload b)))
-      (assert-equal 3 (coin-v2-coinbase-payload-height
+      (assert-true (coin-ok? (coin-block-coinbase-payload b)))
+      (assert-equal 3 (coin-coinbase-payload-height
                         (coin-result-value
-                          (coin-v2-block-coinbase-payload b))))))
+                          (coin-block-coinbase-payload b))))))
 
   (test "the carrier script is output zero of the parent's coinbase"
-    (let* ((script (coin-v2-coinbase-payload-encode
+    (let* ((script (coin-coinbase-payload-encode
                      (simple-payload 3 (string->bytes %sol-a) #u8())))
            (paid (bytes-of #x00 #x14))
            (b (block header-field: (block-header version: 5
@@ -486,8 +485,8 @@
                                            script
                                            (outs (list (cons 50 paid)
                                                        (cons 10 %burn))))))))
-      (assert-equal paid (coin-v2-carrier-script b))
-      (assert-equal #f (coin-v2-carrier-script 42)))))
+      (assert-equal paid (coin-carrier-script b))
+      (assert-equal #f (coin-carrier-script 42)))))
 
 ;; ============================================================
 ;; The SHARES encoding (§6.2)
@@ -495,151 +494,151 @@
 
 (test-group "SHARES wire sizes"
   (test "the fixed prefix is pubkey, signature, blind and length"
-    (assert-equal 33 coin-v2-share-pubkey-bytes)
-    (assert-equal 64 coin-v2-share-signature-bytes)
-    (assert-equal 32 coin-v2-share-blind-bytes)
-    (assert-equal 131 coin-v2-share-fixed-bytes))
+    (assert-equal 33 coin-share-pubkey-bytes)
+    (assert-equal 64 coin-share-signature-bytes)
+    (assert-equal 32 coin-share-blind-bytes)
+    (assert-equal 131 coin-share-fixed-bytes))
 
   (test "one share is at most 643 bytes"
-    (assert-equal 643 coin-v2-max-share-bytes))
+    (assert-equal 643 coin-max-share-bytes))
 
   (test "the SHARES push is at most 5145 bytes"
-    (assert-equal 5145 coin-v2-max-shares-bytes)
-    (assert-equal (+ 1 (* 8 643)) coin-v2-max-shares-bytes))
+    (assert-equal 5145 coin-max-shares-bytes)
+    (assert-equal (+ 1 (* 8 643)) coin-max-shares-bytes))
 
   (test "the COMMITS push is at most 513 bytes"
-    (assert-equal 513 coin-v2-max-commits-bytes)
-    (assert-equal (+ 1 (* 16 32)) coin-v2-max-commits-bytes))
+    (assert-equal 513 coin-max-commits-bytes)
+    (assert-equal (+ 1 (* 16 32)) coin-max-commits-bytes))
 
   (test "the empty pushes carry a zero count byte"
-    (assert-equal (bytes-of 0) coin-v2-empty-shares)
-    (assert-equal (bytes-of 0) coin-v2-empty-commits)))
+    (assert-equal (bytes-of 0) coin-empty-shares)
+    (assert-equal (bytes-of 0) coin-empty-commits)))
 
 ;; Structurally well-formed shares that need no key: the decoder checks
-;; sizes only, and the point-on-curve rule is `coin-v2-check-shares`.
+;; sizes only, and the point-on-curve rule is `coin-check-shares`.
 (define (fake-share tag source)
-  (coin-v2-share pubkey: (filled 33 tag)
+  (coin-share pubkey: (filled 33 tag)
                  signature: (filled 64 tag)
                  blind: (filled 32 tag)
                  solution: (string->bytes source)))
 
 (test-group "SHARES codec"
   (test "no shares encodes to a single zero byte"
-    (assert-equal (bytes-of 0) (coin-v2-shares-encode '())))
+    (assert-equal (bytes-of 0) (coin-shares-encode '())))
 
   (test "no shares decodes to the empty list"
     (assert-equal '() (coin-result-value
-                        (coin-v2-shares-decode (bytes-of 0)))))
+                        (coin-shares-decode (bytes-of 0)))))
 
   (test "one share round-trips every field"
     (let* ((share (fake-share 5 %sol-a))
-           (back (coin-v2-shares-decode (coin-v2-shares-encode (list share)))))
+           (back (coin-shares-decode (coin-shares-encode (list share)))))
       (assert-true (coin-ok? back))
       (assert-equal 1 (length (coin-result-value back)))
       (let ((got (car (coin-result-value back))))
-        (assert-equal (filled 33 5) (coin-v2-share-pubkey got))
-        (assert-equal (filled 64 5) (coin-v2-share-signature got))
-        (assert-equal (filled 32 5) (coin-v2-share-blind got))
-        (assert-equal (string->bytes %sol-a) (coin-v2-share-solution got)))))
+        (assert-equal (filled 33 5) (coin-share-pubkey got))
+        (assert-equal (filled 64 5) (coin-share-signature got))
+        (assert-equal (filled 32 5) (coin-share-blind got))
+        (assert-equal (string->bytes %sol-a) (coin-share-solution got)))))
 
   (test "one share record is 131 bytes plus its solution"
     (assert-equal (+ 131 (string-length %sol-a))
                   (bytevector-length
-                    (coin-v2-share-encode (fake-share 5 %sol-a)))))
+                    (coin-share-encode (fake-share 5 %sol-a)))))
 
   (test "eight shares round-trip in order"
     (let* ((shares (map (lambda (i) (fake-share i %sol-a)) '(1 2 3 4 5 6 7 8)))
-           (back (coin-v2-shares-decode (coin-v2-shares-encode shares))))
+           (back (coin-shares-decode (coin-shares-encode shares))))
       (assert-true (coin-ok? back))
       (assert-equal 8 (length (coin-result-value back)))
       (assert-equal (filled 33 1)
-                    (coin-v2-share-pubkey (car (coin-result-value back))))))
+                    (coin-share-pubkey (car (coin-result-value back))))))
 
   (test "an empty push is malformed"
     (assert-equal 'shares-malformed
-                  (coin-result-reason (coin-v2-shares-decode (bytes-of)))))
+                  (coin-result-reason (coin-shares-decode (bytes-of)))))
 
   (test "a non-bytevector is malformed"
     (assert-equal 'shares-malformed
-                  (coin-result-reason (coin-v2-shares-decode 42))))
+                  (coin-result-reason (coin-shares-decode 42))))
 
   (test "a count above eight is oversize"
     (assert-equal 'shares-oversize
-                  (coin-result-reason (coin-v2-shares-decode (bytes-of 9))))
+                  (coin-result-reason (coin-shares-decode (bytes-of 9))))
     (assert-equal 'shares-oversize
-                  (coin-result-reason (coin-v2-shares-decode (bytes-of 255)))))
+                  (coin-result-reason (coin-shares-decode (bytes-of 255)))))
 
   (test "a push above the byte cap is oversize"
     (assert-equal 'shares-oversize
                   (coin-result-reason
-                    (coin-v2-shares-decode
-                      (filled (+ coin-v2-max-shares-bytes 1) 0)))))
+                    (coin-shares-decode
+                      (filled (+ coin-max-shares-bytes 1) 0)))))
 
   (test "a truncated record is malformed"
     (assert-equal 'shares-malformed
                   (coin-result-reason
-                    (coin-v2-shares-decode
+                    (coin-shares-decode
                       (bytevector-append (bytes-of 1) (filled 130 0))))))
 
   (test "a trailing byte is malformed"
     (assert-equal 'shares-malformed
                   (coin-result-reason
-                    (coin-v2-shares-decode
+                    (coin-shares-decode
                       (bytevector-append
-                        (coin-v2-shares-encode (list (fake-share 5 %sol-a)))
+                        (coin-shares-encode (list (fake-share 5 %sol-a)))
                         (bytes-of 0))))))
 
   (test "a missing record is malformed"
     ;; Count says two, only one is present.
-    (let ((one (coin-v2-shares-encode (list (fake-share 5 %sol-a)))))
+    (let ((one (coin-shares-encode (list (fake-share 5 %sol-a)))))
       (bytevector-u8-set! one 0 2)
       (assert-equal 'shares-malformed
-                    (coin-result-reason (coin-v2-shares-decode one)))))
+                    (coin-result-reason (coin-shares-decode one)))))
 
   (test "a zero-length solution is malformed"
     (assert-equal 'shares-malformed
                   (coin-result-reason
-                    (coin-v2-shares-decode
+                    (coin-shares-decode
                       (bytevector-append (bytes-of 1) (filled 129 0)
                                          (bytes-of 0 0))))))
 
   (test "a solution length above the cap is malformed"
     (assert-equal 'shares-malformed
                   (coin-result-reason
-                    (coin-v2-shares-decode
+                    (coin-shares-decode
                       (bytevector-append (bytes-of 1) (filled 129 0)
-                                         (u16-le (+ coin-v2-max-solution-bytes
+                                         (u16-le (+ coin-max-solution-bytes
                                                     1))
                                          (filled 513 49))))))
 
   (test "a solution shorter than its length prefix is malformed"
     (assert-equal 'shares-malformed
                   (coin-result-reason
-                    (coin-v2-shares-decode
+                    (coin-shares-decode
                       (bytevector-append (bytes-of 1) (filled 129 0)
                                          (u16-le 10) (filled 4 49))))))
 
   (test "the encoder refuses more than eight shares"
     (assert-error
-      (coin-v2-shares-encode
+      (coin-shares-encode
         (map (lambda (i) (fake-share i %sol-a)) '(1 2 3 4 5 6 7 8 9)))))
 
   (test "the encoder refuses shares out of pubkey order"
-    (assert-error (coin-v2-shares-encode
+    (assert-error (coin-shares-encode
                      (list (fake-share 5 %sol-a) (fake-share 2 %sol-b)))))
 
   (test "the encoder refuses a repeated pubkey"
-    (assert-error (coin-v2-shares-encode
+    (assert-error (coin-shares-encode
                      (list (fake-share 5 %sol-a) (fake-share 5 %sol-b)))))
 
   (test "the encoder refuses a malformed field"
     (assert-error
-      (coin-v2-share-encode
-        (coin-v2-share pubkey: (filled 32 1) signature: (filled 64 1)
+      (coin-share-encode
+        (coin-share pubkey: (filled 32 1) signature: (filled 64 1)
                        blind: (filled 32 1) solution: (bytes-of 49))))
     (assert-error
-      (coin-v2-share-encode
-        (coin-v2-share pubkey: (filled 33 1) signature: (filled 64 1)
+      (coin-share-encode
+        (coin-share pubkey: (filled 33 1) signature: (filled 64 1)
                        blind: (filled 32 1) solution: (bytes-of))))))
 
 ;; ============================================================
@@ -647,77 +646,77 @@
 ;; ============================================================
 
 (define (commitment-bytes . tags)
-  (coin-v2-commits-encode (map (lambda (t) (filled 32 t)) tags)))
+  (coin-commits-encode (map (lambda (t) (filled 32 t)) tags)))
 
 (test-group "COMMITS codec"
   (test "no commitments encodes to a single zero byte"
-    (assert-equal (bytes-of 0) (coin-v2-commits-encode '())))
+    (assert-equal (bytes-of 0) (coin-commits-encode '())))
 
   (test "commitments round-trip"
-    (let ((back (coin-v2-commits-decode (commitment-bytes 1 2 3))))
+    (let ((back (coin-commits-decode (commitment-bytes 1 2 3))))
       (assert-true (coin-ok? back))
       (assert-equal 3 (length (coin-result-value back)))
       (assert-equal (filled 32 2) (list-ref (coin-result-value back) 1))))
 
   (test "sixteen commitments fill the push exactly"
-    (let ((bytes (coin-v2-commits-encode
+    (let ((bytes (coin-commits-encode
                    (map (lambda (i) (filled 32 i))
                         '(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15)))))
-      (assert-equal coin-v2-max-commits-bytes (bytevector-length bytes))
-      (assert-true (coin-ok? (coin-v2-commits-decode bytes)))))
+      (assert-equal coin-max-commits-bytes (bytevector-length bytes))
+      (assert-true (coin-ok? (coin-commits-decode bytes)))))
 
   (test "an empty push is malformed"
     (assert-equal 'commits-malformed
-                  (coin-result-reason (coin-v2-commits-decode (bytes-of)))))
+                  (coin-result-reason (coin-commits-decode (bytes-of)))))
 
   (test "a non-bytevector is malformed"
     (assert-equal 'commits-malformed
-                  (coin-result-reason (coin-v2-commits-decode "nope"))))
+                  (coin-result-reason (coin-commits-decode "nope"))))
 
   (test "a count above sixteen is oversize"
     (assert-equal 'commits-oversize
-                  (coin-result-reason (coin-v2-commits-decode (bytes-of 17)))))
+                  (coin-result-reason (coin-commits-decode (bytes-of 17)))))
 
   (test "a push above the byte cap is oversize"
     (assert-equal 'commits-oversize
                   (coin-result-reason
-                    (coin-v2-commits-decode
-                      (filled (+ coin-v2-max-commits-bytes 1) 0)))))
+                    (coin-commits-decode
+                      (filled (+ coin-max-commits-bytes 1) 0)))))
 
   (test "a length that does not match the count is malformed"
     (assert-equal 'commits-malformed
                   (coin-result-reason
-                    (coin-v2-commits-decode
+                    (coin-commits-decode
                       (bytevector-append (bytes-of 2) (filled 32 1)))))
     (assert-equal 'commits-malformed
                   (coin-result-reason
-                    (coin-v2-commits-decode
+                    (coin-commits-decode
                       (bytevector-append (bytes-of 1) (filled 33 1))))))
 
   (test "commitments out of order are refused"
     (assert-equal 'commits-unordered
                   (coin-result-reason
-                    (coin-v2-commits-decode
+                    (coin-commits-decode
                       (bytevector-append (bytes-of 2) (filled 32 9)
                                          (filled 32 1))))))
 
   (test "a repeated commitment is refused"
     (assert-equal 'commits-unordered
                   (coin-result-reason
-                    (coin-v2-commits-decode
+                    (coin-commits-decode
                       (bytevector-append (bytes-of 2) (filled 32 4)
                                          (filled 32 4)))))
-    (assert-error (coin-v2-commits-encode
+    (assert-error (coin-commits-encode
                      (list (filled 32 4) (filled 32 4)))))
 
   (test "the encoder refuses more than sixteen"
     (assert-error
-      (coin-v2-commits-encode
+      (coin-commits-encode
         (map (lambda (i) (filled 32 i))
              '(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16)))))
 
   (test "the encoder refuses a wrong-width commitment"
-    (assert-error (coin-v2-commits-encode (list (filled 31 1))))))
+    (assert-error (coin-commits-encode (list (filled 31 1))))))
 
 ;; ============================================================
 ;; The signature preimage (§6.3)
@@ -727,7 +726,7 @@
 (define %pk-b (filled 33 3))
 
 (define (preimage-with prev height complexity solution pubkey)
-  (coin-v2-share-preimage prev height complexity solution pubkey))
+  (coin-share-preimage prev height complexity solution pubkey))
 
 (define %base-preimage
   (preimage-with %prev %puzzle-height %complexity %sol-a %pk-a))
@@ -783,52 +782,52 @@
     ;; which is what lets ANY producer at height P+1 include the share.
     (assert-equal (bytevector-length %base-preimage) 32)
     (assert-equal %base-preimage
-                  (coin-v2-share-preimage %prev %puzzle-height %complexity
+                  (coin-share-preimage %prev %puzzle-height %complexity
                                           %sol-a %pk-a)))
 
   (test "the tags are the frozen widths"
-    (assert-equal 18 (string-length coin-v2-share-tag))
-    (assert-equal 19 (string-length coin-v2-commit-tag))
-    (assert-equal "SigilCoin/share/v2" coin-v2-share-tag)
-    (assert-equal "SigilCoin/commit/v2" coin-v2-commit-tag))
+    (assert-equal 17 (string-length coin-share-tag))
+    (assert-equal 18 (string-length coin-commit-tag))
+    (assert-equal "SigilCoin/share/1" coin-share-tag)
+    (assert-equal "SigilCoin/commit/1" coin-commit-tag))
 
   (test "malformed arguments raise rather than hash junk"
-    (assert-error (coin-v2-share-preimage (filled 31 1) 1 128 %sol-a %pk-a))
-    (assert-error (coin-v2-share-preimage %prev -1 128 %sol-a %pk-a))
-    (assert-error (coin-v2-share-preimage %prev 1 0 %sol-a %pk-a))
-    (assert-error (coin-v2-share-preimage %prev 1 128 %sol-a (filled 32 2)))))
+    (assert-error (coin-share-preimage (filled 31 1) 1 128 %sol-a %pk-a))
+    (assert-error (coin-share-preimage %prev -1 128 %sol-a %pk-a))
+    (assert-error (coin-share-preimage %prev 1 0 %sol-a %pk-a))
+    (assert-error (coin-share-preimage %prev 1 128 %sol-a (filled 32 2)))))
 
 (test-group "commitments hide and bind"
   (test "a commitment is 32 bytes"
     (assert-equal 32 (bytevector-length
-                       (coin-v2-commitment %base-preimage (filled 32 9)))))
+                       (coin-commitment %base-preimage (filled 32 9)))))
 
   (test "the blind changes the commitment"
     ;; Without the blind, anyone who guessed the program could confirm the
     ;; guess by recomputing the commitment.
-    (assert-true (not (equal? (coin-v2-commitment %base-preimage (filled 32 9))
-                              (coin-v2-commitment %base-preimage
+    (assert-true (not (equal? (coin-commitment %base-preimage (filled 32 9))
+                              (coin-commitment %base-preimage
                                                   (filled 32 10))))))
 
   (test "the commitment differs from the preimage it hides"
     (assert-true (not (equal? %base-preimage
-                              (coin-v2-commitment %base-preimage
+                              (coin-commitment %base-preimage
                                                   (filled 32 9))))))
 
   (test "malformed arguments raise"
-    (assert-error (coin-v2-commitment (filled 31 1) (filled 32 1)))
-    (assert-error (coin-v2-commitment %base-preimage (filled 31 1)))))
+    (assert-error (coin-commitment (filled 31 1) (filled 32 1)))
+    (assert-error (coin-commitment %base-preimage (filled 31 1)))))
 
 (test-group "share payout scripts"
   (test "a share pays P2WPKH of its signed key"
-    (let ((script (coin-v2-share-script %pk-a)))
+    (let ((script (coin-share-script %pk-a)))
       (assert-equal 22 (bytevector-length script))
       (assert-equal 0 (bytevector-u8-ref script 0))
       (assert-equal 20 (bytevector-u8-ref script 1))
       (assert-equal (script-p2wpkh (hash160 %pk-a)) script)))
 
   (test "a wrong-width key raises"
-    (assert-error (coin-v2-share-script (filled 32 2)))))
+    (assert-error (coin-share-script (filled 32 2)))))
 
 ;; ============================================================
 ;; The reward split (§6.5)
@@ -837,7 +836,7 @@
 (define %subsidy 5000000000)
 
 (define (plan-for count value)
-  (coin-v2-split-plan value
+  (coin-split-plan value
                       (map (lambda (i) (fake-share i %sol-a))
                            (let loop ((i 0) (acc '()))
                              (if (>= i count) (reverse acc)
@@ -846,24 +845,24 @@
 
 (test-group "reward split: weights and units"
   (test "the producer is worth two"
-    (assert-equal 2 coin-v2-producer-weight))
+    (assert-equal 2 coin-producer-weight))
 
   (test "with no shares there is no carrier"
-    (assert-equal 2 (coin-v2-split-weight-total 0)))
+    (assert-equal 2 (coin-split-weight-total 0)))
 
   (test "with shares the carrier is always present"
-    (assert-equal 4 (coin-v2-split-weight-total 1))
-    (assert-equal 11 (coin-v2-split-weight-total 8)))
+    (assert-equal 4 (coin-split-weight-total 1))
+    (assert-equal 11 (coin-split-weight-total 8)))
 
   (test "the unit is floor division by the total weight"
-    (assert-equal 454545454 (coin-v2-split-unit %subsidy 8))
-    (assert-equal (quotient %subsidy 4) (coin-v2-split-unit %subsidy 1))
-    (assert-equal (quotient %subsidy 2) (coin-v2-split-unit %subsidy 0)))
+    (assert-equal 454545454 (coin-split-unit %subsidy 8))
+    (assert-equal (quotient %subsidy 4) (coin-split-unit %subsidy 1))
+    (assert-equal (quotient %subsidy 2) (coin-split-unit %subsidy 0)))
 
   (test "an out-of-range share count raises"
-    (assert-error (coin-v2-split-weight-total 9))
-    (assert-error (coin-v2-split-weight-total -1))
-    (assert-error (coin-v2-split-unit -1 0))))
+    (assert-error (coin-split-weight-total 9))
+    (assert-error (coin-split-weight-total -1))
+    (assert-error (coin-split-unit -1 0))))
 
 (test-group "reward split: shape and arithmetic"
   (test "with no shares the producer takes everything in one output"
@@ -890,24 +889,24 @@
 
   (test "the producer keeps two elevenths plus the remainder"
     (let* ((plan (plan-for 8 %subsidy))
-           (unit (coin-v2-split-unit %subsidy 8)))
+           (unit (coin-split-unit %subsidy 8)))
       (assert-equal (+ (* 2 unit) (modulo %subsidy 11)) (car (car plan)))))
 
   (test "the carrier is the last output and is paid one unit"
     (let ((plan (plan-for 3 %subsidy)))
       (assert-equal 5 (length plan))
-      (assert-equal (coin-v2-split-unit %subsidy 3)
+      (assert-equal (coin-split-unit %subsidy 3)
                     (car (list-ref plan 4)))
       (assert-equal %burn (cdr (list-ref plan 4)))))
 
   (test "each share is paid to P2WPKH of its own key"
-    (let ((plan (coin-v2-split-plan %subsidy
+    (let ((plan (coin-split-plan %subsidy
                                     (list (fake-share 1 %sol-a)
                                           (fake-share 2 %sol-b))
                                     %burn)))
-      (assert-equal (coin-v2-share-script (filled 33 1))
+      (assert-equal (coin-share-script (filled 33 1))
                     (cdr (list-ref plan 1)))
-      (assert-equal (coin-v2-share-script (filled 33 2))
+      (assert-equal (coin-share-script (filled 33 2))
                     (cdr (list-ref plan 2)))))
 
   (test "the outputs sum to the block value exactly, at every count"
@@ -933,7 +932,7 @@
       (let loop ((count 0))
         (cond
           ((> count 8) #t)
-          ((<= (modulo %subsidy (coin-v2-split-weight-total count)) 10)
+          ((<= (modulo %subsidy (coin-split-weight-total count)) 10)
            (loop (+ count 1)))
           (else #f)))))
 
@@ -941,20 +940,20 @@
     ;; u = 0, so every share and the carrier are paid nothing and the
     ;; producer keeps the lot. Dust never burns and never leaks to fees.
     (let ((plan (plan-for 8 7)))
-      (assert-equal 0 (coin-v2-split-unit 7 8))
+      (assert-equal 0 (coin-split-unit 7 8))
       (assert-equal 7 (car (car plan)))
       (assert-equal 7 (split-sum plan))
       (assert-equal 10 (length plan))))
 
   (test "a block with shares needs a carrier script"
-    (assert-error (coin-v2-split-plan %subsidy
+    (assert-error (coin-split-plan %subsidy
                                        (list (fake-share 1 %sol-a))
                                        #f))))
 
 (test-group "reward split: checking a coinbase"
   (test "the honest split passes"
     (let ((plan (plan-for 3 %subsidy)))
-      (assert-true (coin-ok? (coin-v2-check-split
+      (assert-true (coin-ok? (coin-check-split
                                (coinbase-tx (bytes-of 1)
                                             (planned-outputs plan))
                                %subsidy
@@ -963,7 +962,7 @@
                                %burn)))))
 
   (test "the no-share split passes"
-    (assert-true (coin-ok? (coin-v2-check-split
+    (assert-true (coin-ok? (coin-check-split
                              (coinbase-tx (bytes-of 1)
                                           (outs (list (cons %subsidy %burn))))
                              %subsidy '() #f))))
@@ -971,7 +970,7 @@
   (test "too few outputs is a shape failure"
     (assert-equal 'coinbase-output-shape
                   (coin-result-reason
-                    (coin-v2-check-split
+                    (coin-check-split
                       (coinbase-tx (bytes-of 1)
                                    (outs (list (cons %subsidy %burn))))
                       %subsidy
@@ -981,7 +980,7 @@
   (test "an extra output is a shape failure"
     (assert-equal 'coinbase-output-shape
                   (coin-result-reason
-                    (coin-v2-check-split
+                    (coin-check-split
                       (coinbase-tx (bytes-of 1)
                                    (outs (list (cons %subsidy %burn)
                                                (cons 0 %burn))))
@@ -989,16 +988,16 @@
 
   (test "shorting a share is a value failure"
     (let* ((shares (list (fake-share 1 %sol-a)))
-           (plan (coin-v2-split-plan %subsidy shares %burn))
+           (plan (coin-split-plan %subsidy shares %burn))
            (broken (planned-outputs plan)))
       (assert-equal
         'coinbase-output-value
         (coin-result-reason
-          (coin-v2-check-split
+          (coin-check-split
             (coinbase-tx (bytes-of 1)
                          (list (car broken)
                                (txout value: 0
-                                      script-pubkey: (coin-v2-share-script
+                                      script-pubkey: (coin-share-script
                                                        (filled 33 1)))
                                (list-ref broken 2)))
             %subsidy shares %burn)))))
@@ -1006,7 +1005,7 @@
   (test "overpaying the producer is a value failure"
     (assert-equal 'coinbase-output-value
                   (coin-result-reason
-                    (coin-v2-check-split
+                    (coin-check-split
                       (coinbase-tx (bytes-of 1)
                                    (outs (list (cons (+ %subsidy 1) %burn))))
                       %subsidy '() #f))))
@@ -1015,12 +1014,12 @@
     ;; The script is derived from the signed key, so a producer cannot pay
     ;; a share to himself and still pass.
     (let* ((shares (list (fake-share 1 %sol-a)))
-           (plan (coin-v2-split-plan %subsidy shares %burn))
+           (plan (coin-split-plan %subsidy shares %burn))
            (honest (planned-outputs plan)))
       (assert-equal
         'coinbase-output-shape
         (coin-result-reason
-          (coin-v2-check-split
+          (coin-check-split
             (coinbase-tx (bytes-of 1)
                          (list (car honest)
                                (txout value: (car (list-ref plan 1))
@@ -1030,12 +1029,12 @@
 
   (test "paying the carrier to the wrong script is a shape failure"
     (let* ((shares (list (fake-share 1 %sol-a)))
-           (plan (coin-v2-split-plan %subsidy shares %burn))
+           (plan (coin-split-plan %subsidy shares %burn))
            (honest (planned-outputs plan)))
       (assert-equal
         'coinbase-output-shape
         (coin-result-reason
-          (coin-v2-check-split
+          (coin-check-split
             (coinbase-tx (bytes-of 1)
                          (list (car honest)
                                (list-ref honest 1)
@@ -1046,7 +1045,7 @@
   (test "the producer's own script is not constrained"
     (let ((plan (plan-for 0 %subsidy)))
       (assert-true
-        (coin-ok? (coin-v2-check-split
+        (coin-ok? (coin-check-split
                     (coinbase-tx (bytes-of 1)
                                  (outs (list (cons %subsidy
                                                    (bytes-of #x51)))))
@@ -1055,70 +1054,70 @@
   (test "a non-transaction is an internal error, not a bad block"
     (assert-equal 'internal-error
                   (coin-result-reason
-                    (coin-v2-check-split 42 %subsidy '() #f)))))
+                    (coin-check-split 42 %subsidy '() #f)))))
 
 ;; ============================================================
 ;; Aggregate-quality fork choice (§5.6, §5.7)
 ;; ============================================================
 
 (define (word length memory steps shares)
-  (coin-v2-score-pack length memory steps shares))
+  (coin-score-pack length memory steps shares))
 
 (test-group "fork choice: the block key"
   (test "greater height always wins"
-    (assert-equal -1 (coin-v2-block-compare 2 (word 512 127 127 0)
+    (assert-equal -1 (coin-block-compare 2 (word 512 127 127 0)
                                             1 (word 1 0 0 8)))
-    (assert-equal 1 (coin-v2-block-compare 1 (word 1 0 0 8)
+    (assert-equal 1 (coin-block-compare 1 (word 1 0 0 8)
                                            2 (word 512 127 127 0))))
 
   (test "at equal height the lower score word wins"
-    (assert-equal -1 (coin-v2-block-compare 5 (word 24 50 51 0)
+    (assert-equal -1 (coin-block-compare 5 (word 24 50 51 0)
                                             5 (word 25 50 51 0)))
-    (assert-true (coin-v2-better-block? 5 (word 24 50 51 0)
+    (assert-true (coin-better-block? 5 (word 24 50 51 0)
                                         5 (word 25 50 51 0))))
 
   (test "an identical key is incomparable"
-    (assert-equal 0 (coin-v2-block-compare 5 (word 24 50 51 3)
+    (assert-equal 0 (coin-block-compare 5 (word 24 50 51 3)
                                            5 (word 24 50 51 3)))
-    (assert-true (not (coin-v2-better-block? 5 (word 24 50 51 3)
+    (assert-true (not (coin-better-block? 5 (word 24 50 51 3)
                                              5 (word 24 50 51 3)))))
 
   (test "a negative height raises"
-    (assert-error (coin-v2-block-compare -1 0 1 0))))
+    (assert-error (coin-block-compare -1 0 1 0))))
 
 (test-group "fork choice: the tip rule"
   (test "a strictly better sibling displaces a childless tip"
-    (assert-true (coin-v2-replaces-tip? (word 25 50 51 0) #f
+    (assert-true (coin-replaces-tip? (word 25 50 51 0) #f
                                         (word 24 50 51 0))))
 
   (test "nothing displaces an extended tip"
-    (assert-true (not (coin-v2-replaces-tip? (word 25 50 51 0) #t
+    (assert-true (not (coin-replaces-tip? (word 25 50 51 0) #t
                                              (word 24 50 51 0)))))
 
   (test "an equal score does not displace: first seen keeps the tip"
     ;; This is the producer's protection. A thief who copies the producer's
-    ;; published solution scores IDENTICALLY, and with the v1 block-hash
+    ;; published solution scores IDENTICALLY, and with the canonical block-hash
     ;; tie-break deleted there is nothing left for him to grind.
-    (assert-true (not (coin-v2-replaces-tip? (word 24 50 51 0) #f
+    (assert-true (not (coin-replaces-tip? (word 24 50 51 0) #f
                                              (word 24 50 51 0)))))
 
   (test "a thief cannot grind graffiti into a win"
     ;; Graffiti is not in the score word at all, so every copy of a block
     ;; with different graffiti has the same key and loses on first-seen.
-    (assert-equal 0 (coin-v2-score-compare (word 24 50 51 0)
+    (assert-equal 0 (coin-score-compare (word 24 50 51 0)
                                            (word 24 50 51 0)))
-    (assert-true (not (coin-v2-replaces-tip? (word 24 50 51 0) #f
+    (assert-true (not (coin-replaces-tip? (word 24 50 51 0) #f
                                              (word 24 50 51 0)))))
 
   (test "a worse sibling never displaces"
-    (assert-true (not (coin-v2-replaces-tip? (word 24 50 51 0) #f
+    (assert-true (not (coin-replaces-tip? (word 24 50 51 0) #f
                                              (word 25 50 51 0))))))
 
 (test-group "fork choice: aggregate quality breaks exactly the right ties"
   (test "greater quality wins when the producer's solution is tied"
-    (assert-true (coin-v2-better-block? 5 (word 24 50 51 3)
+    (assert-true (coin-better-block? 5 (word 24 50 51 3)
                                         5 (word 24 50 51 1)))
-    (assert-true (coin-v2-better-block? 5 (word 24 50 51 8)
+    (assert-true (coin-better-block? 5 (word 24 50 51 8)
                                         5 (word 24 50 51 0))))
 
   (test "no number of shares beats a shorter solution"
@@ -1126,7 +1125,7 @@
       (let loop ((r 0))
         (cond
           ((> r 8) #t)
-          ((coin-v2-better-block? 5 (word 24 50 51 0) 5 (word 25 50 51 r))
+          ((coin-better-block? 5 (word 24 50 51 0) 5 (word 25 50 51 r))
            (loop (+ r 1)))
           (else #f)))))
 
@@ -1135,7 +1134,7 @@
       (let loop ((r 0))
         (cond
           ((> r 8) #t)
-          ((coin-v2-better-block? 5 (word 24 49 51 0) 5 (word 24 50 51 r))
+          ((coin-better-block? 5 (word 24 49 51 0) 5 (word 24 50 51 r))
            (loop (+ r 1)))
           (else #f)))))
 
@@ -1144,7 +1143,7 @@
       (let loop ((r 0))
         (cond
           ((> r 8) #t)
-          ((coin-v2-better-block? 5 (word 24 50 50 0) 5 (word 24 50 51 r))
+          ((coin-better-block? 5 (word 24 50 50 0) 5 (word 24 50 51 r))
            (loop (+ r 1)))
           (else #f)))))
 
@@ -1166,12 +1165,12 @@
                     ((let s-loop ((rb 0))
                        (cond
                          ((> rb 8) #t)
-                         ((= (coin-v2-score-compare
+                         ((= (coin-score-compare
                                (word (car (car as)) (car (cdr (car as)))
                                      (car (cdr (cdr (car as)))) 0)
                                (word (car (car bs)) (car (cdr (car bs)))
                                      (car (cdr (cdr (car bs)))) 0))
-                             (coin-v2-score-compare
+                             (coin-score-compare
                                (word (car (car as)) (car (cdr (car as)))
                                      (car (cdr (cdr (car as)))) ra)
                                (word (car (car bs)) (car (cdr (car bs)))
@@ -1197,7 +1196,7 @@
   (word (list-ref k 1) (list-ref k 2) (list-ref k 3) (list-ref k 4)))
 
 (define (key-better? a b)
-  (coin-v2-better-block? (key-height a) (key-word a)
+  (coin-better-block? (key-height a) (key-word a)
                          (key-height b) (key-word b)))
 
 (define (all-pairs? xs ok?)
@@ -1278,17 +1277,17 @@
 
 (test-group "share validation: what needs no key"
   (test "no shares is always accepted"
-    (assert-true (coin-ok? (coin-v2-check-shares %bare-context
+    (assert-true (coin-ok? (coin-check-shares %bare-context
                                                  (string->bytes %sol-a)
                                                  '())))
     (assert-equal '() (coin-result-value
-                        (coin-v2-check-shares %bare-context
+                        (coin-check-shares %bare-context
                                               (string->bytes %sol-a) '()))))
 
   (test "more than eight shares is oversize"
     (assert-equal 'shares-oversize
                   (coin-result-reason
-                    (coin-v2-check-shares
+                    (coin-check-shares
                       %bare-context (string->bytes %sol-a)
                       (map (lambda (i) (fake-share i %sol-a))
                            '(1 2 3 4 5 6 7 8 9))))))
@@ -1299,8 +1298,8 @@
     (assert-equal
       'shares-at-genesis
       (coin-result-reason
-        (coin-v2-check-shares
-          (coin-v2-coop-context parent-prev-hash: %zero32
+        (coin-check-shares
+          (coin-coop-context parent-prev-hash: %zero32
                                 puzzle-height: -1
                                 complexity: %complexity
                                 spec: %spec
@@ -1312,8 +1311,8 @@
     (assert-equal
       'internal-error
       (coin-result-reason
-        (coin-v2-check-shares
-          (coin-v2-coop-context parent-prev-hash: %prev
+        (coin-check-shares
+          (coin-coop-context parent-prev-hash: %prev
                                 puzzle-height: 1
                                 complexity: %complexity
                                 spec: #f
@@ -1324,38 +1323,38 @@
   (test "a non-context is an internal error, not a bad block"
     (assert-equal 'internal-error
                   (coin-result-reason
-                    (coin-v2-check-shares 42 (string->bytes %sol-a) '())))))
+                    (coin-check-shares 42 (string->bytes %sol-a) '())))))
 
 (test-group "check-coop over a payload"
   (test "an empty co-op payload is accepted with no context"
-    (assert-true (coin-ok? (coin-v2-check-coop
+    (assert-true (coin-ok? (coin-check-coop
                              (simple-payload 3 (string->bytes %sol-a) #u8())
                              #f)))
     (assert-equal '() (coin-result-value
-                        (coin-v2-check-coop
+                        (coin-check-coop
                           (simple-payload 3 (string->bytes %sol-a) #u8())
                           #f))))
 
   (test "a genesis block may carry commitments but no shares"
-    (assert-true (coin-ok? (coin-v2-check-coop
+    (assert-true (coin-ok? (coin-check-coop
                              (payload 0 (string->bytes %sol-a)
-                                      coin-v2-empty-shares
+                                      coin-empty-shares
                                       (commitment-bytes 1 2)
                                       #u8())
                              #f)))
     (assert-equal 'shares-at-genesis
                   (coin-result-reason
-                    (coin-v2-check-coop
+                    (coin-check-coop
                       (payload 0 (string->bytes %sol-a)
-                               (coin-v2-shares-encode
+                               (coin-shares-encode
                                  (list (fake-share 1 %sol-b)))
-                               coin-v2-empty-commits #u8())
+                               coin-empty-commits #u8())
                       #f))))
 
   (test "malformed commits are rejected before the shares are looked at"
     (assert-equal 'commits-unordered
                   (coin-result-reason
-                    (coin-v2-check-coop
+                    (coin-check-coop
                       (payload 2 (string->bytes %sol-a)
                                (bytes-of 200)
                                (bytevector-append (bytes-of 2) (filled 32 9)
@@ -1366,24 +1365,24 @@
   (test "malformed shares are rejected"
     (assert-equal 'shares-oversize
                   (coin-result-reason
-                    (coin-v2-check-coop
+                    (coin-check-coop
                       (payload 2 (string->bytes %sol-a)
-                               (bytes-of 9) coin-v2-empty-commits #u8())
+                               (bytes-of 9) coin-empty-commits #u8())
                       #f))))
 
   (test "a context for the wrong height is an internal error"
     (assert-equal
       'internal-error
       (coin-result-reason
-        (coin-v2-check-coop
+        (coin-check-coop
           (payload 9 (string->bytes %sol-a)
-                   (coin-v2-shares-encode (list (fake-share 1 %sol-b)))
-                   coin-v2-empty-commits #u8())
+                   (coin-shares-encode (list (fake-share 1 %sol-b)))
+                   coin-empty-commits #u8())
           %bare-context))))
 
   (test "a non-payload is an internal error"
     (assert-equal 'internal-error
-                  (coin-result-reason (coin-v2-check-coop 42 #f)))))
+                  (coin-result-reason (coin-check-coop 42 #f)))))
 
 ;; ============================================================
 ;; Share validation with real keys
@@ -1395,30 +1394,30 @@
       (test-group "personalized puzzles with valid compressed keys"
         (test "full key encoding round-trips and is injective"
           (let* ((keys (map pubkey-of '(1 2 3 4 5 6 7 8)))
-                 (encoded (map coin-v2-pubkey-anchor-output keys)))
+                 (encoded (map coin-pubkey-anchor-output keys)))
             (assert-true (all-distinct? encoded))
             (assert-true
               (let loop ((ks keys) (es encoded))
                 (or (null? ks)
                     (and (= 66 (string-length (car es)))
-                         (pbe-anchor-output? (car es))
+                         (puzzle-anchor-output? (car es))
                          (equal? (car ks)
-                                 (coin-v2-anchor-output-pubkey (car es)))
+                                 (coin-anchor-output-pubkey (car es)))
                          (loop (cdr ks) (cdr es))))))))
 
         (test "eight keys share one anchor input and nothing else"
           (let* ((specs
                    (map (lambda (n)
-                          (coin-v2-share-puzzle %bare-context (pubkey-of n)))
+                          (coin-share-puzzle %bare-context (pubkey-of n)))
                         '(1 2 3 4 5 6 7 8)))
                  (anchors
                    (map (lambda (spec)
-                          (list-ref (pbe-spec-examples spec)
-                                    (- (pbe-spec-k spec) 1)))
+                          (list-ref (puzzle-spec-examples spec)
+                                    (- (puzzle-spec-k spec) 1)))
                         specs))
                  (ordinary
                    (map (lambda (spec)
-                          (reverse (cdr (reverse (pbe-spec-examples spec)))))
+                          (reverse (cdr (reverse (puzzle-spec-examples spec)))))
                         specs)))
             (assert-true (all-distinct? ordinary))
             (assert-true (all-distinct? (map cdr anchors)))
@@ -1427,69 +1426,63 @@
                 (or (null? ss)
                     (and (string=? "@" (car (car as)))
                          (string=?
-                           (coin-v2-pubkey-anchor-output
+                           (coin-pubkey-anchor-output
                              (pubkey-of (- 9 (length ss))))
                            (cdr (car as)))
-                         (= %puzzle-height (pbe-spec-height (car ss)))
-                         (= %complexity (pbe-spec-complexity (car ss)))
-                         (= (pbe-spec-k %spec) (pbe-spec-k (car ss)))
+                         (= %puzzle-height (puzzle-spec-height (car ss)))
+                         (= %complexity (puzzle-spec-complexity (car ss)))
+                         (= (puzzle-spec-k %spec) (puzzle-spec-k (car ss)))
                          (= (puzzle-complexity-width %complexity)
                             (puzzle-complexity-width
-                              (pbe-spec-complexity (car ss))))
-                         (= (pbe-spec-constraint %spec)
-                            (pbe-spec-constraint (car ss)))
+                              (puzzle-spec-complexity (car ss))))
+                         (= (puzzle-spec-constraint %spec)
+                            (puzzle-spec-constraint (car ss)))
                          (loop (cdr ss) (cdr as))))))))
 
         (test "key A source fails key B exactly on the anchor"
-          (let* ((a (coin-v2-share-puzzle %bare-context (pubkey-of 1)))
-                 (b (coin-v2-share-puzzle %bare-context (pubkey-of 3)))
+          (let* ((a (coin-share-puzzle %bare-context (pubkey-of 1)))
+                 (b (coin-share-puzzle %bare-context (pubkey-of 3)))
                  (source (personalized-source 1))
-                 (cross (puzzle-run-examples source (pbe-spec-examples b))))
-            (assert-true (coin-ok? (coin-v2-check-solution a source)))
+                 (cross (puzzle-run-examples source (puzzle-spec-examples b))))
+            (assert-true (coin-ok? (coin-check-solution a source)))
             (assert-false (puzzle-report-ok? cross))
             (assert-equal 'solution-mismatch
                           (puzzle-report-error-kind cross))
-            (assert-equal (- (pbe-spec-k b) 1)
+            (assert-equal (- (puzzle-spec-k b) 1)
                           (puzzle-report-index cross))))
 
-        (test "alpha-renaming and trivial wrappers stay key-bound"
-          (let* ((a-output (coin-v2-pubkey-anchor-output (pubkey-of 1)))
-                 (a (coin-v2-share-puzzle %bare-context (pubkey-of 1)))
-                 (b (coin-v2-share-puzzle %bare-context (pubkey-of 3)))
-                 (variants
-                   (list
-                     (personalized-source 1)
-                     (string-append
-                       "(lambda(y)(if(equal? y \"@\")\"" a-output
-                       "\"(list y(list y))))")
-                     (string-append
-                       "(lambda(x)(if(equal? x \"@\")\"" a-output
-                       "\"((lambda(y)(list y(list y)))x)))"))))
+        (test "equivalent source spacing stays key-bound"
+          (let* ((a (coin-share-puzzle %bare-context (pubkey-of 1)))
+                 (b (coin-share-puzzle %bare-context (pubkey-of 3)))
+                 (source (personalized-source 1))
+                 (variants (list source
+                                 (string-append " " source)
+                                 (string-append source " "))))
             (assert-true
               (let loop ((xs variants))
                 (or (null? xs)
                     (let ((own (puzzle-run-examples
-                                 (car xs) (pbe-spec-examples a)))
+                                 (car xs) (puzzle-spec-examples a)))
                           (cross (puzzle-run-examples
-                                   (car xs) (pbe-spec-examples b))))
+                                   (car xs) (puzzle-spec-examples b))))
                       (and (puzzle-report-ok? own)
                            (not (puzzle-report-ok? cross))
-                           (= (- (pbe-spec-k b) 1)
+                           (= (- (puzzle-spec-k b) 1)
                               (puzzle-report-index cross))
                            (loop (cdr xs))))))))))
 
       (test-group "share signatures bind"
         (test "an honest share verifies"
           (let ((share (share-of 1 %sol-a)))
-            (assert-true (coin-v2-share-signature-ok? %bare-context share))))
+            (assert-true (coin-share-signature-ok? %bare-context share))))
 
         (test "a share cannot be replayed at another height"
           ;; P is in the preimage, so the same bytes at height P+1 do not
           ;; verify.
           (let ((share (share-of 1 %sol-a)))
             (assert-true
-              (not (coin-v2-share-signature-ok?
-                     (coin-v2-coop-context parent-prev-hash: %prev
+              (not (coin-share-signature-ok?
+                     (coin-coop-context parent-prev-hash: %prev
                                            puzzle-height: 2
                                            complexity: %complexity
                                            spec: %spec)
@@ -1498,8 +1491,8 @@
         (test "a share cannot be moved to another branch"
           (let ((share (share-of 1 %sol-a)))
             (assert-true
-              (not (coin-v2-share-signature-ok?
-                     (coin-v2-coop-context parent-prev-hash: (filled 32 8)
+              (not (coin-share-signature-ok?
+                     (coin-coop-context parent-prev-hash: (filled 32 8)
                                            puzzle-height: %puzzle-height
                                            complexity: %complexity
                                            spec: %spec)
@@ -1508,8 +1501,8 @@
         (test "a share cannot survive a retarget epoch change"
           (let ((share (share-of 1 %sol-a)))
             (assert-true
-              (not (coin-v2-share-signature-ok?
-                     (coin-v2-coop-context parent-prev-hash: %prev
+              (not (coin-share-signature-ok?
+                     (coin-coop-context parent-prev-hash: %prev
                                            puzzle-height: %puzzle-height
                                            complexity: 256
                                            spec: %spec)
@@ -1517,63 +1510,63 @@
 
         (test "the program cannot be swapped under a valid signature"
           (let* ((share (share-of 1 %sol-a))
-                 (swapped (coin-v2-share
-                            pubkey: (coin-v2-share-pubkey share)
-                            signature: (coin-v2-share-signature share)
-                            blind: (coin-v2-share-blind share)
+                 (swapped (coin-share
+                            pubkey: (coin-share-pubkey share)
+                            signature: (coin-share-signature share)
+                            blind: (coin-share-blind share)
                             solution: (string->bytes %sol-b))))
-            (assert-true (not (coin-v2-share-signature-ok? %bare-context
+            (assert-true (not (coin-share-signature-ok? %bare-context
                                                            swapped)))))
 
         (test "the payout key cannot be redirected"
           (let* ((share (share-of 1 %sol-a))
-                 (stolen (coin-v2-share
+                 (stolen (coin-share
                            pubkey: (pubkey-of 2)
-                           signature: (coin-v2-share-signature share)
-                           blind: (coin-v2-share-blind share)
-                           solution: (coin-v2-share-solution share))))
-            (assert-true (not (coin-v2-share-signature-ok? %bare-context
+                           signature: (coin-share-signature share)
+                           blind: (coin-share-blind share)
+                           solution: (coin-share-solution share))))
+            (assert-true (not (coin-share-signature-ok? %bare-context
                                                            stolen)))))
 
         (test "a garbage signature does not verify"
           (let* ((share (share-of 1 %sol-a))
-                 (junk (coin-v2-share
-                         pubkey: (coin-v2-share-pubkey share)
+                 (junk (coin-share
+                         pubkey: (coin-share-pubkey share)
                          signature: (filled 64 0)
-                         blind: (coin-v2-share-blind share)
-                         solution: (coin-v2-share-solution share))))
-            (assert-true (not (coin-v2-share-signature-ok? %bare-context
+                         blind: (coin-share-blind share)
+                         solution: (coin-share-solution share))))
+            (assert-true (not (coin-share-signature-ok? %bare-context
                                                            junk))))))
 
       (test-group "share validation: the happy path"
         (test "one committed, signed, personalized solution is accepted"
-          (let ((shares (list (valid-share-of 1))))
+          (let ((shares (list (valid-share-of 2))))
             (assert-true
-              (coin-ok? (coin-v2-check-share-solution
+              (coin-ok? (coin-check-share-solution
                           %bare-context (car shares))))
             (assert-true (coin-ok? (check shares)))
             (assert-equal 1 (length (coin-result-value (check shares))))
-            (assert-true (> (coin-v2-shares-quality %bare-context shares) 0))))
+            (assert-true (> (coin-shares-quality %bare-context shares) 0))))
 
         (test "three personalized shares are accepted and returned in order"
-          (let ((shares (in-share-order (map valid-share-of '(1 2 3)))))
+          (let ((shares (in-share-order (map valid-share-of '(2 9 12)))))
             (assert-true (coin-ok? (check shares)))
             (assert-equal 3 (length (coin-result-value (check shares))))))
 
         (test "the accepted shares survive a wire round trip"
-          (let* ((shares (in-share-order (map valid-share-of '(1 2))))
-                 (back (coin-v2-shares-decode
-                         (coin-v2-shares-encode shares))))
+          (let* ((shares (in-share-order (map valid-share-of '(2 9))))
+                 (back (coin-shares-decode
+                         (coin-shares-encode shares))))
             (assert-true (coin-ok? back))
             (assert-true (coin-ok? (check (coin-result-value back)))))))
 
       (test-group "share validation: hostile shares"
         (test "an invalid public key is refused"
           (let* ((good (share-of 1 %sol-a))
-                 (bad (coin-v2-share pubkey: (filled 33 0)
-                                     signature: (coin-v2-share-signature good)
-                                     blind: (coin-v2-share-blind good)
-                                     solution: (coin-v2-share-solution good))))
+                 (bad (coin-share pubkey: (filled 33 0)
+                                     signature: (coin-share-signature good)
+                                     blind: (coin-share-blind good)
+                                     solution: (coin-share-solution good))))
             (assert-equal 'share-bad-pubkey (check-reason (list bad)))))
 
         (test "shares out of pubkey order are refused"
@@ -1592,7 +1585,7 @@
           ;; The parent carried nothing, so nothing may be revealed.
           (assert-equal 'share-uncommitted
                         (coin-result-reason
-                          (coin-v2-check-shares %bare-context
+                          (coin-check-shares %bare-context
                                                 (string->bytes %sol-d)
                                                 (list (share-of 1 %sol-a))))))
 
@@ -1600,14 +1593,14 @@
           ;; The blind is part of the commitment, so the exact opening has
           ;; to be the one the parent carried.
           (let* ((share (share-of 1 %sol-a))
-                 (other (coin-v2-share
-                          pubkey: (coin-v2-share-pubkey share)
-                          signature: (coin-v2-share-signature share)
+                 (other (coin-share
+                          pubkey: (coin-share-pubkey share)
+                          signature: (coin-share-signature share)
                           blind: (filled 32 200)
-                          solution: (coin-v2-share-solution share))))
+                          solution: (coin-share-solution share))))
             (assert-equal 'share-uncommitted
                           (coin-result-reason
-                            (coin-v2-check-shares (context-for (list other))
+                            (coin-check-shares (context-for (list other))
                                                   (string->bytes %sol-d)
                                                   (list share))))))
 
@@ -1615,20 +1608,20 @@
           ;; The commitment is built from the tampered share, so check 4
           ;; passes and check 5 is what rejects it.
           (let* ((honest (share-of 1 %sol-a))
-                 (forged (coin-v2-share
-                           pubkey: (coin-v2-share-pubkey honest)
+                 (forged (coin-share
+                           pubkey: (coin-share-pubkey honest)
                            signature: (filled 64 1)
-                           blind: (coin-v2-share-blind honest)
-                           solution: (coin-v2-share-solution honest))))
+                           blind: (coin-share-blind honest)
+                           solution: (coin-share-solution honest))))
             (assert-equal 'share-bad-signature (check-reason (list forged)))))
 
         (test "a share signed by another key is refused"
           (let* ((honest (share-of 1 %sol-a))
-                 (impostor (coin-v2-share
+                 (impostor (coin-share
                              pubkey: (pubkey-of 2)
-                             signature: (coin-v2-share-signature honest)
-                             blind: (coin-v2-share-blind honest)
-                             solution: (coin-v2-share-solution honest))))
+                             signature: (coin-share-signature honest)
+                             blind: (coin-share-blind honest)
+                             solution: (coin-share-solution honest))))
             (assert-equal 'share-bad-signature
                           (check-reason (list impostor)))))
 
@@ -1637,7 +1630,7 @@
           (let ((shares (list (share-of 1 %sol-a))))
             (assert-equal 'share-duplicate-solution
                           (coin-result-reason
-                            (coin-v2-check-shares (context-for shares)
+                            (coin-check-shares (context-for shares)
                                                   (string->bytes %sol-a)
                                                   shares)))))
 
@@ -1647,9 +1640,9 @@
             (assert-equal 'share-duplicate-solution (check-reason shares))))
 
         (test "distinct personalized programs are distinct shares"
-          (let ((shares (in-share-order (map valid-share-of '(1 2)))))
+          (let ((shares (in-share-order (map valid-share-of '(2 9)))))
             (assert-true
-              (coin-ok? (coin-v2-check-shares (context-for shares)
+              (coin-ok? (coin-check-shares (context-for shares)
                                               (string->bytes %sol-d)
                                               shares)))))
 
@@ -1669,7 +1662,7 @@
 
         (test "eight personalized shares is the reachable ceiling"
           (let ((shares (in-share-order
-                          (map valid-share-of '(1 2 3 4 5 6 7 8)))))
+                          (map valid-share-of '(2 9 12 16 17 20 21 23)))))
             (assert-true (coin-ok? (check shares)))
             (assert-equal 8 (length (coin-result-value (check shares)))))))
 
@@ -1683,21 +1676,21 @@
                  (carried (context-for (list victim))))
             (assert-equal 'share-uncommitted
                           (coin-result-reason
-                            (coin-v2-check-shares carried
+                            (coin-check-shares carried
                                                   (string->bytes %sol-d)
                                                   (list thief))))))
 
         (test "a thief cannot redirect a share he does include"
           ;; Including it obliges him to pay the signed key.
-          (let* ((share (valid-share-of 1))
+          (let* ((share (valid-share-of 2))
                  (shares (list share))
-                 (plan (coin-v2-split-plan %subsidy shares %burn))
+                 (plan (coin-split-plan %subsidy shares %burn))
                  (honest (planned-outputs plan)))
             (assert-true (coin-ok? (check shares)))
             (assert-equal
               'coinbase-output-shape
               (coin-result-reason
-                (coin-v2-check-split
+                (coin-check-split
                   (coinbase-tx (bytes-of 1)
                                (list (car honest)
                                      (txout value: (car (list-ref plan 1))
@@ -1711,7 +1704,7 @@
             (assert-equal
               'coinbase-output-shape
               (coin-result-reason
-                (coin-v2-check-split
+                (coin-check-split
                   (coinbase-tx (bytes-of 1)
                                (outs (list (cons %subsidy %burn))))
                   %subsidy shares %burn)))))
@@ -1722,81 +1715,81 @@
           ;; exists. The copy scores identically, is incomparable, and loses
           ;; on first-seen.
           (let ((honest (word 24 50 51 2)))
-            (assert-equal 0 (coin-v2-score-compare honest honest))
-            (assert-true (not (coin-v2-replaces-tip? honest #f honest)))))
+            (assert-equal 0 (coin-score-compare honest honest))
+            (assert-true (not (coin-replaces-tip? honest #f honest)))))
 
         (test "a thief cannot mine a sibling of the block he stole from"
           ;; A reveal for puzzle P appears in a block at height P+1, so by
           ;; the time it is readable, height P is already extended.
-          (assert-true (not (coin-v2-replaces-tip? (word 25 50 51 0) #t
+          (assert-true (not (coin-replaces-tip? (word 25 50 51 0) #t
                                                    (word 1 0 0 8))))))
 
       (test-group "commit-reveal round trip"
         (test "a commitment made at H opens exactly once at H+1"
-          (let* ((share (valid-share-of 1))
-                 (commitment (coin-v2-share-commitment %bare-context share))
+          (let* ((share (valid-share-of 2))
+                 (commitment (coin-share-commitment %bare-context share))
                  ;; Block H-1 publishes the commitment ...
-                 (parent-commits (coin-v2-commits-encode (list commitment)))
+                 (parent-commits (coin-commits-encode (list commitment)))
                  (carried (coin-result-value
-                            (coin-v2-commits-decode parent-commits)))
+                            (coin-commits-decode parent-commits)))
                  ;; ... and block H reveals against it.
                  (block-payload (payload (+ %puzzle-height 1)
                                          (string->bytes %sol-d)
-                                         (coin-v2-shares-encode (list share))
-                                         coin-v2-empty-commits
+                                         (coin-shares-encode (list share))
+                                         coin-empty-commits
                                          #u8())))
             (assert-equal 32 (bytevector-length commitment))
             (assert-true
-              (coin-ok? (coin-v2-check-coop block-payload
+              (coin-ok? (coin-check-coop block-payload
                                             (context-with carried))))
             (assert-equal
               1 (length (coin-result-value
-                          (coin-v2-check-coop block-payload
+                          (coin-check-coop block-payload
                                               (context-with carried)))))))
 
         (test "the whole thing survives the coinbase codec"
-          (let* ((share (valid-share-of 1))
-                 (carried (list (coin-v2-share-commitment %bare-context
+          (let* ((share (valid-share-of 2))
+                 (carried (list (coin-share-commitment %bare-context
                                                           share)))
-                 (script (coin-v2-coinbase-payload-encode
+                 (script (coin-coinbase-payload-encode
                            (payload 2 (string->bytes %sol-d)
-                                    (coin-v2-shares-encode (list share))
+                                    (coin-shares-encode (list share))
                                     (commitment-bytes 3 4)
                                     (string->bytes "co-op"))))
-                 (back (coin-v2-coinbase-payload-decode script)))
+                 (back (coin-coinbase-payload-decode script)))
             (assert-true (coin-ok? back))
             (assert-true
-              (coin-ok? (coin-v2-check-coop (coin-result-value back)
+              (coin-ok? (coin-check-coop (coin-result-value back)
                                             (context-with carried))))))
 
         (test "an unrevealed commitment simply expires"
           ;; §7.3: no penalty, no refund, and no state kept past one block.
           ;; A block whose parent carried two commitments and which reveals
           ;; one is exactly as valid as one that reveals both.
-          (let* ((a (valid-share-of 1))
+          (let* ((a (valid-share-of 2))
                  (b (valid-share-of 2))
                  (carried (commits-for (list a b)))
                  (one (payload 2 (string->bytes %sol-d)
-                               (coin-v2-shares-encode (list a))
-                               coin-v2-empty-commits #u8())))
+                               (coin-shares-encode (list a))
+                               coin-empty-commits #u8())))
             (assert-equal 2 (length carried))
-            (assert-true (coin-ok? (coin-v2-check-coop
+            (assert-true (coin-ok? (coin-check-coop
                                      one (context-with carried))))
             (assert-equal 1 (length (coin-result-value
-                                      (coin-v2-check-coop
+                                      (coin-check-coop
                                         one (context-with carried)))))))
 
         (test "a commitment cannot be opened at the wrong height"
           ;; Its preimage names P, so the same blind and program produce a
           ;; different commitment one height over and never match.
           (let* ((share (share-of 1 %sol-a))
-                 (carried (list (coin-v2-share-commitment %bare-context
+                 (carried (list (coin-share-commitment %bare-context
                                                           share))))
             (assert-equal
               'share-uncommitted
               (coin-result-reason
-                (coin-v2-check-shares
-                  (coin-v2-coop-context parent-prev-hash: %prev
+                (coin-check-shares
+                  (coin-coop-context parent-prev-hash: %prev
                                         puzzle-height: 2
                                         complexity: %complexity
                                         spec: %spec
@@ -1812,17 +1805,17 @@
             (assert-equal
               'share-uncommitted
               (coin-result-reason
-                (coin-v2-check-shares (context-with junk)
+                (coin-check-shares (context-with junk)
                                       (string->bytes %sol-d)
                                       (list (share-of 1 %sol-a)))))))
 
         (test "the carrier is paid exactly when a reveal is accepted"
-          (let* ((shares (list (valid-share-of 1)))
-                 (with-shares (coin-v2-split-plan %subsidy shares %burn))
-                 (without (coin-v2-split-plan %subsidy '() #f)))
+          (let* ((shares (list (valid-share-of 2)))
+                 (with-shares (coin-split-plan %subsidy shares %burn))
+                 (without (coin-split-plan %subsidy '() #f)))
             (assert-true (coin-ok? (check shares)))
             (assert-equal 3 (length with-shares))
             (assert-equal 1 (length without))
-            (assert-equal (coin-v2-split-unit %subsidy 1)
+            (assert-equal (coin-split-unit %subsidy 1)
                           (car (list-ref with-shares 2)))
             (assert-equal %burn (cdr (list-ref with-shares 2))))))))

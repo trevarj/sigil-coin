@@ -1,62 +1,12 @@
-;;; (sigil coin node chain) — the SigilCoin chain configs
+;;; (sigil coin node chain) — live SigilCoin chain configs
 ;;;
-;;; Two chains, identical in consensus and different only in identity and
-;;; pacing:
-;;;
-;;;   `sigilcoin-main-chain`     the real chain, one block a day
-;;;   `sigilcoin-regtest-chain`  a local chain whose spacing floor is one
-;;;                              second, so tests can mine consecutive
-;;;                              blocks instead of waiting 20 hours
-;;;
-;;; The spacing floor is the reason the two exist separately, and it is why
-;;; the floor is chain policy: it is read from the config, carried into the
-;;; chain's `header-rules` closure, and repeated in the `policy` extension
-;;; for anything that wants to display it. `sigil-coin-consensus` knows only
-;;; the mainnet default.
-;;;
-;;; ============================================================
-;;; BITCOIN-DERIVED CONSENSUS PARAMS
-;;; ============================================================
-;;;
-;;; `consensus-params` is Bitcoin's record and every field is required, but
-;;; SigilCoin has no difficulty and no retarget, so each is pinned to a value
-;;; that means "this does not apply here":
-;;;
-;;;   pow-limit-bits    `coin-header-bits`, the compact form of the largest
-;;;                     representable target. It is NOT a difficulty floor:
-;;;                     it is the entire hash space, so any Bitcoin-derived
-;;;                     helper that reads it computes "no work required". It
-;;;                     is also the only `bits` value a SigilCoin header may
-;;;                     carry, which keeps the field constant chain-wide.
-;;;   target-spacing    86400 seconds, the one-block-a-day cadence. Advisory
-;;;                     only — nothing retargets toward it. The rule with
-;;;                     teeth is the spacing FLOOR in the policy extension.
-;;;   target-timespan   the same 86400. Unused: it exists to be divided by a
-;;;                     retarget that never runs.
-;;;   retarget-interval `#xffffffff`. There is no retarget; the params
-;;;                     validator rejects 0, so "never" is spelled as the
-;;;                     largest u32 rather than as a disabled flag.
-;;;   bip34-height      0. The coinbase has carried the height since genesis;
-;;;                     `coin-coinbase-payload` makes it mandatory, not
-;;;                     merely activated.
-;;;   bip66-height      0. Strict DER signatures from genesis.
-;;;   bip65-height      0. `OP_CHECKLOCKTIMEVERIFY` from genesis.
-;;;   csv-height        0. `OP_CHECKSEQUENCEVERIFY` and relative locktime
-;;;                     from genesis.
-;;;   segwit-height     0. Witness rules from genesis.
-;;;   taproot-height    0. Taproot from genesis.
-;;;
-;;; A new chain has no legacy to grandfather, so every soft fork Bitcoin
-;;; phased in is simply on at height 0. Nothing here implies mining
-;;; difficulty, and nothing in SigilCoin ever calls `next-required-bits`.
+;;; Mainnet and regtest run canonical program-by-example consensus. Mainnet's
+;;; timestamp remains placeholder data until operator chooses launch day;
+;;; changing it requires regenerating genesis constants.
 
 (define-library (sigil coin node chain)
-  (import (sigil math)
-          (sigil bitcoin encoding)
-          (sigil bitcoin consensus)
+  (import (sigil bitcoin consensus)
           (sigil bitcoin node)
-          (sigil coin puzzle)
-          (sigil coin puzzle generator)
           (sigil coin consensus)
           (sigil coin node rules)
           (sigil coin node body)
@@ -70,89 +20,39 @@
     coin-genesis-time
     coin-regtest-genesis-quote
     coin-regtest-genesis-time
-    coin-genesis-header-constant
-    coin-regtest-genesis-header-constant
-    coin-genesis-id-constant
-    coin-regtest-genesis-id-constant
     sigilcoin-consensus-params
     sigilcoin-main-chain
     sigilcoin-regtest-chain)
 
   (begin
 
-    ;; ============================================================
-    ;; Pacing and flavour
-    ;; ============================================================
-
-    ;;; Intended seconds between blocks: one day. Advisory; the enforced rule
-    ;;; is the spacing floor, `coin-min-block-spacing`.
+    ;;; Intended seconds between blocks: one day.
     (define coin-target-block-spacing 86400)
 
-    ;;; The local test chain's spacing floor, in seconds. One second is the
-    ;;; smallest floor that still forces strictly increasing timestamps, so
-    ;;; a test mines consecutive blocks without waiting and without turning
-    ;;; the pacing rule off.
+    ;;; Regtest spacing floor.
     (define coin-regtest-min-block-spacing 1)
 
-    ;;; Where SigilCoin miners hang out. Flavour metadata, not consensus.
+    ;;; Miner community channel.
     (define coin-irc-channel "#systemcrafters")
 
-    ;; ============================================================
-    ;; Genesis
-    ;; ============================================================
-
-    ;;; The launch genesis graffiti, 32 bytes of UTF-8, well inside the
-    ;;; 400-byte graffiti cap. Replacing this string changes the genesis
-    ;;; hash, so the two hex constants below must be regenerated with
-    ;;; `coin-genesis-header-hex` whenever it changes.
+    ;;; Mainnet genesis quote.
     (define coin-genesis-quote
       "Sigil - Practical Symbolic Power")
 
-    ;;; Genesis timestamp: 2026-08-01T00:00:00Z. Far enough in the past that
-    ;;; the future-drift rule accepts genesis, and a first block a full
-    ;;; spacing interval later, on any node with a sane clock.
+    ;;; Placeholder mainnet timestamp. Non-final until launch operator chooses
+    ;;; launch day and regenerates canonical genesis constants.
     (define coin-genesis-time 1785542400)
 
-    ;;; The local test chain's graffiti. Different from mainnet's on purpose:
-    ;;; a distinct genesis hash means a regtest block can never be mistaken
-    ;;; for a mainnet one even if the magic bytes were somehow ignored.
+    ;;; Regtest genesis quote.
     (define coin-regtest-genesis-quote
       "SigilCoin regtest: worthless on purpose")
 
-    ;;; The local test chain's genesis timestamp: 2026-01-01T00:00:00Z.
+    ;;; Fixed regtest genesis timestamp: 2026-01-01T00:00:00Z.
     (define coin-regtest-genesis-time 1767225600)
 
-    ;;; Serialized mainnet genesis header, as hex.
-    ;;;
-    ;;; Checked in rather than computed so the config is inspectable without
-    ;;; running the generator. `test-node.sgl` rebuilds genesis from the quote
-    ;;; and asserts these bytes, so the constant cannot drift from the
-    ;;; builder.
-    (define coin-genesis-header-constant
-      "04000000000000000000000000000000000000000000000000000000000000000000000099a5066258b8dc1726a6d0dcb92472129769a290b29421f39c823e692b5e7a6b00376d6affff7f2031000000")
-
-    ;;; Serialized regtest genesis header, as hex. Same provenance.
-    (define coin-regtest-genesis-header-constant
-      "0400000000000000000000000000000000000000000000000000000000000000000000000a1269df86dc4739f15171c6fab69a35bf7e948aa581b66ddd2ade0028a3cd6c00b95569ffff7f2031000000")
-
-    ;;; Display id (reversed hash) of the mainnet genesis block, for humans.
-    ;;; No leading zeros: there is no proof-of-work to produce them.
-    (define coin-genesis-id-constant
-      "9dee7d0078ae464eedf3ae7fdbf69e80ede1d4aa5d934f7b18a84d56a6a30c21")
-
-    ;;; Display id of the regtest genesis block.
-    (define coin-regtest-genesis-id-constant
-      "e42a0833e85b849033d22db6c517d08ad5f544324da25b4b4d102aade75e378b")
-
-    ;; ============================================================
-    ;; Consensus params
-    ;; ============================================================
-
-    ;;; Bitcoin-shaped consensus params for SigilCoin. See the module header
-    ;;; for what each Bitcoin-derived field means on a chain with no
-    ;;; difficulty and no retarget.
+    ;;; Bitcoin-shaped parameters used by shared transaction validation.
     (define sigilcoin-consensus-params
-      (consensus-params pow-limit-bits: coin-header-bits
+      (consensus-params pow-limit-bits: (coin-bits-encode coin-complexity-max)
                         target-spacing: coin-target-block-spacing
                         target-timespan: coin-target-block-spacing
                         retarget-interval: #xffffffff
@@ -163,47 +63,7 @@
                         segwit-height: 0
                         taproot-height: 0))
 
-    ;; ============================================================
-    ;; Chain configs
-    ;; ============================================================
-
-    ;; The policy every SigilCoin config publishes. `consensus` carries the
-    ;; live rules records the node runs — `rules` for headers and fork
-    ;; choice, `block-rules` for bodies — and `policy` restates the numbers
-    ;; behind them so a status command can print them without unpacking a
-    ;; closure. Only the header rules are built per chain, because the
-    ;; spacing floor is the only chain-varying rule; the body rules are
-    ;; chain-independent and shared.
-    (define (coin-chain-extensions min-spacing)
-      (list
-        (cons 'consensus (list (cons 'rules (coin-header-rules min-spacing))
-                               (cons 'block-rules coin-block-rules)))
-        (cons 'mining (list (cons 'rule 'program-golf)
-                            (cons 'irc-channel coin-irc-channel)
-                            (cons 'puzzle-generator-version
-                                  (puzzle-generator-version))))
-        (cons 'policy (list (cons 'min-block-spacing min-spacing)
-                            (cons 'target-block-spacing
-                                  coin-target-block-spacing)
-                            (cons 'max-future-drift coin-max-future-drift)
-                            (cons 'median-time-span coin-median-time-span)
-                            (cons 'max-block-bytes coin-max-block-bytes)
-                            (cons 'max-solution-bytes coin-max-solution-bytes)
-                            (cons 'max-graffiti-bytes coin-max-graffiti-bytes)
-                            (cons 'max-supply coin-max-supply)
-                            (cons 'max-coinbase-script-bytes
-                                  coin-max-coinbase-script-bytes)))))
-
-    ;;; The spacing floor a chain config enforces, in seconds.
-    ;;;
-    ;;; The floor is carried twice on purpose: inside the `header-rules`
-    ;;; closure, where it is enforced, and in the `policy` extension, where
-    ;;; it can be read. This reads it, which is what a miner needs to date a
-    ;;; block the chain will accept.
-    ;;;
-    ;;; ```scheme
-    ;;; (coin-chain-min-block-spacing sigilcoin-regtest-chain) ; => 1
-    ;;; ```
+    ;;; Read enforced spacing floor from chain policy.
     (define (coin-chain-min-block-spacing chain)
       (: chain-config? -> integer?)
       (let ((entry (assq 'min-block-spacing
@@ -212,81 +72,65 @@
             (error "coin-chain-min-block-spacing: chain publishes no spacing floor"))
         (cdr entry)))
 
-    ;; One shape, two chains: everything except identity and the spacing
-    ;; floor is shared, so the test chain cannot drift away from the rules it
-    ;; is supposed to be testing.
-    (define (coin-chain-config name magic port seeds min-spacing header-hex)
-      (let ((genesis (block-header-parse (hex-decode header-hex))))
+    (define (extensions min-spacing genesis)
+      (list
+        (cons 'consensus
+              (list (cons 'rules (coin-header-rules min-spacing))
+                    ;; Shared node passes durable validated parents after H1;
+                    ;; trusted configured genesis supplies H1's parent body.
+                    (cons 'block-rules
+                          (coin-block-rules-for-genesis genesis))))
+        (cons 'mining
+              (list (cons 'rule 'program-by-example)
+                    (cons 'irc-channel coin-irc-channel)))
+        (cons 'policy
+              (list (cons 'min-block-spacing min-spacing)
+                    (cons 'target-block-spacing coin-target-block-spacing)
+                    (cons 'max-future-drift coin-max-future-drift)
+                    (cons 'median-time-span coin-median-time-span)
+                    (cons 'max-block-bytes coin-max-block-bytes)
+                    (cons 'max-solution-bytes coin-max-solution-bytes)
+                    (cons 'max-graffiti-bytes coin-max-graffiti-bytes)
+                    (cons 'max-supply coin-max-supply)
+                    (cons 'max-coinbase-script-bytes
+                          coin-max-coinbase-script-bytes)))))
+
+    (define (config name magic port seeds min-spacing genesis)
+      (let ((header (block-header-field genesis)))
         (chain-config name: name
                       network-id: name
                       magic: magic
                       default-port: port
                       seed-peers: seeds
-                      ;; The node speaks Bitcoin's wire protocol unchanged,
-                      ;; so it announces the same version and NODE_NETWORK.
                       protocol-version: 70015
                       services: 1
                       user-agent: "/sigilcoin-node:0.1.0/"
-                      genesis-header: genesis
-                      genesis-hash: (block-header-hash genesis)
+                      genesis-header: header
+                      genesis-hash: (block-header-hash header)
                       consensus-params: sigilcoin-consensus-params
-                      extensions: (coin-chain-extensions min-spacing))))
+                      extensions: (extensions min-spacing genesis))))
 
-    ;;; The SigilCoin chain.
-    ;;;
-    ;;; The magic is `8f d1 c0 a5`. It is the first thing on the wire and the
-    ;;; only thing that separates two networks before a single message is
-    ;;; parsed, so it cannot be changed after launch without splitting the
-    ;;; network. It is chosen against three constraints:
-    ;;;
-    ;;;   * it collides with none of Bitcoin's five magics — mainnet
-    ;;;     `f9 be b4 d9`, testnet `0b 11 09 07`, testnet4 `1c 16 3f 28`,
-    ;;;     signet `0a 03 cf 40`, regtest `fa bf b5 da` — nor with the
-    ;;;     familiar Bitcoin-derived ones (Litecoin `fb c0 b6 db`, Bitcoin
-    ;;;     Cash `e3 e1 f3 e8`, Namecoin `f9 be b4 fe`, Dogecoin
-    ;;;     `c0 c0 c0 c0`). `test-node.sgl` asserts the Bitcoin half of that
-    ;;;     against the live configs, so a future edit cannot reintroduce a
-    ;;;     collision. An earlier draft reused regtest's `fa bf b5 da`, which
-    ;;;     made SigilCoin and Bitcoin regtest frames indistinguishable and
-    ;;;     deferred the divergence all the way to a genesis mismatch.
-    ;;;   * every byte has the high bit set, so the frame prefix is not ASCII
-    ;;;     and not even valid UTF-8 (`8f` is a continuation byte and cannot
-    ;;;     start a sequence). A text-based protocol's handshake can never be
-    ;;;     mistaken for a SigilCoin frame, or the reverse.
-    ;;;   * the four bytes are distinct, so a truncated or misaligned read
-    ;;;     cannot match by accident.
-    ;;;
-    ;;; Port 19444 sits deliberately next to Bitcoin's regtest 18444:
-    ;;; SigilCoin is a toy chain and never wants to be mistaken for Bitcoin
-    ;;; mainnet traffic. The seed is `seed.sigilcoin.lol`, operated by the
-    ;;; chain's operator.
-    ;;;
-    ;;; ```scheme
-    ;;; (chain-config-network-id sigilcoin-main-chain) ; => "sigilcoin-main"
-    ;;; ```
+    (define %main-genesis
+      (coin-genesis-block coin-genesis-quote coin-genesis-time))
+
+    (define %regtest-genesis
+      (coin-genesis-block coin-regtest-genesis-quote
+                          coin-regtest-genesis-time))
+
+    ;;; Main SigilCoin network. Genesis timestamp remains non-final.
     (define sigilcoin-main-chain
-      (coin-chain-config "sigilcoin-main"
-                         #u8(#x8f #xd1 #xc0 #xa5)
-                         19444
-                         '(("seed.sigilcoin.lol" . 19444))
-                         coin-min-block-spacing
-                         coin-genesis-header-constant))
+      (config "sigilcoin-main"
+              #u8(#x8f #xd1 #xc0 #xa5)
+              19444
+              '(("seed.sigilcoin.lol" . 19444))
+              coin-min-block-spacing
+              %main-genesis))
 
-    ;;; The local development chain.
-    ;;;
-    ;;; Byte-reversed magic — `a5 c0 d1 8f` — and the next port up, so a
-    ;;; regtest node and a mainnet node on one machine cannot talk to each
-    ;;; other. Reversal preserves every property the mainnet value was chosen
-    ;;; for: still no Bitcoin magic, still no ASCII. No seed peers: a local
-    ;;; chain is wired up by hand.
-    ;;;
-    ;;; ```scheme
-    ;;; (chain-config-name sigilcoin-regtest-chain) ; => "sigilcoin-regtest"
-    ;;; ```
+    ;;; Local development chain.
     (define sigilcoin-regtest-chain
-      (coin-chain-config "sigilcoin-regtest"
-                         #u8(#xa5 #xc0 #xd1 #x8f)
-                         19445
-                         '()
-                         coin-regtest-min-block-spacing
-                         coin-regtest-genesis-header-constant))))
+      (config "sigilcoin-regtest"
+              #u8(#xa5 #xc0 #xd1 #x8f)
+              19445
+              '()
+              coin-regtest-min-block-spacing
+              %regtest-genesis))))

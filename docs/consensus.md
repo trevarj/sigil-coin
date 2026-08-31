@@ -1,33 +1,4 @@
-# SigilCoin Consensus Specification v2
-
-Status: design, frozen for implementation. This document is normative. Where it
-disagrees with the v1 code, the code changes.
-
-v2 is a chain split, not a soft fork. `puzzle-language-version` becomes 2,
-`puzzle-generator-version` becomes 2, `coin-header-version` becomes 5, and
-genesis is regenerated. There is no migration path for a v1 chain and none is
-wanted.
-
----
-
-## 0. Why v2
-
-Survey of 480 v1 puzzles:
-
-| Observation | Value | Consequence |
-|---|---|---|
-| `par` is the quoted literal | 78.3% of puzzles | mining is constant transcription |
-| minimal solution unique | 96.7% | competitors submit identical bytes |
-| `(and 1 Q)`, `(or #f Q)`, ... | unbounded family | identical length/steps/allocations, grindable |
-| peak fuel used | 0.03% of 1e6 | execution metrics inert |
-| peak allocations used | 0.08% of 1e5 | execution metrics inert |
-| structural golfer beat par | 30%, median 6 B, max 43 B | real headroom exists |
-| par range | 25–149 B | absolute thresholds are non-uniform |
-
-Two conclusions drive the whole design. First, the target must be a *function*,
-not a constant, or the game degenerates. Second, difficulty must come from
-widening what a solution has to express, never from tightening the evaluator's
-resource caps, because every node re-evaluates every solution.
+# SigilCoin Consensus Specification
 
 ---
 
@@ -55,70 +26,52 @@ resource caps, because every node re-evaluates every solution.
 
 ## 2. Frozen constants
 
-### 2.1 Puzzle language (`sigil-coin-puzzle`)
+### 2.1 Puzzle language and generator
 
-| Constant | v1 | v2 | Justification |
-|---|---|---|---|
-| `puzzle-language-version` | 1 | 2 | split marker |
-| `puzzle-max-source-bytes` | 256 | **512** | the liveness escape (§8) is a `k`-branch lookup table plus a constraint repair wrapper; at `k=8` it reaches 415 B globally and 458 B with a full-key share anchor |
-| `puzzle-max-fuel` | 1000000 | **200000** | observed peak 300 steps (0.03% of 1e6); 200000 is 660x observed peak and cuts the hostile per-solution cost from ~5.5 s to ~1.1 s, which matters because v2 validates up to 9 solutions per block |
-| `puzzle-max-allocations` | 100000 | **400000** | charging became honest (environment frames, boxes, closures and argument lists are counted, and `append`/`map`/`filter`/`fold` charge what they really cons), so the old number no longer meant the same thing; 400000 restores comparable headroom for real programs |
-| `puzzle-max-string-bytes` | 65536 | 65536 | unchanged |
-| `puzzle-max-eval-depth` | 128 | 128 | unchanged |
-| `puzzle-max-parse-depth` | 64 | 64 | unchanged |
-| `puzzle-max-integer` | 2^256 | 2^256 | unchanged |
-| `puzzle-generator-max-fuel` | — | **20000** | per generation *attempt*, shared across every evaluation in that attempt; bounds puzzle derivation at 64 x 20000 = 1.28 M steps (§11) |
+| Constant | Value |
+|---|---:|
+| `puzzle-max-source-bytes` | 512 |
+| `puzzle-max-fuel` | 200000 |
+| `puzzle-max-allocations` | 400000 |
+| `puzzle-max-string-bytes` | 65536 |
+| `puzzle-max-eval-depth` | 128 |
+| `puzzle-min-par-bytes` | 24 |
+| `puzzle-max-generator-retries` | 64 |
+| `puzzle-max-k` | 8 |
+| `puzzle-complexity-min` | 16 |
+| `puzzle-complexity-max` | 4095 |
+| `puzzle-complexity-genesis` | 128 |
 
-Builtins (41), special forms (7), value domain, and error kinds are unchanged.
+### 2.2 Consensus
 
-### 2.2 Consensus (`sigil-coin-consensus`)
+| Constant | Value |
+|---|---:|
+| `coin-max-block-bytes` | 16384 |
+| `coin-max-solution-bytes` | 512 |
+| `coin-max-graffiti-bytes` | 400 |
+| `coin-max-shares` | 8 |
+| `coin-max-commitments` | 16 |
+| `coin-min-block-spacing` | 72000 |
+| `coin-max-future-drift` | 7200 |
+| `coin-median-time-span` | 11 |
+| `coin-retarget-window` | 16 |
+| `coin-target-margin` | 100 milli-units |
 
-| Constant | v1 | v2 | Justification |
-|---|---|---|---|
-| `coin-max-solution-bytes` | 256 | **512** | tracks `puzzle-max-source-bytes` |
-| `coin-max-graffiti-bytes` | 400 | 400 | unchanged; grinding it is inert in v2 (§5.4) |
-| `coin-max-block-bytes` | 8192 | **16384** | worst-case coinbase is 6588 B of scriptSig plus ~390 B of outputs (§6.6); 16384 leaves ~9.4 KB for transactions, more than 8192 ever gave |
-| `coin-max-shares` | — | **8** | see §6.6 sizing |
-| `coin-max-commitments` | — | **16** | 16 x 32 B = 512 B; 2x the reveal cap, so competing candidates fit |
-| `coin-min-block-spacing` | 72000 | 72000 | unchanged |
-| `coin-max-future-drift` | 7200 | 7200 | unchanged |
-| `coin-median-time-span` | 11 | 11 | unchanged |
-| emission constants | — | unchanged | v2 changes how the subsidy is *split*, never how much is emitted; `coin-max-supply` = 14302999991970 daviwils is untouched |
-
-### 2.3 Generator (`sigil-coin-puzzle/generator`)
-
-| Constant | Value | Justification |
-|---|---|---|
-| `puzzle-generator-version` | 2 | split marker |
-| `puzzle-min-par-bytes` | 24 | unchanged from v1; still the non-degeneracy floor, now on the hidden function's source |
-| `puzzle-max-generator-retries` | 64 | unchanged |
-| `puzzle-max-input-literal-bytes` | 8 | table-solution sizing (§8.3) |
-| `puzzle-max-output-literal-bytes` | 24 | table-solution sizing (§8.3) |
-| `puzzle-complexity-min` | 16 | floor of `C` |
-| `puzzle-complexity-max` | 4095 | 12 bits |
-| `puzzle-complexity-genesis` | 128 | tier 0, `k=3`, narrow grammar: a gentle launch |
-| `puzzle-retarget-window` | 16 | ~13 days mainnet, 16 s regtest; with a 30% beat-par rate the 16-sample median is stable, and 2016 would be 4.6 years at 20 h spacing |
-| `puzzle-target-margin` | 100 | milli-units: the retarget aims for the median achieved solution 10.0% under par. v1's observed beat-par median was 6 B on a 25–149 B par range, i.e. roughly 10% relative |
-
----
+Emission remains defined by `(sigil coin consensus emission)` and is independent
+of reward splitting.
 
 ## 3. Puzzle derivation
 
 ### 3.1 Seed
 
 ```
-seed(H) = SHA256d( "SigilCoin/puzzle/v2"          (19 ASCII bytes)
+seed(H) = SHA256d( "SigilCoin/puzzle/1"          (18 ASCII bytes)
                  || prev_hash                      (32 B, internal order)
                  || u64le(H)
                  || u32le(C(H)) )
 
-seed(0) = SHA256d( "SigilCoin/genesis/puzzle/v2" )
+seed(0) = SHA256d( "SigilCoin/genesis/puzzle/1" )
 ```
-
-`prev_hash` is the internal 32-byte double-SHA256 header hash, never the
-reversed display id. Domain separation from v1 is by the tag. `C(H)` is folded
-in so that a retarget changes the puzzle, which prevents a miner from
-pre-computing solutions across a retarget boundary.
 
 **Determinism.** Fixed-width fields make the preimage injective, so no two
 `(prev_hash, H, C)` triples share a seed. `C(H)` is derived from the parent
@@ -129,7 +82,7 @@ value exactly.
 ### 3.2 Puzzle spec
 
 ```
-puzzle-spec-v2 :=
+puzzle-spec :=
   height          integer
   complexity      C, 16..4095
   constraint      constraint-id, 0..7
@@ -204,7 +157,7 @@ there is a bug in this module rather than a bad block.
 
 **Determinism.** SplitMix64 over exact integers with explicit 64-bit masking,
 FNV-1a absorption of `(seed, H, retry)` with LEB128 self-delimiting integers,
-`let*`-sequenced draws, and the frozen v2 interpreter. No clock, no filesystem,
+`let*`-sequenced draws, and the frozen interpreter. No clock, no filesystem,
 no host randomness.
 
 ---
@@ -238,7 +191,7 @@ single numbers for the score.
 Bare builtins are legal solutions (`car` is 3 bytes). §3.4 step 7 guarantees no
 published puzzle is solved by one.
 
-### 4.2 New interpreter API
+### 4.2 Interpreter API
 
 ```
 (puzzle-run-examples source pairs) -> puzzle-report
@@ -250,7 +203,7 @@ published puzzle is solved by one.
   puzzle-report-index      failing example index, on solution-mismatch
 ```
 
-`puzzle-result` gains a `cells` field so `puzzle-eval` also reports charged
+`puzzle-result` includes a `cells` field so `puzzle-eval` also reports charged
 allocations. Consensus calls `puzzle-run-examples` and nothing else.
 
 ### 4.3 Validation order and tags
@@ -280,7 +233,7 @@ is not.
 
 80 bytes, of which SigilCoin controls three fields.
 
-| Field | Bits | v2 use |
+| Field | Bits |  use |
 |---|---|---|
 | `version` | 32 | pinned to 5 |
 | `time` | 32 | real timestamp, MTP and drift rules unchanged |
@@ -341,7 +294,7 @@ encoded in `W`.
 
 ### 5.4 Bucketing
 
-`cells` (0..100000) and `steps` (0..200000) do not fit 7 bits. They are
+`cells` (0..400000) and `steps` (0..200000) do not fit 7 bits. They are
 bucketed at six buckets per octave, ~12.2% resolution, using exact integer
 arithmetic only:
 
@@ -355,7 +308,7 @@ bucket7(x):
   return min(127, 1 + 6*kk + j)
 ```
 
-Range check: `bucket7(100000) = 100`, `bucket7(200000) = 106`. Both fit in 7
+Range check: `bucket7(400000) = 112`, `bucket7(200000) = 106`. Both fit in 7
 bits with headroom. `bucket7` is monotone non-decreasing.
 
 **The bucketed value is the consensus value.** Fork choice compares header words
@@ -363,21 +316,15 @@ and never body integers, so two solutions in one bucket are exactly tied and
 fall through to aggregate share quality. There is no second, finer order to keep consistent
 with the header. Precision loss is deliberate.
 
-At the survey's observed magnitudes (~300 steps, ~80 cells) the buckets are
-still fine: `bucket7(300) = 50` and `bucket7(340) = 51`. The metrics were inert in
-v1 because nothing read them, not because they lacked resolution.
-
 Worked example: `bucket7(1) = 1`, `bucket7(2) = 7`, `bucket7(300) = 50`,
 `bucket7(340) = 51`.
 
 ### 5.5 Header-to-body commitment
 
-`W` is a *claim*. Body validation recomputes `W` from the validated body and
-requires byte equality with the header. A mismatch is `score-mismatch`, the
-block is invalid, and the node marks the header and its descendants invalid
-permanently — the same discipline v1 used for the length commitment. This is
-what keeps fork choice decidable from headers alone without letting a liar
-outrank an honest chain.
+`W` is a claim. Body validation recomputes it from the validated block and
+requires exact equality with the header. A mismatch is `score-mismatch`; the
+block and its descendants are invalid. This makes header-only ranking safe:
+a false score cannot outrank a valid chain.
 
 ### 5.6 The order
 
@@ -410,25 +357,21 @@ solution by occupying strictly lower-order bits than every producer field: it
 decides exactly the comparisons the producer's own solution leaves tied, and
 nothing else.
 
-**The block-hash tie-break of v1 is deleted from consensus.** This is the
-producer's protection (§10.5). `coin-hash-compare` survives only for stable
-display ordering in the explorer and CLI, where it is not consensus.
-
 ### 5.7 Tip selection
 
-At equal `key`, blocks are incomparable and the incumbent tip is kept. This is
-first-seen, exactly as Bitcoin resolves equal-work siblings. It is order-
-dependent across nodes and converges the moment a child arrives, because height
-dominates the key. The `extended?` hysteresis of v1 is retained unchanged: a
-height that a taller header has already outgrown is settled and no sibling
-displaces it.
+At equal height and equal `W`, blocks are incomparable and the incumbent tip is
+kept. This first-seen rule is order-dependent across nodes and converges when a
+child gives one branch greater height. Once a taller header extends a tip, that
+height is settled and no sibling displaces it.
 
-`coin-better-chain?(candidate, incumbent)` in order:
+`coin-better-chain?(candidate, incumbent)` applies these rules:
 
-1. live beats settled (`extended?` as in v1)
-2. greater height wins
-3. lower `W` wins
-4. otherwise `#f` (incumbent keeps the tip)
+1. a live candidate does not replace a settled tip;
+2. greater height wins;
+3. at equal height, lower `W` wins;
+4. equal `W` keeps the incumbent.
+
+There is no block-hash tie-break. Hash ordering is presentation-only.
 
 ### 5.8 `chain-work` packing
 
@@ -443,10 +386,8 @@ accumulated = sum of saving over the chain, with an illegal header
               contributing 1
 ```
 
-`saving <= 2^32 < coin-rank-base`, so the digits never collide and both are
-recoverable. `accumulated` is strictly increasing along any chain, so no chain
-ranks below its own ancestor. As in v1, height outranks the packed number in
-`better-chain?`, and the packed number only ever decides between siblings.
+`saving` is smaller than `coin-rank-base`, so the packed components cannot
+collide. `accumulated` strictly increases along a valid chain.
 
 ---
 
@@ -464,13 +405,8 @@ The scriptSig is exactly five minimally-encoded data pushes:
 | 4 | COMMITS | 0–513 B | commitments for puzzle `H` (§7.1) |
 | 5 | GRAFFITI | 0–400 B | opaque |
 
-Decoding is strict and total, and closes with the same one-shot canonicality
-check v1 uses: re-encode what was read and require byte equality with the input.
-That single check rejects non-minimal pushes, non-minimal height encodings, and
-trailing bytes.
-
-New decoder tags: `wrong-field-count` (now expects 5), `shares-oversize`,
-`shares-malformed`, `commits-oversize`, `commits-malformed`.
+Decoder tags include `wrong-field-count`, `shares-oversize`,
+`shares-malformed`, `commits-oversize`, and `commits-malformed`.
 
 ### 6.2 SHARES encoding
 
@@ -501,7 +437,7 @@ share instead solves a public task personalized by its compressed payout key:
 
 ```
 global_seed = seed(P)
-share_seed  = SHA256d( "SigilCoin/share-puzzle/v2"
+share_seed  = SHA256d( "SigilCoin/share-puzzle/1"
                      || global_seed
                      || pubkey )
 ```
@@ -537,7 +473,7 @@ seeded tasks, while changing unrelated block fields cannot move a task.
 The signature preimage remains:
 
 ```
-share_preimage = SHA256d( "SigilCoin/share/v2"        (18 ASCII bytes)
+share_preimage = SHA256d( "SigilCoin/share/1"        (17 ASCII bytes)
                         || parent_prev_hash            (32 B)
                         || u64le(P)                    (the share's height)
                         || u32le(C(P))
@@ -667,10 +603,6 @@ GRAFFITI 400 data +   3         =  403
                                    6588  = coin-max-coinbase-script-bytes
 ```
 
-Plus 10 outputs at ~34 B and ~50 B of transaction overhead: ~6720 B of
-coinbase. Against `coin-max-block-bytes = 16384` that leaves ~9.6 KB for
-transactions, which is more than the whole v1 block.
-
 `coin-min-coinbase-script-bytes` is derived from the encoder as today, and is 8:
 height 0 (`OP_0`, 1), a 1-byte solution (2), `SHARES = #u8(0)` (2),
 `COMMITS = #u8(0)` (2), empty graffiti (`OP_0`, 1). SHARES and COMMITS are never
@@ -678,7 +610,7 @@ zero-length pushes because the count byte is always present, which is what makes
 the canonicality re-encode check unambiguous.
 
 `R = 8` is chosen so the coinbase stays under 7 KB at a 16 KB cap. Raising `R`
-to 16 needs a 32 KB cap; that is the documented upgrade path, not a v2 concern.
+to 16 needs a 32 KB cap; that is the documented upgrade path, not a current concern.
 
 ### 6.7 Determinism
 
@@ -694,7 +626,7 @@ output shape is fully determined by `R`. Two nodes cannot disagree.
 ### 7.1 Commitment format
 
 ```
-commitment = SHA256d( "SigilCoin/commit/v2"     (19 ASCII bytes)
+commitment = SHA256d( "SigilCoin/commit/1"     (18 ASCII bytes)
                     || share_preimage           (32 B, exactly as in §6.3)
                     || blind                    (32 B, miner-chosen) )
 
@@ -709,12 +641,9 @@ The `blind` is 32 bytes of the miner's choosing. Without it, the commitment
 would be a hash over public-plus-solution data and an attacker with a guessable
 solution space could confirm a guess. With it, the commitment is hiding.
 
-**The blind is published in the reveal, not withheld.** An earlier draft of
-this section said it was never published, which made §6.4's commitment check
-uncheckable: no validator can recompute `commitment` without it, so the check
-would have to be dropped, and dropping it makes the carrier payment fakeable
-— a producer could claim carrier weight for commitments nobody ever made. The
-blind therefore rides in the reveal alongside the signature:
+**The blind is published in the reveal.** A validator needs it to recompute
+the commitment and prove membership in the parent's COMMITS. The blind rides
+alongside the signature:
 
 ```
 reveal := pubkey (33 B) || sig (64 B) || blind (32 B) || u16le len || solution
@@ -812,10 +741,6 @@ nothing because nobody can reveal them.
 there exists a solution that any miner can construct mechanically from public
 data.
 
-The v1 escape — quote the target literal — is gone, because the answer is a
-function and there is no literal to quote. It is replaced by the **table
-solution**.
-
 ### 8.1 Public data available to a miner
 
 `prev_hash` (from the parent header), `H`, `C(H)` (derived, and committed in
@@ -842,9 +767,7 @@ Per test branch: 18 + `|i|` + `|o|`. The bare wrapper `(lambda(x)` + `)` is 11
 bytes, and a constraint repair adds to it: `ci 3` (`letrec` required) is the
 worst at +29, `ci 7` (`fold` required) +24.
 
-**The arithmetic in the first draft of this section was wrong, and the
-implementation caught it.** At `k = 10`, `|i| <= 8`, `|o| <= 24`, the worst
-reachable table is not 486 bytes:
+The exact size bounds rule out `k = 10`. At `|i| <= 8` and `|o| <= 24`:
 
 ```
 ci 3, k = 10 : 40 + 9 * (18 + 8 + 24) + 25 = 515   > 512, INFEASIBLE
@@ -869,8 +792,7 @@ true maximum over all accepted inputs.
 
 The generator does not trust any of this arithmetic: §3.4 step 8 constructs the
 actual table solution, prints it, parses it, constraint-checks it, and runs it
-against all `k` pairs before a puzzle can be published. That check is what
-found the 515-byte case; the numbers here are documentation, not the guarantee.
+against all `k` pairs before a puzzle can be published. The executable check is the guarantee; these bounds document it.
 
 ### 8.4 Constraint repair transforms
 
@@ -1057,11 +979,6 @@ would miss a hand-built `(quote x)`; the AST check alone would miss nothing, but
 the byte check is `O(n)` and runs before parsing, which is the cheap rejection
 path.
 
-Rule 4's "free" is essential: a solution that binds `(let ((map ...)) ...)` uses
-`map` as a local, not a builtin, and the walker's `B` set gets that right
-because builtin names are shadowable in v1/v2 semantics while special-form names
-are not.
-
 Costs: one `O(|s|)` byte scan plus one `O(|ast|)` walk, both bounded by 512
 bytes of source. Negligible against evaluation.
 
@@ -1078,18 +995,13 @@ The producer's own solution for puzzle `H` is necessarily revealed in block `H`
 and cannot be committed in advance, because puzzle `H` does not exist until
 block `H-1` does. Three things together make copying it unprofitable:
 
-1. **No hash tie-break.** A thief who copies the solution byte-for-byte produces
-   an identical `(L, MB, SB)`. In v1 he would then grind the 400-byte graffiti
-   until his block hash was lower and take the tip with certainty. In v2 an
-   equal `W` never displaces an incumbent (§5.6, §5.7), so the grind buys
-   nothing.
-2. **Aggregate verified work.** To get a strictly lower `W` at equal
-   `(L, MB, SB)` the thief must carry greater `Q`: under-par solutions to
-   pubkey-personalized tasks, from commitments in block `H-1`, with every
-   accepted reveal paid by the unchanged reward split. Extra keys or
-   same-score wrappers alone contribute nothing.
-3. **`extended?` hysteresis.** Once any taller header exists, height `H` is
-   settled and no sibling displaces it at all.
+1. **No hash tie-break.** Copying the solution produces the same
+   `(L, MB, SB)`, and equal `W` never displaces the incumbent.
+2. **Aggregate verified work.** Strictly improving `W` after copying requires
+   greater `Q`: valid under-par solutions to personalized tasks committed in
+   block `H-1`, with every reveal paid by the reward split.
+3. **Settled-height hysteresis.** Once a taller header exists, height `H` is
+   settled and no sibling displaces it.
 
 What remains: a thief who copies the solution *and* matches aggregate quality
 produces an incomparable sibling. Nodes that saw the producer's block first keep
@@ -1101,7 +1013,7 @@ same-block reveal can be protected against.
 
 ## 11. Validation cost
 
-Per block, worst case, with the frozen v2 caps:
+Per block, worst case, with the frozen caps:
 
 | Work | Bound | Notes |
 |---|---|---|
@@ -1116,9 +1028,6 @@ Per block, worst case, with the frozen v2 caps:
 | dedup | 9 x 9 byte compares of <= 512 B | ~40 KB of memcmp |
 | commitment lookup | 8 lookups in a 16-element set | parent's COMMITS |
 | transactions | Bitcoin's existing cost | unchanged |
-
-Puzzle-language steps calibrate at ~5.5 microseconds per step under hostile
-programs (5.5 s per 1e6 steps, measured in v1). So:
 
 ```
 solutions      : 1.8 M steps   ~=  9.9 s
@@ -1162,179 +1071,48 @@ into Bitcoin's connector, which is the only supported path.
 
 ---
 
-## 12. Migration
-
-### 12.1 `sigil-coin-puzzle`
-
-- `puzzle.sgl`: bump `puzzle-language-version` to 2; `puzzle-max-source-bytes`
-  512; `puzzle-max-fuel` 200000; add `cells` to `puzzle-result`; add
-  `puzzle-run-examples` and the `puzzle-report` record; add a quote-free value
-  printer for constraint 2. The evaluator core, builtins, special forms, error
-  kinds, and value model are untouched.
-- `generator.sgl`: substantially rewritten. `puzzle-spec` gains `complexity`,
-  `constraint`, `k`, `examples`, `hidden-source`, `table-solution` and loses
-  `target` and `solution`. New: the constraint catalogue and walker, the
-  constraint-restricted example domains, the 1-arity builtin degeneracy probe,
-  the table-solution builder and repair transforms, and
-  `puzzle-generator-max-fuel`. `puzzle-prng` is unchanged and stays frozen.
-- New module `puzzle/constraints.sgl` holding the catalogue, the walker, and
-  `constraint-ok?`, imported by both the generator and consensus. Keeping it out
-  of `puzzle.sgl` keeps the interpreter free of anything that is not the
-  language.
-
-**Tests that break:** `test-generator.sgl` entirely — every assertion about
-`puzzle-spec-target`, `puzzle-spec-solution`, the target byte band
-(`puzzle-min-target-bytes` / `puzzle-max-target-bytes` are deleted), the
-`iota`-run par rewrite, and the fallback source. `test-puzzle.sgl` breaks only
-where it asserts `puzzle-max-source-bytes = 256` or `puzzle-max-fuel = 1000000`,
-plus any test asserting `puzzle-result` field arity.
-
-### 12.2 `sigil-coin-consensus`
-
-- `seed.sgl`: new tag, `C` folded into the preimage, new genesis tag. Signature
-  becomes `coin-puzzle-seed(prev-hash, height, complexity)`.
-- `coinbase.sgl`: five pushes instead of three; SHARES and COMMITS codecs; new
-  tags. The canonicality re-encode check is kept verbatim — it is the single
-  best thing in the v1 codec.
-- `solution.sgl`: PBE checking against `k` pairs on one machine, 1-arity
-  procedure requirement, constraint checks, and the new tags.
-- `fork-choice.sgl`: `coin-solution-compare` and `coin-better-solution?` are
-  replaced by `coin-score-compare` over 32-bit words. `coin-hash-compare` stays
-  but leaves consensus. `coin-replaces-tip?` requires a strictly lower `W`.
-- New `score.sgl`: `bucket7`, `coin-score-encode`, `coin-score-decode`,
-  `coin-score-from-block`; its low field commits `(15-Q)`, not raw `R`.
-- New `shares.sgl`: personalized share seed and PBE derivation, under-par
-  validation, contribution and `Q`, share preimage, verification, ordering,
-  dedup, and unchanged split arithmetic.
-- New `retarget.sgl`: margin, median, clamp, `bits` codec.
-- `rules.sgl`: `coin-max-block-bytes` 16384. Timestamp rules unchanged.
-- `emission.sgl`: **unchanged**. The split is an output-shape rule; total
-  emission and `coin-max-supply` are untouched.
-
-**Tests that break:** `test-coinbase.sgl` entirely (three-push format).
-`test-consensus.sgl` where it asserts solution semantics or fork-choice
-tie-breaking by hash. `test-emission.sgl` should pass unchanged, and if it does
-not, emission was touched by mistake.
-
-### 12.3 `sigil-coin-node`
-
-- `rules.sgl`: `coin-header-version` 5; `coin-header-bits` becomes the
-  `0x207F0000 | C` codec plus a derived-value check instead of an equality
-  check; `coin-header-solution-length` becomes `coin-header-score`;
-  `coin-rank-base` becomes `2^32 + 1` and `coin-solution-saving` becomes
-  `2^32 - W`; `coin-better-chain?` drops the hash tie-break.
-  `coin-accept-header?` gains the `C` derivation, which means it now needs the
-  parent chain's last 16 headers — `previous-headers` already supplies a
-  window, and the window requirement grows from 11 (MTP) to 16.
-- `body.sgl`: coinbase script bounds become 8..6588; new validation order
-  (§11); the header commitment check compares `W`, not a length.
-- `chain.sgl`: `max-block-bytes`, `max-solution-bytes`, `max-coinbase-script-bytes`
-  and the advertised `puzzle-generator-version` all move; add
-  `complexity-genesis` and `retarget-window` to the advertised parameters.
-- `genesis.sgl`: builds a v2 genesis (version 5, `bits = 0x207F0080`, `nonce` =
-  the genesis block's own `W`, five-push coinbase with empty SHARES and
-  COMMITS).
-- `miner.sgl`: mines against examples rather than a target; must construct the
-  table solution as its floor and then search for something shorter; must
-  collect reveals and build the split outputs.
-
-**Tests that break:** `test-node.sgl` and `test-chain.sgl` wherever they build
-headers with version 4, `bits = 0x207fffff`, or a nonce holding a solution
-length; `test-network.sgl` block construction, which builds coinbases directly.
-The network test's own findings still hold and are unaffected by v2:
-`sigil-bitcoin` has no getdata/block responder, and
-`db-best-chain-header-rows-after` resolves locators by height across branches.
-
-### 12.4 `sigil-coin-cli` and `sigil-coin-explorer`
-
-- CLI `mine`: the whole solver changes; add `commit` and `reveal` subcommands
-  and a share wallet key.
-- CLI `operate`/status: renders `W` fields instead of a solution length.
-- Explorer: block pages show the examples, the constraint, `C`, the score
-  fields, and the share table with payouts. `store.sgl` gains share and
-  commitment columns.
-
-### 12.5 Genesis regeneration
-
-Required, because the seed tag, the header version, `bits`, and the coinbase
-format all change.
-
-1. Derive `seed(0) = SHA256d("SigilCoin/genesis/puzzle/v2")` and generate the
-   height-0 puzzle at `C = 128`.
-2. Solve it (the table solution is acceptable for genesis).
-3. Build the coinbase: height `OP_0`, the solution, empty SHARES (`R = 0`),
-   empty COMMITS (`K = 0`), the chosen graffiti.
-4. Compute `W` from the body and set `nonce = W`; set `bits = 0x207F0080`,
-   `version = 5`.
-5. Regenerate `deploy/genesis-constants.sgl` with the new header, hash, and
-   merkle root.
-6. Update `LAUNCH.md`.
-
-Genesis carries no shares, so `Q = 0` and its `W` quality field is `15-Q = 15`
-in bits [7:4], with zero in [3:0].
-
----
-
-## 13. Complete failure tag index
+## 12. Complete failure tag index
 
 | Tag | Source | Meaning |
 |---|---|---|
-| `not-bytevector`, `malformed-script`, `wrong-field-count`, `not-a-push`, `bad-height`, `non-canonical` | coinbase codec | as v1, `wrong-field-count` now expects 5 |
-| `solution-empty`, `solution-oversize`, `graffiti-oversize` | coinbase codec | as v1, new solution bound 512 |
-| `shares-oversize`, `shares-malformed`, `shares-unordered`, `shares-at-genesis` | SHARES codec | |
-| `commits-oversize`, `commits-malformed`, `commits-unordered` | COMMITS codec | |
-| `solution-malformed`, `solution-parse-failed`, `solution-eval-failed` | solution check | |
-| `solution-not-a-procedure` | solution check | result is not a 1-arity procedure |
-| `solution-mismatch` | solution check | detail is the failing example index |
-| `constraint-violated` | constraint check | detail names the rule |
-| `share-bad-pubkey`, `share-bad-signature`, `share-uncommitted`, `share-duplicate-solution`, `share-not-under-par` | share check | personalized task or share binding failed |
-| `share-solution-*` | share check | the solution tags above, prefixed |
-| `coinbase-output-shape`, `coinbase-output-value` | split check | |
-| `score-mismatch` | header commitment | recomputed `W` differs from the header |
-| `score-reserved-nonzero` | header field check | low nibble non-zero; every `15-Q` nibble is legal |
-| `bits-prefix`, `bits-reserved-nonzero`, `complexity-mismatch`, `complexity-range` | `bits` check | |
-| `height-mismatch`, `missing-coinbase`, `block-oversize`, `malformed-block` | as v1 | |
-| `internal-error` | anywhere | a check raised; always a bug |
+| `not-bytevector`, `malformed-script`, `wrong-field-count`, `not-a-push`, `bad-height`, `non-canonical` | coinbase codec | malformed or non-canonical payload |
+| `solution-empty`, `solution-oversize`, `graffiti-oversize` | coinbase codec | field exceeds frozen bounds |
+| `shares-oversize`, `shares-malformed`, `shares-unordered`, `shares-at-genesis` | SHARES codec | invalid reveal set |
+| `commits-oversize`, `commits-malformed`, `commits-unordered` | COMMITS codec | invalid commitment set |
+| `solution-malformed`, `solution-parse-failed`, `solution-eval-failed` | solution check | malformed source or interpreter failure |
+| `solution-not-a-procedure`, `solution-mismatch` | solution check | wrong result shape or examples not reproduced |
+| `constraint-violated` | constraint check | source or AST violates selected rule |
+| `share-bad-pubkey`, `share-bad-signature`, `share-uncommitted`, `share-duplicate-solution`, `share-not-under-par` | share check | personalized task or binding failed |
+| `share-solution-*` | share check | solution rejection, prefixed for a share |
+| `coinbase-output-shape`, `coinbase-output-value` | reward split | output count, scripts, or values differ |
+| `score-mismatch`, `score-reserved-nonzero` | score check | body commitment differs or reserved bits are set |
+| `bits-prefix`, `bits-reserved-nonzero`, `complexity-mismatch`, `complexity-range` | complexity check | invalid or incorrect `bits` commitment |
+| `height-mismatch`, `missing-coinbase`, `block-oversize`, `malformed-block` | block check | malformed block envelope or body |
+| `internal-error` | any check | implementation failure while validating |
 
 ---
 
-## 14. Open questions
+## 13. Open questions
 
 **1. Commitment censorship has no in-protocol defence.**
 A producer can simply omit COMMITS. The carrier output (§7.4) pays him to
 include them, but a miner who expects to win most heights is better off
-excluding everyone. *Recommendation:* ship v2 as specified and measure. The
+excluding everyone. *Recommendation:* ship as specified and measure. The
 cheapest real fix, if censorship shows up, is to make the commitment count a
 soft input to retargeting — a chain whose blocks carry no commitments is
 treated as easier and gets a higher `C` — which costs the censor difficulty
 rather than requiring a new mechanism. Do not build that until the behaviour is
 observed.
 
-**2. The producer/share weight split (2 vs 1) is a guess.**
-At `R = 8` the producer keeps 18.2%. If that is too little, producers will carry
-less share work than the quality tie-break rewards; if too much, sharing is not worth the
-sharer's effort. There is no survey data on this, because v1 had no shares.
-*Recommendation:* start at 2/1/1 and treat it as the first constant to revisit
-after a month of mainnet. It is a pure output-shape rule, so changing it is a
-one-line consensus change with no structural consequences.
-
-**3. Aggregate-quality bands are launch constants.**
+**2. Aggregate-quality bands are launch constants.**
 The 5%, 10%, and 15% contribution steps prevent raw-key multiplication from
 ranking like deep work, but no live co-op margin distribution exists yet.
 *Recommendation:* ship the four frozen bands and measure. Distinct shares mean
 distinct personalized tasks, not distinct owners; ownership identity is neither
-observable nor required by consensus. Revisit bands only in a future chain
-version if observed margins cluster pathologically around a boundary.
+observable nor required by consensus. Revisit bands only through an explicit hard fork if observed margins cluster
+pathologically around a boundary.
 
-**4. Retarget window of 16 is short.**
-At mainnet spacing that is ~13 days, but the margin distribution is heavy-tailed
-(70% of v1 blocks did not beat par at all), so a 16-sample median can jump. The
-0.25x–4x clamp bounds the damage per window, but `C` could oscillate.
-*Recommendation:* 16 for launch, because a young chain needs feedback more than
-it needs stability, and revisit to 32 if two consecutive retargets move `C` by
-more than 2x in opposite directions.
-
-**5. `k` and grammar width both scale with `C`, and they interact.**
+**3. `k` and grammar width both scale with `C`, and they interact.**
 Raising `k` makes overfitting more expensive (good) but also makes the table
 solution longer, which pushes against the 512-byte cap. This was measured and
 resolved: `k = 10` reaches 515 bytes under the `letrec` repair and does not

@@ -1,98 +1,116 @@
-;;; (sigil coin consensus fork-choice) — ranking siblings at one height
+;;; (sigil coin consensus fork-choice) — ranking blocks
 ;;;
-;;; Among valid blocks at the same height the SHORTEST solution wins. A tie
-;;; on length is broken by the LOWEST block hash, comparing the internal
-;;; 32-byte double-SHA256 header hash byte by byte from index 0 — the same
-;;; bytes a header carries in `previous-block`, not the reversed display id.
-;;; That order is frozen: comparing the display id instead would reverse
-;;; roughly half of all tie-breaks.
+;;; The block key is `key(b) = (height(b), W(b))` and the order is (§5.6):
 ;;;
-;;; The tip rule this induces is not longest-chain alone. A strictly better
-;;; sibling replaces the current tip, but only while the tip is still
-;;; childless: once a child extends the tip the height is settled and normal
-;;; longest-chain applies, so a late short solution cannot reorganise a chain
-;;; that has already moved on.
+;;;   b1 < b2  iff  height(b1) > height(b2)
+;;;                 or (height(b1) = height(b2) and W(b1) < W(b2))
 ;;;
-;;; `puzzle-spec-par` plays no part. Par is an upper bound the generator
-;;; happens to know, and solutions below it are legal and expected; ranking
-;;; against par would reject exactly the blocks the game is trying to
-;;; reward.
+;;; where "<" means "is the better tip". Height dominates, so this is
+;;; longest-chain first; `W` only ever decides between siblings.
+;;;
+;;; HOW AGGREGATE QUALITY COMPOSES. `W` packs
+;;; `(L-1, MB, SB, 15-Q)` into disjoint fixed-width fields, most significant
+;;; first, so unsigned `<` on `W` is lexicographic `<` on that tuple (see
+;;; `(sigil coin consensus score)` for why). `15-Q` occupies the four bits
+;;; BELOW every producer field. Therefore verified co-op work changes two
+;;; blocks' order only when `(L, MB, SB)` tie. Raw reveal count `R` remains a
+;;; separate reward-split input and cannot buy ranking.
+;;;
+;;; STRICT WEAK ORDERING. Let `f(b) = (-height(b), W(b))` in Z x Z under the
+;;; lexicographic order, which is a strict total order because both
+;;; components are. Then `b1 < b2` iff `f(b1) < f(b2)`, so:
+;;;
+;;;   irreflexive               lexicographic `<` on a total order is
+;;;   asymmetric                  irreflexive and asymmetric
+;;;   transitive                inherited
+;;;   incomparability is        `b1` and `b2` are incomparable iff
+;;;     transitive                `f(b1) = f(b2)`, and equality is an
+;;;                               equivalence relation
+;;;
+;;; which is exactly the definition of a strict weak ordering. Its
+;;; equivalence classes are "same height, same score word". Extending `W`
+;;; with the share field does not touch this proof: `W` is still one
+;;; integer, and the axioms are properties of the lexicographic order on
+;;; `Z x Z`, not of how `W`'s bits are spent.
+;;;
+;;; THERE IS NO BLOCK-HASH TIE-BREAK, AND ONE MUST NOT BE ADDED.
+;;; A thief who copies the producer's own solution — which he can, it is
+;;; published in the clear with no commitment possible (§7.5) — produces a
+;;; block that scores IDENTICALLY. If hash broke that tie he could grind
+;;; graffiti until his block sorted lower and take the height. With no hash
+;;; tie-break the two blocks are incomparable, `coin-replaces-tip?`
+;;; answers `#f`, and the incumbent keeps the tip. First-seen decides, and
+;;; first-seen is the honest producer, because the thief had to see the
+;;; block to copy it.
+;;;
+;;; Equal keys being incomparable is order-dependent across nodes, exactly
+;;; as Bitcoin's equal-work siblings are, and converges the moment a child
+;;; arrives because height dominates the key.
 
 (define-library (sigil coin consensus fork-choice)
   (import (sigil math)
-          (sigil bitcoin utils))
+          (sigil coin consensus score))
   (export
-    coin-hash-compare
-    coin-solution-compare
-    coin-better-solution?
+    coin-block-compare
+    coin-better-block?
     coin-replaces-tip?)
 
   (begin
 
-    ;;; Compare two internal 32-byte block hashes.
-    ;;;
-    ;;; Returns -1 when `a` is lower, 1 when `b` is lower, 0 when equal.
-    ;;;
-    ;;; ```scheme
-    ;;; (coin-hash-compare (make-bytevector 32 0) (make-bytevector 32 1))
-    ;;; ; => -1
-    ;;; ```
-    (define (coin-hash-compare a b)
-      (: bytevector? bytevector? -> integer?)
-      (require-bytevector-length "coin-hash-compare" a 32)
-      (require-bytevector-length "coin-hash-compare" b 32)
-      (let loop ((i 0))
-        (if (>= i 32)
-            0
-            (let ((x (bytevector-u8-ref a i))
-                  (y (bytevector-u8-ref b i)))
-              (cond
-                ((< x y) -1)
-                ((> x y) 1)
-                (else (loop (+ i 1))))))))
+    (define (require-height who height)
+      (if (not (and (number? height) (exact? height) (integer? height)
+                    (>= height 0)))
+          (error (string-append who ": height out of range")))
+      height)
 
-    ;;; Rank two valid blocks at the same height.
+    ;;; Rank two blocks by `key = (height, W)`. Lower is the better tip.
     ;;;
-    ;;; Returns -1 when the first is the better block, 1 when the second is,
-    ;;; and 0 only when the two are indistinguishable to fork choice, which
-    ;;; for distinct valid blocks means they are the same block.
+    ;;; Returns -1 when the first block is better, 1 when the second is, and
+    ;;; 0 when the two are INCOMPARABLE — same height, same score word — in
+    ;;; which case the caller keeps whatever it already has.
     ;;;
     ;;; ```scheme
-    ;;; (coin-solution-compare #u8(1) hash-a #u8(1 2) hash-b) ; => -1
+    ;;; (coin-block-compare 2 999 1 0)  ; => -1
+    ;;; (coin-block-compare 1 40 1 40)  ; => 0
     ;;; ```
-    (define (coin-solution-compare a-solution a-hash b-solution b-hash)
-      (: bytevector? bytevector? bytevector? bytevector? -> integer?)
-      (require-bytevector "coin-solution-compare" a-solution)
-      (require-bytevector "coin-solution-compare" b-solution)
-      (let ((a-len (bytevector-length a-solution))
-            (b-len (bytevector-length b-solution)))
-        (cond
-          ((< a-len b-len) -1)
-          ((> a-len b-len) 1)
-          (else (coin-hash-compare a-hash b-hash)))))
+    (define (coin-block-compare a-height a-score b-height b-score)
+      (: integer? integer? integer? integer? -> integer?)
+      (require-height "coin-block-compare" a-height)
+      (require-height "coin-block-compare" b-height)
+      (cond
+        ((> a-height b-height) -1)
+        ((< a-height b-height) 1)
+        (else (coin-score-compare a-score b-score))))
 
     ;;; True when the first block strictly outranks the second.
     ;;;
     ;;; ```scheme
-    ;;; (coin-better-solution? #u8(1) hash-a #u8(1 2) hash-b) ; => #t
+    ;;; (coin-better-block? 1 40 1 48) ; => #t
     ;;; ```
-    (define (coin-better-solution? a-solution a-hash b-solution b-hash)
-      (: bytevector? bytevector? bytevector? bytevector? -> boolean?)
-      (< (coin-solution-compare a-solution a-hash b-solution b-hash) 0))
+    (define (coin-better-block? a-height a-score b-height b-score)
+      (: integer? integer? integer? integer? -> boolean?)
+      (< (coin-block-compare a-height a-score b-height b-score) 0))
 
-    ;;; True when `candidate` should displace the current tip.
+    ;;; True when a sibling should displace the current tip (§5.7).
     ;;;
     ;;; `tip-extended?` is whether a child already builds on the tip. Once
     ;;; one does, the height is settled and no sibling displaces it however
-    ;;; short its solution; before that, a strictly better sibling wins.
+    ;;; good its score; before that, a STRICTLY lower score word wins and an
+    ;;; equal one does not.
+    ;;;
+    ;;; That hysteresis is also what protects a revealed share (§7.5). A
+    ;;; reveal for puzzle `P` is published in a block at height `P+1`, so by
+    ;;; the time a thief can read it, height `P` has already been extended by
+    ;;; the very block that carried it and no sibling of `P` can take it
+    ;;; back. The reveal is safe precisely because publishing it requires a
+    ;;; block that settles its height.
     ;;;
     ;;; ```scheme
-    ;;; (coin-replaces-tip? #u8(1 2) tip-hash #f #u8(1) new-hash)   ; => #t
-    ;;; (coin-replaces-tip? #u8(1 2) tip-hash #t #u8(1) new-hash)   ; => #f
+    ;;; (coin-replaces-tip? 48 #f 40) ; => #t
+    ;;; (coin-replaces-tip? 48 #t 40) ; => #f
+    ;;; (coin-replaces-tip? 40 #f 40) ; => #f
     ;;; ```
-    (define (coin-replaces-tip? tip-solution tip-hash tip-extended?
-                                candidate-solution candidate-hash)
-      (: bytevector? bytevector? boolean? bytevector? bytevector? -> boolean?)
+    (define (coin-replaces-tip? tip-score tip-extended? candidate-score)
+      (: integer? boolean? integer? -> boolean?)
       (and (not tip-extended?)
-           (coin-better-solution? candidate-solution candidate-hash
-                                  tip-solution tip-hash)))))
+           (coin-score-better? candidate-score tip-score)))))

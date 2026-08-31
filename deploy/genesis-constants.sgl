@@ -12,8 +12,8 @@
 ;;;     sigil deploy/genesis-constants.sgl --redirects ./dev-redirects.sgl
 ;;;
 ;;; Edit QUOTE and TIME below, run it, then paste the two hex strings into
-;;; `coin-genesis-header-constant` and `coin-genesis-id-constant` and the
-;;; quote and time into `coin-genesis-quote` and `coin-genesis-time`.
+;;; `coin-genesis-header-constant` and `coin-genesis-id-constant` in the
+;;; genesis module, and quote/time into the chain module.
 ;;; `test-node.sgl` rebuilds genesis from the quote and asserts the
 ;;; constants, so a mismatch fails the suite rather than shipping.
 
@@ -29,7 +29,7 @@
 
 (println "quote: ~a" QUOTE)
 ;; BYTES, not characters. The quote becomes coinbase graffiti verbatim via
-;; `string->utf8`, and the graffiti cap (400 B) and the block cap (8192 B)
+;; `string->utf8`, and the graffiti cap (400 B) and block cap (16384 B)
 ;; are byte limits. `string-length` would under-count any non-ASCII quote and
 ;; report a quote as legal that the consensus rules reject.
 (println "quote-bytes: ~a" (bytevector-length (string->utf8 QUOTE)))

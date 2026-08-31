@@ -1,55 +1,91 @@
-;;; (sigil coin consensus seed) — puzzle seed derivation
+;;; (sigil coin consensus seed) — canonical puzzle seed derivation
 ;;;
-;;; Every block's puzzle is a pure function of the chain, so the seed handed
-;;; to `puzzle-for` must be unambiguous down to the byte:
-;;;
-;;;   seed(height) = SHA256d(previous-block-hash || u64le(height))
-;;;
-;;; Two encoding decisions are frozen here:
-;;;
-;;;   * `previous-block-hash` is the INTERNAL 32-byte double-SHA256 header
-;;;     hash, exactly the bytes `block-header-hash` returns and exactly the
-;;;     bytes a header carries in its `previous-block` field. It is NOT the
-;;;     reversed, big-endian display id that `block-header-id` prints.
-;;;   * the height is a fixed-width 8-byte unsigned LITTLE-ENDIAN integer,
-;;;     matching every other integer on the Bitcoin wire. Fixed width means
-;;;     the concatenation is injective, so no two (hash, height) pairs share
-;;;     a seed.
-;;;
-;;; Genesis has no predecessor, so its seed cannot be derived and is defined
-;;; outright as SHA256d over a domain-separated ASCII tag. Deriving it from
-;;; the all-zero previous hash instead would collide with any future height
-;;; whose parent hash happened to be zero, which is not a risk worth leaving
-;;; open for the sake of one branch.
+;;; seed(H) = SHA256d(tag || prev_hash || u64le(H) || u32le(C(H))).
+;;; Genesis uses its own frozen domain tag. Caller-owned bounded caches memoize
+;;; pure `(prev_hash, height, complexity)` derivation without changing results.
 
 (define-library (sigil coin consensus seed)
-  (import (sigil math)
+  (import (sigil struct)
+          (sigil math)
+          (sigil list)
           (sigil bitcoin utils)
           (sigil bitcoin primitives)
           (sigil coin puzzle generator))
   (export
+    ;; Domain separation
+    coin-puzzle-tag
     coin-genesis-seed-tag
     coin-genesis-seed
+
+    ;; Derivation
     coin-height-encode
+    coin-complexity-encode
     coin-puzzle-seed
-    coin-puzzle-for)
+    coin-puzzle-for
+
+    ;; Caching
+    coin-puzzle-cache
+    coin-puzzle-cache?
+    coin-puzzle-cache-capacity
+    coin-puzzle-cache-entries
+    coin-puzzle-cache-open
+    coin-puzzle-cache-size
+    coin-puzzle-cache-ref
+    coin-puzzle-cached)
 
   (begin
 
     (define %max-height #xffffffff)
+    (define %seed-bytes 32)
     (define %zero-hash (make-bytevector 32 0))
 
+    ;;; Domain-separation tag folded into every non-genesis seed preimage.
+    ;;;
+    ;;; ```scheme
+    ;;; coin-puzzle-tag ; => "SigilCoin/puzzle/1"
+    ;;; ```
+    (define coin-puzzle-tag "SigilCoin/puzzle/1")
+
     ;;; Domain-separation tag whose SHA256d is the genesis puzzle seed.
-    (define coin-genesis-seed-tag "SigilCoin/genesis/puzzle/v1")
+    (define coin-genesis-seed-tag "SigilCoin/genesis/puzzle/1")
 
     ;;; The genesis puzzle seed: 32 bytes, defined rather than derived.
+    ;;;
+    ;;; Genesis has no predecessor, so deriving it from the all-zero
+    ;;; previous hash would collide with any future height whose parent hash
+    ;;; happened to be zero. `C` is deliberately NOT folded in here: there is
+    ;;; exactly one genesis and its complexity is the frozen
+    ;;; `puzzle-complexity-genesis`.
     (define coin-genesis-seed (hash256 coin-genesis-seed-tag))
+
+    ;; The tag is ASCII by construction, so one byte per character. Written
+    ;; out rather than taken from a string encoder because the preimage is
+    ;; consensus and must not depend on a host's encoding choices.
+    (define (ascii->bytes s)
+      (let* ((n (string-length s))
+             (bv (make-bytevector n 0)))
+        (let loop ((i 0))
+          (if (>= i n)
+              bv
+              (begin
+                (bytevector-u8-set! bv i (char->integer (string-ref s i)))
+                (loop (+ i 1)))))))
+
+    (define %tag-bytes (ascii->bytes coin-puzzle-tag))
 
     (define (require-height who height)
       (if (not (and (number? height) (exact? height) (integer? height)
                     (<= 0 height %max-height)))
           (error (string-append who ": height out of range")))
       height)
+
+    (define (require-complexity who complexity)
+      (if (not (and (number? complexity) (exact? complexity)
+                    (integer? complexity)
+                    (<= puzzle-complexity-min complexity)
+                    (<= complexity puzzle-complexity-max)))
+          (error (string-append who ": complexity out of range")))
+      complexity)
 
     ;;; Encode a height as the 8 fixed-width little-endian bytes the seed
     ;;; preimage uses.
@@ -62,38 +98,181 @@
       (require-height "coin-height-encode" height)
       (u64-le height))
 
-    ;;; Derive the 32-byte puzzle seed for a block.
-    ;;;
-    ;;; `previous-hash` is the internal 32-byte header hash of the parent.
-    ;;; At height 0 there is no parent: the previous hash must be the 32 zero
-    ;;; bytes a genesis header carries, and the frozen `coin-genesis-seed` is
-    ;;; returned instead of a derivation.
+    ;;; Encode a complexity as the 4 fixed-width little-endian bytes the
+    ;;; seed preimage uses.
     ;;;
     ;;; ```scheme
-    ;;; (bytevector-length (coin-puzzle-seed (make-bytevector 32 0) 0)) ; => 32
-    ;;; (equal? coin-genesis-seed (coin-puzzle-seed (make-bytevector 32 0) 0))
-    ;;; ; => #t
+    ;;; (coin-complexity-encode 128) ; => #u8(128 0 0 0)
     ;;; ```
-    (define (coin-puzzle-seed previous-hash height)
-      (: bytevector? integer? -> bytevector?)
+    (define (coin-complexity-encode complexity)
+      (: integer? -> bytevector?)
+      (require-complexity "coin-complexity-encode" complexity)
+      (u32-le complexity))
+
+    ;;; Derive the 32-byte canonical puzzle seed for a block.
+    ;;;
+    ;;; `previous-hash` is the internal 32-byte header hash of the parent.
+    ;;; At height 0 there is no parent: the previous hash must be the 32
+    ;;; zero bytes a genesis header carries, and the frozen
+    ;;; `coin-genesis-seed` is returned instead of a derivation.
+    ;;;
+    ;;; Raising on a malformed argument is deliberate. Every caller supplies
+    ;;; a parent hash from the block store and a complexity it derived
+    ;;; itself; neither ever comes from the network, so a bad one is a node
+    ;;; bug and must not be reported as a bad block.
+    ;;;
+    ;;; ```scheme
+    ;;; (equal? coin-genesis-seed
+    ;;;         (coin-puzzle-seed (make-bytevector 32 0) 0 128)) ; => #t
+    ;;; (bytevector-length (coin-puzzle-seed (make-bytevector 32 7) 1 16))
+    ;;; ; => 32
+    ;;; ```
+    (define (coin-puzzle-seed previous-hash height complexity)
+      (: bytevector? integer? integer? -> bytevector?)
       (require-bytevector-length "coin-puzzle-seed" previous-hash 32)
       (require-height "coin-puzzle-seed" height)
+      (require-complexity "coin-puzzle-seed" complexity)
       (if (= height 0)
           (begin
             (if (not (equal? %zero-hash previous-hash))
-                (error "coin-puzzle-seed: genesis must have a zero previous hash"))
+                (error
+                  "coin-puzzle-seed: genesis must have a zero previous hash"))
             coin-genesis-seed)
-          (hash256 (bytevector-append previous-hash
-                                      (coin-height-encode height)))))
+          (hash256
+            (bytevector-append %tag-bytes
+                               previous-hash
+                               (u64-le height)
+                               (u32-le complexity)))))
 
-    ;;; Regenerate the puzzle a block at `height` must solve.
+    ;;; Regenerate the program-by-example puzzle a block at `height` must
+    ;;; solve.
     ;;;
-    ;;; Pure: the same parent hash and height always produce a byte-identical
-    ;;; puzzle on every node.
+    ;;; Pure: the same parent hash, height and complexity always produce a
+    ;;; byte-identical puzzle on every node. Expensive: prefer
+    ;;; `coin-puzzle-cached` on any path that validates more than one
+    ;;; block at a height.
     ;;;
     ;;; ```scheme
-    ;;; (puzzle-spec? (coin-puzzle-for (make-bytevector 32 7) 12)) ; => #t
+    ;;; (puzzle-spec? (coin-puzzle-for (make-bytevector 32 7) 12 128)) ; => #t
     ;;; ```
-    (define (coin-puzzle-for previous-hash height)
-      (: bytevector? integer? -> puzzle-spec?)
-      (puzzle-for (coin-puzzle-seed previous-hash height) height))))
+    (define (coin-puzzle-for previous-hash height complexity)
+      (: bytevector? integer? integer? -> puzzle-spec?)
+      (puzzle-for (coin-puzzle-seed previous-hash height complexity)
+               height complexity))
+
+    ;; ============================================================
+    ;; Caching
+    ;; ============================================================
+
+    ;;; A bounded puzzle cache, owned by the caller.
+    ;;;
+    ;;; `entries` is a most-recently-used-first association list of
+    ;;; `(seed . spec)`, trimmed to `capacity`. A node holds one of these
+    ;;; per chain and every sibling at a height then pays derivation once.
+    ;;;
+    ;;; ponytail: linear assoc list. `capacity` is a few dozen and every
+    ;;; lookup is a 32-byte compare against a 1.28 M step miss, so a hash
+    ;;; table would be all cost and no measurable gain; switch if the cache
+    ;;; ever holds hundreds of heights.
+    (define-struct coin-puzzle-cache
+      (capacity default: 32)
+      (entries default: '() mutable: #t))
+
+    (define %default-capacity 32)
+
+    ;;; Open an empty cache.
+    ;;;
+    ;;; With no argument the capacity is 32 heights, which covers two
+    ;;; retarget windows of siblings. A positive integer overrides it.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-puzzle-cache-size (coin-puzzle-cache-open)) ; => 0
+    ;;; ```
+    (define (coin-puzzle-cache-open . maybe-capacity)
+      (: integer? ... -> coin-puzzle-cache?)
+      (let ((capacity
+              (cond
+                ((null? maybe-capacity) %default-capacity)
+                ((not (null? (cdr maybe-capacity)))
+                 (error "coin-puzzle-cache-open: too many arguments"))
+                ((and (number? (car maybe-capacity))
+                      (exact? (car maybe-capacity))
+                      (integer? (car maybe-capacity))
+                      (> (car maybe-capacity) 0))
+                 (car maybe-capacity))
+                (else
+                  (error
+                    "coin-puzzle-cache-open: capacity must be positive")))))
+        (coin-puzzle-cache capacity: capacity entries: '())))
+
+    ;;; Number of puzzles currently held.
+    (define (coin-puzzle-cache-size cache)
+      (: coin-puzzle-cache? -> integer?)
+      (length (coin-puzzle-cache-entries cache)))
+
+    ;; The first `n` items of `xs`, or all of them when it is shorter.
+    (define (take-prefix xs n)
+      (let loop ((ys xs) (i 0) (acc '()))
+        (if (or (null? ys) (>= i n))
+            (reverse acc)
+            (loop (cdr ys) (+ i 1) (cons (car ys) acc)))))
+
+    ;; Look a seed up without touching the cache.
+    (define (lookup cache seed)
+      (let loop ((es (coin-puzzle-cache-entries cache)))
+        (cond
+          ((null? es) #f)
+          ((equal? seed (car (car es))) (cdr (car es)))
+          (else (loop (cdr es))))))
+
+    ;;; The cached puzzle for a `(previous-hash, height, complexity)`
+    ;;; triple, or `#f`. Never derives.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-puzzle-cache-ref (coin-puzzle-cache-open) zero32 0 128)
+    ;;; ; => #f
+    ;;; ```
+    (define (coin-puzzle-cache-ref cache previous-hash height complexity)
+      (: coin-puzzle-cache? bytevector? integer? integer? -> any?)
+      (if (not (coin-puzzle-cache? cache))
+          (error "coin-puzzle-cache-ref: expected a cache"))
+      (lookup cache (coin-puzzle-seed previous-hash height complexity)))
+
+    ;;; The puzzle for a block, derived once per height and reused after.
+    ;;;
+    ;;; Returns exactly what `coin-puzzle-for` would: the cache is an
+    ;;; optimisation with no consensus meaning, and a node that never uses
+    ;;; one validates the same chain, slower.
+    ;;;
+    ;;; ```scheme
+    ;;; (let ((c (coin-puzzle-cache-open)))
+    ;;;   (coin-puzzle-cached c (make-bytevector 32 7) 1 128)
+    ;;;   (coin-puzzle-cache-size c))
+    ;;; ; => 1
+    ;;; ```
+    (define (coin-puzzle-cached cache previous-hash height complexity)
+      (: coin-puzzle-cache? bytevector? integer? integer? -> puzzle-spec?)
+      (if (not (coin-puzzle-cache? cache))
+          (error "coin-puzzle-cached: expected a cache"))
+      (let* ((seed (coin-puzzle-seed previous-hash height complexity))
+             (found (lookup cache seed))
+             ;; The seed alone is NOT a sufficient key. At height 0 the seed is
+             ;; the fixed genesis tag for every complexity, so a hit cached at
+             ;; one `C` would answer for another and the cache would stop being
+             ;; correctness-neutral. No node path derives height 0 at a
+             ;; non-genesis complexity today, but the cache must not depend on
+             ;; that: confirm the entry is for this height and complexity, and
+             ;; treat a mismatch as a miss.
+             (hit (and found
+                       (= height (puzzle-spec-height found))
+                       (= complexity (puzzle-spec-complexity found))
+                       found)))
+        (if hit
+            hit
+            (let ((spec (puzzle-for seed height complexity)))
+              (set-coin-puzzle-cache-entries!
+                cache
+                (take-prefix (cons (cons seed spec)
+                                   (coin-puzzle-cache-entries cache))
+                             (coin-puzzle-cache-capacity cache)))
+              spec))))))

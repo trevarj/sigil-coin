@@ -1,73 +1,91 @@
-;;; (sigil coin consensus coinbase) — the coinbase scriptSig payload
+;;; (sigil coin consensus coinbase) — the five-push coinbase payload
 ;;;
-;;; A SigilCoin coinbase input carries the block's mining claim in its
-;;; scriptSig, as exactly three minimally-encoded data pushes, in this order:
+;;; A SigilCoin canonical coinbase input carries the whole mining claim in its
+;;; scriptSig, as exactly five minimally-encoded data pushes (§6.1):
 ;;;
-;;;   1. HEIGHT    — BIP34-style, the block height as a Bitcoin script number
-;;;                  (little-endian sign-magnitude). Height 0 is the empty
-;;;                  push, `OP_0`.
-;;;   2. SOLUTION  — the puzzle-lang source the miner is claiming, 1 to
-;;;                  `coin-max-solution-bytes` bytes. Fork choice ranks
-;;;                  blocks by this push's length, so it is consensus.
-;;;   3. GRAFFITI  — 0 to `coin-max-graffiti-bytes` opaque bytes. Consensus
-;;;                  never looks inside; it is a channel quote.
+;;;   1. HEIGHT    0-5 B      minimally encoded BIP34 script number
+;;;   2. SOLUTION  1-512 B    the producer's own solution for puzzle `H`
+;;;   3. SHARES    1-5145 B   reveals for puzzle `H-1` (§6.2)
+;;;   4. COMMITS   1-513 B    commitments for puzzle `H` (§7.1)
+;;;   5. GRAFFITI  0-400 B    opaque; consensus never looks inside
 ;;;
-;;; Bitcoin caps a coinbase scriptSig at 100 bytes. SigilCoin does not: the
-;;; solution and the graffiti live here, so `sigil-bitcoin`'s coinbase
-;;; validator is deliberately not reused for this field.
+;;; SHARES and COMMITS are never zero-length pushes: their count byte is
+;;; always present. That is what keeps the canonicality re-encode
+;;; unambiguous, because an empty push and a `#u8(0)` push are different
+;;; scripts and only one of them is the encoding of "no shares".
 ;;;
-;;; Decoding is strict and total. The decoder rebuilds the canonical
-;;; encoding from what it read and rejects anything that does not reproduce
-;;; the input byte for byte, which is what closes off non-minimal pushes,
-;;; non-minimal height encodings and trailing bytes in one check.
+;;; Decoding is strict and total, and closes with one-shot canonicality
+;;; check kept verbatim: re-encode what was read and require byte equality
+;;; with the input. That single test rejects non-minimal pushes, non-minimal
+;;; height encodings and trailing bytes at once, which is why it is worth
+;;; more than any number of piecemeal rules.
+;;;
+;;; Bitcoin caps a coinbase scriptSig at 100 bytes, because nothing
+;;; consensus-bearing lives in it there. In SigilCoin the entire mining
+;;; claim does, so `sigil-bitcoin`'s coinbase validator is deliberately not
+;;; reused for this field.
+;;;
+;;; THE SHARES AND COMMITS PUSHES ARE CARRIED, NOT PARSED, by the codec.
+;;; Their contents are `(sigil coin consensus shares)`'s rule, and the
+;;; canonicality check has to re-encode exactly the bytes it read.
+;;; `coin-check-coop` is where the two meet.
 
 (define-library (sigil coin consensus coinbase)
   (import (sigil struct)
           (sigil math)
-          (sigil bitcoin utils)
           (sigil bitcoin script)
           (sigil bitcoin tx)
           (sigil bitcoin consensus)
-          (sigil coin puzzle)
-          (sigil coin consensus result))
+          (sigil coin consensus result)
+          (sigil coin consensus rules)
+          (sigil coin consensus shares))
   (export
-    coin-max-solution-bytes
-    coin-max-graffiti-bytes
+    ;; Script bounds
+    coin-min-coinbase-script-bytes
+    coin-max-coinbase-script-bytes
+    coin-coinbase-script-bounds
+
+    ;; The payload
     coin-coinbase-payload
     coin-coinbase-payload?
     coin-coinbase-payload-height
     coin-coinbase-payload-solution
+    coin-coinbase-payload-shares
+    coin-coinbase-payload-commits
     coin-coinbase-payload-graffiti
     coin-coinbase-payload-encode
     coin-coinbase-payload-decode
     coin-block-coinbase
-    coin-block-coinbase-payload)
+    coin-block-coinbase-payload
+
+    ;; The co-op rules over a decoded payload
+    coin-carrier-script
+    coin-check-coop)
 
   (begin
 
     (define %max-height #xffffffff)
 
-    ;;; Maximum solution length, in bytes. Tied to the interpreter's own
-    ;;; source cap: a longer push could never parse anyway.
-    (define coin-max-solution-bytes puzzle-max-source-bytes)
-
-    ;;; Maximum graffiti length, in bytes.
-    (define coin-max-graffiti-bytes 400)
-
-    ;;; The decoded contents of a coinbase scriptSig.
+    ;;; The decoded contents of a canonical coinbase scriptSig.
     ;;;
     ;;; ```scheme
     ;;; (coin-coinbase-payload-height
-    ;;;   (coin-coinbase-payload height: 7 solution: #u8(49) graffiti: #u8()))
+    ;;;   (coin-coinbase-payload height: 7
+    ;;;                             solution: #u8(49)
+    ;;;                             shares: coin-empty-shares
+    ;;;                             commits: coin-empty-commits
+    ;;;                             graffiti: #u8()))
     ;;; ; => 7
     ;;; ```
     (define-struct coin-coinbase-payload
       (height integer?)
       (solution bytevector?)
+      (shares bytevector?)
+      (commits bytevector?)
       (graffiti bytevector?))
 
     ;; Shared field checks. The encoder raises on a violation because it is
-    ;; only ever handed locally built data; the decoder converts the same
+    ;; only ever handed locally built data; the decoder turns the same
     ;; conditions into tagged results.
     (define (height-ok? height)
       (and (number? height) (exact? height) (integer? height)
@@ -78,41 +96,127 @@
            (>= (bytevector-length solution) 1)
            (<= (bytevector-length solution) coin-max-solution-bytes)))
 
+    (define (shares-ok? shares)
+      (and (bytevector? shares)
+           (>= (bytevector-length shares) 1)
+           (<= (bytevector-length shares) coin-max-shares-bytes)))
+
+    (define (commits-ok? commits)
+      (and (bytevector? commits)
+           (>= (bytevector-length commits) 1)
+           (<= (bytevector-length commits) coin-max-commits-bytes)))
+
     (define (graffiti-ok? graffiti)
       (and (bytevector? graffiti)
            (<= (bytevector-length graffiti) coin-max-graffiti-bytes)))
 
     ;;; Encode a payload as coinbase scriptSig bytes.
     ;;;
-    ;;; Raises when a field is out of range: a miner building a block is
-    ;;; expected to hand over legal fields, and a silent truncation here
-    ;;; would produce an unminable block.
+    ;;; Raises when a field is out of range, exactly as canonical does: a miner
+    ;;; building a block is expected to hand over legal fields, and a silent
+    ;;; truncation here would produce an unminable block.
     ;;;
     ;;; ```scheme
-    ;;; (coin-coinbase-payload-encode
-    ;;;   (coin-coinbase-payload height: 1 solution: #u8(49) graffiti: #u8()))
-    ;;; ; => #u8(#x01 #x01 #x01 #x31 #x00)
+    ;;; (bytevector-length
+    ;;;   (coin-coinbase-payload-encode
+    ;;;     (coin-coinbase-payload height: 0
+    ;;;                               solution: #u8(49)
+    ;;;                               shares: coin-empty-shares
+    ;;;                               commits: coin-empty-commits
+    ;;;                               graffiti: #u8())))
+    ;;; ; => 8
     ;;; ```
     (define (coin-coinbase-payload-encode payload)
       (: coin-coinbase-payload? -> bytevector?)
       (if (not (coin-coinbase-payload? payload))
-          (error "coin-coinbase-payload-encode: expected a coinbase payload"))
+          (error
+            "coin-coinbase-payload-encode: expected a coinbase payload"))
       (let ((height (coin-coinbase-payload-height payload))
             (solution (coin-coinbase-payload-solution payload))
+            (shares (coin-coinbase-payload-shares payload))
+            (commits (coin-coinbase-payload-commits payload))
             (graffiti (coin-coinbase-payload-graffiti payload)))
         (if (not (height-ok? height))
             (error "coin-coinbase-payload-encode: height out of range"))
         (if (not (solution-ok? solution))
-            (error "coin-coinbase-payload-encode: solution length out of range"))
+            (error
+              "coin-coinbase-payload-encode: solution length out of range"))
+        (if (not (shares-ok? shares))
+            (error
+              "coin-coinbase-payload-encode: shares length out of range"))
+        (if (not (commits-ok? commits))
+            (error
+              "coin-coinbase-payload-encode: commits length out of range"))
         (if (not (graffiti-ok? graffiti))
-            (error "coin-coinbase-payload-encode: graffiti length out of range"))
+            (error
+              "coin-coinbase-payload-encode: graffiti length out of range"))
         (script-append
           (script-push-data (script-number-encode height))
           (script-push-data solution)
+          (script-push-data shares)
+          (script-push-data commits)
           (script-push-data graffiti))))
 
-    ;; Parse the script into chunks, or #f when it is malformed. `script-parse`
-    ;; raises on a truncated push, so the raise is absorbed here.
+    ;;; Smallest legal canonical coinbase scriptSig, in bytes: 8.
+    ;;;
+    ;;; Height 0 as the empty push (`OP_0`, 1), a one-byte solution (2),
+    ;;; `SHARES = #u8(0)` (2), `COMMITS = #u8(0)` (2) and empty graffiti
+    ;;; (`OP_0`, 1). Derived from the encoder rather than written down, so
+    ;;; it cannot drift from the payload format.
+    ;;;
+    ;;; ```scheme
+    ;;; coin-min-coinbase-script-bytes ; => 8
+    ;;; ```
+    (define coin-min-coinbase-script-bytes
+      (bytevector-length
+        (coin-coinbase-payload-encode
+          (coin-coinbase-payload height: 0
+                                    solution: (make-bytevector 1 49)
+                                    shares: coin-empty-shares
+                                    commits: coin-empty-commits
+                                    graffiti: #u8()))))
+
+    ;;; Largest legal canonical coinbase scriptSig, in bytes: 6588.
+    ;;;
+    ;;;   HEIGHT      6 = 5 data (`#xffffffff` as a script number, four
+    ;;;                 magnitude bytes plus the sign pad) + 1 opcode
+    ;;;   SOLUTION  515 = 512 data + `OP_PUSHDATA2` and its two length bytes
+    ;;;   SHARES   5148 = 5145 data + `OP_PUSHDATA2`
+    ;;;   COMMITS   516 = 513 data + `OP_PUSHDATA2`
+    ;;;   GRAFFITI  403 = 400 data + `OP_PUSHDATA2`
+    ;;;
+    ;;; Derived from the encoder for the same reason as the floor. With ten
+    ;;; outputs and transaction overhead the worst-case coinbase is ~6976
+    ;;; bytes, so it remains under 7 KB against a 16384-byte block.
+    ;;;
+    ;;; ```scheme
+    ;;; coin-max-coinbase-script-bytes ; => 6588
+    ;;; ```
+    (define coin-max-coinbase-script-bytes
+      (bytevector-length
+        (coin-coinbase-payload-encode
+          (coin-coinbase-payload
+            height: %max-height
+            solution: (make-bytevector coin-max-solution-bytes 49)
+            shares: (make-bytevector coin-max-shares-bytes 0)
+            commits: (make-bytevector coin-max-commits-bytes 0)
+            graffiti: (make-bytevector coin-max-graffiti-bytes 49)))))
+
+    ;;; SigilCoin's inclusive `(min . max)` coinbase scriptSig bounds.
+    ;;;
+    ;;; A length bound only. It admits plenty of junk besides every
+    ;;; canonical payload; the decoder is what rejects the junk, and it runs
+    ;;; on every block.
+    ;;;
+    ;;; ```scheme
+    ;;; coin-coinbase-script-bounds ; => (8 . 6588)
+    ;;; ```
+    (define coin-coinbase-script-bounds
+      (cons coin-min-coinbase-script-bytes
+            coin-max-coinbase-script-bytes))
+
+    ;; Parse the script into chunks, or #f when it is malformed.
+    ;; `script-parse` raises on a truncated push, so the raise is absorbed.
     (define (parse-chunks script)
       (guard (e (#t #f))
         (script-parse script)))
@@ -129,16 +233,20 @@
           ((bytevector? (script-chunk-data (car xs))) (loop (cdr xs)))
           (else #f))))
 
-    ;;; Decode coinbase scriptSig bytes into a payload.
+    (define (nth-chunk chunks i)
+      (let loop ((xs chunks) (n i))
+        (if (= 0 n) (car xs) (loop (cdr xs) (- n 1)))))
+
+    ;;; Decode coinbase scriptSig bytes into a canonical payload.
     ;;;
     ;;; Total: any input, however hostile, yields a `coin-result`. Rejection
-    ;;; reasons are `not-bytevector`, `malformed-script`, `wrong-field-count`,
-    ;;; `not-a-push`, `bad-height`, `solution-empty`, `solution-oversize`,
-    ;;; `graffiti-oversize` and `non-canonical`.
+    ;;; reasons are `not-bytevector`, `malformed-script`, `wrong-field-count`
+    ;;; (five pushes now), `not-a-push`, `bad-height`, `solution-empty`,
+    ;;; `solution-oversize`, `shares-malformed`, `shares-oversize`,
+    ;;; `commits-malformed`, `commits-oversize`, `graffiti-oversize` and
+    ;;; `non-canonical`.
     ;;;
     ;;; ```scheme
-    ;;; (coin-ok? (coin-coinbase-payload-decode #u8(#x01 #x01 #x01 #x31 #x00)))
-    ;;; ; => #t
     ;;; (coin-result-reason (coin-coinbase-payload-decode #u8(#x02 #x01)))
     ;;; ; => malformed-script
     ;;; ```
@@ -152,58 +260,70 @@
               (cond
                 ((not chunks)
                  (coin-error 'malformed-script "truncated pushdata"))
-                ((not (= 3 (chunk-count chunks)))
+                ((not (= 5 (chunk-count chunks)))
                  (coin-error 'wrong-field-count
-                             "expected exactly three pushes"))
+                             "expected exactly five pushes"))
                 ((not (all-pushes? chunks))
                  (coin-error 'not-a-push "expected data pushes only"))
                 (else
-                  (let* ((height-bytes (script-chunk-data (car chunks)))
-                         (solution (script-chunk-data (car (cdr chunks))))
-                         (graffiti (script-chunk-data
-                                     (car (cdr (cdr chunks)))))
+                  (let* ((height-bytes (script-chunk-data
+                                         (nth-chunk chunks 0)))
+                         (solution (script-chunk-data (nth-chunk chunks 1)))
+                         (shares (script-chunk-data (nth-chunk chunks 2)))
+                         (commits (script-chunk-data (nth-chunk chunks 3)))
+                         (graffiti (script-chunk-data (nth-chunk chunks 4)))
                          (height (script-number-decode height-bytes)))
                     (cond
                       ((not (height-ok? height))
                        (coin-error 'bad-height "height out of range"))
                       ((= 0 (bytevector-length solution))
                        (coin-error 'solution-empty "solution push is empty"))
-                      ((> (bytevector-length solution) coin-max-solution-bytes)
+                      ((> (bytevector-length solution)
+                          coin-max-solution-bytes)
                        (coin-error 'solution-oversize
                                    "solution exceeds the byte cap"))
-                      ((> (bytevector-length graffiti) coin-max-graffiti-bytes)
+                      ;; The count byte is mandatory, so an empty push is
+                      ;; malformed rather than "no shares".
+                      ((= 0 (bytevector-length shares))
+                       (coin-error 'shares-malformed "shares push is empty"))
+                      ((> (bytevector-length shares) coin-max-shares-bytes)
+                       (coin-error 'shares-oversize
+                                   "shares exceed the byte cap"))
+                      ((= 0 (bytevector-length commits))
+                       (coin-error 'commits-malformed
+                                   "commits push is empty"))
+                      ((> (bytevector-length commits)
+                          coin-max-commits-bytes)
+                       (coin-error 'commits-oversize
+                                   "commits exceed the byte cap"))
+                      ((> (bytevector-length graffiti)
+                          coin-max-graffiti-bytes)
                        (coin-error 'graffiti-oversize
                                    "graffiti exceeds the byte cap"))
                       (else
                         (let ((payload (coin-coinbase-payload
                                          height: height
                                          solution: solution
+                                         shares: shares
+                                         commits: commits
                                          graffiti: graffiti)))
-                          ;; One canonicality check covers non-minimal
-                          ;; pushes and non-minimal height encodings: the
+                          ;; One-shot canonicality check: the
                           ;; canonical encoding of what we read must be the
                           ;; bytes we were given.
                           (if (not (equal? script
                                            (coin-coinbase-payload-encode
                                              payload)))
-                              (coin-error 'non-canonical
-                                          "scriptSig is not the canonical encoding")
+                              (coin-error
+                                'non-canonical
+                                "scriptSig is not the canonical encoding")
                               (coin-ok payload))))))))))))
 
-    ;;; Return a block's coinbase transaction, or `#f` when it has none.
-    ;;;
-    ;;; Total: a malformed block yields `#f` rather than a raise.
-    ;;;
-    ;;; ```scheme
-    ;;; (coin-block-coinbase 42) ; => #f
-    ;;; ```
+    ;; Return first transaction; strict payload decoding rejects malformed input.
     (define (coin-block-coinbase b)
-      (: any? -> any?)
       (guard (e (#t #f))
         (and (block? b)
              (pair? (block-transactions b))
-             (let ((tx (car (block-transactions b))))
-               (and (coinbase-transaction? tx) tx)))))
+             (car (block-transactions b)))))
 
     ;;; Decode a block's coinbase payload.
     ;;;
@@ -220,4 +340,77 @@
             (coin-error 'missing-coinbase
                         "block has no coinbase transaction")
             (coin-coinbase-payload-decode
-              (txin-script-sig (car (transaction-inputs tx)))))))))
+              (txin-script-sig (car (transaction-inputs tx)))))))
+
+    ;;; The carrier's payout script: `scriptPubKey` of output 0 of the
+    ;;; PARENT block's coinbase (§6.5).
+    ;;;
+    ;;; The carrier is the producer of block `H-1`, paid weight 1 in block
+    ;;; `H` for having carried the commitments that `H` reveals. The parent
+    ;;; is by definition already validated and in the block store, so this
+    ;;; needs no lookup beyond it.
+    ;;;
+    ;;; Total: `#f` when the parent is missing or has no coinbase output,
+    ;;; which for a validated parent cannot happen.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-carrier-script 42) ; => #f
+    ;;; ```
+    (define (coin-carrier-script parent-block)
+      (: any? -> any?)
+      (guard (e (#t #f))
+        (let ((tx (coin-block-coinbase parent-block)))
+          (and tx
+               (pair? (transaction-outputs tx))
+               (txout-script-pubkey (car (transaction-outputs tx)))))))
+
+    ;;; Validate a decoded payload's SHARES and COMMITS (§6.4, §7.1).
+    ;;;
+    ;;; `context` is the co-op context built from the VALIDATED PARENT: the
+    ;;; previous hash block `H-1` carries, `P = H-1`, `C(P)`, the puzzle
+    ;;; those derive, and block `H-1`'s decoded COMMITS. Pass `#f` for a
+    ;;; block that has no parent, which is genesis and only genesis.
+    ;;;
+    ;;; On success the value is the list of accepted shares. Its length is
+    ;;; `R` for the split (§6.5); aggregate ranking quality `Q` is derived
+    ;;; from their personalized margins. Pubkeys determine payout scripts.
+    ;;;
+    ;;; This block's own COMMITS are decoded and canonicality-checked here
+    ;;; but are not otherwise consensus until the CHILD reveals against
+    ;;; them: §7.3 keeps no state for an unrevealed commitment, which
+    ;;; expires with no penalty and no refund the moment block `H+1` is
+    ;;; accepted.
+    ;;;
+    ;;; Total. Rejection reasons are the shares and commits codecs', plus
+    ;;; `shares-at-genesis` and `internal-error`.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-result-value (coin-check-coop payload #f)) ; => ()
+    ;;; ```
+    (define (coin-check-coop payload context)
+      (: any? any? -> coin-result?)
+      (guard (e (#t (coin-error 'internal-error "the co-op check raised")))
+        (if (not (coin-coinbase-payload? payload))
+            (coin-error 'internal-error "expected a coinbase payload")
+            (let ((commits (coin-commits-decode
+                             (coin-coinbase-payload-commits payload)))
+                  (shares (coin-shares-decode
+                            (coin-coinbase-payload-shares payload))))
+              (cond
+                ((coin-failed? commits) commits)
+                ((coin-failed? shares) shares)
+                ((null? (coin-result-value shares)) (coin-ok '()))
+                ;; A share reveals puzzle `H-1`. Genesis has no parent, so
+                ;; no commitment can ever have been carried for it.
+                ((or (= 0 (coin-coinbase-payload-height payload))
+                     (not (coin-coop-context? context)))
+                 (coin-error 'shares-at-genesis "genesis carries no shares"))
+                ((not (= (coin-coop-context-puzzle-height context)
+                         (- (coin-coinbase-payload-height payload) 1)))
+                 (coin-error 'internal-error
+                             "co-op context is for the wrong height"))
+                (else
+                  (coin-check-shares
+                    context
+                    (coin-coinbase-payload-solution payload)
+                    (coin-result-value shares))))))))))

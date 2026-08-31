@@ -6,9 +6,9 @@
 ;;; still being waited on. So the server goes in its own operating-system
 ;;; process and this file is what that process runs.
 ;;;
-;;; It is the binary's own entry point and nothing more, so `--help`,
-;;; `--version` and the timeouts a test measures are the ones an operator
-;;; gets:
+;;; Normal arguments use the binary's own entry point. Test-only
+;;; `--bounded DIR PORT` calls the same accept loop with `requests: 1`, so
+;;; its clean shutdown can be asserted without killing the child:
 ;;;
 ;;; ```sh
 ;;; sigil -L <paths...> explorer-peer.sgl -- --regtest --data-dir DIR --port N
@@ -17,6 +17,20 @@
 ;;; This is not a test file: the runner collects `test-*.sgl` and
 ;;; `*-test.sgl`, so it is never executed as one.
 
-(import (sigil coin explorer))
+(import (sigil coin node)
+        (sigil coin explorer))
 
-(explorer-main)
+(define (app-args raw)
+  (let loop ((xs raw))
+    (cond ((null? xs) raw)
+          ((string=? (car xs) "--") (cdr xs))
+          (else (loop (cdr xs))))))
+
+(let ((args (app-args (cdr (command-line)))))
+  (if (and (= 3 (length args)) (string=? "--bounded" (car args)))
+      (explorer-serve sigilcoin-regtest-chain
+                      (car (cdr args))
+                      port: (string->number (car (cdr (cdr args))))
+                      requests: 1
+                      timeout: 300)
+      (explorer-main)))

@@ -1,9 +1,9 @@
-;;; (sigil coin puzzle constraints) — the v2 rotating constraint catalogue
+;;; (sigil coin puzzle constraints) — the canonical rotating constraint catalogue
 ;;;
 ;;; Every height draws one of eight syntactic rules from the block seed, and
 ;;; a solution must satisfy it. A rule is a decidable predicate over the raw
 ;;; source bytes, the parsed AST, or both: no evaluation, one byte scan and
-;;; one AST walk, both bounded by `puzzle-v2-max-source-bytes`. That is what
+;;; one AST walk, both bounded by `puzzle-max-source-bytes`. That is what
 ;;; lets consensus reject a constraint violation before paying for
 ;;; evaluation.
 ;;;
@@ -369,7 +369,7 @@
     ;;; Every other rule is satisfied by choosing the body and the example
     ;;; domain, so the wrapper is the bare lambda. The generator never trusts
     ;;; this: it prints, parses, re-checks the constraint and re-runs the
-    ;;; result (see `(sigil coin puzzle examples)`).
+    ;;; result (see `(sigil coin puzzle generator)`).
     ;;;
     ;;; ```scheme
     ;;; (puzzle-constraint-wrap 0 "(list x x)") ; => "(lambda(x)(list x x))"

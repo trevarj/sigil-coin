@@ -4,8 +4,12 @@ A blockchain whose proof of work is program synthesis.
 
 SigilCoin is a toy chain for the Sigil community. It is worth nothing, it is
 intended to stay worth nothing, and there is no premine. What it is not is
-careless: the consensus rules below are as tight as a real chain's, because a
-joke currency that forks on a rounding error is not funny, it is just broken.
+careless: consensus rules are as tight as a real chain's, because a joke
+currency that forks on a rounding error is not funny, it is just broken.
+
+[`consensus.md`](consensus.md) is the sole normative protocol specification.
+This paper explains motivation and design; where prose differs from that
+specification, `consensus.md` governs.
 
 The chain is built on the `sigil-bitcoin` libraries and keeps Bitcoin's
 80-byte header, transaction format, UTXO set and script engine. It replaces
@@ -152,9 +156,8 @@ be retained that was not charged, the total is also an upper bound on live
 memory.
 
 Fuel alone would not give that bound. Measured programs allocate up to about
-3 cells per step, so the fuel cap alone would permit roughly 140 MB of churn,
-consistent with the ~124 MB resident set a reviewer measured for a
-closure-retaining loop that an earlier counter charged nothing for. The
+3 cells per step, so the fuel cap alone would permit roughly 140 MB of churn.
+A closure-retaining stress program reached about 124 MB resident set. The
 allocation cap, not fuel, is what bounds memory.
 
 The cap is a pure function of the program and its inputs. No host word size,
@@ -176,12 +179,12 @@ the evaluator, so a validator needs no handler on the hot path.
 Every block's puzzle is a pure function of the chain up to its parent:
 
 ```
-seed(H) = SHA256d( "SigilCoin/puzzle/v2"      19 ASCII bytes
+seed(H) = SHA256d( "SigilCoin/puzzle/1"      18 ASCII bytes
                  || prev_hash                  32 B, internal order
                  || u64le(H)
                  || u32le(C(H)) )
 
-seed(0) = SHA256d( "SigilCoin/genesis/puzzle/v2" )
+seed(0) = SHA256d( "SigilCoin/genesis/puzzle/1" )
 ```
 
 `prev_hash` is the internal 32-byte header hash, never the reversed display
@@ -357,12 +360,10 @@ body and example domain: the generator draws digit-free values under
 `no-digits`, excludes symbols and prints quote-free literals under `no-quote`,
 and restricts integers to single digits under `small-literals`.
 
-### 6.1 Why arithmetic alone was not trusted
+### 6.1 Executable liveness bound
 
-The size argument for the table is easy to state and was, in its first
-written form, wrong. Per branch the table costs `18 + |i| + |o|` bytes, with
-the input literal capped at 8 and the output at 24. The specification's first
-draft concluded that ten examples fit inside 512 bytes. They do not:
+Per branch the table costs `18 + |i| + |o|` bytes, with the input literal
+capped at 8 and the output at 24. Ten examples do not fit every repair:
 
 ```
 letrec repair, k = 10 : 40 + 9 * (18 + 8 + 24) + 25 = 515   INFEASIBLE
@@ -409,7 +410,7 @@ repurposed: `version` is pinned to 5, `bits` carries the difficulty parameter
 ```
 bit  31              22 21     15 14      8 7    4 3    0
     +------------------+---------+---------+------+------+
-    |      L - 1       |   MB    |   SB    | 8-R  | 0000 |
+    |      L - 1       |   MB    |   SB    |15-Q  | 0000 |
     +------------------+---------+---------+------+------+
        10 bits           7 bits    7 bits   4 bits 4 bits
 ```
@@ -417,20 +418,19 @@ bit  31              22 21     15 14      8 7    4 3    0
 - `L` is the producer's solution length in bytes, 1..512, stored biased by one
 - `MB` is a bucket of the cells the solution charged
 - `SB` is a bucket of the steps it spent
-- `R` is the accepted revealed share count, 0..8, stored as `8-R` so that more
-  shares gives a lower word
+- `Q` is aggregate verified share quality, 0..15, stored as `15-Q` so that
+  more verified work gives a lower word
 - the low nibble is reserved zero
 
 Lower is better, and plain unsigned comparison *is* the composite order:
 disjoint fixed-width fields laid out most-significant-first in ranking
 priority form the base-2^width numeral of the tuple, and comparing numerals of
 equal width is lexicographic comparison of their digits. Length dominates
-memory dominates steps dominates share count.
+memory dominates steps dominates aggregate verified share quality.
 
-Share count is last for a reason. It must break ties without ever outranking a
-better program, so it occupies strictly lower-order bits than every producer
-field: it decides exactly the comparisons the producer's own solution leaves
-tied, and nothing else.
+Quality is last for a reason. It breaks ties without outranking a better
+producer program, so it occupies strictly lower-order bits than every producer
+field. Raw reveal count remains separate and controls only the reward split.
 
 Because every field is derived from the block body and the low nibble is
 reserved, the header carries **zero free entropy**. There is no nonce to
@@ -452,11 +452,12 @@ bucket7(x) = 0                                        if x = 0
 ```
 
 `bucket7(1) = 1`, `bucket7(2) = 7`, `bucket7(300) = 50`, `bucket7(340) = 51`,
-`bucket7(100000) = 100`, `bucket7(200000) = 106`.
+`bucket7(400000) = 112`, `bucket7(200000) = 106`.
 
 The bucketed value is the consensus value. Fork choice compares header words
 and never body integers, so two solutions in one bucket are exactly tied and
-fall through to share count. The precision loss is deliberate: there is no
+fall through to aggregate share quality. The precision loss is deliberate:
+there is no
 second, finer order that could drift out of agreement with the header.
 
 ### 7.3 The header-to-body commitment
@@ -495,14 +496,11 @@ work       = accumulated * (2^32 + 1) + saving
 `saving <= 2^32 < 2^32 + 1`, so the digits never collide, and `accumulated` is
 strictly increasing along any chain, so no chain ranks below its own ancestor.
 
-**There is no block-hash tie-break.** An earlier design broke ties by lower
-block hash, which was grindable through 400 bytes of coinbase graffiti — and
-ties are the normal case, because the optimal program for a puzzle is often
-unique. A thief could copy a producer's program, grind graffiti until his
-block hash was lower, and take the tip with certainty. Deleting the tie-break
-removes that entirely: an equal `W` never displaces an incumbent. Hash
-comparison survives only for stable display ordering in the explorer and the
-CLI, where it decides nothing.
+**There is no block-hash tie-break.** Such a tie-break would be grindable
+through 400 bytes of coinbase graffiti, and ties are common because an optimal
+program is often unique. Equal `W` never displaces an incumbent. Hash
+comparison exists only for stable display ordering in the explorer and CLI,
+where it decides nothing.
 
 ---
 
@@ -577,8 +575,6 @@ can solve a puzzle and eight get nothing. Co-op blocks are the answer: a block
 may carry up to 8 signed shares from other miners, each paid out of the
 block's own reward.
 
-*(Section status: specified and partly built. See section 13.)*
-
 ### 9.1 The problem, and why the pipeline is two blocks
 
 The producer's own solution is necessarily revealed in the block that claims
@@ -595,9 +591,10 @@ Commit–reveal, staggered across two heights:
 | `H+1` | reveals and share payouts | `H` |
 
 A commitment is `SHA256d(tag || share_preimage || blind)` where the blind is
-32 bytes of the miner's own choosing and is never published. Without the
-blind, a commitment over a guessable solution space could be confirmed by
-guessing. With it, the commitment hides.
+32 bytes of the miner's own choosing. The reveal carries the blind so every
+validator can recompute the commitment. It remains secret while hiding matters,
+then becomes public with the solution. Without it, a guessable solution could
+be confirmed before reveal.
 
 The two-block stagger is what protects a revealed share. A reveal for puzzle
 `P` is published in a block at height `P+1`. To steal it, a thief would have
@@ -609,7 +606,7 @@ a block that settles its height.**
 ### 9.2 What a share binds
 
 ```
-share_preimage = SHA256d( "SigilCoin/share/v2"
+share_preimage = SHA256d( "SigilCoin/share/1"
                         || parent_prev_hash    the prev_hash that derived puzzle P
                         || u64le(P)
                         || u32le(C(P))
@@ -660,9 +657,10 @@ commitments?" He is paid, one block later, by the *next* producer, for having
 carried commitments that were revealed. He cannot fake it: fabricated
 commitments earn nothing, because nobody can reveal them.
 
-Including shares costs the producer real reward. What pays for it is the
-tie-break: a producer carrying even one share strictly outranks every
-zero-share sibling with the same program, and ties are the normal case.
+Including shares costs the producer real reward. What pays for it is aggregate
+verified quality `Q`: under-par personalized shares improve the score after
+producer length, memory, and steps tie. Raw share count affects only the reward
+split.
 
 ### 9.4 Unrevealed commitments
 
@@ -712,17 +710,18 @@ Worst case per block, at the frozen caps:
 | --- | --- |
 | header checks | O(1) |
 | block size | one serialization |
-| coinbase decode | O(6332) bytes, five pushes and one re-encode |
-| puzzle derivation | 64 attempts x 20000 steps = 1.28 M steps, cached per height |
+| coinbase decode | O(6588) bytes, five pushes and one re-encode |
+| global puzzle derivation | 64 attempts x 20000 steps = 1.28 M steps, cached per height |
+| personalized puzzle derivation | 8 x 64 x 20000 steps = 10.24 M steps |
 | producer solution | 200000 steps on one machine |
 | share solutions | 8 x 200000 steps |
 | signature verification | 8 ECDSA |
 | transactions | Bitcoin's existing cost |
 
-Hostile programs calibrate at about 5.5 microseconds per step, so the worst
-case is roughly 17 seconds for the first block at a height and 10 for each
-sibling after — against a 72000-second spacing floor, about 0.02% duty. Typical
-cost is microseconds: measured puzzles used around 300 steps and 80 cells.
+At about 5.5 microseconds per puzzle-language step, the uncached ceiling is
+roughly 73 seconds, about 0.1% of the 72000-second spacing floor. Global and
+personalized puzzle specs are cached across siblings. Typical cost is
+microseconds: measured puzzles used around 300 steps and 80 cells.
 
 Two rules keep that bound real.
 
@@ -745,7 +744,7 @@ One integration rule is worth stating in public, because getting it wrong
 produces a node that rejects every valid block: **never call Bitcoin's block
 connector directly on a SigilCoin block.** It enforces Bitcoin's 100-byte
 coinbase scriptSig cap and Bitcoin's subsidy schedule, and a SigilCoin
-coinbase scriptSig runs to 6332 bytes. SigilCoin's own rules record must be
+coinbase scriptSig runs to 6588 bytes. SigilCoin's own rules record must be
 passed into the connector.
 
 ---
@@ -766,19 +765,6 @@ read cannot match.
 **Wallet.** Keys, bech32 addresses with HRP `sgl` (so addresses read `sgl1…`),
 balance and spending, in the CLI. The key lives in the node's data directory
 and is the operator's to back up.
-
-**Mining.** `sigilcoin puzzle` prints the day's puzzle — the pairs, the
-constraint, the seed, par and the always-legal baseline — and
-`sigilcoin mine --solution '<program>'` checks a candidate against the
-regenerated puzzle before building anything, because the failures worth
-reporting (wrong output, not a procedure, over the cap, a parse error) are all
-knowable without touching the chain. `sigilcoin commit` and `sigilcoin reveal`
-produce share commitments and reveals. Which rule set `puzzle` and `mine` run
-under is read from the chain's own advertised generator version, so no flag
-day is needed; today the newer surface derives the real puzzle, checks a
-candidate against the real rule and reports the real score word, and block
-assembly follows the node switchover (section 15). There is no mining loop, because there
-is nothing to grind: a block is finished the moment the program is written.
 
 **Explorer.** A read-only HTTP site over the node's database: chain summary,
 block list, block detail with the puzzle, the score decomposition and the
@@ -801,26 +787,24 @@ proxy. Operational detail is in `deploy/RUNBOOK.md`; the launch gate is in
 Three design decisions came from measuring rather than reasoning, and it is
 worth saying which.
 
-**The puzzle asks for a function because a survey said it had to.** An earlier
-design published a target *value* and asked for a program producing it. A
-survey of 480 generated puzzles found that in **78.3%** of cases the best known
-answer was the quoted literal of the target: mining was transcription. The
-same survey found the minimal solution unique 96.7% of the time (so
-competitors submit identical bytes and every block is a tie), an unbounded
-family of same-length variants that made tie-breaking grindable, and execution
-metrics sitting at 0.03% of the fuel cap and 0.08% of the allocation cap — so
-the resource terms of any score would have been inert. A function cannot be
-quoted. That single change is what the whole design is built around, and it
-was not an aesthetic call.
+**The puzzle asks for a function because pre-freeze measurement required
+it.** Before protocol rules were frozen, a survey model tested target-value
+puzzles by asking for a program that produced one value. This model was never
+an implemented SigilCoin ruleset. Across 480 generated cases, **78.3%** of best
+known answers were quoted target literals: mining reduced to transcription.
+The survey also found the minimal answer unique 96.7% of the time, unbounded
+same-length variants that made hash tie-breaking grindable, and execution
+metrics at 0.03% of the fuel cap and 0.08% of the allocation cap. PBE replaced
+that measurement model before freeze: a function cannot be quoted, and its
+examples expose structure worth synthesizing.
 
-**The example count is 8 because the arithmetic was wrong.** The specification
-argued that ten examples fit the source cap. Building the actual table showed
-that under one repair wrapper it needs 515 bytes against a 512-byte limit, and
-under another it fits with two bytes to spare. Two bytes is not a margin. The
-count was frozen at 8, where the proven worst case is 415.
+**The example count is 8 because executable bounds beat estimates.** Ten
+examples need 515 bytes under one repair wrapper and leave only two bytes under
+another. The count was frozen at 8, where the global worst case is 415 bytes
+and the personalized worst case is 458 bytes.
 
-**Liveness is verified, not argued.** Because that arithmetic failed once, the
-generator does not rely on it at all. Every accepted puzzle has had its
+**Liveness is verified, not argued.** The generator does not rely on size
+arithmetic alone. Every accepted puzzle has had its
 fallback solution constructed, printed, parsed, constraint-checked and run
 against every published pair, under the real consensus caps, before it can be
 published. The documented size bound is documentation; the check is the
@@ -883,13 +867,11 @@ costs the censor difficulty rather than requiring a new mechanism. That is not
 built, and should not be until the behaviour is observed.
 
 **The producer's own program can be copied.** It is revealed in the block that
-claims it and cannot be committed in advance. Deleting the hash tie-break, the
-share-count field and the settled-height rule together make copying
-unprofitable in most cases, but a thief who copies the program *and* matches
-the share count produces an incomparable sibling: nodes that saw the honest
-block first keep it, a node syncing from scratch may adopt either, and the
-next block settles it. That is Bitcoin's equal-work race, and it is the honest
-limit of what a same-block reveal can be protected against.
+claims it and cannot be committed in advance. No hash tie-break, aggregate
+verified quality, and the settled-height rule make copying unprofitable in
+most cases. A thief who copies the program and matches `Q` produces an
+incomparable sibling: nodes keep the first one seen, and the next block settles
+the height. That is the honest limit of same-block reveal protection.
 
 **The producer/share weight split is a guess.** Producer 2, each share 1,
 carrier 1. There is no data behind it, because nothing with shares has ever
@@ -923,44 +905,15 @@ robust as it sounds.
 
 ## 15. Implementation status
 
-What follows is the state of the source tree, distinguished from the design
-above, because a whitepaper that describes intentions as facts is the thing
-this project is trying not to be.
+Source tree implements canonical design end to end: puzzle generation and
+constraints; seed derivation and bounded cache; solution scoring and retarget;
+co-op shares, blind-bearing reveal, commitments and reward split; durable-parent
+node validation and block building; CLI puzzle/mine/commit/reveal; read-only,
+escaped explorer pages and JSON.
 
-**Complete and live:** the puzzle language, its parser, evaluator and caps;
-the puzzle generator, the constraint catalogue and the verified table
-solution; seed derivation and the puzzle cache; solution verification; the
-score word and its bucketing; margin retargeting and the `bits` codec; the
-node's header rules, fork choice, ranking, block-body validation, genesis
-builder and block builder; the five-push coinbase codec; the CLI and the
-explorer.
-
-**Specified but not yet enforced by consensus:** co-op shares and
-commit–reveal (section 9). The coinbase format reserves the two pushes and the
-score word reserves the share field, but the consensus package does not yet
-verify a share signature, a commitment membership or the reward split. The
-node currently rejects any block carrying a non-empty share or commitment
-list, rather than accepting data no rule checks. The CLI can already produce
-commitments and reveals with the exact bytes the specification freezes, and
-the explorer decodes and displays them, both against the written spec rather
-than against consensus code. Until that code lands, a block pays its producer
-alone.
-
-**Not yet switched over:** the mainnet and regtest chain configurations still
-wire the older rule set, so two sets of genesis constants exist in the tree —
-the ones the chain config carries and the ones the current genesis builder
-produces. Publishing a genesis hash is therefore premature; `LAUNCH.md` still
-describes the older parameters, and it is the switchover, not this document,
-that settles them.
-
-Where this document and `docs/consensus-v2.md` disagree, the code was
-followed. Two places matter. The allocation cap is 400000 cells, not the
-100000 the specification carries; it was recalibrated against measurement,
-and the specification has not caught up. And the maximum example count is 8 in
-both, but the specification's derived table still quotes a 10-example figure
-in one place, which the frozen constant contradicts.
-
----
+Mainnet genesis quote is configured, but timestamp and derived constants remain
+explicitly non-final until operator chooses launch day. Regtest genesis is fixed
+and used by integration tests.
 
 ## 16. Constants
 
@@ -988,7 +941,7 @@ in one place, which the frozen constant contradicts.
 | `bits` | `0x207F0000 \| C` |
 | `nonce` | the score word `W` |
 | max shares / commitments | 8 / 16 |
-| coinbase scriptSig | 8 .. 6332 bytes |
+| coinbase scriptSig | 8 .. 6588 bytes |
 | graffiti cap | 400 bytes |
 | block size cap | 16384 bytes |
 | block spacing floor | 72000 seconds; target 86400 |

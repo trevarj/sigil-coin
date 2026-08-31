@@ -1,78 +1,109 @@
-;;; SigilCoin chain configuration: ranking key, header rules, genesis.
+;;; SigilCoin node wiring: header semantics, derivation cache,
+;;; chain-derived complexity, body validation and canonical genesis.
 ;;;
-;;; The rules here are what a node runs, so they are exercised the way a node
-;;; meets them: through the `header-rules` record a chain config carries, with
-;;; candidates and bodies built by hand, including bodies that are junk.
+;;; Tests drive exact seam entry points and live chain configs through
+;;; the exact entry points the seam calls — `accept?`, `chain-work`,
+;;; `better-chain?` and `connect` — with headers and bodies built by hand,
+;;; including bodies that lie about what they carry.
 
 (import (sigil test)
         (sigil io)
+        (sigil fs)
+        (sigil error)
+        (sigil string)
         (sigil math)
         (sigil bitcoin utils)
+        (sigil bitcoin encoding)
         (sigil bitcoin tx)
         (sigil bitcoin consensus)
         (sigil bitcoin node)
+        (sigil secp256k1)
         (sigil coin puzzle)
         (sigil coin puzzle generator)
         (sigil coin consensus)
-        (sigil coin node))
+        (sigil coin node)
+        (sigil coin node rules)
+        (sigil coin node body)
+        (sigil coin node miner)
+        (sigil coin node genesis)
+        (sigil coin node chain))
 
 ;; ============================================================
 ;; Helpers
 ;; ============================================================
 
 (define %zero32 (make-bytevector 32 0))
-(define %coinbase-index #xffffffff)
 
-;; A distinct 32-byte hash per index, low byte first so the ordering under
-;; `coin-hash-compare` is the index ordering.
+;; A payout script. `OP_RETURN "sg"`: unspendable, which keeps the test
+;; blocks' outputs out of anyone's way.
+(define %payout #u8(#x6a #x02 #x73 #x67))
+
 (define (hash-of k)
   (let ((bv (make-bytevector 32 0)))
     (bytevector-u8-set! bv 0 k)
     bv))
 
-;; The solution length a header commits to when the commitment is not what
-;; the test is about. Any legal length does; this one is mid-range.
-(define %default-solution-length 40)
+;; The regtest genesis: a real canonical block, and the parent every test builds on.
+(define %genesis-block
+  (coin-genesis-block coin-regtest-genesis-quote coin-regtest-genesis-time))
+(define %genesis (block-header-field %genesis-block))
+(define %genesis-hash (block-header-hash %genesis))
+(define %genesis-time (block-header-time %genesis))
 
-(define (header-claiming previous time solution-length)
-  (block-header version: coin-header-version
-                previous-block: previous
-                merkle-root: %zero32
-                time: time
-                bits: coin-header-bits
-                ;; The solution-length commitment fork choice ranks by.
-                nonce: solution-length))
+;; The local chain's spacing floor: one second, so a test never waits.
+(define %spacing coin-regtest-min-block-spacing)
 
-(define (header-at previous time)
-  (header-claiming previous time %default-solution-length))
+(define (accept? previous-headers header)
+  (coin-accept-header? sigilcoin-consensus-params
+                          previous-headers
+                          header
+                          %spacing))
 
-;; A block whose coinbase claims a solution of exactly `solution-length`
-;; bytes. The solution is not a real one: `chain-work` ranks by the length of
-;; the push, and a block that cannot solve its puzzle is rejected elsewhere.
-(define (block-claiming height solution-length)
-  (let ((script (coin-coinbase-payload-encode
-                  (coin-coinbase-payload
-                    height: height
-                    solution: (make-bytevector solution-length 49)
-                    graffiti: #u8()))))
-    (block header-field: (header-at %zero32 1767225600)
-           transactions: (list
-                           (transaction
-                             version: 1
-                             inputs: (list
-                                       (txin previous-output:
-                                               (outpoint txid: %zero32
-                                                         index: %coinbase-index)
-                                             script-sig: script
-                                             sequence: #xffffffff
-                                             witness: '()))
-                             outputs: (list (txout value: 0
-                                                   script-pubkey: #u8(#x6a)))
-                             lock-time: 0)))))
+;; The complexity a header at `height` must carry on this chain.
+(define (required previous-headers height)
+  (coin-required-complexity previous-headers height))
 
-;; `body-known?` is #f throughout: SigilCoin's rank comes from the header, so
-;; the flag carries no information the rule reads, and pinning it to the
-;; headers-first value proves the rule never consults it.
+;; A block extending `parent` at `height`, mining `solution` (or the table
+;; solution when `#f`) against the puzzle at `complexity`.
+(define (build-on parent height complexity solution)
+  (coin-build-block parent
+                       height
+                       complexity
+                       solution
+                       "systemcrafters"
+                       %payout
+                       (+ (block-header-time parent) %spacing)))
+
+(define %block1 (build-on %genesis 1 coin-genesis-complexity #f))
+(define %header1 (block-header-field %block1))
+
+;; Connect a body the way the node does, through the rules record.
+(define (connect height b)
+  ((block-rules-connect coin-block-rules)
+   coin-block-rules
+   sigilcoin-consensus-params
+   height
+   '()
+   b
+   #t
+   %genesis-block))
+
+;; Replace a block's header, leaving the body alone: how a lie is built.
+(define (with-header b header)
+  (block b header-field: header))
+
+(define (with-nonce b w)
+  (with-header b (block-header (block-header-field b) nonce: w)))
+
+;; A block whose coinbase claims `solution`, built without the miner's own
+;; check, so a test can present a body the rules are supposed to refuse.
+(define (block-claiming header height solution)
+  (block header-field: header
+         transactions: (list (coin-mining-coinbase height
+                                                      solution
+                                                      "systemcrafters"
+                                                      %payout))))
+
 (define (candidate-at height work hash extended?)
   (chain-candidate hash: hash
                    height: height
@@ -80,603 +111,722 @@
                    body-known?: #f
                    extended?: extended?))
 
-;; A candidate at `height` whose header commits to a `solution-length`-byte
-;; solution, ranked exactly as `chain-work` ranks it.
-(define (candidate-claiming height solution-length hash extended?)
+;; A candidate ranked exactly as `chain-work` ranks a header claiming `w`.
+(define (candidate-claiming height w hash extended?)
   (candidate-at height
-                (coin-chain-work (header-claiming %zero32
-                                                  1767225600
-                                                  solution-length)
-                                 #f
-                                 0)
+                (coin-chain-work
+                  (block-header version: coin-header-version
+                                previous-block: %zero32
+                                merkle-root: %zero32
+                                time: %genesis-time
+                                bits: coin-genesis-bits
+                                nonce: w)
+                  #f
+                  0)
                 hash
                 extended?))
 
-(define (chain-rules chain)
-  (chain-config-header-rules chain))
+(define (bytes<? a b)
+  (let loop ((i 0))
+    (cond ((>= i (bytevector-length a)) #f)
+          ((< (bytevector-u8-ref a i) (bytevector-u8-ref b i)) #t)
+          ((> (bytevector-u8-ref a i) (bytevector-u8-ref b i)) #f)
+          (else (loop (+ i 1))))))
 
-(define (accept-with chain previous-headers header)
-  ((header-rules-accept? (chain-rules chain))
-   (chain-config-consensus-params chain)
-   previous-headers
-   header))
+(define (sort-bytes xs key)
+  (let loop ((rest xs) (out '()))
+    (if (null? rest)
+        out
+        (loop (cdr rest)
+              (let insert ((ys out))
+                (cond ((null? ys) (list (car rest)))
+                      ((bytes<? (key (car rest)) (key (car ys)))
+                       (cons (car rest) ys))
+                      (else (cons (car ys) (insert (cdr ys))))))))))
 
-(define %main-genesis (chain-config-genesis-header sigilcoin-main-chain))
-(define %regtest-genesis (chain-config-genesis-header sigilcoin-regtest-chain))
+(define (signed-share n source context)
+  (let* ((secret (make-bytevector 32 n))
+         (pubkey (secp256k1-pubkey-create secret))
+         (bytes (string->utf8 source))
+         (preimage (coin-share-preimage
+                     (coin-coop-context-parent-prev-hash context)
+                     (coin-coop-context-puzzle-height context)
+                     (coin-coop-context-complexity context)
+                     bytes
+                     pubkey)))
+    (coin-share pubkey: pubkey
+                   signature: (secp256k1-ecdsa-sign secret preimage)
+                   blind: (make-bytevector 32 (+ n 100))
+                   solution: bytes)))
 
-;; A parent well in the past, so every derived timestamp clears the
-;; future-drift rule no matter when the suite runs.
-(define %parent %regtest-genesis)
-(define %parent-time (block-header-time %parent))
-(define %parent-hash (block-header-hash %parent))
+(define (message-of err)
+  (let ((message (exception-message err)))
+    (if (string? message) message "")))
 
-(define (child-at offset)
-  (header-at %parent-hash (+ %parent-time offset)))
+(define (raises-containing? thunk text)
+  (guard (err (#t (string-contains? (message-of err) text)))
+    (thunk)
+    #f))
 
-(define (policy-of chain key)
-  (let ((entry (assoc key (chain-config-extension chain 'policy '()))))
-    (and entry (cdr entry))))
-
-(define (mining-of chain key)
-  (let ((entry (assoc key (chain-config-mining-metadata chain))))
-    (and entry (cdr entry))))
-
-;; The node's own tip selection, reproduced: every stored header becomes a
-;; candidate, a height is `extended?` exactly when a taller header exists, and
-;; the chain's `better-chain?` picks the winner. This mirrors `best-row` in
-;; `(sigil bitcoin node)` closely enough to show what the node would choose.
-(define (best-candidate rules candidates)
-  (let ((better? (header-rules-better-chain? rules)))
-    (let loop ((xs candidates) (best #f))
-      (cond ((null? xs) best)
-            ((not best) (loop (cdr xs) (car xs)))
-            ((better? (car xs) best) (loop (cdr xs) (car xs)))
-            (else (loop (cdr xs) best))))))
-
-(define (max-height candidates)
-  (let loop ((xs candidates) (best 0))
-    (cond ((null? xs) best)
-          ((> (chain-candidate-height (car xs)) best)
-           (loop (cdr xs) (chain-candidate-height (car xs))))
-          (else (loop (cdr xs) best)))))
-
-;; Re-stamp a candidate list the way the node does, marking every height a
-;; taller header already builds on as settled.
-(define (with-extended-flags candidates)
-  (let ((tallest (max-height candidates)))
-    (map (lambda (candidate)
-           (chain-candidate candidate
-                            extended?: (< (chain-candidate-height candidate)
-                                          tallest)))
-         candidates)))
+(define (block-with-coinbase b coinbase . maybe-nonce)
+  (let* ((transactions (cons coinbase (cdr (block-transactions b))))
+         (header (block-header (block-header-field b)
+                               merkle-root: (merkle-root
+                                              (map transaction-txid
+                                                   transactions))
+                               nonce: (if (null? maybe-nonce)
+                                          (block-header-nonce
+                                            (block-header-field b))
+                                          (car maybe-nonce)))))
+    (block b header-field: header transactions: transactions)))
 
 ;; ============================================================
-;; The ranking key
+;; Header field semantics
+;; ============================================================
+
+(test-group "sigilcoin header fields"
+  (test "the version is frozen"
+    (assert-equal 5 coin-header-version)
+    ;; Buried deployments require at least version four.
+    (assert-true (>= coin-header-version 4)))
+
+  (test "bits carries the complexity and nothing else"
+    (assert-equal #x207f0080 coin-genesis-bits)
+    (assert-equal #x207f0080 (coin-bits-encode 128))
+    (assert-equal 128 (coin-result-value (coin-bits-decode #x207f0080)))
+    ;; The whole value stays inside what a Bitcoin-side reader tolerates.
+    (assert-true (<= (coin-bits-encode coin-complexity-max) #x207fffff))
+    (assert-equal 'bits-prefix
+                  (coin-result-reason (coin-bits-decode #x1d00ffff)))
+    (assert-equal 'malformed-header
+                  (coin-result-reason (coin-bits-decode "soon"))))
+
+  (test "the nonce carries the composite score word"
+    (let ((w (coin-header-score %header1)))
+      (assert-true (coin-header-score-ok? w))
+      ;; Every field is derived from the body; the low nibble is reserved
+      ;; zero, so there is no entropy in the field to grind.
+      (assert-equal 0 (bitwise-and w #xf))
+      (assert-equal 0 (coin-score-quality (coin-score-decode w)))
+      (assert-equal (bytevector-length
+                      (coin-coinbase-payload-solution
+                        (coin-result-value
+                          (coin-block-coinbase-payload %block1))))
+                    (coin-score-length (coin-score-decode w)))))
+
+  (test "an illegal score word is refused before it is stored"
+    (assert-equal #f (coin-header-score-ok? 1))
+    (assert-equal #f (coin-header-score-ok? #x100000000))
+    (assert-equal #f (coin-header-score-ok? -1))
+    (assert-equal #f (coin-header-score-ok? "soon"))
+    ;; Every four-bit `15-Q` value is legal; only low nibble is reserved.
+    (assert-true (coin-ok? (coin-score-check #x90)))
+    (assert-equal 'score-reserved-nonzero
+                  (coin-result-reason (coin-score-check 1)))))
+
+;; ============================================================
+;; The ranking key and fork choice
 ;; ============================================================
 
 (test-group "sigilcoin ranking key"
-  (test "shorter solutions score higher"
-    (assert-equal 256 (coin-solution-saving 1))
-    (assert-equal 255 (coin-solution-saving 2))
-    (assert-equal 1 (coin-solution-saving coin-max-solution-bytes))
-    (assert-true (> (coin-solution-saving 10) (coin-solution-saving 11))))
-
-  (test "an impossible length scores the reserved rejected value"
-    (assert-equal 0 (coin-solution-saving 0))
-    (assert-equal 0 (coin-solution-saving (+ coin-max-solution-bytes 1)))
-    (assert-equal 0 (coin-solution-saving -1))
-    (assert-equal 0 (coin-solution-saving "49")))
-
-  (test "the base leaves room for every saving"
-    (assert-equal (+ coin-max-solution-bytes 2) coin-rank-base)
-    (assert-true (> coin-rank-base (coin-solution-saving 1))))
+  (test "a lower score word is a larger saving"
+    (assert-equal #x100000000 (coin-score-saving 0))
+    (assert-true (> (coin-score-saving (coin-score-pack 24 0 0 0))
+                    (coin-score-saving (coin-score-pack 25 0 0 0))))
+    ;; An illegal word scores the reserved rejected value.
+    (assert-equal 0 (coin-score-saving 1))
+    (assert-equal 0 (coin-score-saving "24")))
 
   (test "the two digits round-trip"
-    (assert-equal 3 (coin-rank-accumulated (coin-rank-encode 3 256)))
-    (assert-equal 256 (coin-rank-tip-saving (coin-rank-encode 3 256)))
-    (assert-equal 0 (coin-rank-tip-saving (coin-rank-encode 7 0)))
-    (assert-equal 7 (coin-rank-accumulated (coin-rank-encode 7 0)))))
-
-(test-group "sigilcoin chain work"
-  (test "the tip digit is the length the header commits to"
-    (let ((work (coin-chain-work (header-claiming %zero32 1767225600 10)
-                                 #f
-                                 0)))
-      (assert-equal (coin-solution-saving 10) (coin-rank-tip-saving work))
-      (assert-equal (coin-solution-saving 10) (coin-rank-accumulated work))))
-
-  (test "the accumulated digit sums the whole chain"
-    (let* ((first (coin-chain-work (header-claiming %zero32 1767225600 10)
-                                   #f
-                                   0))
-           (second (coin-chain-work (header-claiming %zero32 1767225601 20)
-                                    #f
-                                    first)))
-      (assert-equal (+ (coin-solution-saving 10) (coin-solution-saving 20))
-                    (coin-rank-accumulated second))
-      (assert-equal (coin-solution-saving 20) (coin-rank-tip-saving second))))
+    (assert-equal (+ #x100000000 1) coin-rank-base)
+    (assert-true (> coin-rank-base (coin-score-saving 0)))
+    (assert-equal 3 (coin-rank-accumulated (coin-rank-encode 3 99)))
+    (assert-equal 99 (coin-rank-tip-saving (coin-rank-encode 3 99))))
 
   (test "the provisional value equals the settled one"
-    ;; This is the property the header commitment exists for: the number the
-    ;; node stores at header ingest is the number it stores again when the
-    ;; body validates, so a block is rankable before anyone has its body.
-    (let loop ((length 1))
-      (when (<= length coin-max-solution-bytes)
-        (let ((header (header-claiming %zero32 1767225600 length)))
-          (assert-equal (coin-chain-work header #f 0)
-                        (coin-chain-work header
-                                         (block-claiming 1 length)
-                                         0)))
-        (loop (* length 2)))))
+    ;; The property the header commitment exists for: the number stored at
+    ;; header ingest is the number stored again when the body validates.
+    (assert-equal (coin-chain-work %header1 #f 0)
+                  (coin-chain-work %header1 %block1 0))
+    ;; And a hostile body cannot move a rank or raise.
+    (assert-equal (coin-chain-work %header1 #f 0)
+                  (coin-chain-work %header1 42 0))
+    (assert-equal (coin-rank-encode 1 0) (coin-chain-work 42 #f 0)))
 
   (test "the key is strictly increasing along a chain"
-    ;; The worst block a header can claim, then the best: every step climbs.
-    (let* ((a (coin-chain-work
-                (header-claiming %zero32 1767225600 coin-max-solution-bytes)
-                #f
-                0))
-           (b (coin-chain-work (header-claiming %zero32 1767225601 1) #f a))
-           (c (coin-chain-work
-                (header-claiming %zero32 1767225602 coin-max-solution-bytes)
-                #f
-                b)))
+    (let* ((worst (coin-score-pack coin-max-solution-bytes 127 127 0))
+           (best (coin-score-pack 1 0 0 8))
+           (a (coin-chain-work (block-header %header1 nonce: worst) #f 0))
+           (b (coin-chain-work (block-header %header1 nonce: best) #f a)))
       (assert-true (> a 0))
-      (assert-true (> b a))
-      (assert-true (> c b))))
-
-  (test "the body is ignored, however hostile it is"
-    ;; The seam passes a body once one validates. SigilCoin's rank does not
-    ;; read it, so junk in that argument cannot change a rank or raise.
-    (let ((header (header-at %zero32 1767225600)))
-      (assert-equal #f (coin-block-solution-length 42))
-      (assert-equal (coin-chain-work header #f 0)
-                    (coin-chain-work header 42 0))
-      (assert-equal (coin-chain-work header #f 0)
-                    (coin-chain-work header
-                                     (block header-field: header
-                                            transactions: '())
-                                     0))
-      ;; Not even a body whose solution disagrees with the header: the
-      ;; disagreement is a body rule, not a ranking input.
-      (assert-equal (coin-chain-work header #f 0)
-                    (coin-chain-work header (block-claiming 1 7) 0))))
-
-  (test "a header claiming an illegal length ranks at the floor"
-    ;; `accept?` refuses to store such a header, so this only has to be
-    ;; total, not meaningful.
-    (let ((work (coin-chain-work (header-claiming %zero32 1767225600 0)
-                                 #f
-                                 0)))
-      (assert-equal 0 (coin-rank-tip-saving work))
-      (assert-equal 1 (coin-rank-accumulated work)))
-    (assert-equal (coin-rank-encode 1 0) (coin-chain-work 42 #f 0))))
-
-;; ============================================================
-;; Fork choice
-;; ============================================================
+      (assert-true (> b a)))))
 
 (test-group "sigilcoin fork choice"
   (test "the taller chain wins"
-    (assert-true (coin-better-chain? (candidate-claiming 2 200 (hash-of 9) #f)
-                                     (candidate-claiming 1 1 (hash-of 1) #f)))
+    (assert-true (coin-better-chain?
+                   (candidate-claiming 2 (coin-score-pack 400 0 0 0)
+                                       (hash-of 9) #f)
+                   (candidate-claiming 1 (coin-score-pack 24 0 0 0)
+                                       (hash-of 1) #f))))
+
+  (test "at equal height the lower score word wins"
+    (let ((better (candidate-claiming 5 (coin-score-pack 24 0 0 0)
+                                      (hash-of 9) #f))
+          (worse (candidate-claiming 5 (coin-score-pack 25 0 0 0)
+                                     (hash-of 1) #f)))
+      (assert-true (coin-better-chain? better worse))
+      (assert-equal #f (coin-better-chain? worse better))))
+
+  (test "shares break a tie the producer's own solution leaves"
+    ;; Share count occupies strictly lower-order bits than every producer
+    ;; field, so it decides exactly the comparisons the program leaves tied.
+    (let ((with-shares (candidate-claiming 5 (coin-score-pack 40 3 9 2)
+                                           (hash-of 1) #f))
+          (without (candidate-claiming 5 (coin-score-pack 40 3 9 0)
+                                       (hash-of 2) #f))
+          (shorter (candidate-claiming 5 (coin-score-pack 39 3 9 0)
+                                       (hash-of 3) #f)))
+      (assert-true (coin-better-chain? with-shares without))
+      ;; And never outranks a genuinely better program.
+      (assert-true (coin-better-chain? shorter with-shares))
+      (assert-equal #f (coin-better-chain? with-shares shorter))))
+
+  (test "the block-hash tie-break is gone"
+    ;; A block-hash tie-break would make 400 graffiti bytes grindable. An
+    ;; equal score word therefore never displaces the incumbent, whatever the
+    ;; hashes are.
+    (let ((low (candidate-claiming 5 (coin-score-pack 40 0 0 0)
+                                   (hash-of 1) #f))
+          (high (candidate-claiming 5 (coin-score-pack 40 0 0 0)
+                                    (hash-of 200) #f)))
+      (assert-equal #f (coin-better-chain? low high))
+      (assert-equal #f (coin-better-chain? high low))))
+
+  (test "a height a taller header outgrew stays settled"
     (assert-equal #f
-                  (coin-better-chain? (candidate-claiming 1 1 (hash-of 1) #f)
-                                      (candidate-claiming 2 200 (hash-of 9) #f))))
+                  (coin-better-chain?
+                    (candidate-claiming 5 (coin-score-pack 1 0 0 8)
+                                        (hash-of 0) #t)
+                    (candidate-claiming 5 (coin-score-pack 400 0 0 0)
+                                        (hash-of 250) #f)))
+    (assert-true (coin-better-chain?
+                   (candidate-claiming 6 (coin-score-pack 400 0 0 0)
+                                       (hash-of 250) #f)
+                   (candidate-claiming 5 (coin-score-pack 1 0 0 8)
+                                       (hash-of 0) #t))))
 
-  (test "at equal height the shorter solution wins"
-    (assert-true (coin-better-chain? (candidate-claiming 5 10 (hash-of 9) #f)
-                                     (candidate-claiming 5 11 (hash-of 1) #f)))
-    (assert-equal #f
-                  (coin-better-chain? (candidate-claiming 5 11 (hash-of 1) #f)
-                                      (candidate-claiming 5 10 (hash-of 9) #f))))
-
-  (test "an equal-length tie breaks on the lower internal hash"
-    (assert-true (coin-better-chain? (candidate-claiming 5 10 (hash-of 1) #f)
-                                     (candidate-claiming 5 10 (hash-of 2) #f)))
-    (assert-equal #f
-                  (coin-better-chain? (candidate-claiming 5 10 (hash-of 2) #f)
-                                      (candidate-claiming 5 10 (hash-of 1) #f))))
-
-  (test "an identical candidate does not displace the incumbent"
-    (assert-equal #f
-                  (coin-better-chain? (candidate-claiming 5 10 (hash-of 1) #f)
-                                      (candidate-claiming 5 10 (hash-of 1) #f))))
-
-  (test "a sibling whose body nobody has still ranks by its commitment"
-    ;; Both candidates are headers-first: no body has been validated for
-    ;; either. The shorter claim still wins, which is what lets the node
-    ;; decide whose body to go and get.
-    (let ((short (candidate-claiming 5 1 (hash-of 250) #f))
-          (long (candidate-claiming 5 coin-max-solution-bytes (hash-of 0) #f)))
-      (assert-equal #f (chain-candidate-body-known? short))
-      (assert-equal #f (chain-candidate-body-known? long))
-      (assert-true (coin-better-chain? short long))
-      (assert-equal #f (coin-better-chain? long short))))
-
-  (test "a height a child already extends is never re-selected"
-    ;; The best possible sibling, arriving after the height was settled.
-    (assert-equal #f
-                  (coin-better-chain? (candidate-claiming 5 1 (hash-of 0) #t)
-                                      (candidate-claiming 5 200 (hash-of 250) #f))))
-
-  (test "an extended incumbent yields to any live candidate"
-    (assert-true (coin-better-chain? (candidate-claiming 6 200 (hash-of 250) #f)
-                                     (candidate-claiming 5 1 (hash-of 0) #t))))
-
-  (test "two settled candidates still rank against each other"
-    ;; Equally settled means settledness decides nothing, so the ordinary
-    ;; height/solution/hash order applies. `best-row` never reaches this
-    ;; case, but the relation has to be an order regardless.
-    (assert-true (coin-better-chain? (candidate-claiming 6 10 (hash-of 1) #t)
-                                     (candidate-claiming 5 10 (hash-of 1) #t)))
-    (assert-equal #f
-                  (coin-better-chain? (candidate-claiming 5 10 (hash-of 1) #t)
-                                      (candidate-claiming 6 10 (hash-of 1) #t)))
-    (assert-true (coin-better-chain? (candidate-claiming 5 10 (hash-of 1) #t)
-                                     (candidate-claiming 5 11 (hash-of 1) #t)))
-    (assert-true (coin-better-chain? (candidate-claiming 5 10 (hash-of 1) #t)
-                                     (candidate-claiming 5 10 (hash-of 2) #t)))
-    ;; Irreflexive: no candidate outranks itself.
-    (assert-equal #f
-                  (coin-better-chain? (candidate-claiming 5 10 (hash-of 1) #t)
-                                      (candidate-claiming 5 10 (hash-of 1) #t))))
-
-  (test "the relation is antisymmetric over every settledness pairing"
-    ;; At most one direction may be #t, across both `extended?` values and
-    ;; candidates differing in height, in solution length and in hash.
-    (let ((candidates (list (candidate-claiming 5 10 (hash-of 1) #f)
-                            (candidate-claiming 5 10 (hash-of 2) #f)
-                            (candidate-claiming 5 11 (hash-of 1) #f)
-                            (candidate-claiming 6 10 (hash-of 1) #f)
-                            (candidate-claiming 5 10 (hash-of 1) #t)
-                            (candidate-claiming 5 10 (hash-of 2) #t)
-                            (candidate-claiming 5 11 (hash-of 1) #t)
-                            (candidate-claiming 6 10 (hash-of 1) #t))))
+  (test "the relation is irreflexive and antisymmetric"
+    (let ((candidates (list (candidate-claiming 5 (coin-score-pack 40 0 0 0)
+                                                (hash-of 1) #f)
+                            (candidate-claiming 5 (coin-score-pack 41 0 0 0)
+                                                (hash-of 2) #f)
+                            (candidate-claiming 6 (coin-score-pack 40 0 0 0)
+                                                (hash-of 1) #f)
+                            (candidate-claiming 5 (coin-score-pack 40 0 0 0)
+                                                (hash-of 1) #t)
+                            (candidate-claiming 6 (coin-score-pack 41 0 0 0)
+                                                (hash-of 2) #t))))
       (for-each
         (lambda (x)
+          (assert-equal #f (coin-better-chain? x x))
           (for-each
             (lambda (y)
               (assert-equal #f (and (coin-better-chain? x y)
                                     (coin-better-chain? y x))))
             candidates))
-        candidates)))
+        candidates))))
 
-  (test "it agrees with the consensus package's sibling ranking"
-    (let ((short #u8(49))
-          (long #u8(49 50)))
-      (assert-equal
-        (coin-better-solution? short (hash-of 9) long (hash-of 1))
-        (coin-better-chain? (candidate-claiming 5 1 (hash-of 9) #f)
-                            (candidate-claiming 5 2 (hash-of 1) #f)))
-      (assert-equal
-        (coin-better-solution? short (hash-of 2) short (hash-of 1))
-        (coin-better-chain? (candidate-claiming 5 1 (hash-of 2) #f)
-                            (candidate-claiming 5 1 (hash-of 1) #f))))))
+;; ============================================================
+;; The puzzle derivation cache
+;; ============================================================
+
+(test-group "sigilcoin puzzle cache"
+  (test "a cache hit is indistinguishable from a cold derivation"
+    (let* ((parent (hash-of 3))
+           (cache (coin-puzzle-cache-open))
+           (cold (coin-puzzle-for parent 7 128))
+           (miss (coin-puzzle-cached cache parent 7 128))
+           (hit (coin-puzzle-cached cache parent 7 128)))
+      (assert-equal 1 (coin-puzzle-cache-size cache))
+      ;; The second call returns the very object the first derived.
+      (assert-true (eq? miss hit))
+      ;; And that object is field for field what a cold derivation produces.
+      (assert-equal (puzzle-spec-height cold) (puzzle-spec-height hit))
+      (assert-equal (puzzle-spec-complexity cold) (puzzle-spec-complexity hit))
+      (assert-equal (puzzle-spec-constraint cold) (puzzle-spec-constraint hit))
+      (assert-equal (puzzle-spec-k cold) (puzzle-spec-k hit))
+      (assert-equal (puzzle-spec-examples cold) (puzzle-spec-examples hit))
+      (assert-equal (puzzle-spec-hidden-source cold) (puzzle-spec-hidden-source hit))
+      (assert-equal (puzzle-spec-table-solution cold)
+                    (puzzle-spec-table-solution hit))
+      (assert-equal (puzzle-spec-par cold) (puzzle-spec-par hit))
+      (assert-equal (puzzle-spec-retries cold) (puzzle-spec-retries hit))))
+
+  (test "the key separates every input the seed separates"
+    (let ((cache (coin-puzzle-cache-open)))
+      (coin-puzzle-cached cache (hash-of 4) 7 128)
+      (coin-puzzle-cached cache (hash-of 5) 7 128)
+      (coin-puzzle-cached cache (hash-of 4) 8 128)
+      (coin-puzzle-cached cache (hash-of 4) 7 129)
+      (assert-equal 4 (coin-puzzle-cache-size cache))
+      ;; Repeating any of them adds nothing.
+      (coin-puzzle-cached cache (hash-of 4) 7 128)
+      (assert-equal 4 (coin-puzzle-cache-size cache))))
+
+  (test "siblings at one height pay derivation once"
+    ;; The reason the cache is a requirement rather than an optimisation:
+    ;; every sibling at a height is judged against the same puzzle, and a
+    ;; node validating the second one must not derive again.
+    (let* ((sibling (block-claiming %header1 1 "(lambda(x)x)"))
+           (before (coin-node-puzzle-cache-size)))
+      ;; Height 1's puzzle is already cached: `%block1` was built against it.
+      (assert-true (> before 0))
+      (assert-equal 'solution-mismatch
+                    (coin-result-reason
+                      (coin-block-score %genesis-block
+                                           1
+                                           coin-genesis-complexity
+                                           sibling)))
+      (assert-equal (coin-header-score %header1)
+                    (coin-result-value
+                      (coin-block-score %genesis-block
+                                           1
+                                           coin-genesis-complexity
+                                           %block1)))
+      (assert-equal before (coin-node-puzzle-cache-size)))))
+
+;; ============================================================
+;; Chain-derived complexity and retargeting
+;; ============================================================
+
+;; A synthetic header chain from genesis, each header committing to a
+;; solution exactly as long as its own height's par, so every margin is
+;; zero. Bodies are irrelevant here: `accept?` and the retarget read only
+;; headers.
+(define (par-at previous-hash height complexity)
+  (puzzle-spec-par (coin-node-puzzle previous-hash height complexity)))
+
+(define (header-claiming previous time complexity length)
+  (block-header version: coin-header-version
+                previous-block: previous
+                merkle-root: %zero32
+                time: time
+                bits: (coin-bits-encode complexity)
+                nonce: (coin-score-pack length 0 0 0)))
+
+;; Genesis plus `count` headers, oldest first, each claiming its own par.
+(define (chain-of count)
+  (let loop ((i 1) (previous %genesis) (acc (list %genesis)))
+    (if (> i count)
+        (reverse acc)
+        (let* ((previous-hash (block-header-hash previous))
+               (header (header-claiming
+                         previous-hash
+                         (+ %genesis-time i)
+                         coin-genesis-complexity
+                         (par-at previous-hash i coin-genesis-complexity))))
+          (loop (+ i 1) header (cons header acc))))))
+
+(define %window (chain-of 15))
+
+(test-group "sigilcoin complexity derivation"
+  (test "the early chain is the frozen genesis complexity"
+    ;; `C(0) = 128` and `C(H) = 128` for `1 <= H < 16`. No partial window is
+    ;; ever used: the first retarget is at 16 over a full window.
+    (assert-equal 128 coin-genesis-complexity)
+    (assert-equal 128 (required '() 0))
+    (assert-equal 128 (required (list %genesis) 1))
+    (let loop ((height 1))
+      (when (< height coin-retarget-window)
+        (assert-equal #f (coin-retarget-height? height))
+        (assert-equal 128 (required %window height))
+        (loop (+ height 1)))))
+
+  (test "the height comes from the history the seam supplies"
+    (assert-equal 0 (coin-header-height '()))
+    (assert-equal 1 (coin-header-height (list %genesis)))
+    (assert-equal 16 (coin-header-height %window)))
+
+  (test "a full window retargets, and genesis is in it"
+    (assert-true (coin-retarget-height? coin-retarget-window))
+    ;; Fifteen headers claiming exactly par give a margin of zero, and
+    ;; genesis's own margin cannot move the upper median off zero whichever
+    ;; side of par it falls. So the factor is 1000 + 0 - 100 = 900 and
+    ;; `C` drops from 128 to floor(128 * 900 / 1000) = 115.
+    (assert-equal 16 (length %window))
+    (assert-equal 16 (length (coin-window-margins %window 16)))
+    (assert-equal '(0 0 0 0 0 0 0 0 0 0 0 0 0 0 0)
+                  (cdr (coin-window-margins %window 16)))
+    (assert-equal 115 (required %window 16)))
+
+  (test "a window that beats par raises the complexity"
+    ;; The same chain, but every header claims a solution well under par.
+    (let* ((beaten
+             (let loop ((i 1) (previous %genesis) (acc (list %genesis)))
+               (if (> i 15)
+                   (reverse acc)
+                   (let* ((previous-hash (block-header-hash previous))
+                          (par (par-at previous-hash i
+                                       coin-genesis-complexity))
+                          (header (header-claiming
+                                    previous-hash
+                                    (+ %genesis-time i)
+                                    coin-genesis-complexity
+                                    (max 1 (quotient par 2)))))
+                     (loop (+ i 1) header (cons header acc)))))))
+      ;; Halving the length is a margin of at least 500 milli-units, so the
+      ;; factor is at least 1400 and `C` rises rather than falls.
+      (assert-true (> (required beaten 16) 128))))
+
+  (test "the derivation is total against a history it cannot use"
+    (assert-error (coin-window-margins (list %genesis) 16))
+    (assert-error (coin-required-complexity (list 42) 1))))
 
 ;; ============================================================
 ;; Header acceptance
 ;; ============================================================
 
 (test-group "sigilcoin header acceptance"
-  (test "genesis is accepted by its own chain's rules"
-    (assert-true (accept-with sigilcoin-main-chain '() %main-genesis))
-    (assert-true (accept-with sigilcoin-regtest-chain '() %regtest-genesis)))
+  (test "genesis and a well-formed child are accepted"
+    (assert-true (accept? '() %genesis))
+    (assert-true (accept? (list %genesis) %header1)))
 
-  (test "a well-formed child is accepted"
-    (assert-true (accept-with sigilcoin-regtest-chain
-                              (list %parent)
-                              (child-at 1)))
-    (assert-true (accept-with sigilcoin-main-chain
-                              (list %parent)
-                              (child-at coin-min-block-spacing))))
+  (test "the version is pinned to five"
+    (assert-equal #f
+                  (accept? (list %genesis)
+                           (block-header %header1 version: 4))))
 
-  (test "the spacing floor comes from the chain, not the package"
-    ;; One second apart: legal on the local chain, far too fast on mainnet.
-    (assert-true (accept-with sigilcoin-regtest-chain
-                              (list %parent)
-                              (child-at 1)))
+  (test "bits must equal the complexity derived from the parent chain"
+    ;; The whole point of §9.4: `C` is never miner-chosen, so a header that
+    ;; disagrees with the derived value is refused before it is stored.
     (assert-equal #f
-                  (accept-with sigilcoin-main-chain
-                               (list %parent)
-                               (child-at 1)))
-    (assert-equal #f
-                  (accept-with sigilcoin-main-chain
-                               (list %parent)
-                               (child-at (- coin-min-block-spacing 1))))
-    (assert-equal coin-min-block-spacing
-                  (policy-of sigilcoin-main-chain 'min-block-spacing))
-    (assert-equal coin-regtest-min-block-spacing
-                  (policy-of sigilcoin-regtest-chain 'min-block-spacing)))
+                  (accept? (list %genesis)
+                           (block-header %header1
+                                         bits: (coin-bits-encode 129))))
+    (assert-equal 'complexity-mismatch
+                  (coin-result-reason
+                    (coin-check-bits (coin-bits-encode 129) 128))))
 
-  (test "a header that does not link to its parent is rejected"
-    (assert-equal #f
-                  (accept-with sigilcoin-regtest-chain
-                               (list %parent)
-                               (header-at (hash-of 7) (+ %parent-time 1)))))
+  (test "a retarget height must carry the retargeted complexity"
+    (let* ((parent (list-ref %window 15))
+           (child (header-claiming (block-header-hash parent)
+                                   (+ (block-header-time parent) %spacing)
+                                   115
+                                   40))
+           (stale (block-header child bits: coin-genesis-bits)))
+      (assert-true (accept? %window child))
+      ;; The same header carrying the pre-retarget complexity is refused.
+      (assert-equal #f (accept? %window stale))))
 
-  (test "a header at or below its parent's time is rejected"
+  (test "the score word only has to be a legal word here"
     (assert-equal #f
-                  (accept-with sigilcoin-regtest-chain
-                               (list %parent)
-                               (child-at 0))))
+                  (accept? (list %genesis) (block-header %header1 nonce: 1)))
+    (assert-true
+      (accept? (list %genesis) (block-header %header1 nonce: #x90)))
+    ;; A legal word that lies about the body still passes: that is a body
+    ;; rule, and this is what makes fork choice decidable from headers alone.
+    (assert-true (accept? (list %genesis)
+                          (block-header %header1
+                                        nonce: (coin-score-pack 1 0 0 0)))))
 
-  (test "a header from the far future is rejected"
-    (assert-equal #f
-                  (accept-with sigilcoin-regtest-chain
-                               (list %parent)
-                               (header-at %parent-hash #xfffffffe))))
-
-  (test "the frozen header fields are enforced"
-    (let ((ok (child-at 1)))
-      (assert-true (accept-with sigilcoin-regtest-chain (list %parent) ok))
-      (assert-equal #f
-                    (accept-with sigilcoin-regtest-chain
-                                 (list %parent)
-                                 (block-header version: 2
-                                               previous-block: %parent-hash
-                                               merkle-root: %zero32
-                                               time: (+ %parent-time 1)
-                                               bits: coin-header-bits
-                                               nonce: %default-solution-length)))
-      (assert-equal #f
-                    (accept-with sigilcoin-regtest-chain
-                                 (list %parent)
-                                 (block-header version: coin-header-version
-                                               previous-block: %parent-hash
-                                               merkle-root: %zero32
-                                               time: (+ %parent-time 1)
-                                               bits: #x1d00ffff
-                                               nonce: %default-solution-length)))))
-
-  (test "the solution-length commitment must be a legal length"
-    ;; The header field is 32 bits wide; only 1..256 describes a block that
-    ;; could ever decode, so `accept?` refuses the rest before storing it.
-    (assert-true (coin-header-solution-length-ok? 1))
-    (assert-true (coin-header-solution-length-ok? coin-max-solution-bytes))
-    (assert-equal #f (coin-header-solution-length-ok? 0))
-    (assert-equal #f (coin-header-solution-length-ok?
-                       (+ coin-max-solution-bytes 1)))
-    (assert-equal %default-solution-length
-                  (coin-header-solution-length (child-at 1)))
-    (assert-true (accept-with sigilcoin-regtest-chain
-                              (list %parent)
-                              (header-claiming %parent-hash
-                                               (+ %parent-time 1)
-                                               1)))
-    (assert-equal #f
-                  (accept-with sigilcoin-regtest-chain
-                               (list %parent)
-                               (header-claiming %parent-hash
-                                                (+ %parent-time 1)
-                                                0)))
-    (assert-equal #f
-                  (accept-with sigilcoin-regtest-chain
-                               (list %parent)
-                               (header-claiming %parent-hash
-                                                (+ %parent-time 1)
-                                                (+ coin-max-solution-bytes 1)))))
+  (test "linkage and pacing are enforced by the header rules"
+    (assert-equal #f (accept? (list %genesis)
+                              (block-header %header1
+                                            previous-block: (hash-of 7))))
+    (assert-equal #f (accept? (list %genesis)
+                              (block-header %header1 time: %genesis-time)))
+    (assert-equal #f (accept? (list %genesis)
+                              (block-header %header1 time: #xfffffffe))))
 
   (test "a malformed header is rejected rather than raising"
-    (assert-equal #f (accept-with sigilcoin-regtest-chain (list %parent) 42)))
-
-  (test "the rules refuse a nonsensical spacing floor"
+    (assert-equal #f (accept? (list %genesis) 42))
+    (assert-equal #f (accept? (list %genesis) "soon"))
     (assert-error (coin-header-rules -1))
-    (assert-error (coin-header-rules "soon"))))
+    (assert-true (header-rules? (coin-header-rules %spacing)))))
 
 ;; ============================================================
-;; Chain configs
+;; The coinbase payload codec and the co-op seam
 ;; ============================================================
 
-(test-group "sigilcoin chain configs"
-  (test "mainnet identity"
-    (assert-equal "sigilcoin-main" (chain-config-name sigilcoin-main-chain))
-    (assert-equal "sigilcoin-main"
-                  (chain-config-network-id sigilcoin-main-chain))
-    (assert-equal #u8(#x8f #xd1 #xc0 #xa5)
-                  (chain-config-magic sigilcoin-main-chain))
-    (assert-equal 19444 (chain-config-default-port sigilcoin-main-chain))
-    (assert-equal '(("seed.sigilcoin.lol" . 19444))
-                  (chain-config-seed-peers sigilcoin-main-chain))
-    (assert-equal 70015
-                  (chain-config-protocol-version sigilcoin-main-chain))
-    (assert-equal 1 (chain-config-services sigilcoin-main-chain))
-    (assert-equal "/sigilcoin-node:0.1.0/"
-                  (chain-config-user-agent sigilcoin-main-chain)))
+(test-group "sigilcoin coinbase payload"
+  (test "the bounds are the payload format's own extremes"
+    (assert-equal 8 coin-min-coinbase-script-bytes)
+    (assert-equal 6588 coin-max-coinbase-script-bytes)
+    (assert-equal (cons 8 6588) coin-coinbase-script-bounds)
+    (assert-equal 5145 coin-max-shares-bytes)
+    (assert-equal 513 coin-max-commits-bytes)
+    (assert-true (> coin-max-coinbase-script-bytes 100)))
 
-  (test "the local chain is a separate network"
-    (assert-equal "sigilcoin-regtest"
-                  (chain-config-name sigilcoin-regtest-chain))
-    (assert-equal #u8(#xa5 #xc0 #xd1 #x8f)
-                  (chain-config-magic sigilcoin-regtest-chain))
-    (assert-equal 19445 (chain-config-default-port sigilcoin-regtest-chain))
-    (assert-equal '() (chain-config-seed-peers sigilcoin-regtest-chain))
-    ;; Different magic, port and genesis: the two cannot be confused.
-    (assert-true (not (equal? (chain-config-magic sigilcoin-main-chain)
-                              (chain-config-magic sigilcoin-regtest-chain))))
-    (assert-true (not (equal? (chain-config-genesis-hash sigilcoin-main-chain)
-                              (chain-config-genesis-hash
-                                sigilcoin-regtest-chain)))))
+  (test "five pushes round-trip"
+    (let* ((payload (coin-coinbase-payload
+                      height: 7
+                      solution: #u8(99 97 114)
+                      shares: coin-empty-shares
+                      commits: coin-empty-commits
+                      graffiti: #u8(104 105)))
+           (script (coin-coinbase-payload-encode payload))
+           (decoded (coin-coinbase-payload-decode script)))
+      (assert-true (coin-ok? decoded))
+      (assert-equal 7 (coin-coinbase-payload-height
+                        (coin-result-value decoded)))
+      (assert-equal #u8(99 97 114)
+                    (coin-coinbase-payload-solution
+                      (coin-result-value decoded)))
+      (assert-equal #u8(104 105)
+                    (coin-coinbase-payload-graffiti
+                      (coin-result-value decoded)))
+      (assert-equal script
+                    (coin-coinbase-payload-encode
+                      (coin-result-value decoded)))))
 
-  (test "no SigilCoin magic collides with a Bitcoin network"
-    ;; The magic is the whole of network separation on the wire: a collision
-    ;; means two networks' frames are indistinguishable and the divergence is
-    ;; only caught later, at a genesis mismatch. Read from the live Bitcoin
-    ;; configs rather than copied, so this cannot pass against stale bytes.
-    (let ((bitcoin-magics (map chain-config-magic
-                               (list bitcoin-mainnet-chain
-                                     bitcoin-testnet-chain
-                                     bitcoin-testnet4-chain
-                                     bitcoin-signet-chain
-                                     bitcoin-regtest-chain)))
-          (coin-magics (list (chain-config-magic sigilcoin-main-chain)
-                             (chain-config-magic sigilcoin-regtest-chain))))
-      (assert-equal 5 (length bitcoin-magics))
-      ;; Regtest's was the actual collision once; name it so the guard is
-      ;; obvious even if the list above is ever trimmed.
-      (assert-true (and (member #u8(#xfa #xbf #xb5 #xda) bitcoin-magics) #t))
-      (for-each
-        (lambda (coin-magic)
-          (assert-equal 4 (bytevector-length coin-magic))
-          ;; Every byte has the high bit set: never ASCII, never valid UTF-8,
-          ;; so no text protocol's handshake can be read as a frame prefix.
-          (let loop ((i 0))
-            (when (< i 4)
-              (assert-true (>= (bytevector-u8-ref coin-magic i) #x80))
-              (loop (+ i 1))))
-          (for-each
-            (lambda (bitcoin-magic)
-              (assert-equal #f (equal? coin-magic bitcoin-magic)))
-            bitcoin-magics))
-        coin-magics)))
+  (test "the decoder is strict and total"
+    (assert-equal 'not-bytevector
+                  (coin-result-reason (coin-coinbase-payload-decode 42)))
+    (assert-equal 'malformed-script
+                  (coin-result-reason
+                    (coin-coinbase-payload-decode #u8(#x02 #x01))))
+    ;; The count byte is mandatory, so an empty SHARES push is malformed
+    ;; rather than "no shares" — which is what keeps the canonicality
+    ;; re-encode unambiguous.
+    (assert-error
+      (coin-coinbase-payload-encode
+        (coin-coinbase-payload height: 1
+                                  solution: #u8(49)
+                                  shares: #u8()
+                                  commits: coin-empty-commits
+                                  graffiti: #u8())))
+    (assert-error
+      (coin-coinbase-payload-encode
+        (coin-coinbase-payload
+          height: 1
+          solution: (make-bytevector (+ coin-max-solution-bytes 1) 49)
+          shares: coin-empty-shares
+          commits: coin-empty-commits
+          graffiti: #u8()))))
 
-  (test "sigil-bitcoin's placeholder agrees about the magic"
-    ;; `sigil-bitcoin` still carries a placeholder `sigilcoin` config. Two
-    ;; repos disagreeing about the magic is the same failure as a collision,
-    ;; so pin them together from the side that owns the value.
-    (assert-equal (chain-config-magic sigilcoin-main-chain)
-                  (chain-config-magic (chain-config-by-name "sigilcoin"))))
+  (test "the maximum solution round-trips"
+    (assert-equal 512 coin-max-solution-bytes)
+    (assert-true (coin-ok?
+                   (coin-coinbase-payload-decode
+                     (coin-coinbase-payload-encode
+                       (coin-coinbase-payload
+                         height: 1
+                         solution: (make-bytevector coin-max-solution-bytes
+                                                    49)
+                         shares: coin-empty-shares
+                         commits: coin-empty-commits
+                         graffiti: #u8()))))))
 
-  (test "consensus params say nothing about difficulty"
-    (let ((params (chain-config-consensus-params sigilcoin-main-chain)))
-      (assert-true (eq? params sigilcoin-consensus-params))
-      ;; The pow limit is the whole hash space and matches the frozen header
-      ;; bits, so no header can fail a target check.
-      (assert-equal coin-header-bits
-                    (consensus-params-pow-limit-bits params))
-      (assert-equal 86400 (consensus-params-target-spacing params))
-      (assert-equal coin-target-block-spacing
-                    (consensus-params-target-spacing params))
-      (assert-equal #xffffffff (consensus-params-retarget-interval params))
-      ;; Every soft fork is on from genesis: there is no legacy to phase in.
-      (assert-equal 0 (consensus-params-bip34-height params))
-      (assert-equal 0 (consensus-params-bip66-height params))
-      (assert-equal 0 (consensus-params-bip65-height params))
-      (assert-equal 0 (consensus-params-csv-height params))
-      (assert-equal 0 (consensus-params-segwit-height params))
-      (assert-equal 0 (consensus-params-taproot-height params))))
+  (test "the co-op seam consumes consensus codecs"
+    (let ((empty (coin-coinbase-payload height: 1
+                                           solution: #u8(49)
+                                           shares: coin-empty-shares
+                                           commits: coin-empty-commits
+                                           graffiti: #u8())))
+      (assert-equal '() (coin-result-value (coin-check-coop empty #f)))
+      (assert-equal 'shares-malformed
+                    (coin-result-reason
+                      (coin-check-coop
+                        (coin-coinbase-payload empty shares: #u8(1)) #f)))
+      ;; Commitments are validated now and become meaningful to the child.
+      (assert-equal '()
+                    (coin-result-value
+                      (coin-check-coop
+                        (coin-coinbase-payload
+                          empty commits: (coin-commits-encode '()))
+                        #f))))))
 
-  (test "the node resolves the chain's own header rules"
-    (let ((rules (chain-config-header-rules sigilcoin-main-chain)))
-      (assert-true (header-rules? rules))
-      (assert-true (eq? coin-chain-work (header-rules-chain-work rules)))
-      (assert-true (eq? coin-better-chain? (header-rules-better-chain? rules)))
-      ;; Not Bitcoin's, which is what the seam falls back to when a chain
-      ;; attaches nothing.
-      (assert-true (not (eq? bitcoin-header-rules rules))))
-    (assert-true (header-rules?
-                   (chain-config-header-rules sigilcoin-regtest-chain))))
+;; ============================================================
+;; Body validation: the header commitment
+;; ============================================================
 
-  (test "the node resolves the chain's own block rules"
-    (let ((rules (chain-config-block-rules sigilcoin-main-chain)))
-      (assert-true (block-rules? rules))
-      (assert-true (eq? coin-block-rules rules))
-      (assert-true (eq? coin-connect-block (block-rules-connect rules)))
-      (assert-true (eq? coin-block-reward (block-rules-subsidy rules)))
-      (assert-equal coin-coinbase-script-bounds
-                    (block-rules-coinbase-script-bounds rules))
-      ;; Not Bitcoin's, which is what the seam falls back to when a chain
-      ;; attaches nothing: Bitcoin's emission and its 100-byte coinbase cap
-      ;; would both reject a real SigilCoin block.
-      (assert-true (not (eq? bitcoin-block-rules rules)))
-      (assert-true (not (equal? bitcoin-coinbase-script-bounds
-                                coin-coinbase-script-bounds))))
-    (assert-true (eq? coin-block-rules
-                      (chain-config-block-rules sigilcoin-regtest-chain))))
+(test-group "sigilcoin body validation"
+  (test "a mined block validates end to end"
+    ;; The miner's block, through the exact `connect` the node calls, with
+    ;; the header it built accepted by the exact `accept?` the node calls.
+    (assert-true (accept? (list %genesis) %header1))
+    (assert-equal coin-header-version (block-header-version %header1))
+    (assert-equal coin-genesis-bits (block-header-bits %header1))
+    (assert-true (block-merkle-root-valid? %block1))
+    ;; `connect` returns the updated UTXO set and raises on any rejection,
+    ;; so reaching this at all is the whole assertion.
+    (let ((utxos (connect 1 %block1)))
+      (assert-true (not (eq? #f utxos)))
+      ;; One coinbase output, worth exactly the height-1 subsidy.
+      (assert-equal 1 (length (transaction-outputs
+                                (car (block-transactions %block1)))))
+      (assert-equal (coin-block-reward 1)
+                    (transaction-output-value
+                      (car (block-transactions %block1))))))
 
-  (test "policy and flavour are published in extensions"
-    (assert-equal "#systemcrafters"
-                  (mining-of sigilcoin-main-chain 'irc-channel))
-    (assert-equal 'program-golf (mining-of sigilcoin-main-chain 'rule))
-    (assert-equal (puzzle-generator-version)
-                  (mining-of sigilcoin-main-chain 'puzzle-generator-version))
-    (assert-equal coin-max-block-bytes
-                  (policy-of sigilcoin-main-chain 'max-block-bytes))
-    (assert-equal coin-max-solution-bytes
-                  (policy-of sigilcoin-main-chain 'max-solution-bytes))
-    (assert-equal coin-max-graffiti-bytes
-                  (policy-of sigilcoin-main-chain 'max-graffiti-bytes))
-    (assert-equal coin-max-future-drift
-                  (policy-of sigilcoin-main-chain 'max-future-drift))
-    (assert-equal coin-median-time-span
-                  (policy-of sigilcoin-main-chain 'median-time-span))
-    (assert-equal coin-target-block-spacing
-                  (policy-of sigilcoin-main-chain 'target-block-spacing))
-    (assert-equal coin-max-supply
-                  (policy-of sigilcoin-main-chain 'max-supply))
-    (assert-equal coin-max-coinbase-script-bytes
-                  (policy-of sigilcoin-main-chain
-                             'max-coinbase-script-bytes))))
+  (test "the solution is the table solution unless the miner golfs"
+    (let ((solution (coin-coinbase-payload-solution
+                      (coin-result-value
+                        (coin-block-coinbase-payload %block1)))))
+      (assert-equal (coin-table-solution %genesis-hash
+                                            1
+                                            coin-genesis-complexity)
+                    solution)
+      (assert-true (coin-ok?
+                     (coin-check-solution
+                       (coin-puzzle-for %genesis-hash 1
+                                           coin-genesis-complexity)
+                       solution)))))
+
+  (test "a header claiming a better block than it carries is rejected"
+    ;; Understating the length is the attack the commitment exists for: it
+    ;; would outrank an honest sibling on headers alone.
+    (let* ((claimed (coin-score-decode (coin-header-score %header1)))
+           (better (coin-score-pack (- (coin-score-length claimed) 1)
+                                       0 0 0)))
+      (assert-true (< better (coin-header-score %header1)))
+      (assert-error (connect 1 (with-nonce %block1 better)))))
+
+  (test "a header claiming a worse block than it carries is rejected too"
+    ;; The check is equality, not a bound: overstating is just as invalid.
+    (let* ((claimed (coin-score-decode (coin-header-score %header1)))
+           (worse (coin-score-pack (+ (coin-score-length claimed) 1)
+                                      127 127 0)))
+      (assert-true (> worse (coin-header-score %header1)))
+      (assert-error (connect 1 (with-nonce %block1 worse)))))
+
+  (test "the memory and step buckets are committed too"
+    (let ((claimed (coin-score-decode (coin-header-score %header1))))
+      (assert-error
+        (connect 1 (with-nonce %block1
+                               (coin-score-pack
+                                 (coin-score-length claimed)
+                                 0
+                                 0
+                                 0))))))
+
+  (test "a body that disagrees with an honest header is rejected"
+    ;; The other direction: the header is the one the miner built, and the
+    ;; body has been swapped for one carrying a different solution.
+    (let* ((other (build-on %genesis 1 coin-genesis-complexity
+                            (utf8->string
+                              (coin-table-solution
+                                %genesis-hash 1 coin-genesis-complexity))))
+           (swapped (with-header
+                      (coin-build-block %genesis 1
+                                           coin-genesis-complexity
+                                           #f "different graffiti" %payout
+                                           (+ %genesis-time %spacing))
+                      %header1)))
+      ;; Same solution, different graffiti: the score word is unchanged, so
+      ;; this one is a legitimate sibling and still connects.
+      (assert-equal (coin-header-score %header1)
+                    (block-header-nonce (block-header-field other)))
+      ;; But a body whose coinbase does not back the header's merkle root is
+      ;; Bitcoin's rule, and a body whose solution does not back the score
+      ;; word is SigilCoin's. Both refuse.
+      (assert-error (connect 1 swapped))))
+
+  (test "the height in the coinbase must be the block's height"
+    (assert-equal 'height-mismatch
+                  (coin-result-reason
+                    (coin-block-score %genesis-block
+                                         2
+                                         coin-genesis-complexity
+                                         %block1)))
+    (assert-error (connect 2 %block1)))
+
+  (test "a block whose solution does not solve its puzzle is rejected"
+    ;; The miner refuses to build one at all.
+    (assert-error (build-on %genesis 1 coin-genesis-complexity "car"))
+    ;; And a body assembled around a solution the builder would refuse is
+    ;; refused by the rules: this one is a 1-arity procedure that simply
+    ;; does not reproduce the pairs.
+    (let ((bad (block-claiming %header1 1 "(lambda(x)x)")))
+      (assert-equal 'solution-mismatch
+                    (coin-result-reason
+                      (coin-block-score %genesis-block
+                                           1
+                                           coin-genesis-complexity
+                                           bad)))
+      (assert-error (connect 1 bad)))
+    ;; The genesis solution is for the genesis puzzle: at height 1 it is
+    ;; answering a different question, and which way it fails — a mismatch
+    ;; or an evaluator error on an input it was never written for — is not
+    ;; consensus, only that it fails.
+    (assert-true (coin-failed?
+                   (coin-block-score
+                     %genesis-block
+                     1
+                     coin-genesis-complexity
+                     (block-claiming %header1
+                                     1
+                                     coin-genesis-solution)))))
+
+  (test "the body rules are total against junk"
+    (assert-error (connect 1 42))
+    (assert-equal 'missing-coinbase
+                  (coin-result-reason
+                    (coin-block-score %genesis-block 1
+                                         coin-genesis-complexity 42)))
+    (assert-equal 'internal-error
+                  (coin-result-reason
+                    (coin-block-score %genesis-block 1 "soon" %block1))))
+
+  (test "the rules record is the canonical one"
+    (assert-true (block-rules? coin-block-rules))
+    (assert-true (eq? coin-connect-block
+                      (block-rules-connect coin-block-rules)))
+    ;; The block rules use the chain's emission schedule directly.
+    (assert-true (eq? coin-block-reward
+                      (block-rules-subsidy coin-block-rules)))
+    (assert-equal coin-coinbase-script-bounds
+                  (block-rules-coinbase-script-bounds coin-block-rules))
+    (assert-true (not (equal? bitcoin-coinbase-script-bounds
+                              coin-coinbase-script-bounds)))))
 
 ;; ============================================================
 ;; Genesis
 ;; ============================================================
 
-(define %genesis-block (coin-genesis-block coin-genesis-quote
-                                           coin-genesis-time))
-
 (test-group "sigilcoin genesis"
   (test "rebuilding from the quote reproduces the checked-in constants"
     (assert-equal coin-genesis-header-constant
                   (coin-genesis-header-hex coin-genesis-quote
-                                           coin-genesis-time))
+                                              coin-genesis-time))
     (assert-equal coin-regtest-genesis-header-constant
                   (coin-genesis-header-hex coin-regtest-genesis-quote
-                                           coin-regtest-genesis-time))
-    ;; Byte for byte against what the chain config actually serves.
-    (assert-equal (block-header-serialize %main-genesis)
-                  (block-header-serialize
-                    (coin-genesis-header coin-genesis-quote
-                                         coin-genesis-time)))
-    (assert-equal (block-header-serialize %regtest-genesis)
-                  (block-header-serialize
-                    (coin-genesis-header coin-regtest-genesis-quote
-                                         coin-regtest-genesis-time)))
-    (assert-equal (chain-config-genesis-hash sigilcoin-main-chain)
-                  (coin-genesis-hash coin-genesis-quote coin-genesis-time))
-    (assert-equal coin-genesis-id-constant (block-header-id %main-genesis))
+                                              coin-regtest-genesis-time))
+    (assert-equal 160 (string-length coin-genesis-header-constant))
+    (assert-equal coin-genesis-id-constant
+                  (block-header-id (coin-genesis-header coin-genesis-quote
+                                                           coin-genesis-time)))
     (assert-equal coin-regtest-genesis-id-constant
-                  (block-header-id %regtest-genesis)))
-
-  (test "genesis is seeded with its real rank"
-    ;; The node seeds its header table with `(chain-work genesis #f 0)` and
-    ;; never revisits it, because genesis has no body to download. The header
-    ;; commitment is what makes that seeded value the true one rather than a
-    ;; placeholder every later chain then inherits.
-    (let ((stored (coin-chain-work %main-genesis #f 0)))
-      ;; The solution length is the generator's, not a choice.
-      (assert-equal 49 (bytevector-length coin-genesis-solution))
-      (assert-equal 49 (coin-header-solution-length %main-genesis))
-      (assert-equal 208 (coin-solution-saving 49))
-      (assert-equal (coin-rank-encode 208 208) stored)
-      (assert-equal 208 (coin-rank-accumulated stored))
-      (assert-equal 208 (coin-rank-tip-saving stored))
-      ;; And handing the body over changes nothing.
-      (assert-equal stored (coin-chain-work %main-genesis %genesis-block 0))))
-
-  (test "a different quote is a different genesis"
+                  (block-header-id %genesis))
+    ;; A different quote is a different genesis, so regenerating after the
+    ;; launch date is set is one call and one constant.
     (assert-true (not (equal? (coin-genesis-hash coin-genesis-quote
-                                                 coin-genesis-time)
+                                                    coin-genesis-time)
                               (coin-genesis-hash "something else"
-                                                 coin-genesis-time)))))
+                                                    coin-genesis-time))))
+    (assert-true (not (equal? (coin-genesis-hash coin-genesis-quote
+                                                    coin-genesis-time)
+                              (coin-genesis-hash coin-genesis-quote
+                                                    (+ 1 coin-genesis-time))))))
 
-  (test "the header commits to the coinbase"
+  (test "the header fields are frozen"
+    (assert-equal 5 (block-header-version %genesis))
+    (assert-equal #x207f0080 (block-header-bits %genesis))
+    (assert-equal coin-genesis-score (block-header-nonce %genesis))
+    (assert-equal %zero32 (block-header-previous-block %genesis))
+    ;; Genesis carries no shares, so aggregate quality is zero.
+    (assert-equal 0 (coin-score-quality
+                      (coin-score-decode coin-genesis-score))))
+
+  (test "the header commits to its own body"
     (assert-true (block-merkle-root-valid? %genesis-block))
-    (assert-equal (block-header-merkle-root (block-header-field %genesis-block))
-                  (merkle-root (list (transaction-txid
-                                       (coin-genesis-coinbase
-                                         coin-genesis-quote))))))
-
-  (test "there is no premine and the output cannot be spent"
-    (let* ((coinbase (car (block-transactions %genesis-block)))
-           (outputs (transaction-outputs coinbase)))
-      (assert-equal 0 (coin-block-reward 0))
-      (assert-equal 1 (length outputs))
-      (assert-equal 0 (txout-value (car outputs)))
-      (assert-equal 0 (transaction-output-value coinbase))
-      ;; A bare OP_RETURN: evaluation fails immediately, for everyone.
-      (assert-equal #u8(#x6a) (txout-script-pubkey (car outputs)))
-      (assert-equal coin-genesis-script-pubkey
-                    (txout-script-pubkey (car outputs)))))
+    (assert-equal (coin-header-score %genesis)
+                  (coin-result-value
+                    (coin-block-score #f
+                                         0
+                                         coin-genesis-complexity
+                                         %genesis-block)))
+    (assert-true (accept? '() %genesis)))
 
   (test "the coinbase carries a real, verifiable solution"
     (let ((payload (coin-block-coinbase-payload %genesis-block)))
@@ -686,152 +836,322 @@
       (assert-equal coin-genesis-solution
                     (coin-coinbase-payload-solution
                       (coin-result-value payload)))
-      (assert-equal (string->utf8 coin-genesis-quote)
+      (assert-equal (string->utf8 coin-regtest-genesis-quote)
                     (coin-coinbase-payload-graffiti
+                      (coin-result-value payload)))
+      ;; Empty SHARES and COMMITS, which is what §12.5 specifies.
+      (assert-equal coin-empty-shares
+                    (coin-coinbase-payload-shares
+                      (coin-result-value payload)))
+      (assert-equal coin-empty-commits
+                    (coin-coinbase-payload-commits
                       (coin-result-value payload))))
-    ;; The solution solves the puzzle the genesis seed generates.
-    (assert-true (coin-ok? (coin-verify-block-solution %zero32
-                                                       0
-                                                       %genesis-block)))
-    (assert-true (coin-ok? (coin-check-solution (coin-puzzle-for %zero32 0)
-                                                coin-genesis-solution))))
+    (assert-true (coin-ok?
+                   (coin-check-solution
+                     (coin-puzzle-for %zero32 0 coin-genesis-complexity)
+                     coin-genesis-solution))))
+
+  (test "there is no premine and the output cannot be spent"
+    (let* ((coinbase (car (block-transactions %genesis-block)))
+           (outputs (transaction-outputs coinbase)))
+      (assert-equal 0 (coin-block-reward 0))
+      (assert-equal 1 (length outputs))
+      (assert-equal 0 (txout-value (car outputs)))
+      (assert-equal #u8(#x6a) (txout-script-pubkey (car outputs)))))
 
   (test "genesis is a legal block under the size and header rules"
     (assert-true (coin-ok? (coin-validate-block-size %genesis-block)))
+    (assert-equal 16384 coin-max-block-bytes)
+    (assert-equal 200000 coin-max-fuel)
     (assert-true (coin-ok? (coin-validate-header-context
                              '()
-                             %main-genesis
-                             coin-genesis-time)))
-    (assert-equal coin-header-version (block-header-version %main-genesis))
-    (assert-equal coin-header-bits (block-header-bits %main-genesis))
-    (assert-true (coin-header-solution-length-ok?
-                   (coin-header-solution-length %main-genesis)))
-    (assert-equal %zero32 (block-header-previous-block %main-genesis))
-    ;; Version 4 is not decoration: Bitcoin's connector reads the buried
-    ;; deployment heights in these params as version floors, and SigilCoin
-    ;; sets all of them to 0.
-    (assert-equal 4 coin-header-version)
-    (assert-true (>= coin-header-version 4))))
-
+                             %genesis
+                             coin-regtest-genesis-time)))))
 
 ;; ============================================================
-;; Running the chain through the library seam
+;; Co-op commit/reveal, payouts, and live canonical node path
 ;; ============================================================
-;;
-;; These exercise the exact entry points `(sigil bitcoin node)` calls on a
-;; chain's rules: header-chain acceptance, accumulated work, and tip choice,
-;; with candidates built by hand so a case a live chain would take many
-;; blocks to reach is one line. `test-chain.sgl` drives the same rules
-;; through a real `node-open` instead.
 
-(define (headers-from-genesis genesis count spacing)
-  (let loop ((i 0)
-             (previous genesis)
-             (acc (list genesis)))
-    (if (>= i count)
-        (reverse acc)
-        (let ((next (header-at (block-header-hash previous)
-                               (+ (block-header-time previous) spacing))))
-          (loop (+ i 1) next (cons next acc))))))
+;; Full-workspace harness omits optional native secp256k1; package harness
+;; binds it and runs co-op integration.
+(define %native-secp256k1?
+  (guard (err (#t #f))
+    (and (secp256k1-seckey-verify? (make-bytevector 32 1)) #t)))
 
-(define %regtest-rules (chain-rules sigilcoin-regtest-chain))
-(define %regtest-params
-  (chain-config-consensus-params sigilcoin-regtest-chain))
-(define %regtest-headers
-  (headers-from-genesis %regtest-genesis 3 coin-regtest-min-block-spacing))
+;; Two deterministic pubkeys whose personalized tasks have a shorter golf.
+(define %share-context0 (coin-parent-context %block1))
+(define %share-source-1
+  "(lambda(x)(if(equal? x \"@\")\"adbliemffghlbcgeeajjfndonfkklkafgfnhbobidegaeibjppjmbhpfojnfnnahip\"(cons x(list x x))))")
+(define %share-source-6
+  "(lambda(x)(if(equal? x \"@\")\"adpaagkbinfgfdmeonpfdjbppcdkgbpadppidncdhoiiaoogbbihpkjpdhjkacioak\"(+(* x 6)52)))")
+(define %coop-shares
+  (if %native-secp256k1?
+      (sort-bytes (list (signed-share 1 %share-source-1 %share-context0)
+                        (signed-share 6 %share-source-6 %share-context0))
+                  coin-share-pubkey)
+      '()))
+(define %coop-commitments
+  (sort-bytes
+    (map (lambda (share)
+           (coin-share-commitment %share-context0 share))
+         %coop-shares)
+    (lambda (x) x)))
+(define %coop-parent
+  (coin-build-block %genesis
+                       1
+                       coin-genesis-complexity
+                       #f
+                       "commit"
+                       %payout
+                       (+ %genesis-time %spacing)
+                       '()
+                       0
+                       %coop-commitments))
+(define %coop-context (coin-parent-context %coop-parent))
+(define %coop-block
+  (and %native-secp256k1?
+       (coin-build-coop-block
+         %coop-parent
+         2
+         coin-genesis-complexity
+         #f
+         %coop-shares
+         "reveal"
+         %payout
+         (+ (block-header-time (block-header-field %coop-parent)) %spacing))))
 
-(test-group "sigilcoin through the node seam"
-  (test "the library validates a SigilCoin header chain with these rules"
-    (assert-true (header-chain-valid? %regtest-params
-                                      %regtest-headers
-                                      %regtest-rules))
-    ;; Bitcoin's own rules reject the same chain: there is no proof-of-work.
-    (assert-equal #f (header-chain-valid? %regtest-params %regtest-headers))
-    ;; And a chain that breaks SigilCoin's own pacing is refused.
-    (assert-equal #f
-                  (header-chain-valid?
-                    %regtest-params
-                    (list %regtest-genesis
-                          (header-at (block-header-hash %regtest-genesis)
-                                     (block-header-time %regtest-genesis)))
-                    %regtest-rules)))
+(define (connect/parent height b parent utxos)
+  (coin-connect-block coin-block-rules
+                         sigilcoin-consensus-params
+                         height
+                         utxos
+                         b
+                         #t
+                         parent))
 
-  (test "accumulated work is what the library would persist"
-    (let ((work (header-chain-work %regtest-headers %regtest-rules))
-          (saving (coin-solution-saving %default-solution-length)))
-      ;; Four headers, no bodies anywhere, and every rank is already the
-      ;; final one because each header carries its own commitment: genesis
-      ;; contributes what its own 49-byte solution is worth, the three
-      ;; children what they each claim.
-      (assert-equal saving (coin-rank-tip-saving work))
-      (assert-equal (+ (coin-solution-saving
-                         (coin-header-solution-length %regtest-genesis))
-                       (* 3 saving))
-                    (coin-rank-accumulated work))
-      (assert-equal work
-                    (coin-chain-work
-                      (list-ref %regtest-headers 3)
-                      #f
-                      (header-chain-work (list (list-ref %regtest-headers 0)
-                                               (list-ref %regtest-headers 1)
-                                               (list-ref %regtest-headers 2))
-                                         %regtest-rules)))))
+(define (replace-at xs index value)
+  (let loop ((ys xs) (i index))
+    (cond ((null? ys) '())
+          ((= i 0) (cons value (cdr ys)))
+          (else (cons (car ys) (loop (cdr ys) (- i 1)))))))
 
-  (test "tip selection follows the tallest chain"
-    (let ((candidates (with-extended-flags
-                        (list (candidate-claiming 0 200 (hash-of 0) #f)
-                              (candidate-claiming 1 200 (hash-of 1) #f)
-                              (candidate-claiming 2 200 (hash-of 2) #f)))))
+(define (submit-block n b)
+  (node-ingest-headers n (list (block-header-field b)))
+  (node-store-block n b)
+  (node-validate-blocks n))
+
+(when %native-secp256k1?
+  (test-group "sigilcoin co-op body"
+  (test "multiple personalized shares validate strictly under par"
+    (for-each
+      (lambda (share)
+        (let ((spec (coin-share-puzzle
+                      %coop-context (coin-share-pubkey share))))
+          (assert-true (< (bytevector-length (coin-share-solution share))
+                          (puzzle-spec-par spec)))
+          (assert-true (coin-ok?
+                         (coin-check-solution
+                           spec (coin-share-solution share))))))
+      %coop-shares)
+    (let ((accepted (coin-result-value
+                      (coin-check-coop
+                        (coin-result-value
+                          (coin-block-coinbase-payload %coop-block))
+                        %coop-context))))
+      (assert-equal 2 (length accepted))
+      (assert-equal (map coin-share-pubkey %coop-shares)
+                    (map coin-share-pubkey accepted))
+      (assert-equal (map coin-share-solution %coop-shares)
+                    (map coin-share-solution accepted))))
+
+  (test "commitments at H authorize reveals and exact payouts at H+1"
+    (let* ((parent-utxos (connect/parent 1 %coop-parent %genesis-block '()))
+           (outputs (transaction-outputs
+                      (car (block-transactions %coop-block))))
+           (unit (coin-split-unit (coin-block-reward 2) 2)))
+      (assert-equal 4 (length outputs))
+      ;; Producer weight 2, two share weights, one carrier weight.
+      (assert-equal (* 2 unit) (txout-value (list-ref outputs 0)))
+      (assert-equal unit (txout-value (list-ref outputs 1)))
+      (assert-equal unit (txout-value (list-ref outputs 2)))
+      (assert-equal unit (txout-value (list-ref outputs 3)))
+      (assert-equal (coin-share-script
+                      (coin-share-pubkey (list-ref %coop-shares 0)))
+                    (txout-script-pubkey (list-ref outputs 1)))
+      (assert-equal (coin-carrier-script %coop-parent)
+                    (txout-script-pubkey (list-ref outputs 3)))
+      (assert-true (not (eq? #f
+                             (connect/parent 2 %coop-block %coop-parent
+                                             parent-utxos))))))
+
+  (test "aggregate Q equals header claim and low field is 15-Q"
+    (let* ((quality (coin-shares-quality %coop-context %coop-shares))
+           (word (coin-header-score (block-header-field %coop-block)))
+           (decoded (coin-score-decode word)))
+      (assert-equal quality (coin-score-quality decoded))
+      (assert-equal word
+                    (coin-result-value
+                      (coin-block-score %coop-parent
+                                           2
+                                           coin-genesis-complexity
+                                           %coop-block)))
+      (assert-equal (- 15 quality)
+                    (bitwise-and (arithmetic-shift word -4) #xf))))
+
+  (test "uncommitted and replayed shares are rejected"
+    (let ((payload (coin-result-value
+                     (coin-block-coinbase-payload %coop-block))))
+      (assert-equal 'share-uncommitted
+                    (coin-result-reason
+                      (coin-check-coop payload
+                                          (coin-parent-context %block1))))
+      (let* ((wrong-prev (hash-of 99))
+             (wrong (coin-coop-context
+                      parent-prev-hash: wrong-prev
+                      puzzle-height: 1
+                      complexity: coin-genesis-complexity
+                      spec: (coin-node-puzzle
+                              wrong-prev 1 coin-genesis-complexity)
+                      commits: %coop-commitments)))
+        (assert-true (coin-failed? (coin-check-coop payload wrong))))))
+
+  (test "wrong carrier, split, and Q are rejected"
+    (let* ((parent-utxos (connect/parent 1 %coop-parent %genesis-block '()))
+           (coinbase (car (block-transactions %coop-block)))
+           (outputs (transaction-outputs coinbase))
+           (last (list-ref outputs 3))
+           (wrong-carrier
+             (block-with-coinbase
+               %coop-block
+               (transaction coinbase
+                            outputs: (replace-at
+                                       outputs 3
+                                       (txout last script-pubkey: #u8(#x6a))))))
+           (producer (list-ref outputs 0))
+           (share (list-ref outputs 1))
+           (wrong-values
+             (block-with-coinbase
+               %coop-block
+               (transaction
+                 coinbase
+                 outputs: (replace-at
+                            (replace-at outputs 0
+                                        (txout producer
+                                               value: (+ 1
+                                                         (txout-value producer))))
+                            1
+                            (txout share value: (- (txout-value share) 1))))))
+           (score (coin-score-decode
+                    (coin-header-score (block-header-field %coop-block))))
+           (wrong-q
+             (with-nonce
+               %coop-block
+               (coin-score-pack (coin-score-length score)
+                                   (coin-score-memory score)
+                                   (coin-score-steps score)
+                                   0))))
+      (assert-true (raises-containing?
+                     (lambda () (connect/parent 2 wrong-carrier %coop-parent
+                                                parent-utxos))
+                     "coinbase-output-shape"))
+      (assert-true (raises-containing?
+                     (lambda () (connect/parent 2 wrong-values %coop-parent
+                                                parent-utxos))
+                     "coinbase-output-value"))
+      (assert-true (raises-containing?
+                     (lambda () (connect/parent 2 wrong-q %coop-parent
+                                                parent-utxos))
+                     "score-mismatch"))))
+
+  (test "16 KiB gate runs before hostile body work"
+    (let* ((huge-tx
+             (transaction
+               version: 1
+               inputs: (list
+                         (txin previous-output:
+                                 (outpoint txid: (hash-of 8) index: 0)
+                               script-sig: #u8()
+                               sequence: #xffffffff
+                               witness: '()))
+               outputs: (list
+                          (txout value: 0
+                                 script-pubkey:
+                                   (make-bytevector coin-max-block-bytes 1)))
+               lock-time: 0))
+           (fat (coin-build-block %genesis
+                                     1
+                                     coin-genesis-complexity
+                                     #f
+                                     "fat"
+                                     %payout
+                                     (+ %genesis-time %spacing)
+                                     (list huge-tx)
+                                     0)))
+      (assert-equal 'block-oversize
+                    (coin-result-reason (coin-validate-block-size fat)))
+      (assert-true (raises-containing?
+                     (lambda () (connect/parent 1 fat %genesis-block '()))
+                     "block-oversize")))))
+
+(test-group "sigilcoin canonical live node"
+  (test "configured genesis validates H1 and durable H validates H+1 after restart"
+    (let ((dir (make-temp-directory)))
+      ;; H1 receives trusted configured genesis because generic node's genesis
+      ;; anchor has no body row.
+      (let ((first (node-open sigilcoin-regtest-chain dir)))
+        (assert-equal 1 (submit-block first %coop-parent))
+        (assert-equal 1
+                      (node-status-snapshot-validated-block-count
+                        (node-status first)))
+        (node-close first))
+      ;; H1's validated body now comes from SQLite and supplies both COMMITS
+      ;; and carrier producer script after process state has been discarded.
+      (let ((reopened (node-open sigilcoin-regtest-chain dir)))
+        (assert-equal 1 (submit-block reopened %coop-block))
+        (assert-equal 2
+                      (node-status-snapshot-best-height
+                        (node-status reopened)))
+        (assert-equal 2
+                      (node-status-snapshot-validated-block-count
+                        (node-status reopened)))
+        (assert-equal (hex-encode
+                        (block-header-hash (block-header-field %coop-block)))
+                      (node-status-snapshot-best-block-hash
+                        (node-status reopened)))
+        (node-close reopened))))
+
+  (test "bodyless better sibling cannot roll validated canonical block back"
+    (let* ((dir (make-temp-directory))
+           (n (node-open sigilcoin-regtest-chain dir))
+           (fake (block-header
+                   version: coin-header-version
+                   previous-block: (block-header-hash
+                                     (block-header-field %coop-parent))
+                   merkle-root: (make-bytevector 32 9)
+                   time: (+ (block-header-time
+                              (block-header-field %coop-parent))
+                            %spacing)
+                   bits: coin-genesis-bits
+                   nonce: (coin-score-pack 1 0 0 15))))
+      (assert-equal 1 (submit-block n %coop-parent))
+      (assert-equal 1 (submit-block n %coop-block))
+      (assert-equal 1 (node-ingest-headers n (list fake)))
+      (assert-equal 0 (node-validate-blocks n))
       (assert-equal 2
-                    (chain-candidate-height
-                      (best-candidate %regtest-rules candidates)))))
-
-  (test "a shorter sibling takes the tip while the height is unsettled"
-    (let* ((long (candidate-claiming 2 40 (hash-of 3) #f))
-           (short (candidate-claiming 2 12 (hash-of 9) #f))
-           (candidates (with-extended-flags
-                         (list (candidate-claiming 0 200 (hash-of 0) #f)
-                               (candidate-claiming 1 200 (hash-of 1) #f)
-                               long
-                               short))))
-      (assert-equal (hash-of 9)
-                    (chain-candidate-hash
-                      (best-candidate %regtest-rules candidates)))))
-
-  (test "a child settles the height against a later, shorter sibling"
-    (let* ((incumbent (candidate-claiming 2 40 (hash-of 3) #f))
-           (child (candidate-claiming 3 40 (hash-of 4) #f))
-           (late-and-shorter (candidate-claiming 2 1 (hash-of 9) #f))
-           (candidates (with-extended-flags
-                         (list (candidate-claiming 0 200 (hash-of 0) #f)
-                               (candidate-claiming 1 200 (hash-of 1) #f)
-                               incumbent
-                               child
-                               late-and-shorter)))
-           (best (best-candidate %regtest-rules candidates)))
-      ;; The better solution arrived too late: height 2 is settled, so the
-      ;; child stays the tip. This is `coin-replaces-tip?` at chain scale.
-      (assert-equal 3 (chain-candidate-height best))
-      (assert-equal (hash-of 4) (chain-candidate-hash best))))
-
-  (test "a header-only sibling displaces a validated one when it is shorter"
-    ;; The reorganisation SigilCoin's consensus demands and headers-first
-    ;; sync has to start: nobody has the challenger's body yet, and its
-    ;; header alone is enough to make the node go and fetch it.
-    (let* ((validated (candidate-claiming 2 200 (hash-of 3) #f))
-           (header-only (candidate-claiming 2 12 (hash-of 0) #f))
-           (candidates (with-extended-flags (list header-only validated))))
-      (assert-equal #f (chain-candidate-body-known? header-only))
-      (assert-equal (hash-of 0)
-                    (chain-candidate-hash
-                      (best-candidate %regtest-rules candidates)))))
-
-  (test "a longer header-only sibling does not displace anything"
-    (let* ((validated (candidate-claiming 2 12 (hash-of 3) #f))
-           (header-only (candidate-claiming 2 200 (hash-of 0) #f))
-           (candidates (with-extended-flags (list header-only validated))))
-      (assert-equal (hash-of 3)
-                    (chain-candidate-hash
-                      (best-candidate %regtest-rules candidates))))))
+                    (node-status-snapshot-best-block-height (node-status n)))
+      (assert-equal (hex-encode
+                      (block-header-hash (block-header-field %coop-block)))
+                    (node-status-snapshot-best-block-hash (node-status n)))
+      (node-close n)
+      ;; Restart rebuilds active metadata without following bodyless branch.
+      (let ((reopened (node-open sigilcoin-regtest-chain dir)))
+        (assert-equal 2
+                      (node-status-snapshot-best-block-height
+                        (node-status reopened)))
+        (assert-equal (hex-encode
+                        (block-header-hash (block-header-field %coop-block)))
+                      (node-status-snapshot-best-block-hash
+                        (node-status reopened)))
+        (node-close reopened))))))
 
 (run-tests)

@@ -27,10 +27,17 @@
 (define-library (sigil coin consensus rules)
   (import (sigil math)
           (sigil list)
+          (sigil coin puzzle)
           (sigil bitcoin consensus)
           (sigil coin consensus result))
   (export
     coin-max-block-bytes
+    coin-max-solution-bytes
+    coin-max-graffiti-bytes
+    coin-max-shares
+    coin-max-commitments
+    coin-max-k
+    coin-max-fuel
     coin-min-block-spacing
     coin-max-future-drift
     coin-median-time-span
@@ -42,7 +49,25 @@
   (begin
 
     ;;; Maximum serialized block size, in bytes.
-    (define coin-max-block-bytes 8192)
+    (define coin-max-block-bytes 16384)
+
+    ;;; Maximum source bytes accepted by consensus.
+    (define coin-max-solution-bytes puzzle-max-source-bytes)
+
+    ;;; Maximum opaque coinbase graffiti bytes.
+    (define coin-max-graffiti-bytes 400)
+
+    ;;; Maximum co-op reveals per block.
+    (define coin-max-shares 8)
+
+    ;;; Maximum commitments per block.
+    (define coin-max-commitments 16)
+
+    ;;; Maximum published example count.
+    (define coin-max-k 8)
+
+    ;;; Shared evaluator fuel cap.
+    (define coin-max-fuel puzzle-max-fuel)
 
     ;;; Minimum seconds between a header and its parent on mainnet: 20 hours.
     ;;; This is the default floor; a chain config may supply its own.

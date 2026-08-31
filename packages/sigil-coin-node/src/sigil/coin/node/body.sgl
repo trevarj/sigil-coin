@@ -1,158 +1,28 @@
-;;; (sigil coin node body) — SigilCoin block-body validation
+;;; (sigil coin node body) — canonical block-body validation
 ;;;
-;;; The second half of the seam into `sigil-bitcoin-node`. Where
-;;; `(sigil coin node rules)` supplies the `header-rules` a node ranks
-;;; headers with, this module supplies the `block-rules` it validates bodies
-;;; with, and the chain config carries both.
-;;;
-;;; A `block-rules` record is three things: a `connect` procedure, an
-;;; emission schedule, and the inclusive coinbase scriptSig byte bounds. Two
-;;; of them are just SigilCoin's own constants; the interesting one is
-;;; `connect`.
-;;;
-;;; ============================================================
-;;; WHAT CONNECT DOES, AND WHAT IT DELEGATES
-;;; ============================================================
-;;;
-;;; SigilCoin's block body IS a Bitcoin block body. Transactions, the UTXO
-;;; set, script execution, value conservation, coinbase maturity, the BIP34
-;;; height commitment and the merkle root are Bitcoin's rules unchanged, so
-;;; `coin-connect-block` runs them by calling Bitcoin's own connector — the
-;;; procedure inside `bitcoin-block-rules` — rather than reimplementing any
-;;; of it. It hands that connector SigilCoin's OWN rules record, which is why
-;;; the emission read there is `coin-block-reward` and the coinbase bounds
-;;; are SigilCoin's rather than Bitcoin's 2..100.
-;;;
-;;; What SigilCoin adds are the two body rules Bitcoin has no equivalent of:
-;;;
-;;;   1. the SIZE CAP, `coin-max-block-bytes`. Bitcoin's connector has no
-;;;      block weight rule in this library, so nothing else enforces it.
-;;;   2. the SOLUTION. The puzzle is regenerated from the parent hash and the
-;;;      height and the coinbase's claimed program is re-run against it. This
-;;;      is the whole mining rule, and body validation is the only place it
-;;;      can live, because the solution is in the coinbase.
-;;;   3. the SOLUTION-LENGTH COMMITMENT. The header carries the length of the
-;;;      solution, because fork choice has to rank a block before anyone has
-;;;      its body — see `(sigil coin node rules)`. That makes the header's
-;;;      value a claim, and this is where the claim meets the coinbase that
-;;;      is supposed to back it. A block whose solution is not exactly as
-;;;      long as its header said is invalid, so overstating the golf to win a
-;;;      reorganisation does not buy an attacker a tip: it buys a header
-;;;      branch the node marks invalid for good.
-;;;
-;;; ORDER. Size first because it is one serialization and it bounds the cost
-;;; of everything after it. Solution second, before Bitcoin's connector,
-;;; because Bitcoin's connector mutates the indexed UTXO set it is handed:
-;;; raising after it has run would leave the caller's in-memory set carrying
-;;; a rejected block's outputs. Rejecting first costs a solution check on a
-;;; body that Bitcoin might have rejected more cheaply — up to the puzzle
-;;; interpreter's fuel ceiling per block — which is the price of never
-;;; corrupting a UTXO set. A node that wants to pay less should gate blocks
-;;; before validation, not reorder the rules.
-;;;
-;;; WHERE THE PARENT HASH COMES FROM. `connect` is handed the height but not
-;;; the parent, so the parent hash is read from the block's own header. That
-;;; is not the block choosing its own puzzle: by the time a body is
-;;; validated, `coin-accept-header?` has already checked that this header
-;;; links to a stored parent, and the node has already checked that the
-;;; stored body's header serializes to the accepted header byte for byte. A
-;;; block that names a different parent is a block on a different branch, at
-;;; a different height, judged against that branch's puzzle.
-;;;
-;;; EVERY REJECTION RAISES. `sigil-coin-consensus` returns tagged results and
-;;; never raises; the node seam expects a raise. The translation happens
-;;; here, once, and carries the reason symbol into the message so the
-;;; database's stored failure reason names the rule that fired.
+;;; Size and header fields are gated before any program runs. Producer and
+;;; personalized share programs are then checked, reward outputs are checked
+;;; against the exact 2/1/1 split, and only then does Bitcoin's connector
+;;; mutate the UTXO set.
 
 (define-library (sigil coin node body)
   (import (sigil math)
+          (sigil bitcoin utils)
+          (sigil bitcoin tx)
           (sigil bitcoin consensus)
+          (sigil coin puzzle)
           (sigil coin consensus)
           (sigil coin node rules))
   (export
-    coin-min-coinbase-script-bytes
-    coin-max-coinbase-script-bytes
-    coin-coinbase-script-bounds
+    coin-score-for-solution
+    coin-parent-context
+    coin-block-score
     coin-connect-block
-    coin-block-rules)
+    coin-block-rules
+    coin-block-rules-for-genesis)
 
   (begin
 
-    ;; ============================================================
-    ;; Coinbase scriptSig bounds
-    ;; ============================================================
-
-    ;; The largest height the coinbase payload can carry: the BIP34 domain,
-    ;; and the same bound `coin-coinbase-payload-encode` enforces.
-    (define %max-height #xffffffff)
-
-    ;;; Smallest legal SigilCoin coinbase scriptSig, in bytes: 4.
-    ;;;
-    ;;; That is the canonical encoding of the smallest payload there is —
-    ;;; height 0 as the empty push (`OP_0`, 1 byte), a one-byte solution
-    ;;; (push opcode plus the byte, 2), and empty graffiti (`OP_0`, 1). It is
-    ;;; derived from the encoder rather than written down, so it cannot drift
-    ;;; away from the payload format.
-    ;;;
-    ;;; ```scheme
-    ;;; coin-min-coinbase-script-bytes ; => 4
-    ;;; ```
-    (define coin-min-coinbase-script-bytes
-      (bytevector-length
-        (coin-coinbase-payload-encode
-          (coin-coinbase-payload height: 0
-                                 solution: (make-bytevector 1 49)
-                                 graffiti: #u8()))))
-
-    ;;; Largest legal SigilCoin coinbase scriptSig, in bytes: 668.
-    ;;;
-    ;;; Bitcoin caps this field at 100 bytes because nothing consensus-bearing
-    ;;; lives in it. SigilCoin's mining claim does, so the cap is the exact
-    ;;; size of the largest canonical payload:
-    ;;;
-    ;;;   HEIGHT    6 bytes. The largest height, `#xffffffff`, encodes as a
-    ;;;             Bitcoin script number in 5 bytes — four magnitude bytes
-    ;;;             plus the `#x00` sign pad the top bit forces — under a
-    ;;;             one-byte push opcode.
-    ;;;   SOLUTION  259 bytes. `coin-max-solution-bytes` is 256, one past the
-    ;;;             single-byte length field, so the minimal push is
-    ;;;             `OP_PUSHDATA2`: opcode, two length bytes, 256 of data.
-    ;;;   GRAFFITI  403 bytes. `coin-max-graffiti-bytes` is 400, also an
-    ;;;             `OP_PUSHDATA2`: opcode, two length bytes, 400 of data.
-    ;;;
-    ;;; 6 + 259 + 403 = 668. Derived from the encoder for the same reason as
-    ;;; the floor: the number and the payload format cannot disagree.
-    ;;;
-    ;;; ```scheme
-    ;;; coin-max-coinbase-script-bytes ; => 668
-    ;;; ```
-    (define coin-max-coinbase-script-bytes
-      (bytevector-length
-        (coin-coinbase-payload-encode
-          (coin-coinbase-payload
-            height: %max-height
-            solution: (make-bytevector coin-max-solution-bytes 49)
-            graffiti: (make-bytevector coin-max-graffiti-bytes 49)))))
-
-    ;;; SigilCoin's inclusive `(min . max)` coinbase scriptSig byte bounds.
-    ;;;
-    ;;; This is a length bound only. It admits every canonical payload and
-    ;;; plenty of junk besides; the payload decoder is what rejects the junk,
-    ;;; and it runs on every block through `coin-verify-block-solution`.
-    ;;;
-    ;;; ```scheme
-    ;;; coin-coinbase-script-bounds ; => (4 . 668)
-    ;;; ```
-    (define coin-coinbase-script-bounds
-      (cons coin-min-coinbase-script-bytes coin-max-coinbase-script-bytes))
-
-    ;; ============================================================
-    ;; Connect
-    ;; ============================================================
-
-    ;; Turn a rejected `coin-result` into the raise the node seam expects,
-    ;; naming the frozen reason symbol so the stored failure reason is
-    ;; machine-readable, and appending the advisory detail for a human.
     (define (require-coin-ok who result)
       (if (coin-failed? result)
           (error (string-append who
@@ -163,67 +33,210 @@
                                 ")")))
       (coin-result-value result))
 
-    ;;; Validate a SigilCoin block body and return the updated UTXO set.
-    ;;;
-    ;;; The `block-rules` `connect` procedure: called by the node as
-    ;;; `(coin-connect-block rules params height utxos b verify-scripts?
-    ;;;                      parent-block)`.
-    ;;; `rules` is the record this procedure was reached through, and is
-    ;;; passed on unchanged so the delegated Bitcoin connector reads
-    ;;; SigilCoin's emission and coinbase bounds out of it.
-    ;;;
-    ;;; Raises on any rejection. The message names the reason symbol:
-    ;;; `block-oversize` and `malformed-block` from the size rule,
-    ;;; `missing-coinbase`, `height-mismatch`, the payload decoder's reasons
-    ;;; and `coin-check-solution`'s reasons from the mining rule,
-    ;;; `solution-length-mismatch` from the header commitment, and Bitcoin's
-    ;;; own messages from everything it validates.
-    ;;;
-    ;;; ```scheme
-    ;;; (coin-connect-block coin-block-rules params 1 '() b #t parent)
-    ;;; ```
+    ;;; Build share-validation context from a validated parent block.
+    (define (coin-parent-context parent-block)
+      (: block? -> coin-coop-context?)
+      (let* ((header (block-header-field parent-block))
+             (payload (require-coin-ok
+                        "coin-parent-context: coinbase"
+                        (coin-block-coinbase-payload parent-block)))
+             (complexity (require-coin-ok
+                           "coin-parent-context: bits"
+                           (coin-header-complexity header)))
+             (commits (require-coin-ok
+                        "coin-parent-context: commits"
+                        (coin-commits-decode
+                          (coin-coinbase-payload-commits payload))))
+             (height (coin-coinbase-payload-height payload))
+             (previous-hash (block-header-previous-block header)))
+        (coin-coop-context
+          parent-prev-hash: previous-hash
+          puzzle-height: height
+          complexity: complexity
+          spec: (coin-node-puzzle previous-hash height complexity)
+          commits: commits)))
+
+    ;;; Score a producer solution with aggregate personalized-share quality.
+    (define (coin-score-for-solution previous-hash height complexity
+                                        solution quality)
+      (: bytevector? integer? integer? any? integer? -> coin-result?)
+      (let* ((spec (coin-node-puzzle previous-hash height complexity))
+             (checked (coin-check-solution spec solution)))
+        (if (coin-failed? checked)
+            checked
+            (let ((report (coin-result-value checked)))
+              (coin-ok
+                (coin-score-encode
+                  (coin-solution-length solution)
+                  (puzzle-report-cells report)
+                  (puzzle-report-steps report)
+                  quality))))))
+
+    (define (context-for parent-block header height)
+      (cond
+        ((= height 0) #f)
+        ((not parent-block)
+         (error "coin-block-score: missing validated parent block"))
+        ((not (equal? (block-header-hash (block-header-field parent-block))
+                      (block-header-previous-block header)))
+         (error "coin-block-score: parent block does not match the header"))
+        (else (coin-parent-context parent-block))))
+
+    ;; Validate mining claims and return `(score shares context payload)`.
+    (define (check-block-claims parent-block height complexity b)
+      (guard (e (#t (coin-error 'internal-error "the block score check raised")))
+        (let ((decoded (coin-block-coinbase-payload b)))
+          (if (coin-failed? decoded)
+              decoded
+              (let* ((header (block-header-field b))
+                     (payload (coin-result-value decoded))
+                     (context (context-for parent-block header height)))
+                (if (not (= height (coin-coinbase-payload-height payload)))
+                    (coin-error 'height-mismatch
+                                "the coinbase height is not the block height")
+                    (let ((coop (coin-check-coop payload context)))
+                      (if (coin-failed? coop)
+                          coop
+                          (let* ((shares (coin-result-value coop))
+                                 (quality (if (null? shares)
+                                              0
+                                              (coin-shares-quality
+                                                context shares)))
+                                 (scored (coin-score-for-solution
+                                           (block-header-previous-block header)
+                                           height
+                                           complexity
+                                           (coin-coinbase-payload-solution
+                                             payload)
+                                           quality)))
+                            (if (coin-failed? scored)
+                                scored
+                                (coin-ok (list (coin-result-value scored)
+                                               shares
+                                               context
+                                               payload))))))))))))
+
+    ;;; Recompute exact header score from producer and personalized shares.
+    (define (coin-block-score parent-block height complexity b)
+      (: any? any? any? any? -> coin-result?)
+      (let ((checked (check-block-claims parent-block height complexity b)))
+        (if (coin-failed? checked)
+            checked
+            (coin-ok (car (coin-result-value checked))))))
+
+    ;; Fee arithmetic before Bitcoin's mutating connector. This mirrors only
+    ;; value flow; Bitcoin still owns structural, maturity and script checks.
+    (define (outpoint=? a b)
+      (and (= (outpoint-index a) (outpoint-index b))
+           (or (equal? (outpoint-txid a) (outpoint-txid b))
+               (equal? (outpoint-txid a)
+                       (reverse-bytevector (outpoint-txid b))))))
+
+    (define (member-outpoint? op xs)
+      (let loop ((ys xs))
+        (and (pair? ys)
+             (or (outpoint=? op (car ys)) (loop (cdr ys))))))
+
+    (define (local-output op outputs)
+      (let loop ((xs outputs))
+        (cond ((null? xs) #f)
+              ((outpoint=? op (car (car xs))) (cdr (car xs)))
+              (else (loop (cdr xs))))))
+
+    (define (input-output utxos local op)
+      (or (local-output op local)
+          (let ((entry (utxo-set-lookup utxos op)))
+            (and entry (utxo-entry-output entry)))))
+
+    (define (transaction-input-value tx utxos local spent)
+      (let loop ((inputs (transaction-inputs tx)) (total 0) (used spent))
+        (if (null? inputs)
+            (cons total used)
+            (let* ((op (txin-previous-output (car inputs)))
+                   (output (input-output utxos local op)))
+              (if (or (member-outpoint? op used) (not output))
+                  (error "coin-connect-block: missing or repeated input"))
+              (loop (cdr inputs)
+                    (+ total (txout-value output))
+                    (cons op used))))))
+
+    (define (add-local-outputs tx local)
+      (let ((txid (transaction-txid tx)))
+        (let loop ((outputs (transaction-outputs tx)) (index 0) (out local))
+          (if (null? outputs)
+              out
+              (loop (cdr outputs)
+                    (+ index 1)
+                    (cons (cons (outpoint txid: txid index: index)
+                                (car outputs))
+                          out))))))
+
+    (define (block-fees b utxos)
+      (let loop ((txs (cdr (block-transactions b)))
+                 (local '())
+                 (spent '())
+                 (fees 0))
+        (if (null? txs)
+            fees
+            (let* ((input (transaction-input-value (car txs)
+                                                   utxos local spent))
+                   (fee (- (car input)
+                           (transaction-output-value (car txs)))))
+              (if (< fee 0)
+                  (error "coin-connect-block: transaction overspends"))
+              (loop (cdr txs)
+                    (add-local-outputs (car txs) local)
+                    (cdr input)
+                    (+ fees fee))))))
+
+    ;;; Validate a block with its explicit validated parent body.
     (define (coin-connect-block rules params height utxos b verify-scripts?
-                                parent-block)
+                                   parent-block)
       (: block-rules? consensus-params? integer? list? block? any? any? -> list?)
-      ;; One serialization, and it also establishes that `b` is a block, so
-      ;; reading its header below cannot raise.
       (require-coin-ok "coin-connect-block: block size"
                        (coin-validate-block-size b))
       (let* ((header (block-header-field b))
-             (payload (require-coin-ok
-                        "coin-connect-block: solution"
-                        (coin-verify-block-solution
-                          (block-header-previous-block header)
-                          height
-                          b))))
-        ;; The header already ranked this block by the length it claims. Now
-        ;; that the coinbase is in hand, the claim has to be true.
-        (unless (= (coin-header-solution-length header)
-                   (bytevector-length
-                     (coin-coinbase-payload-solution payload)))
-          (error (string-append
-                   "coin-connect-block: solution-length-mismatch"
-                   " (the header does not commit to the coinbase"
-                   " solution's length)"))))
+             (claimed (coin-header-score header)))
+        (unless (= coin-header-version (block-header-version header))
+          (error "coin-connect-block: wrong-version"))
+        ;; Header acceptance binds this decoded value to chain-derived
+        ;; retarget history before any body can reach this connector.
+        (let* ((complexity (require-coin-ok
+                             "coin-connect-block: bits"
+                             (coin-header-complexity header)))
+               (checked (check-block-claims parent-block height complexity b))
+               (value (require-coin-ok "coin-connect-block: score" checked))
+               (score (car value))
+               (shares (cadr value))
+               (coinbase (car (block-transactions b)))
+               (carrier (and (pair? shares)
+                             (coin-carrier-script parent-block)))
+               (total (+ ((block-rules-subsidy rules) height)
+                         (block-fees b utxos))))
+          (require-coin-ok "coin-connect-block: score"
+                           (coin-score-check claimed))
+          (unless (= claimed score)
+            (error "coin-connect-block: score-mismatch"))
+          (require-coin-ok "coin-connect-block: split"
+                           (coin-check-split coinbase total shares carrier))))
       ((block-rules-connect bitcoin-block-rules)
-       rules
-       params
-       height
-       utxos
-       b
-       verify-scripts?
-       parent-block))
+       rules params height utxos b verify-scripts? parent-block))
 
-    ;;; SigilCoin's block-body validation rules.
-    ;;;
-    ;;; Attached to both chain configs as
-    ;;; `(consensus (block-rules . coin-block-rules))`, which is where
-    ;;; `chain-config-block-rules` reads it.
-    ;;;
-    ;;; ```scheme
-    ;;; ((block-rules-subsidy coin-block-rules) 1) ; => 100000000
-    ;;; ```
     (define coin-block-rules
       (block-rules connect: coin-connect-block
                    subsidy: coin-block-reward
-                   coinbase-script-bounds: coin-coinbase-script-bounds))))
+                   coinbase-script-bounds: coin-coinbase-script-bounds))
+
+    ;;; Build rules that provide trusted configured genesis to block one.
+    (define (coin-block-rules-for-genesis genesis)
+      (: block? -> block-rules?)
+      (block-rules
+        connect: (lambda (rules params height utxos b verify-scripts?
+                                parent-block)
+                   (coin-connect-block
+                     rules params height utxos b verify-scripts?
+                     (if (and (= height 1) (not parent-block))
+                         genesis
+                         parent-block)))
+        subsidy: coin-block-reward
+        coinbase-script-bounds: coin-coinbase-script-bounds))))

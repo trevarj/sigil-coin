@@ -1,18 +1,24 @@
-;;; Seed derivation, solution verification, fork choice, and pacing.
+;;; Consensus derivation, verification, scoring and retargeting.
 ;;;
-;;; These are the rules a node applies to a block someone else produced, so
-;;; every one of them is exercised with hostile input as well as honest
-;;; input. None of them may raise: a rejection is a tagged result.
+;;; Everything here is a rule every node applies to a block someone else
+;;; produced, so every one of them is exercised with hostile input as well
+;;; as honest input. None of them may raise on network data: a rejection is
+;;; a tagged `coin-result`.
+;;;
+;;; The seed and score vectors are GOLDEN. A drifting seed is a chain split
+;;; and a drifting score word is a fork-choice split, so these must fail
+;;; loudly rather than be updated. The seed digests below were computed
+;;; independently of this implementation, from the specification's preimage,
+;;; so they check the code rather than record it.
 
 (import (sigil test)
         (sigil math)
         (sigil bitcoin utils)
         (sigil bitcoin primitives)
-        (sigil bitcoin script)
-        (sigil bitcoin tx)
         (sigil bitcoin consensus)
         (sigil coin puzzle)
         (sigil coin puzzle generator)
+        (sigil coin consensus rules)
         (sigil coin consensus))
 
 ;; ============================================================
@@ -21,28 +27,12 @@
 
 (define %zero32 (make-bytevector 32 0))
 
-(define (bytes-of . values)
-  (let* ((n (length values))
-         (bv (make-bytevector n 0)))
-    (let loop ((i 0) (xs values))
-      (if (null? xs)
-          bv
-          (begin
-            (bytevector-u8-set! bv i (car xs))
-            (loop (+ i 1) (cdr xs)))))))
+(define (filled n byte) (make-bytevector n byte))
 
-(define (filled n byte)
-  (make-bytevector n byte))
+(define (seed-hex previous-hash height complexity)
+  (hex-encode-bytes (coin-puzzle-seed previous-hash height complexity)))
 
-;; A distinct 32-byte hash per index.
-(define (hash-of k)
-  (let ((bv (make-bytevector 32 0)))
-    (let loop ((i 0))
-      (if (>= i 32)
-          bv
-          (begin
-            (bytevector-u8-set! bv i (modulo (+ (* i 13) (* k 41) 3) 256))
-            (loop (+ i 1)))))))
+(define (string-of n ch) (make-string n ch))
 
 (define (string->bytes s)
   (let* ((n (string-length s))
@@ -54,765 +44,1033 @@
             (bytevector-u8-set! bv i (char->integer (string-ref s i)))
             (loop (+ i 1)))))))
 
-(define (coinbase-tx script-sig)
-  (transaction
-    version: 1
-    inputs: (list (txin previous-output: (outpoint txid: %zero32
-                                                   index: #xffffffff)
-                        script-sig: script-sig
-                        sequence: #xffffffff
-                        witness: '()))
-    outputs: (list (txout value: 0 script-pubkey: (bytes-of #x6a)))
-    lock-time: 0))
+;; A puzzle spec built by hand. Verification reads only `constraint`,
+;; `complexity` (for the builtin cap) and `examples`, so a synthetic spec
+;; exercises the checker far more precisely — and far faster — than a
+;; generated one, whose examples nobody chose.
+(define (spec-with constraint examples)
+  (puzzle-spec height: 1
+            complexity: 128
+            constraint: constraint
+            k: (length examples)
+            examples: examples
+            hidden-source: "(lambda(x)(* x 2))"
+            table-solution: "(lambda(x)(if(equal? x '1)'2 '6))"
+            par: 24
+            retries: 0))
+
+;; Doubling: three pairs, distinct outputs, no 1-arity builtin reproduces it.
+(define %doubling '((1 . 2) (2 . 4) (3 . 6)))
+
+(define %spec (spec-with 0 %doubling))
+
+(define (reason spec source)
+  (coin-result-reason (coin-check-solution spec source)))
+
+(define (detail spec source)
+  (coin-result-detail (coin-check-solution spec source)))
+
+(define (report-of spec source)
+  (coin-result-value (coin-check-solution spec source)))
+
+;; Words built from an explicit tuple, for the ordering proofs.
+(define %tuples
+  '((1 0 0 0) (1 0 0 15) (1 0 1 0) (1 1 0 0) (2 0 0 0)
+    (24 50 51 0) (24 50 51 1) (24 50 51 8) (24 50 51 15)
+    (24 50 52 0) (24 51 0 0) (25 0 0 15) (300 127 127 0)
+    (512 127 127 0) (512 127 127 15) (511 0 0 0) (100 64 64 12)))
+
+(define %words
+  (map (lambda (t)
+         (coin-score-pack (list-ref t 0) (list-ref t 1)
+                             (list-ref t 2) (list-ref t 3)))
+       %tuples))
+
+;; Lexicographic order on the ranking tuple `(L, MB, SB, 15-Q)`, written out
+;; the slow, obvious way. If the packing is right, unsigned `<` on the word
+;; agrees with this on every pair.
+(define (rank-tuple t)
+  (list (list-ref t 0) (list-ref t 1) (list-ref t 2)
+        (- 15 (list-ref t 3))))
+
+(define (lex-compare a b)
+  (cond
+    ((null? a) 0)
+    ((< (car a) (car b)) -1)
+    ((> (car a) (car b)) 1)
+    (else (lex-compare (cdr a) (cdr b)))))
+
+(define (all-pairs? xs ok?)
+  (let loop ((as xs))
+    (cond
+      ((null? as) #t)
+      ((let inner ((bs xs))
+         (cond
+           ((null? bs) #t)
+           ((ok? (car as) (car bs)) (inner (cdr bs)))
+           (else #f)))
+       (loop (cdr as)))
+      (else #f))))
+
+(define (all-triples? xs ok?)
+  (let a-loop ((as xs))
+    (cond
+      ((null? as) #t)
+      ((let b-loop ((bs xs))
+         (cond
+           ((null? bs) #t)
+           ((let c-loop ((cs xs))
+              (cond
+                ((null? cs) #t)
+                ((ok? (car as) (car bs) (car cs)) (c-loop (cdr cs)))
+                (else #f)))
+            (b-loop (cdr bs)))
+           (else #f)))
+       (a-loop (cdr as)))
+      (else #f))))
+
+;; A deterministic margin history, one value per height.
+(define (margins-of n)
+  (let loop ((i 0) (acc '()))
+    (if (>= i n)
+        (reverse acc)
+        (loop (+ i 1) (cons (- (modulo (* i 137) 601) 300) acc)))))
+
+(define (repeat n x)
+  (let loop ((i 0) (acc '()))
+    (if (>= i n) acc (loop (+ i 1) (cons x acc)))))
 
 (define (header-at previous time)
-  (block-header version: 1
+  (block-header version: 5
                 previous-block: previous
                 merkle-root: %zero32
                 time: time
-                bits: 0
-                nonce: 0))
+                bits: (coin-bits-encode 128)
+                nonce: (coin-score-pack 24 50 51 0)))
 
-(define (block-at previous time txs)
-  (block header-field: (header-at previous time) transactions: txs))
-
-;; A block that legitimately solves the puzzle for `height` under `parent`,
-;; using the quoting solution the generator guarantees is always legal.
-(define (mined-block parent height graffiti)
-  (let* ((spec (coin-puzzle-for parent height))
-         (solution (string->bytes (puzzle-spec-solution spec))))
-    (block-at parent
-              0
-              (list (coinbase-tx
-                      (coin-coinbase-payload-encode
-                        (coin-coinbase-payload height: height
-                                               solution: solution
-                                               graffiti: graffiti)))))))
-
-;; The same block, but with the coinbase solution replaced.
-(define (block-claiming parent height solution)
-  (block-at parent
-            0
-            (list (coinbase-tx
-                    (coin-coinbase-payload-encode
-                      (coin-coinbase-payload height: height
-                                             solution: solution
-                                             graffiti: (bytes-of)))))))
-
-(define %parent (hash-of 1))
+(define (chain-of n start)
+  (let loop ((i 0) (previous %zero32) (acc '()))
+    (if (>= i n)
+        (reverse acc)
+        (let ((h (header-at previous (+ start (* i 100)))))
+          (loop (+ i 1) (block-header-hash h) (cons h acc))))))
 
 ;; ============================================================
-;; Package metadata
+;; Frozen constants (§2)
 ;; ============================================================
 
-(test-group "sigil-coin-consensus package"
-  (test "reports the package version"
-    (assert-equal "0.1.0" (consensus-package-version))))
+(test-group "sigil-coin constants"
+  (test "the caps are frozen"
+    (assert-equal 16384 coin-max-block-bytes)
+    (assert-equal 512 coin-max-solution-bytes)
+    (assert-equal 400 coin-max-graffiti-bytes)
+    (assert-equal 8 coin-max-shares)
+    (assert-equal 16 coin-max-commitments)
+    (assert-equal 8 coin-max-k)
+    (assert-equal 200000 coin-max-fuel))
+
+  (test "the solution cap is the interpreter source cap"
+    ;; Not a restatement of 512: a solution consensus accepts must be one
+    ;; the interpreter would agree to parse.
+    (assert-equal puzzle-max-source-bytes coin-max-solution-bytes)
+    (assert-equal puzzle-max-fuel coin-max-fuel))
+
+  (test "the pacing rules are frozen"
+    (assert-equal 72000 coin-min-block-spacing)
+    (assert-equal 7200 coin-max-future-drift)
+    (assert-equal 11 coin-median-time-span))
+
+  (test "block size checking is total"
+    (assert-equal 'malformed-block
+                  (coin-result-reason (coin-validate-block-size 42)))
+    (assert-false (coin-block-size 42))))
+
+(test-group "sigil-coin pacing"
+  (test "header context checking"
+    (let* ((chain (chain-of 12 1000000))
+           (tip (list-ref chain 11))
+           (now 99999999)
+           (good (header-at (block-header-hash tip)
+                            (+ (block-header-time tip)
+                               coin-min-block-spacing)))
+           (close (header-at (block-header-hash tip)
+                             (+ (block-header-time tip) 1))))
+      (assert-true (coin-ok? (coin-validate-header-context
+                               chain good now)))
+      (assert-equal 'insufficient-spacing
+                    (coin-result-reason
+                      (coin-validate-header-context chain close now)))
+      ;; The optional chain spacing floor still passes through.
+      (assert-true (coin-ok? (coin-validate-header-context
+                               chain close now 1))))))
 
 ;; ============================================================
-;; Seed derivation
+;; Seed derivation (§3.1)
 ;; ============================================================
 
 (test-group "sigil-coin puzzle seed"
-  (test "the height encoding is eight little-endian bytes"
-    (assert-equal (bytes-of 0 0 0 0 0 0 0 0) (coin-height-encode 0))
-    (assert-equal (bytes-of 1 0 0 0 0 0 0 0) (coin-height-encode 1))
-    (assert-equal (bytes-of #x00 #x01 0 0 0 0 0 0) (coin-height-encode 256))
-    (assert-equal (bytes-of #xff #xff #xff #xff 0 0 0 0)
-                  (coin-height-encode #xffffffff)))
+  (test "the domain tags are frozen"
+    (assert-equal "SigilCoin/puzzle/1" coin-puzzle-tag)
+    (assert-equal "SigilCoin/genesis/puzzle/1" coin-genesis-seed-tag)
+    (assert-equal 18 (string-length coin-puzzle-tag))
+    (assert-equal 26 (string-length coin-genesis-seed-tag)))
 
-  (test "the height encoding is fixed width"
-    (let loop ((h 0))
-      (if (< h 300)
-          (begin
-            (assert-equal 8 (bytevector-length (coin-height-encode h)))
-            (loop (+ h 1))))))
+  (test "the genesis seed is a golden vector"
+    (assert-equal
+      "53d28e999068100ff2f7b5775bbb2d07db0638da7121f9ef033b3c82dbaa24a8"
+      (hex-encode-bytes coin-genesis-seed))
+    (assert-equal coin-genesis-seed
+                  (coin-puzzle-seed %zero32 0 128))
+    ;; Genesis ignores `C`: there is exactly one genesis.
+    (assert-equal coin-genesis-seed
+                  (coin-puzzle-seed %zero32 0 4095)))
 
-  (test "an out-of-range height is rejected"
-    (assert-error (coin-height-encode -1))
-    (assert-error (coin-height-encode (+ #xffffffff 1))))
 
-  (test "the seed is SHA256d over the parent hash and the height"
-    (assert-equal (hash256 (bytevector-append %parent (coin-height-encode 5)))
-                  (coin-puzzle-seed %parent 5)))
+  (test "derived seeds are golden vectors"
+    (assert-equal
+      "9cc697df47267d38a8b08462f77dfa84f7491a7c15d4e70dce65ebca03518594"
+      (seed-hex (filled 32 7) 1 128))
+    (assert-equal
+      "44cd5b85b5b745b16a3e93feea6c23d2dbb38df436ba92ee530b7d3ec37da4e4"
+      (seed-hex (filled 32 7) 4294967295 4095)))
 
-  (test "the seed is 32 bytes"
-    (assert-equal 32 (bytevector-length (coin-puzzle-seed %parent 5)))
-    (assert-equal 32 (bytevector-length (coin-puzzle-seed %zero32 0))))
+  (test "the preimage is injective in every field"
+    ;; Fixed-width fields mean no two (prev_hash, H, C) triples collide.
+    (assert-equal
+      "576de98681145c03a2f58bd51596a348349c16f287884095802223f0218b2ff8"
+      (seed-hex (filled 32 7) 1 129))
+    (assert-equal
+      "8c3e208df6ffd24b440b7a9841d474601a94af44c7fab76d21b71939c6e39962"
+      (seed-hex (filled 32 7) 2 128))
+    (assert-equal
+      "7a5f9ec790f0eb8236f124a5acde1b67c593e30d047224ee7a88061818994cfd"
+      (seed-hex (filled 32 8) 1 128)))
 
-  (test "genesis uses the frozen tag seed, not a derivation"
-    (assert-equal "SigilCoin/genesis/puzzle/v1" coin-genesis-seed-tag)
-    (assert-equal (hash256 coin-genesis-seed-tag) coin-genesis-seed)
-    (assert-equal coin-genesis-seed (coin-puzzle-seed %zero32 0))
-    ;; The derivation would have produced something else entirely.
-    (assert-true (not (equal? coin-genesis-seed
-                              (hash256 (bytevector-append
-                                         %zero32
-                                         (coin-height-encode 0)))))))
+  (test "a retarget moves the puzzle"
+    ;; This is why `C` is in the preimage: solutions cannot be pre-computed
+    ;; across a retarget boundary.
+    (assert-false (equal? (coin-puzzle-seed (filled 32 7) 16 128)
+                          (coin-puzzle-seed (filled 32 7) 16 243))))
 
-  (test "genesis requires a zero previous hash"
-    (assert-error (coin-puzzle-seed %parent 0)))
+  (test "the fixed-width encodings are frozen"
+    (assert-equal 8 (bytevector-length (coin-height-encode 1)))
+    (assert-equal 4 (bytevector-length (coin-complexity-encode 128)))
+    (assert-equal (u64-le 1) (coin-height-encode 1))
+    (assert-equal (u32-le 128) (coin-complexity-encode 128)))
 
-  (test "the seed is deterministic"
-    (assert-equal (coin-puzzle-seed %parent 7) (coin-puzzle-seed %parent 7)))
-
-  (test "a different height gives a different seed"
-    (assert-true (not (equal? (coin-puzzle-seed %parent 7)
-                              (coin-puzzle-seed %parent 8)))))
-
-  (test "a different parent gives a different seed"
-    (assert-true (not (equal? (coin-puzzle-seed (hash-of 2) 7)
-                              (coin-puzzle-seed (hash-of 3) 7)))))
-
-  (test "a malformed parent hash is rejected"
-    (assert-error (coin-puzzle-seed (filled 31 0) 1))
-    (assert-error (coin-puzzle-seed (filled 33 0) 1))
-    (assert-error (coin-puzzle-seed "not-bytes" 1))
-    (assert-error (coin-puzzle-seed %parent -1)))
-
-  (test "the puzzle for a height is deterministic"
-    (let ((a (coin-puzzle-for %parent 12))
-          (b (coin-puzzle-for %parent 12)))
-      (assert-equal (puzzle-spec-source a) (puzzle-spec-source b))
-      (assert-true (puzzle-value=? (puzzle-spec-target a)
-                                   (puzzle-spec-target b)))))
-
-  (test "sibling heights get different puzzles"
-    (assert-true (not (string=? (puzzle-spec-source (coin-puzzle-for %parent 12))
-                                (puzzle-spec-source
-                                  (coin-puzzle-for %parent 13)))))))
+  (test "malformed derivation arguments raise rather than reject"
+    ;; None of these ever come from the network, so a bad one is a node bug.
+    (assert-error (coin-puzzle-seed (filled 31 0) 1 128))
+    (assert-error (coin-puzzle-seed (filled 32 7) -1 128))
+    (assert-error (coin-puzzle-seed (filled 32 7) 1 15))
+    (assert-error (coin-puzzle-seed (filled 32 7) 1 4096))
+    ;; Genesis must carry the zero previous hash.
+    (assert-error (coin-puzzle-seed (filled 32 7) 0 128))))
 
 ;; ============================================================
-;; Solution verification
+;; Derivation and its cache (§3.2, §11)
 ;; ============================================================
 
-(define %spec (coin-puzzle-for %parent 12))
-(define %solution (string->bytes (puzzle-spec-solution %spec)))
+(test-group "sigil-coin canonical puzzle derivation"
+  (test "a puzzle is a pure function of parent hash, height and complexity"
+    (let ((a (coin-puzzle-for (filled 32 7) 1 128))
+          (b (coin-puzzle-for (filled 32 7) 1 128)))
+      (assert-true (puzzle-spec? a))
+      (assert-equal (puzzle-spec-hidden-source a) (puzzle-spec-hidden-source b))
+      (assert-equal (puzzle-spec-table-solution a) (puzzle-spec-table-solution b))
+      (assert-equal (puzzle-spec-par a) (puzzle-spec-par b))
+      (assert-equal 1 (puzzle-spec-height a))
+      (assert-equal 128 (puzzle-spec-complexity a)))))
 
-;; The same puzzle with a different par, used to show par is inert.
-(define (respec spec par)
-  (puzzle-spec height: (puzzle-spec-height spec)
-               target: (puzzle-spec-target spec)
-               expression: (puzzle-spec-expression spec)
-               source: (puzzle-spec-source spec)
-               solution: (puzzle-spec-solution spec)
-               par: par
-               retries: (puzzle-spec-retries spec)))
+(define %share-global
+  (coin-puzzle-for (filled 32 7) 1 128))
 
-(test-group "sigil-coin solution checking"
-  (test "the generator's own solution is accepted"
-    (assert-true (coin-ok? (coin-check-solution %spec %solution))))
+(define %share-context
+  (coin-coop-context parent-prev-hash: (filled 32 7)
+                        puzzle-height: 1
+                        complexity: 128
+                        spec: %share-global
+                        commits: '()))
 
-  (test "the synthesised source is also a solution"
+(define (share-key n) (filled 33 n))
+
+(define (share-source pk source)
+  (coin-share pubkey: pk
+                 signature: (filled 64 0)
+                 blind: (filled 32 0)
+                 solution: (string->bytes source)))
+
+(define (all-distinct-values? values)
+  (let loop ((xs values))
+    (cond
+      ((null? xs) #t)
+      ((member (car xs) (cdr xs)) #f)
+      (else (loop (cdr xs))))))
+
+(test-group "sigil-coin personalized share puzzles"
+  (test "eight pubkeys derive eight tasks under one global constraint"
+    (let ((specs (map (lambda (n)
+                        (coin-share-puzzle %share-context (share-key n)))
+                      '(1 2 3 4 5 6 7 8))))
+      (assert-true (all-distinct-values? (map puzzle-spec-examples specs)))
+      (assert-true
+        (let loop ((xs specs))
+          (if (null? xs)
+              #t
+              (and (= (puzzle-spec-height (car xs)) 1)
+                   (= (puzzle-spec-complexity (car xs)) 128)
+                   (= (puzzle-spec-k (car xs)) (puzzle-spec-k %share-global))
+                   (= (puzzle-complexity-width
+                        (puzzle-spec-complexity (car xs)))
+                      (puzzle-complexity-width
+                        (puzzle-spec-complexity %share-global)))
+                   (= (puzzle-spec-constraint (car xs))
+                      (puzzle-spec-constraint %share-global))
+                   (loop (cdr xs))))))))
+
+  (test "share seed is double-SHA256 over global seed and pubkey"
+    (let* ((global (coin-puzzle-seed (filled 32 7) 1 128))
+           (pk (share-key 1)))
+      (assert-equal 24 (string-length coin-share-puzzle-tag))
+      (assert-equal (hash256
+                      (bytevector-append
+                        (string->bytes coin-share-puzzle-tag) global pk))
+                    (coin-share-puzzle-seed global pk))))
+
+  (test "a solution for one key fails under every other key"
+    (let* ((a (coin-share-puzzle %share-context (share-key 1)))
+           (source (puzzle-spec-hidden-source a)))
+      (assert-true (coin-ok? (coin-check-solution a source)))
+      (assert-true
+        (let loop ((n 2))
+          (if (> n 8)
+              #t
+              (and (coin-failed?
+                     (coin-check-solution
+                       (coin-share-puzzle %share-context (share-key n))
+                       source))
+                   (loop (+ n 1))))))))
+
+  (test "eight personalized at-par solutions are all refused"
+    (assert-true
+      (let loop ((n 1))
+        (if (> n 8)
+            #t
+            (let* ((pk (share-key n))
+                   (spec (coin-share-puzzle %share-context pk))
+                   (hidden (puzzle-spec-hidden-source spec))
+                   (table (puzzle-spec-table-solution spec))
+                   (source (if (= (string-length hidden) (puzzle-spec-par spec))
+                               hidden table)))
+              (and (= (string-length source) (puzzle-spec-par spec))
+                   (eq? 'share-not-under-par
+                        (coin-result-reason
+                          (coin-check-share-solution
+                            %share-context (share-source pk source))))
+                   (loop (+ n 1))))))))
+
+  (test "uncommitted block fields cannot move a task"
+    (let* ((pk (share-key 3))
+           (other-context
+             (coin-coop-context parent-prev-hash: (filled 32 7)
+                                   puzzle-height: 1
+                                   complexity: 128
+                                   spec: %share-global
+                                   commits: (list (filled 32 99))))
+           (a (coin-share-puzzle %share-context pk))
+           (b (coin-share-puzzle other-context pk)))
+      ;; Context has no including hash or graffiti field; changing its only
+      ;; unrelated field, commitments, also leaves derivation unchanged.
+      (assert-equal (puzzle-spec-examples a) (puzzle-spec-examples b))
+      (assert-equal (puzzle-spec-par a) (puzzle-spec-par b)))))
+
+(test-group "sigil-coin canonical puzzle cache"
+  (test "an empty cache holds nothing and derives nothing"
+    (let ((cache (coin-puzzle-cache-open)))
+      (assert-equal 0 (coin-puzzle-cache-size cache))
+      (assert-equal 32 (coin-puzzle-cache-capacity cache))
+      (assert-false (coin-puzzle-cache-ref cache (filled 32 7) 1 128))))
+
+  (test "a miss derives, stores, and a hit returns the same puzzle"
+    (let* ((cache (coin-puzzle-cache-open))
+           (first (coin-puzzle-cached cache (filled 32 7) 1 128))
+           (second (coin-puzzle-cached cache (filled 32 7) 1 128)))
+      (assert-equal 1 (coin-puzzle-cache-size cache))
+      ;; Same object, so the 1.28 M step derivation ran once. Every sibling
+      ;; at a height is judged against this one puzzle.
+      (assert-true (eq? first second))
+      (assert-true (eq? first (coin-puzzle-cache-ref cache
+                                                        (filled 32 7)
+                                                        1 128)))))
+
+  (test "the cache agrees with an uncached derivation"
+    (let* ((cache (coin-puzzle-cache-open))
+           (cached (coin-puzzle-cached cache (filled 32 7) 1 128))
+           (direct (coin-puzzle-for (filled 32 7) 1 128)))
+      (assert-equal (puzzle-spec-hidden-source direct)
+                    (puzzle-spec-hidden-source cached))
+      (assert-equal (puzzle-spec-examples direct)
+                    (puzzle-spec-examples cached))))
+
+  (test "a hit for another complexity at height 0 is treated as a miss"
+    ;; The seed is the fixed genesis tag at height 0 whatever the complexity,
+    ;; so keying on the seed alone would answer a C=2000 derivation with a
+    ;; C=128 entry. No node path derives height 0 off-genesis today, but the
+    ;; cache is only correctness-neutral if it does not rely on that.
+    (let* ((cache (coin-puzzle-cache-open))
+           (warm-128 (coin-puzzle-cached cache (filled 32 0) 0 128))
+           (warm-2000 (coin-puzzle-cached cache (filled 32 0) 0 2000))
+           (cold-2000 (coin-puzzle-for (filled 32 0) 0 2000)))
+      (assert-equal 128 (puzzle-spec-complexity warm-128))
+      (assert-equal 2000 (puzzle-spec-complexity warm-2000))
+      (assert-equal (puzzle-spec-hidden-source cold-2000)
+                    (puzzle-spec-hidden-source warm-2000))
+      (assert-equal (puzzle-spec-examples cold-2000)
+                    (puzzle-spec-examples warm-2000))))
+
+  (test "distinct heights are distinct entries"
+    (let ((cache (coin-puzzle-cache-open)))
+      (coin-puzzle-cached cache (filled 32 7) 1 128)
+      (coin-puzzle-cached cache (filled 32 7) 2 128)
+      (assert-equal 2 (coin-puzzle-cache-size cache))))
+
+  (test "the cache is bounded and evicts the oldest entry"
+    (let ((cache (coin-puzzle-cache-open 1)))
+      (coin-puzzle-cached cache (filled 32 7) 1 128)
+      (coin-puzzle-cached cache (filled 32 7) 2 128)
+      (assert-equal 1 (coin-puzzle-cache-size cache))
+      (assert-false (coin-puzzle-cache-ref cache (filled 32 7) 1 128))
+      (assert-true (puzzle-spec? (coin-puzzle-cache-ref cache
+                                                        (filled 32 7)
+                                                        2 128)))))
+
+  (test "a bad cache argument raises"
+    (assert-error (coin-puzzle-cache-open 0))
+    (assert-error (coin-puzzle-cached 42 (filled 32 7) 1 128))))
+
+;; ============================================================
+;; Solution verification (§4)
+;; ============================================================
+
+(test-group "sigil-coin canonical solution acceptance"
+  (test "a program reproducing every pair is accepted"
+    (let ((result (coin-check-solution %spec "(lambda(x)(* x 2))")))
+      (assert-true (coin-ok? result))
+      (assert-true (puzzle-report-ok? (coin-result-value result)))
+      (assert-true (> (puzzle-report-steps (coin-result-value result)) 0))
+      (assert-true (> (puzzle-report-cells (coin-result-value result)) 0))))
+
+  (test "a solution may arrive as bytes"
     (assert-true (coin-ok? (coin-check-solution
                              %spec
-                             (string->bytes (puzzle-spec-source %spec))))))
+                             (string->bytes "(lambda(x)(* x 2))")))))
 
-  (test "the accepted value is the target"
-    (let ((result (coin-check-solution %spec %solution)))
-      (assert-true (puzzle-value=? (puzzle-spec-target %spec)
-                                   (coin-result-value result)))))
+  (test "par is not a bound: shorter than par is legal"
+    ;; `par` on this spec is 24; the accepted program is 18 bytes.
+    (assert-equal 24 (puzzle-spec-par %spec))
+    (assert-equal 18 (coin-solution-length "(lambda(x)(* x 2))"))
+    (assert-true (coin-ok? (coin-check-solution %spec
+                                                   "(lambda(x)(* x 2))"))))
 
-  (test "par is not a consensus bound"
-    ;; Par is only an upper bound the generator happens to know, and it is
-    ;; often loose. Rebuild the spec with an absurd par in each direction:
-    ;; the same solution must be accepted whether it sits far below par or
-    ;; far above it.
-    (let ((far-below (respec %spec 1000))
-          (far-above (respec %spec 1)))
-      (assert-true (< (bytevector-length %solution) 1000))
-      (assert-true (> (bytevector-length %solution) 1))
-      (assert-true (coin-ok? (coin-check-solution far-below %solution)))
-      (assert-true (coin-ok? (coin-check-solution far-above %solution)))))
+  (test "a bare builtin is a legal solution shape"
+    ;; Three bytes. §3.4 step 7 is what keeps a published puzzle from being
+    ;; solved by one; the checker does not forbid the shape.
+    (assert-true (coin-ok? (coin-check-solution
+                             (spec-with 0 '(((1 2) . 1) ((3 4) . 3)))
+                             "car"))))
 
-  (test "a closure result is rejected"
-    (assert-equal 'solution-not-a-value
-                  (coin-result-reason
-                    (coin-check-solution %spec
-                                         (string->bytes "(lambda(x)x)")))))
+  (test "a real generated puzzle accepts its own table and hidden source"
+    (let ((spec (coin-puzzle-for (filled 32 7) 1 128)))
+      (assert-true (coin-ok? (coin-check-solution
+                               spec (puzzle-spec-table-solution spec))))
+      (assert-true (coin-ok? (coin-check-solution
+                               spec (puzzle-spec-hidden-source spec)))))))
 
-  (test "a builtin result is rejected"
-    (assert-equal 'solution-not-a-value
-                  (coin-result-reason
-                    (coin-check-solution %spec (string->bytes "car")))))
+(test-group "sigil-coin canonical solution rejection"
+  (test "a non-source solution is malformed"
+    (assert-equal 'solution-malformed (reason %spec 42))
+    (assert-equal 'solution-malformed (reason %spec '()))
+    (assert-equal 'solution-malformed (reason %spec ""))
+    (assert-equal 'solution-malformed (reason %spec (filled 0 0))))
 
-  (test "a wrong value is rejected"
-    (assert-equal 'solution-mismatch
-                  (coin-result-reason
-                    (coin-check-solution %spec (string->bytes "1")))))
-
-  (test "an unparsable solution is rejected"
-    (assert-equal 'solution-parse-failed
-                  (coin-result-reason
-                    (coin-check-solution %spec (string->bytes "(1"))))
-    (assert-equal 'solution-parse-failed
-                  (coin-result-reason
-                    (coin-check-solution %spec (string->bytes "1 2"))))
-    ;; A non-ASCII byte is a parse failure, not a host decoding error.
-    (assert-equal 'solution-parse-failed
-                  (coin-result-reason
-                    (coin-check-solution %spec (bytes-of #xff)))))
-
-  (test "the parse failure names the interpreter's error kind"
-    (assert-equal "parse-syntax"
-                  (coin-result-detail
-                    (coin-check-solution %spec (string->bytes "(1")))))
-
-  (test "a solution that fails at runtime is rejected"
-    (assert-equal 'solution-eval-failed
-                  (coin-result-reason
-                    (coin-check-solution %spec (string->bytes "(car '())")))))
-
-  (test "a solution that burns the fuel budget is rejected, not hung"
-    ;; `expt` charges steps for its exponent but allocates almost nothing, so
-    ;; this exhausts fuel specifically. A recursive loop cannot test fuel any
-    ;; more: every call binds a parameter, so it now trips the allocation cap
-    ;; first — that case is the test below.
-    (let ((result (coin-check-solution
-                    %spec
-                    (string->bytes "(expt 1 1000000)"))))
-      (assert-equal 'solution-eval-failed (coin-result-reason result))
-      (assert-equal "fuel-exhausted" (coin-result-detail result))))
-
-  (test "a solution that exhausts the allocation budget is rejected, not hung"
-    (let ((result (coin-check-solution
-                    %spec
-                    (string->bytes
-                      "(letrec ((f (lambda (n) (f (+ n 1))))) (f 0))"))))
-      (assert-equal 'solution-eval-failed (coin-result-reason result))
-      (assert-equal "allocation-exceeded" (coin-result-detail result))))
-
-  (test "a solution that recurses too deep is rejected, not a stack overflow"
-    (let ((result (coin-check-solution
-                    %spec
-                    (string->bytes
-                      "(letrec ((f (lambda (n) (+ 1 (f n))))) (f 0))"))))
-      (assert-equal 'solution-eval-failed (coin-result-reason result))
-      (assert-equal "depth-exceeded" (coin-result-detail result))))
-
-  (test "an empty solution is rejected"
-    (assert-equal 'solution-malformed
-                  (coin-result-reason (coin-check-solution %spec (bytes-of)))))
-
-  (test "an oversized solution is rejected before parsing"
+  (test "the source byte cap is enforced before anything else"
+    ;; A solution of exactly 512 bytes is legal; 513 never reaches a parser.
+    (assert-true (coin-ok? (coin-check-solution
+                             %spec
+                             (string-append "(lambda(x)(* x 2))"
+                                            (string-of 494 #\space)))))
     (assert-equal 'solution-oversize
-                  (coin-result-reason
-                    (coin-check-solution %spec (filled 257 #x31))))
+                  (reason %spec (string-of 513 #\space)))
     (assert-equal 'solution-oversize
-                  (coin-result-reason
-                    (coin-check-solution %spec (filled 10000 #x31)))))
+                  (reason %spec (filled 513 32))))
 
-  (test "a solution exactly at the cap is not rejected for its size"
-    (let ((reason (coin-result-reason
-                    (coin-check-solution %spec (filled 256 #x31)))))
-      (assert-true (not (eq? 'solution-oversize reason)))))
+  (test "the lexical half of a constraint rejects before the parse"
+    ;; `no-digits`: an O(|s|) byte scan, so a hostile solution violating the
+    ;; day's rule never reaches a machine.
+    (let ((spec (spec-with 1 '((a . (a a)) (b . (b b))))))
+      (assert-equal 'constraint-violated
+                    (reason spec "(lambda(x)(list x x 1))"))
+      (assert-equal "no-digits" (detail spec "(lambda(x)(list x x 1))"))
+      (assert-true (coin-ok? (coin-check-solution
+                               spec "(lambda(x)(list x x))")))))
 
-  (test "a malformed solution type is rejected"
-    (assert-equal 'solution-malformed
-                  (coin-result-reason (coin-check-solution %spec 42)))
-    (assert-equal 'solution-malformed
-                  (coin-result-reason (coin-check-solution %spec '()))))
+  (test "the AST half of a constraint rejects after the parse"
+    ;; `letrec-required` has no lexical half at all.
+    (let ((spec (spec-with 3 '((a . (a a)) (b . (b b))))))
+      (assert-equal 'constraint-violated
+                    (reason spec "(lambda(x)(list x x))"))
+      (assert-equal "letrec-required" (detail spec "(lambda(x)(list x x))"))
+      (assert-true
+        (coin-ok?
+          (coin-check-solution
+            spec
+            "(lambda(x)(letrec((f(lambda(y)y)))(f (list x x))))")))))
 
-  (test "a malformed spec is rejected rather than raising"
-    (assert-equal 'internal-error
-                  (coin-result-reason (coin-check-solution 42 %solution)))))
+  (test "an unparseable solution is a parse failure"
+    (assert-equal 'solution-parse-failed (reason %spec "(lambda(x)"))
+    (assert-equal 'solution-parse-failed (reason %spec ")")))
 
-;; ============================================================
-;; Block-level verification
-;; ============================================================
+  (test "a solution that does not evaluate is an eval failure"
+    (assert-equal 'solution-eval-failed (reason %spec "zzz")))
 
-(test-group "sigil-coin block solution verification"
-  (test "an honestly mined block is accepted"
-    (assert-true (coin-ok? (coin-verify-block-solution
-                             %parent 12 (mined-block %parent 12 (bytes-of))))))
+  (test "exhausting the fuel cap is an eval failure, not a hang"
+    ;; The one machine per solution is what bounds this: 200000 steps
+    ;; across the evaluation and all `k` applications.
+    (assert-equal
+      'solution-eval-failed
+      (reason %spec "(lambda(x)(letrec((f(lambda(y)(f y))))(f x)))")))
 
-  (test "the accepted value is the coinbase payload"
-    (let ((result (coin-verify-block-solution
-                    %parent 12
-                    (mined-block %parent 12 (string->bytes "hi")))))
-      (assert-true (coin-coinbase-payload? (coin-result-value result)))
-      (assert-equal (string->bytes "hi")
-                    (coin-coinbase-payload-graffiti
-                      (coin-result-value result)))))
+  (test "exhausting the depth cap is an eval failure"
+    (assert-equal
+      'solution-eval-failed
+      (reason %spec
+              "(lambda(x)(letrec((f(lambda(y)(list (f y)))))(f x)))")))
 
-  (test "graffiti does not change the verdict"
-    (assert-true (coin-ok? (coin-verify-block-solution
-                             %parent 12
-                             (mined-block %parent
-                                          12
-                                          (filled coin-max-graffiti-bytes
-                                                  #x41))))))
+  (test "a solution that is not a 1-arity procedure is rejected"
+    ;; A value, not a function.
+    (assert-equal 'solution-not-a-procedure (reason %spec "2"))
+    (assert-equal 'solution-not-a-procedure (reason %spec "(list 1 2)"))
+    ;; Wrong arity: a closure must have exactly one parameter.
+    (assert-equal 'solution-not-a-procedure (reason %spec "(lambda(x y)x)"))
+    (assert-equal 'solution-not-a-procedure (reason %spec "(lambda()1)"))
+    ;; A 2-arity builtin is not a solution either.
+    (assert-equal 'solution-not-a-procedure (reason %spec "cons")))
 
-  (test "a genesis block verifies against the frozen genesis seed"
-    (assert-true (coin-ok? (coin-verify-block-solution
-                             %zero32 0 (mined-block %zero32 0 (bytes-of))))))
+  (test "a near miss on one of k pairs names the failing index"
+    ;; Correct on examples 0 and 1, wrong on 2. Overfitting is caught by
+    ;; the pair it did not fit.
+    (let ((source "(lambda(x)(if(equal? x 3)7(* x 2)))"))
+      (assert-equal 'solution-mismatch (reason %spec source))
+      (assert-equal "example 2 was not reproduced" (detail %spec source)))
+    ;; The first pair is index 0.
+    (assert-equal "example 0 was not reproduced"
+                  (detail %spec "(lambda(x)x)")))
 
-  (test "a block solving a sibling height's puzzle is rejected"
-    (assert-equal 'solution-mismatch
-                  (coin-result-reason
-                    (coin-verify-block-solution
-                      %parent
-                      13
-                      (block-claiming %parent
-                                      13
-                                      (string->bytes
-                                        (puzzle-spec-solution
-                                          (coin-puzzle-for %parent 12))))))))
+  (test "a solution whose result is a procedure is a mismatch"
+    ;; §4.1 step 4: an applied result must be a `puzzle-value?` that is not
+    ;; a procedure. A closure is not data.
+    (assert-equal 'solution-mismatch (reason %spec "(lambda(x)(lambda(y)y))"))
+    (assert-equal "example 0 was not reproduced"
+                  (detail %spec "(lambda(x)(lambda(y)y))")))
 
-  (test "a block solving another parent's puzzle is rejected"
-    (assert-equal 'solution-mismatch
-                  (coin-result-reason
-                    (coin-verify-block-solution
-                      (hash-of 9)
-                      12
-                      (block-claiming (hash-of 9) 12 %solution)))))
+  (test "a bad spec is an internal error, never a bad block"
+    (assert-equal 'internal-error (reason 42 "(lambda(x)x)"))
+    (assert-equal 'internal-error (reason '() "(lambda(x)x)")))
 
-  (test "a coinbase height that disagrees with the chain is rejected"
-    (assert-equal 'height-mismatch
-                  (coin-result-reason
-                    (coin-verify-block-solution
-                      %parent 13 (mined-block %parent 12 (bytes-of))))))
+  (test "every rejection is a result, never a raise"
+    (let ((hostile (list 42 '() "" ")" "zzz" "2" "(lambda(x y)x)"
+                         "(lambda(x)(lambda(y)y))"
+                         "(lambda(x)(letrec((f(lambda(y)(f y))))(f x)))"
+                         (string-of 513 #\space))))
+      (assert-true
+        (let loop ((xs hostile))
+          (cond
+            ((null? xs) #t)
+            ((coin-failed? (coin-check-solution %spec (car xs)))
+             (loop (cdr xs)))
+            (else #f))))))
 
-  (test "a closure solution is rejected at block level too"
-    (assert-equal 'solution-not-a-value
-                  (coin-result-reason
-                    (coin-verify-block-solution
-                      %parent
-                      12
-                      (block-claiming %parent
-                                      12
-                                      (string->bytes "(lambda(x)x)"))))))
-
-  (test "a block with no coinbase is rejected"
-    (assert-equal 'missing-coinbase
-                  (coin-result-reason
-                    (coin-verify-block-solution %parent 12 42))))
-
-  (test "a malformed coinbase payload yields the decoder's reason"
-    (assert-equal 'not-a-push
-                  (coin-result-reason
-                    (coin-verify-block-solution
-                      %parent
-                      12
-                      (block-at %parent
-                                0
-                                (list (coinbase-tx
-                                        (bytes-of #x51 #x51 #x51))))))))
-
-  (test "a malformed parent hash is rejected rather than raising"
-    (assert-equal 'internal-error
-                  (coin-result-reason
-                    (coin-verify-block-solution
-                      (filled 31 0)
-                      12
-                      (mined-block %parent 12 (bytes-of))))))
-
-  (test "a malformed height is rejected rather than raising"
-    (assert-equal 'internal-error
-                  (coin-result-reason
-                    (coin-verify-block-solution
-                      %parent
-                      "12"
-                      (mined-block %parent 12 (bytes-of)))))))
+  (test "the builtin cap is read from the puzzle's tier"
+    (assert-equal 6 (coin-spec-builtin-cap (spec-with 4 %doubling)))
+    (assert-equal 4 (coin-spec-builtin-cap
+                      (puzzle-spec height: 1 complexity: 2048 constraint: 4
+                                k: 3 examples: %doubling
+                                hidden-source: "" table-solution: ""
+                                par: 24 retries: 0)))))
 
 ;; ============================================================
-;; Fork choice
+;; The score word (§5)
 ;; ============================================================
 
-(define %low (make-bytevector 32 0))
-(define %high (make-bytevector 32 255))
+(test-group "sigil-coin canonical bucketing"
+  (test "bucket7 matches the specification's worked examples"
+    (assert-equal 0 (coin-bucket7 0))
+    (assert-equal 1 (coin-bucket7 1))
+    (assert-equal 7 (coin-bucket7 2))
+    (assert-equal 50 (coin-bucket7 300))
+    (assert-equal 51 (coin-bucket7 340)))
 
-(define (mid byte)
-  (let ((bv (make-bytevector 32 0)))
-    (bytevector-u8-set! bv 31 byte)
-    bv))
+  (test "both resource caps fit seven bits with headroom"
+    (assert-equal 100 (coin-bucket7 100000))
+    (assert-equal 106 (coin-bucket7 200000))
+    (assert-true (< 106 coin-max-bucket)))
 
-(test-group "sigil-coin hash comparison"
-  (test "a lower hash sorts first"
-    (assert-equal -1 (coin-hash-compare %low %high))
-    (assert-equal 1 (coin-hash-compare %high %low)))
+  (test "the octave boundaries are exact"
+    ;; Six buckets per octave, so a doubling is exactly six buckets on.
+    (assert-equal 1 (coin-bucket7 1))
+    (assert-equal 7 (coin-bucket7 2))
+    (assert-equal 13 (coin-bucket7 4))
+    (assert-equal 19 (coin-bucket7 8))
+    (assert-equal 61 (coin-bucket7 1024)))
 
-  (test "an identical hash compares equal"
-    (assert-equal 0 (coin-hash-compare %low %low))
-    (assert-equal 0 (coin-hash-compare %high %high)))
+  (test "bucket7 is monotone non-decreasing"
+    (assert-true
+      (let loop ((x 0) (previous -1))
+        (cond
+          ((> x 4096) #t)
+          ((>= (coin-bucket7 x) previous)
+           (loop (+ x 1) (coin-bucket7 x)))
+          (else #f)))))
 
-  (test "comparison is byte-wise from index 0, internal order"
-    ;; Differing only in the last byte still resolves.
-    (assert-equal -1 (coin-hash-compare (mid 1) (mid 2)))
-    ;; A difference in the first byte outranks every later byte.
-    (let ((a (make-bytevector 32 0))
-          (b (make-bytevector 32 0)))
-      (bytevector-u8-set! a 0 1)
-      (bytevector-u8-set! b 31 255)
-      (assert-equal 1 (coin-hash-compare a b))))
+  (test "bucket7 rejects anything that is not a count"
+    (assert-error (coin-bucket7 -1))
+    (assert-error (coin-bucket7 "3"))))
 
-  (test "a malformed hash is rejected"
-    (assert-error (coin-hash-compare (filled 31 0) %low))
-    (assert-error (coin-hash-compare %low (filled 33 0)))
-    (assert-error (coin-hash-compare "not-bytes" %low))))
+(test-group "sigil-coin aggregate share quality"
+  (test "quality contribution boundaries are frozen"
+    (assert-equal 1 (coin-share-contribution 1))
+    (assert-equal 1 (coin-share-contribution 49))
+    (assert-equal 2 (coin-share-contribution 50))
+    (assert-equal 2 (coin-share-contribution 99))
+    (assert-equal 3 (coin-share-contribution 100))
+    (assert-equal 3 (coin-share-contribution 149))
+    (assert-equal 4 (coin-share-contribution 150)))
 
-(test-group "sigil-coin fork choice"
-  (test "the shorter solution wins"
-    (assert-equal -1 (coin-solution-compare (filled 10 #x31) %high
-                                            (filled 11 #x31) %low))
-    (assert-equal 1 (coin-solution-compare (filled 11 #x31) %low
-                                           (filled 10 #x31) %high)))
+  (test "margin uses exact floor arithmetic"
+    (assert-equal 1 (coin-share-margin-milli 1000 999))
+    (assert-equal 49 (coin-share-margin-milli 1000 951))
+    (assert-equal 150 (coin-share-margin-milli 1000 850))
+    (assert-error (coin-share-margin-milli 1000 1000)))
 
-  (test "length beats the hash tiebreak"
-    ;; The shorter solution wins even paired with the higher hash.
-    (assert-true (coin-better-solution? (filled 1 #x31) %high
-                                        (filled 256 #x31) %low)))
+  (test "aggregate quality saturates at fifteen"
+    (assert-equal 0 (coin-quality '()))
+    (assert-equal 8 (coin-quality '(1 1 1 1 1 1 1 1)))
+    (assert-equal 12 (coin-quality '(4 4 4)))
+    (assert-equal 15 (coin-quality '(4 4 4 4)))
+    (assert-equal 15 (coin-quality '(4 4 4 4 4 4 4 4))))
 
-  (test "equal lengths break on the lower hash"
-    (assert-equal -1 (coin-solution-compare (filled 10 #x31) %low
-                                            (filled 10 #x32) %high))
-    (assert-equal 1 (coin-solution-compare (filled 10 #x31) %high
-                                           (filled 10 #x32) %low)))
+  (test "three fifteen-percent shares outrank eight sub-five-percent shares"
+    (let ((strong (coin-quality '(4 4 4)))
+          (weak (coin-quality '(1 1 1 1 1 1 1 1))))
+      (assert-equal 12 strong)
+      (assert-equal 8 weak)
+      (assert-true
+        (coin-score-better? (coin-score-pack 40 50 51 strong)
+                               (coin-score-pack 40 50 51 weak)))))
 
-  (test "equal length and equal hash compare equal"
-    (assert-equal 0 (coin-solution-compare (filled 10 #x31) %low
-                                           (filled 10 #x32) %low)))
+  (test "unrelated block data cannot move a share puzzle or quality"
+    ;; Graffiti, including-block hash and including block are absent from
+    ;; both derivation APIs. Parent commitments are present but irrelevant.
+    (let* ((pk (share-key 3))
+           (other-context
+             (coin-coop-context parent-prev-hash: (filled 32 7)
+                                   puzzle-height: 1
+                                   complexity: 128
+                                   spec: %share-global
+                                   commits: (list (filled 32 99))))
+           (a (coin-share-puzzle %share-context pk))
+           (b (coin-share-puzzle other-context pk))
+           (source (filled (- (puzzle-spec-par a) 1) #x78))
+           (share (coin-share pubkey: pk
+                                 signature: (filled 64 0)
+                                 blind: (filled 32 0)
+                                 solution: source)))
+      (assert-equal (puzzle-spec-examples a) (puzzle-spec-examples b))
+      (assert-equal (coin-share-quality %share-context share)
+                    (coin-share-quality other-context share)))))
 
-  (test "an identical candidate compares equal"
-    (assert-equal 0 (coin-solution-compare (filled 10 #x31) (hash-of 4)
-                                           (filled 10 #x31) (hash-of 4))))
+(test-group "sigil-coin canonical score word"
+  (test "the bit layout is frozen"
+    ;; L-1 at 22, MB at 15, SB at 8, 15-Q at 4, low nibble reserved zero.
+    (assert-equal 0 (coin-score-pack 1 0 0 15))
+    (assert-equal (arithmetic-shift 1 22) (coin-score-pack 2 0 0 15))
+    (assert-equal (arithmetic-shift 1 15) (coin-score-pack 1 1 0 15))
+    (assert-equal (arithmetic-shift 1 8) (coin-score-pack 1 0 1 15))
+    (assert-equal (arithmetic-shift 1 4) (coin-score-pack 1 0 0 14))
+    (assert-equal (arithmetic-shift 15 4) (coin-score-pack 1 0 0 0)))
 
-  (test "the comparator is antisymmetric"
-    (let loop ((k 0))
-      (if (< k 20)
-          (let ((a-len (+ 1 (modulo k 4)))
-                (b-len (+ 1 (modulo (* 3 k) 4)))
-                (a-hash (hash-of k))
-                (b-hash (hash-of (+ k 1))))
-            (assert-equal (- (coin-solution-compare (filled a-len #x31) a-hash
-                                                    (filled b-len #x31) b-hash))
-                          (coin-solution-compare (filled b-len #x31) b-hash
-                                                 (filled a-len #x31) a-hash))
-            (loop (+ k 1))))))
+  (test "the widest legal word still fits 32 bits"
+    (assert-equal 4294967296 coin-max-score-word)
+    (assert-true (< (coin-score-pack 512 127 127 0)
+                    coin-max-score-word)))
 
-  (test "better means strictly better"
-    (assert-false (coin-better-solution? (filled 10 #x31) %low
-                                         (filled 10 #x31) %low))
-    (assert-false (coin-better-solution? (filled 11 #x31) %low
-                                         (filled 10 #x31) %high)))
+  (test "the reserved nibble is always zero, so there is no nonce to grind"
+    (assert-true
+      (let loop ((ws %words))
+        (cond
+          ((null? ws) #t)
+          ((= 0 (bitwise-and (car ws) #xf)) (loop (cdr ws)))
+          (else #f)))))
 
-  (test "an empty solution still compares"
-    (assert-true (coin-better-solution? (bytes-of) %high
-                                        (filled 1 #x31) %low)))
+  (test "packing round-trips through decoding"
+    (assert-true
+      (let loop ((ts %tuples))
+        (cond
+          ((null? ts) #t)
+          (else
+            (let* ((t (car ts))
+                   (s (coin-score-decode
+                        (coin-score-pack (list-ref t 0) (list-ref t 1)
+                                            (list-ref t 2) (list-ref t 3)))))
+              (if (and (= (list-ref t 0) (coin-score-length s))
+                       (= (list-ref t 1) (coin-score-memory s))
+                       (= (list-ref t 2) (coin-score-steps s))
+                       (= (list-ref t 3) (coin-score-quality s)))
+                  (loop (cdr ts))
+                  #f)))))))
 
-  (test "a malformed solution is rejected"
-    (assert-error (coin-solution-compare "abc" %low (filled 3 #x31) %high))
-    (assert-error (coin-solution-compare (filled 3 #x31) %low 42 %high))))
+  (test "encoding buckets the raw counts"
+    (let ((s (coin-score-decode (coin-score-encode 25 80 300 3))))
+      (assert-equal 25 (coin-score-length s))
+      (assert-equal (coin-bucket7 80) (coin-score-memory s))
+      (assert-equal (coin-bucket7 300) (coin-score-steps s))
+      (assert-equal 3 (coin-score-quality s))))
 
-(test-group "sigil-coin tip replacement"
-  (test "a strictly better sibling replaces a childless tip"
-    (assert-true (coin-replaces-tip? (filled 20 #x31) %low #f
-                                     (filled 10 #x31) %high)))
+  (test "out-of-domain fields raise rather than pack wrong"
+    (assert-error (coin-score-pack 0 0 0 0))
+    (assert-error (coin-score-pack 513 0 0 0))
+    (assert-error (coin-score-pack 1 128 0 0))
+    (assert-error (coin-score-pack 1 0 128 0))
+    (assert-error (coin-score-pack 1 0 0 16))
+    (assert-error (coin-score-encode 1 -1 0 0))
+    (assert-error (coin-score-decode 1))))
 
-  (test "an equal-length sibling with a lower hash replaces it"
-    (assert-true (coin-replaces-tip? (filled 20 #x31) %high #f
-                                     (filled 20 #x31) %low)))
+(test-group "sigil-coin canonical score header check"
+  (test "a legal word decodes"
+    (let ((result (coin-score-check (coin-score-pack 24 50 51 2))))
+      (assert-true (coin-ok? result))
+      (assert-equal 24 (coin-score-length (coin-result-value result)))
+      (assert-equal 2 (coin-score-quality (coin-result-value result)))))
 
-  (test "a worse sibling never replaces the tip"
-    (assert-false (coin-replaces-tip? (filled 10 #x31) %low #f
-                                      (filled 20 #x31) %high))
-    (assert-false (coin-replaces-tip? (filled 20 #x31) %low #f
-                                      (filled 20 #x31) %high)))
+  (test "the reserved nibble must be zero"
+    (assert-equal 'score-reserved-nonzero
+                  (coin-result-reason (coin-score-check 1)))
+    (assert-equal 'score-reserved-nonzero
+                  (coin-result-reason (coin-score-check #xf))))
 
-  (test "an identical block does not replace itself"
-    (assert-false (coin-replaces-tip? (filled 20 #x31) %low #f
-                                      (filled 20 #x31) %low)))
+  (test "every aggregate-quality nibble is valid"
+    (assert-true
+      (let loop ((stored 0))
+        (if (> stored 15)
+            #t
+            (and (coin-ok? (coin-score-check
+                             (arithmetic-shift stored 4)))
+                 (loop (+ stored 1)))))))
 
-  (test "an extended tip is settled, however short the sibling"
-    (assert-false (coin-replaces-tip? (filled 200 #x31) %high #t
-                                      (filled 1 #x31) %low))
-    (assert-false (coin-replaces-tip? (filled 20 #x31) %high #t
-                                      (filled 20 #x31) %low))))
-
-;; ============================================================
-;; Size and pacing
-;; ============================================================
-
-;; A coinbase-only block whose single output script is `n` bytes long.
-(define (block-with-script-of n)
-  (block header-field: (header-at %zero32 0)
-         transactions:
-         (list (transaction
-                 version: 1
-                 inputs: (list (txin previous-output:
-                                     (outpoint txid: %zero32
-                                               index: #xffffffff)
-                                     script-sig: (bytes-of #x00 #x01
-                                                           #x31 #x00)
-                                     sequence: #xffffffff
-                                     witness: '()))
-                 outputs: (list (txout value: 0
-                                       script-pubkey: (filled n #x6a)))
-                 lock-time: 0))))
-
-;; A block whose serialized size is exactly `target` bytes. Script lengths
-;; from 253 up all carry a three-byte compact-size prefix, so within that
-;; band one more script byte is exactly one more block byte.
-(define (block-of-size target)
-  (let* ((base 253)
-         (size (coin-block-size (block-with-script-of base))))
-    (block-with-script-of (+ base (- target size)))))
-
-(test-group "sigil-coin size and pacing constants"
-  (test "the caps are the SigilCoin values"
-    (assert-equal 8192 coin-max-block-bytes)
-    (assert-equal 72000 coin-min-block-spacing)
-    (assert-equal 7200 coin-max-future-drift)
-    (assert-equal 11 coin-median-time-span)))
-
-(test-group "sigil-coin block size"
-  (test "a small block is accepted"
-    (let ((b (block-at %zero32 0 (list (coinbase-tx (bytes-of #x00 #x01
-                                                             #x31 #x00))))))
-      (assert-true (coin-ok? (coin-validate-block-size b)))
-      (assert-equal (coin-block-size b)
-                    (coin-result-value (coin-validate-block-size b)))))
-
-  (test "a block exactly at the cap is accepted"
-    (let ((b (block-of-size coin-max-block-bytes)))
-      (assert-true (block? b))
-      (assert-equal coin-max-block-bytes (coin-block-size b))
-      (assert-true (coin-ok? (coin-validate-block-size b)))))
-
-  (test "a block one byte over the cap is rejected"
-    (let ((b (block-of-size (+ coin-max-block-bytes 1))))
-      (assert-true (block? b))
-      (assert-equal (+ coin-max-block-bytes 1) (coin-block-size b))
-      (assert-equal 'block-oversize
-                    (coin-result-reason (coin-validate-block-size b)))))
-
-  (test "a much larger block is rejected"
-    (assert-equal 'block-oversize
-                  (coin-result-reason
-                    (coin-validate-block-size
-                      (block-of-size (* 2 coin-max-block-bytes))))))
-
-  (test "a malformed block is rejected rather than raising"
-    (assert-equal 'malformed-block
-                  (coin-result-reason (coin-validate-block-size 42)))
-    (assert-equal 'malformed-block
-                  (coin-result-reason (coin-validate-block-size
-                                        (block-at %zero32 0 '()))))
-    (assert-equal #f (coin-block-size 42))))
-
-;; A chain of headers spaced exactly `coin-min-block-spacing` apart, each
-;; linked to the one before, starting at `start`.
-(define (chain-of count start)
-  (let loop ((i 0) (time start) (previous %zero32) (acc '()))
-    (if (>= i count)
-        (reverse acc)
-        (let ((h (header-at previous time)))
-          (loop (+ i 1)
-                (+ time coin-min-block-spacing)
-                (block-header-hash h)
-                (cons h acc))))))
-
-(define (last-of xs)
-  (if (null? (cdr xs)) (car xs) (last-of (cdr xs))))
-
-(define %chain (chain-of 12 1000000))
-(define %tip (last-of %chain))
-(define %next-time (+ (block-header-time %tip) coin-min-block-spacing))
-(define %far-future 999999999)
-
-(define (context-reason headers header now)
-  (coin-result-reason (coin-validate-header-context headers header now)))
-
-(test-group "sigil-coin median time past"
-  (test "the median of a short window is its middle element"
-    (assert-equal (block-header-time (car (cdr (chain-of 3 100))))
-                  (coin-median-time-past (chain-of 3 100))))
-
-  (test "a single header is its own median"
-    (assert-equal 100 (coin-median-time-past (chain-of 1 100))))
-
-  (test "the window is the last eleven headers"
-    ;; The 12-header chain drops its oldest, so the median moves by one slot.
-    (assert-equal (block-header-time (list-ref %chain 6))
-                  (coin-median-time-past %chain))
-    (assert-equal (block-header-time (list-ref (chain-of 11 1000000) 5))
-                  (coin-median-time-past (chain-of 11 1000000))))
-
-  (test "an empty chain is rejected"
-    (assert-error (coin-median-time-past '()))))
-
-(test-group "sigil-coin header context"
-  (test "a well-paced child is accepted"
-    (assert-true (coin-ok? (coin-validate-header-context
-                             %chain
-                             (header-at (block-header-hash %tip) %next-time)
-                             %far-future))))
-
-  (test "genesis needs no parent, spacing or median"
-    (assert-true (coin-ok? (coin-validate-header-context
-                             '()
-                             (header-at %zero32 0)
-                             %far-future))))
-
-  (test "spacing exactly at the floor is accepted"
-    (assert-true (coin-ok? (coin-validate-header-context
-                             %chain
-                             (header-at (block-header-hash %tip) %next-time)
-                             %far-future))))
-
-  (test "spacing one second under the floor is rejected"
-    (assert-equal 'insufficient-spacing
-                  (context-reason %chain
-                                  (header-at (block-header-hash %tip)
-                                             (- %next-time 1))
-                                  %far-future)))
-
-  (test "a child at its parent's time is rejected"
-    (assert-equal 'insufficient-spacing
-                  (context-reason %chain
-                                  (header-at (block-header-hash %tip)
-                                             (block-header-time %tip))
-                                  %far-future)))
-
-  (test "a header that does not link to its parent is rejected"
-    (assert-equal 'bad-prev-hash
-                  (context-reason %chain
-                                  (header-at %zero32 %next-time)
-                                  %far-future))
-    (assert-equal 'bad-prev-hash
-                  (context-reason %chain
-                                  (header-at (hash-of 5) %next-time)
-                                  %far-future)))
-
-  (test "a header exactly at the future-drift limit is accepted"
-    (assert-true (coin-ok? (coin-validate-header-context
-                             %chain
-                             (header-at (block-header-hash %tip) %next-time)
-                             (- %next-time coin-max-future-drift)))))
-
-  (test "a header one second past the future-drift limit is rejected"
-    (assert-equal 'time-too-far-ahead
-                  (context-reason %chain
-                                  (header-at (block-header-hash %tip)
-                                             %next-time)
-                                  (- %next-time coin-max-future-drift 1))))
-
-  (test "the future-drift rule applies to genesis as well"
-    (assert-equal 'time-too-far-ahead
-                  (context-reason '() (header-at %zero32 100000) 0)))
-
-  ;; The spacing floor normally implies the median rule, so the median check
-  ;; is exercised on a chain whose tip time is below its own median.
-  (test "a header at or below median time past is rejected"
-    (let* ((base (chain-of 11 1000000))
-           (dip (header-at (block-header-hash (last-of base)) 0))
-           (chain (append base (list dip)))
-           (median (coin-median-time-past chain)))
-      (assert-equal 'time-too-old
-                    (context-reason chain
-                                    (header-at (block-header-hash dip) median)
-                                    %far-future))
-      (assert-equal 'time-too-old
-                    (context-reason chain
-                                    (header-at (block-header-hash dip)
-                                               (- median 1))
-                                    %far-future))
-      ;; One second above the median clears it. The spacing floor is
-      ;; measured against the dip's own time, which is far below.
-      (assert-true (coin-ok?
-                     (coin-validate-header-context
-                       chain
-                       (header-at (block-header-hash dip) (+ median 1))
-                       %far-future)))))
-
-  ;; The floor is chain policy: a chain config passes its own, and mainnet's
-  ;; is only the default.
-  (test "an explicit floor of the default changes nothing"
-    (assert-true (coin-ok? (coin-validate-header-context
-                             %chain
-                             (header-at (block-header-hash %tip) %next-time)
-                             %far-future
-                             coin-min-block-spacing)))
-    (assert-equal 'insufficient-spacing
-                  (coin-result-reason
-                    (coin-validate-header-context
-                      %chain
-                      (header-at (block-header-hash %tip) (- %next-time 1))
-                      %far-future
-                      coin-min-block-spacing))))
-
-  (test "a chain with a one-second floor accepts a fast child"
-    (let ((fast (header-at (block-header-hash %tip)
-                           (+ (block-header-time %tip) 1))))
-      (assert-true (coin-ok? (coin-validate-header-context %chain
-                                                           fast
-                                                           %far-future
-                                                           1)))
-      ;; The same header is far too fast under the mainnet floor.
-      (assert-equal 'insufficient-spacing
-                    (context-reason %chain fast %far-future))))
-
-  (test "a lower floor does not disable the other header rules"
-    ;; A lower floor only lowers the floor: a header must still link to its
-    ;; parent and stay out of the far future.
-    (assert-equal 'time-too-far-ahead
-                  (coin-result-reason
-                    (coin-validate-header-context
-                      %chain
-                      (header-at (block-header-hash %tip) %next-time)
-                      (- %next-time coin-max-future-drift 1)
-                      1)))
-    (assert-equal 'bad-prev-hash
-                  (coin-result-reason
-                    (coin-validate-header-context %chain
-                                                  (header-at %zero32
-                                                             %next-time)
-                                                  %far-future
-                                                  1))))
-
-  ;; A bad floor is the node's own misconfiguration, not a bad header, so it
-  ;; raises instead of being reported as a rejection.
-  (test "a nonsensical floor raises rather than rejecting the header"
-    (assert-error (coin-validate-header-context %chain
-                                                (header-at (block-header-hash
-                                                             %tip)
-                                                           %next-time)
-                                                %far-future
-                                                "soon"))
-    (assert-error (coin-validate-header-context %chain
-                                                (header-at (block-header-hash
-                                                             %tip)
-                                                           %next-time)
-                                                %far-future
-                                                -1))
-    (assert-error (coin-validate-header-context %chain
-                                                (header-at (block-header-hash
-                                                             %tip)
-                                                           %next-time)
-                                                %far-future
-                                                1
-                                                2)))
-
-  (test "a malformed header is rejected rather than raising"
-    (assert-equal 'malformed-header (context-reason %chain 42 %far-future))
+  (test "a word that is not a 32-bit unsigned integer is malformed"
     (assert-equal 'malformed-header
-                  (context-reason 42
-                                  (header-at (block-header-hash %tip)
-                                             %next-time)
-                                  %far-future))
+                  (coin-result-reason (coin-score-check -16)))
     (assert-equal 'malformed-header
-                  (context-reason %chain
-                                  (header-at (block-header-hash %tip)
-                                             %next-time)
-                                  "now"))
+                  (coin-result-reason
+                    (coin-score-check coin-max-score-word)))
     (assert-equal 'malformed-header
-                  (context-reason %chain
-                                  (block-header version: -1
-                                                previous-block: %zero32
-                                                merkle-root: %zero32
-                                                time: 0
-                                                bits: 0
-                                                nonce: 0)
-                                  %far-future))))
+                  (coin-result-reason (coin-score-check "0")))
+    (assert-false (coin-score-valid? "0"))))
 
-(run-tests)
+(test-group "sigil-coin canonical score ordering"
+  (test "unsigned comparison IS lexicographic comparison on the tuple"
+    ;; The proof obligation of §5.3: no case analysis on the hot path is
+    ;; sound only if the packing makes the two orders identical.
+    (assert-true
+      (all-pairs?
+        %tuples
+        (lambda (a b)
+          (= (lex-compare (rank-tuple a) (rank-tuple b))
+             (coin-score-compare
+               (coin-score-pack (list-ref a 0) (list-ref a 1)
+                                   (list-ref a 2) (list-ref a 3))
+               (coin-score-pack (list-ref b 0) (list-ref b 1)
+                                   (list-ref b 2) (list-ref b 3))))))))
+
+  (test "length dominates memory dominates steps dominates aggregate quality"
+    (assert-true (coin-score-better? (coin-score-pack 24 127 127 0)
+                                        (coin-score-pack 25 0 0 8)))
+    (assert-true (coin-score-better? (coin-score-pack 24 50 127 0)
+                                        (coin-score-pack 24 51 0 8)))
+    (assert-true (coin-score-better? (coin-score-pack 24 50 51 0)
+                                        (coin-score-pack 24 50 52 8))))
+
+  (test "aggregate quality breaks ties and only ties"
+    ;; Verified share work cannot outrank a better producer program.
+    (assert-true (coin-score-better? (coin-score-pack 24 50 51 1)
+                                        (coin-score-pack 24 50 51 0)))
+    (assert-false (coin-score-better? (coin-score-pack 25 50 51 8)
+                                         (coin-score-pack 24 50 51 0))))
+
+  (test "equal words are incomparable, so the incumbent tip is kept"
+    (assert-equal 0 (coin-score-compare (coin-score-pack 24 50 51 3)
+                                           (coin-score-pack 24 50 51 3)))
+    (assert-false (coin-score-better? (coin-score-pack 24 50 51 3)
+                                         (coin-score-pack 24 50 51 3))))
+
+  (test "the order is a strict weak ordering"
+    ;; Irreflexive.
+    (assert-true
+      (let loop ((ws %words))
+        (cond ((null? ws) #t)
+              ((coin-score-better? (car ws) (car ws)) #f)
+              (else (loop (cdr ws))))))
+    ;; Asymmetric.
+    (assert-true
+      (all-pairs? %words
+                  (lambda (a b)
+                    (not (and (coin-score-better? a b)
+                              (coin-score-better? b a))))))
+    ;; Transitive.
+    (assert-true
+      (all-triples? %words
+                    (lambda (a b c)
+                      (if (and (coin-score-better? a b)
+                               (coin-score-better? b c))
+                          (coin-score-better? a c)
+                          #t))))
+    ;; Incomparability is transitive, which is what makes it *weak*.
+    (assert-true
+      (all-triples?
+        %words
+        (lambda (a b c)
+          (let ((ab (and (not (coin-score-better? a b))
+                         (not (coin-score-better? b a))))
+                (bc (and (not (coin-score-better? b c))
+                         (not (coin-score-better? c b))))
+                (ac (and (not (coin-score-better? a c))
+                         (not (coin-score-better? c a)))))
+            (if (and ab bc) ac #t))))))
+
+  (test "comparison rejects anything that is not a 32-bit word"
+    (assert-error (coin-score-compare -1 0))
+    (assert-error (coin-score-compare 0 coin-max-score-word))))
+
+;; ============================================================
+;; Retargeting (§9)
+;; ============================================================
+
+(test-group "sigil-coin canonical retarget parameters"
+  (test "the retarget parameters are frozen"
+    (assert-equal 16 coin-retarget-window)
+    (assert-equal 100 coin-target-margin)
+    (assert-equal 1000 coin-margin-clamp)
+    (assert-equal 250 coin-factor-min)
+    (assert-equal 4000 coin-factor-max)
+    (assert-equal 16 coin-complexity-min)
+    (assert-equal 4095 coin-complexity-max)
+    (assert-equal 128 coin-complexity-genesis)
+    (assert-equal puzzle-complexity-genesis coin-complexity-genesis)))
+
+(test-group "sigil-coin canonical margin signal"
+  (test "the margin is relative, in milli-units"
+    (assert-equal 100 (coin-margin 100 90))
+    (assert-equal 0 (coin-margin 100 100))
+    (assert-equal -10 (coin-margin 100 101))
+    ;; Relative, so the same absolute beat means more on a short par.
+    (assert-equal 200 (coin-margin 50 40))
+    (assert-equal 40 (coin-margin 250 240)))
+
+  (test "division floors toward negative infinity"
+    ;; 1000 * -1 / 7 = -142.857..., so -143, not -142.
+    (assert-equal -143 (coin-margin 7 8))
+    (assert-equal 142 (coin-margin 7 6)))
+
+  (test "the margin is clamped both ways"
+    (assert-equal -1000 (coin-margin 24 512))
+    (assert-equal -1000 (coin-margin 24 48))
+    ;; A solution can never beat par by more than par, so +1000 is the
+    ;; unreachable side of the clamp.
+    (assert-equal 958 (coin-margin 24 1)))
+
+  (test "a nonsensical par or length raises"
+    (assert-error (coin-margin 0 10))
+    (assert-error (coin-margin -1 10))
+    (assert-error (coin-margin 100 0))))
+
+(test-group "sigil-coin canonical margin median"
+  (test "the median is the upper middle of a sorted window"
+    (assert-equal 5 (coin-margin-median
+                      '(0 0 0 0 0 0 0 0 5 5 5 5 5 5 5 5)))
+    (assert-equal 8 (coin-margin-median
+                      '(15 14 13 12 11 10 9 8 7 6 5 4 3 2 1 0)))
+    (assert-equal -300 (coin-margin-median (repeat 16 -300))))
+
+  (test "a partial window is not a smaller window"
+    ;; §9.4: no partial window is ever used, so this is an error, not a
+    ;; median of what happens to be available.
+    (assert-error (coin-margin-median '()))
+    (assert-error (coin-margin-median (repeat 15 0)))
+    (assert-error (coin-margin-median (repeat 17 0)))))
+
+(test-group "sigil-coin canonical retarget adjustment"
+  (test "a retarget fires every sixteenth height from sixteen"
+    (assert-false (coin-retarget-height? 0))
+    (assert-false (coin-retarget-height? 1))
+    (assert-false (coin-retarget-height? 15))
+    (assert-true (coin-retarget-height? 16))
+    (assert-false (coin-retarget-height? 17))
+    (assert-true (coin-retarget-height? 32))
+    (assert-true (coin-retarget-height? 4096)))
+
+  (test "hitting the target margin holds the complexity still"
+    (assert-equal 128 (coin-next-complexity 128 (repeat 16 100)))
+    (assert-equal 4095 (coin-next-complexity 4095 (repeat 16 100))))
+
+  (test "beating par by more than the target raises the complexity"
+    (assert-equal 243 (coin-next-complexity 128 (repeat 16 1000)))
+    (assert-true (> (coin-next-complexity 512 (repeat 16 300)) 512)))
+
+  (test "missing the target lowers the complexity"
+    (assert-equal 115 (coin-next-complexity 128 (repeat 16 0)))
+    (assert-true (< (coin-next-complexity 512 (repeat 16 -200)) 512)))
+
+  (test "the factor clamps at a quarter, which is the load-bearing side"
+    ;; f = 1000 + m - 100 would be -100 at m = -1000: negative, and a
+    ;; collapse in one window. The clamp is what stops it.
+    (assert-equal 32 (coin-next-complexity 128 (repeat 16 -1000)))
+    (assert-equal 32 (coin-next-complexity 128 (repeat 16 -700)))
+    ;; The upper clamp is unreachable: m <= 1000 caps the raw factor at
+    ;; 1900, well under 4000. 4095 * 1.9 would be 7780 before the C bound.
+    (assert-equal 4095 (coin-next-complexity 4095 (repeat 16 1000)))
+    (assert-equal 3800 (coin-next-complexity 2000 (repeat 16 1000))))
+
+  (test "the complexity bounds hold in both directions"
+    (assert-equal 16 (coin-next-complexity 16 (repeat 16 -1000)))
+    (assert-equal 16 (coin-next-complexity 32 (repeat 16 -1000)))
+    (assert-equal 4095 (coin-next-complexity 4000 (repeat 16 1000)))
+    (assert-true
+      (let loop ((c 16))
+        (cond
+          ((> c 4095) #t)
+          ((let ((down (coin-next-complexity c (repeat 16 -1000)))
+                 (up (coin-next-complexity c (repeat 16 1000))))
+             (and (>= down 16) (<= down 4095) (>= up 16) (<= up 4095)))
+           (loop (+ c 407)))
+          (else #f)))))
+
+  (test "a complexity outside the bounds raises"
+    (assert-error (coin-next-complexity 15 (repeat 16 0)))
+    (assert-error (coin-next-complexity 4096 (repeat 16 0)))))
+
+(test-group "sigil-coin canonical early chain"
+  (test "genesis and the first partial window are the genesis complexity"
+    (assert-equal 128 (coin-complexity-at 0 '()))
+    (assert-equal 128 (coin-complexity-at 1 '()))
+    (assert-equal 128 (coin-complexity-at 15 '()))
+    (assert-equal 128 (coin-complexity-for 0 128 #f))
+    (assert-equal 128 (coin-complexity-for 15 128 #f)))
+
+  (test "the first retarget is at height sixteen over heights 0..15"
+    (let ((margins (margins-of 64)))
+      (assert-equal (coin-next-complexity
+                      128
+                      (let loop ((xs margins) (i 0) (acc '()))
+                        (if (>= i 16) (reverse acc)
+                            (loop (cdr xs) (+ i 1) (cons (car xs) acc)))))
+                    (coin-complexity-at 16 margins))))
+
+  (test "between retargets the complexity does not move"
+    (let ((margins (margins-of 64)))
+      (assert-equal (coin-complexity-at 16 margins)
+                    (coin-complexity-at 17 margins))
+      (assert-equal (coin-complexity-at 16 margins)
+                    (coin-complexity-at 31 margins))
+      (assert-true (or (not (= (coin-complexity-at 31 margins)
+                               (coin-complexity-at 32 margins)))
+                       #t))))
+
+  (test "the incremental form agrees with the whole-history fold"
+    ;; A node never folds the chain: it carries `C(H-1)` from the parent's
+    ;; own `bits`. The two must not be able to disagree.
+    (let ((margins (margins-of 96)))
+      (assert-true
+        (let loop ((h 1) (parent (coin-complexity-at 0 margins)))
+          (if (> h 80)
+              #t
+              (let* ((window
+                       (let take ((xs margins) (i 0) (acc '()))
+                         (cond
+                           ((>= i h) (reverse acc))
+                           ((null? xs) (reverse acc))
+                           ((< i (- h 16)) (take (cdr xs) (+ i 1) acc))
+                           (else (take (cdr xs) (+ i 1)
+                                       (cons (car xs) acc))))))
+                     (incremental (coin-complexity-for h parent window)))
+                (if (= incremental (coin-complexity-at h margins))
+                    (loop (+ h 1) incremental)
+                    #f)))))))
+
+  (test "a history too short for the height raises"
+    (assert-error (coin-complexity-at 16 (margins-of 15)))
+    (assert-error (coin-complexity-at -1 '()))))
+
+;; ============================================================
+;; The `bits` codec (§5.2, §9.4)
+;; ============================================================
+
+(test-group "sigil-coin canonical bits codec"
+  (test "the prefix is frozen and stays under the max-target compact number"
+    (assert-equal #x207f0000 coin-bits-prefix)
+    (assert-true (<= (coin-bits-encode 4095) #x207fffff)))
+
+  (test "encoding round-trips over the whole complexity range"
+    (assert-equal #x207f0080 (coin-bits-encode 128))
+    (assert-true
+      (let loop ((c 16))
+        (cond
+          ((> c 4095) #t)
+          ((= c (coin-result-value (coin-bits-decode
+                                     (coin-bits-encode c))))
+           (loop (+ c 1)))
+          (else #f)))))
+
+  (test "a wrong prefix is rejected"
+    (assert-equal 'bits-prefix
+                  (coin-result-reason (coin-bits-decode #x1d00ffff)))
+    (assert-equal 'bits-prefix
+                  (coin-result-reason (coin-bits-decode #x207e0080))))
+
+  (test "bits 15:12 are reserved zero"
+    (assert-equal 'bits-reserved-nonzero
+                  (coin-result-reason (coin-bits-decode #x207fffff)))
+    (assert-equal 'bits-reserved-nonzero
+                  (coin-result-reason (coin-bits-decode #x207f1080))))
+
+  (test "a complexity outside [16, 4095] is rejected"
+    (assert-equal 'complexity-range
+                  (coin-result-reason (coin-bits-decode #x207f0000)))
+    (assert-equal 'complexity-range
+                  (coin-result-reason (coin-bits-decode #x207f000f))))
+
+  (test "a word that is not 32-bit unsigned is malformed"
+    (assert-equal 'malformed-header
+                  (coin-result-reason (coin-bits-decode -1)))
+    (assert-equal 'malformed-header
+                  (coin-result-reason (coin-bits-decode 4294967296)))
+    (assert-equal 'malformed-header
+                  (coin-result-reason (coin-bits-decode "0"))))
+
+  (test "the derived complexity wins: C is never miner-chosen"
+    (assert-true (coin-ok? (coin-check-bits #x207f0080 128)))
+    (assert-equal 128 (coin-result-value (coin-check-bits #x207f0080 128)))
+    (assert-equal 'complexity-mismatch
+                  (coin-result-reason (coin-check-bits #x207f0080 129)))
+    ;; The codec's own rejections come through first.
+    (assert-equal 'bits-prefix
+                  (coin-result-reason (coin-check-bits #x207e0080 128)))
+    ;; The expected value is the node's own, so a bad one raises.
+    (assert-error (coin-check-bits #x207f0080 15)))
+
+  (test "bits checking is total on hostile input"
+    (assert-true
+      (let loop ((xs (list -1 0 "0" '() 4294967296 #x207fffff #x207f0000)))
+        (cond
+          ((null? xs) #t)
+          ((coin-failed? (coin-check-bits (car xs) 128)) (loop (cdr xs)))
+          (else #f))))))

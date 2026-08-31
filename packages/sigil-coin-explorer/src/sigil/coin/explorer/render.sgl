@@ -2,7 +2,7 @@
 ;;;
 ;;; ## Everything from a block is hostile until it is escaped
 ;;;
-;;; Graffiti is 400 bytes a miner chose, and a solution is 256 bytes a miner
+;;; Graffiti is 400 bytes a miner chose, and a solution is 512 bytes a miner
 ;;; chose. Both reach this module as raw `bytevector`s, and both are printed
 ;;; on a page other people read. So there is exactly ONE way text from a
 ;;; block becomes markup, and it is two stages that always run in order:
@@ -469,10 +469,7 @@
       '("height" "time" "miner" "bytes" "par" "margin" "reward" "quote"))
 
     ;; ============================================================
-    ;; v2 sections
-    ;;
-    ;; Every one of these renders nothing at all on a v1 block, so a chain
-    ;; that has not split shows exactly the page it showed before.
+    ;; Puzzle, score, shares and split sections
     ;; ============================================================
 
     (define (hex-word n)
@@ -502,10 +499,8 @@
                        pairs))
             "</table>")))
 
-    (define (v2-puzzle-section b)
-      (if (not (explorer-block-v2? b))
-          ""
-          (join (list
+    (define (puzzle-section b)
+      (join (list
                   "<h2>Puzzle</h2>"
                   "<p class=\"q\">A solution is a one-argument function that"
                   " reproduces every pair below, under the day's constraint."
@@ -526,12 +521,10 @@
                   (field "examples (k)" (optional-number (explorer-block-k b)))
                   (field "par" (optional-number (explorer-block-par b)))
                   "</table>"
-                  (examples-table (explorer-block-examples b))))))
+                  (examples-table (explorer-block-examples b)))))
 
-    (define (v2-score-section b)
-      (if (not (explorer-block-v2? b))
-          ""
-          (join (list
+    (define (score-section b)
+      (join (list
                   "<h2>Producer score</h2>"
                   "<p class=\"q\">Lower is better. Length dominates memory,"
                   " memory dominates steps, and aggregate personalized-share"
@@ -570,7 +563,7 @@
                               (explorer-escape
                                 (hex-word (explorer-block-score-word b)))
                               "<span class=\"q\">the header nonce</span>"))
-                  "</tr></table>"))))
+                  "</tr></table>")))
 
     (define (share-source-text s)
       (let ((source (explorer-share-solution-source s))
@@ -614,10 +607,8 @@
       '("#" "miner" "bytes" "personal par" "margin" "Q+" "steps"
         "cells" "SB" "MB" "payout"))
 
-    (define (v2-shares-section b)
-      (if (not (explorer-block-v2? b))
-          ""
-          (let ((shares (explorer-block-shares b)))
+    (define (shares-section b)
+      (let ((shares (explorer-block-shares b)))
             (join (list
                     "<h2>Co-op shares</h2>"
                     (if (null? shares)
@@ -638,7 +629,7 @@
                                 "</table>")))
                     "<p>commitments carried: "
                     (optional-number (explorer-block-commit-count b))
-                    "</p>")))))
+                    "</p>"))))
 
     (define (role-text role)
       (cond ((eq? role 'producer) "producer")
@@ -671,10 +662,8 @@
     (define %output-headings
       '("#" "role" "paid to" "value" "split says" ""))
 
-    (define (v2-split-section b)
-      (if (not (explorer-block-v2? b))
-          ""
-          (let ((outputs (explorer-block-outputs b)))
+    (define (split-section b)
+      (let ((outputs (explorer-block-outputs b)))
             (if (null? outputs)
                 ""
                 (join (list
@@ -691,7 +680,7 @@
                                       (explorer-block-total-output b))
                                     (amount-cell (explorer-block-reward b))
                                     "<span class=\"q\">subsidy</span>"))
-                        "</tr></table>"))))))
+                        "</tr></table>")))))
 
     (define %difficulty-headings
       '("height" "C" "par" "bytes" "margin" ""))
@@ -861,10 +850,6 @@
                        (let ((seed (explorer-summary-puzzle-seed summary)))
                          (if (string? seed) (explorer-escape seed) "&mdash;")))
                 "</table>"
-                (let ((target (explorer-summary-puzzle-target summary)))
-                  (if (string? target)
-                      (string-append "<pre>" (explorer-text target) "</pre>")
-                      ""))
                 (examples-table (explorer-summary-puzzle-examples summary))
                 (author-table
                   (explorer-author-tally
@@ -974,16 +959,11 @@
                              (explorer-escape (symbol->string problem)))
                       ""))
                 "</table>"
-                (v2-puzzle-section b)
+                (puzzle-section b)
                 "<h2>Solution</h2><pre>" (solution-text b) "</pre>"
-                (v2-score-section b)
-                (v2-shares-section b)
-                (v2-split-section b)
-                (let ((target (explorer-block-target b)))
-                  (if (string? target)
-                      (string-append "<h2>Target</h2><pre>"
-                                     (explorer-text target) "</pre>")
-                      ""))
+                (score-section b)
+                (shares-section b)
+                (split-section b)
                 "<h2>Quote</h2><pre>"
                 (let ((graffiti (explorer-block-graffiti b)))
                   (if (and (bytevector? graffiti)
@@ -1070,7 +1050,6 @@
               (json-number (explorer-block-solution-length b)))
         (cons "par" (json-number (explorer-block-par b)))
         (cons "under_par" (json-number (explorer-block-under-par b)))
-        (cons "target" (json-text (explorer-block-target b)))
         (cons "seed" (json-text (explorer-block-seed b)))
         (cons "graffiti" (json-text (explorer-block-graffiti b)))
         (cons "transactions"
@@ -1081,7 +1060,6 @@
                 (if problem (symbol->string problem) 'null)))
         (cons "author" (json-text (explorer-block-author b)))
         (cons "margin" (json-number (explorer-block-margin b)))
-        (cons "version" (json-number (explorer-block-version b)))
         (cons "complexity" (json-number (explorer-block-complexity b)))
         (cons "constraint"
               (if (number? (explorer-block-constraint b))
@@ -1093,18 +1071,16 @@
         (cons "k" (json-number (explorer-block-k b)))
         (cons "examples" (map example-alist (explorer-block-examples b)))
         (cons "score"
-              (if (explorer-block-v2? b)
-                  (list (cons "word" (json-number
-                                       (explorer-block-score-word b)))
-                        (cons "length" (json-number
-                                         (explorer-block-score-length b)))
-                        (cons "memory" (json-number
-                                         (explorer-block-score-memory b)))
-                        (cons "steps" (json-number
-                                        (explorer-block-score-steps b)))
-                        (cons "quality" (json-number
-                                          (explorer-block-score-quality b))))
-                  'null))
+              (list (cons "word" (json-number
+                                    (explorer-block-score-word b)))
+                    (cons "length" (json-number
+                                      (explorer-block-score-length b)))
+                    (cons "memory" (json-number
+                                      (explorer-block-score-memory b)))
+                    (cons "steps" (json-number
+                                     (explorer-block-score-steps b)))
+                    (cons "quality" (json-number
+                                       (explorer-block-score-quality b)))))
         (cons "share_count" (json-number (explorer-block-share-count b)))
         (cons "shares" (map share-alist (explorer-block-shares b)))
         (cons "commitments" (json-number (explorer-block-commit-count b)))
@@ -1175,7 +1151,6 @@
         (cons "next_reward" (explorer-summary-next-reward summary))
         (cons "next_halving_height"
               (json-number (explorer-summary-next-halving-height summary)))
-        (cons "version" (json-number (explorer-summary-version summary)))
         (cons "complexity" (json-number (explorer-summary-complexity summary)))
         (cons "next_complexity"
               (json-number (explorer-summary-next-complexity summary)))
@@ -1184,7 +1159,6 @@
         (cons "puzzle"
               (list
                 (cons "par" (json-number (explorer-summary-puzzle-par summary)))
-                (cons "target" (json-text (explorer-summary-puzzle-target summary)))
                 (cons "seed" (json-text (explorer-summary-puzzle-seed summary)))
                 (cons "constraint"
                       (if (number? (explorer-summary-puzzle-constraint summary))

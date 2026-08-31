@@ -1,34 +1,20 @@
-;;; (sigil coin consensus) — SigilCoin consensus rules
+;;; (sigil coin consensus) — canonical SigilCoin consensus
 ;;;
-;;; Facade over the rule modules. SigilCoin reuses Bitcoin's header,
-;;; transaction, UTXO and script machinery from `sigil-bitcoin-consensus`
-;;; wholesale; what lives here is only what SigilCoin changes:
-;;;
-;;;   (sigil coin consensus emission)    the daviwil emission schedule
-;;;   (sigil coin consensus seed)        puzzle seed derivation
-;;;   (sigil coin consensus coinbase)    the coinbase scriptSig payload
-;;;   (sigil coin consensus solution)    the mining rule
-;;;   (sigil coin consensus fork-choice) shortest solution wins
-;;;   (sigil coin consensus rules)       size and pacing
-;;;   (sigil coin consensus result)      the tagged result all of them return
-;;;
-;;; The package is pure: it validates data it is handed. No database, no
-;;; network, no node runtime.
-;;;
-;;; ```scheme
-;;; (import (sigil coin consensus))
-;;; (coin-block-reward 31)  ; => 10000000000
-;;; (coin-ok? (coin-verify-block-solution parent-hash height block))
-;;; ```
+;;; Pure consensus rules for puzzle derivation, solution scoring, retargeting,
+;;; co-op shares, commit-reveal, coinbase payloads, fork choice and emission.
+;;; No database, network or clock exists here beyond values supplied by callers.
 
 (define-library (sigil coin consensus)
   (import (sigil coin consensus result)
           (sigil coin consensus emission)
+          (sigil coin consensus rules)
           (sigil coin consensus seed)
-          (sigil coin consensus coinbase)
           (sigil coin consensus solution)
-          (sigil coin consensus fork-choice)
-          (sigil coin consensus rules))
+          (sigil coin consensus score)
+          (sigil coin consensus retarget)
+          (sigil coin consensus shares)
+          (sigil coin consensus coinbase)
+          (sigil coin consensus fork-choice))
   (export
     ;; Package metadata
     consensus-package-version
@@ -56,53 +42,162 @@
     coin-block-reward
     coin-cumulative-supply
 
-    ;; Puzzle seed
+    ;; Frozen caps
+    coin-max-block-bytes
+    coin-max-solution-bytes
+    coin-max-graffiti-bytes
+    coin-max-shares
+    coin-max-commitments
+    coin-max-k
+    coin-max-fuel
+    coin-min-block-spacing
+    coin-max-future-drift
+    coin-median-time-span
+    coin-median-time-past
+    coin-validate-header-context
+    coin-block-size
+    coin-validate-block-size
+
+    ;; Puzzle derivation
+    coin-puzzle-tag
     coin-genesis-seed-tag
     coin-genesis-seed
     coin-height-encode
+    coin-complexity-encode
     coin-puzzle-seed
     coin-puzzle-for
+    coin-puzzle-cache
+    coin-puzzle-cache?
+    coin-puzzle-cache-capacity
+    coin-puzzle-cache-entries
+    coin-puzzle-cache-open
+    coin-puzzle-cache-size
+    coin-puzzle-cache-ref
+    coin-puzzle-cached
 
-    ;; Coinbase payload
-    coin-max-solution-bytes
-    coin-max-graffiti-bytes
+    ;; Solution verification
+    coin-solution-length
+    coin-spec-builtin-cap
+    coin-check-solution
+
+    ;; Score
+    coin-bucket7
+    coin-max-bucket
+    coin-score
+    coin-score?
+    coin-score-length
+    coin-score-memory
+    coin-score-steps
+    coin-score-quality
+    coin-score-encode
+    coin-score-pack
+    coin-score-decode
+    coin-score-valid?
+    coin-score-check
+    coin-max-score-word
+    coin-score-compare
+    coin-score-better?
+
+    ;; Retargeting
+    coin-retarget-window
+    coin-target-margin
+    coin-margin-clamp
+    coin-factor-min
+    coin-factor-max
+    coin-complexity-min
+    coin-complexity-max
+    coin-complexity-genesis
+    coin-margin
+    coin-margin-median
+    coin-retarget-height?
+    coin-next-complexity
+    coin-complexity-for
+    coin-complexity-at
+    coin-bits-prefix
+    coin-bits-encode
+    coin-bits-decode
+    coin-check-bits
+
+    ;; Co-op shares, commit-reveal and the reward split
+    coin-share-pubkey-bytes
+    coin-share-signature-bytes
+    coin-share-blind-bytes
+    coin-commitment-bytes
+    coin-share-fixed-bytes
+    coin-max-share-bytes
+    coin-max-shares-bytes
+    coin-max-commits-bytes
+    coin-empty-shares
+    coin-empty-commits
+    coin-share-tag
+    coin-share-puzzle-tag
+    coin-commit-tag
+    coin-share-puzzle-seed
+    coin-pubkey-anchor-output
+    coin-anchor-output-pubkey
+    coin-share-puzzle
+    coin-share-preimage
+    coin-commitment
+    coin-share-commitment
+    coin-share-script
+    coin-share
+    coin-share?
+    coin-share-pubkey
+    coin-share-signature
+    coin-share-blind
+    coin-share-solution
+    coin-share-encode
+    coin-shares-encode
+    coin-shares-decode
+    coin-commits-encode
+    coin-commits-decode
+    coin-coop-context
+    coin-coop-context?
+    coin-coop-context-parent-prev-hash
+    coin-coop-context-puzzle-height
+    coin-coop-context-complexity
+    coin-coop-context-spec
+    coin-coop-context-commits
+    coin-share-signature-ok?
+    coin-share-margin-milli
+    coin-share-contribution
+    coin-quality
+    coin-share-quality
+    coin-shares-quality
+    coin-check-share-solution
+    coin-check-shares
+    coin-producer-weight
+    coin-split-weight-total
+    coin-split-unit
+    coin-split-plan
+    coin-check-split
+
+    ;; The coinbase payload
+    coin-min-coinbase-script-bytes
+    coin-max-coinbase-script-bytes
+    coin-coinbase-script-bounds
     coin-coinbase-payload
     coin-coinbase-payload?
     coin-coinbase-payload-height
     coin-coinbase-payload-solution
+    coin-coinbase-payload-shares
+    coin-coinbase-payload-commits
     coin-coinbase-payload-graffiti
     coin-coinbase-payload-encode
     coin-coinbase-payload-decode
     coin-block-coinbase
     coin-block-coinbase-payload
-
-    ;; Solution verification
-    coin-check-solution
-    coin-verify-block-solution
+    coin-carrier-script
+    coin-check-coop
 
     ;; Fork choice
-    coin-hash-compare
-    coin-solution-compare
-    coin-better-solution?
-    coin-replaces-tip?
-
-    ;; Size and pacing
-    coin-max-block-bytes
-    coin-min-block-spacing
-    coin-max-future-drift
-    coin-median-time-span
-    coin-median-time-past
-    coin-block-size
-    coin-validate-block-size
-    coin-validate-header-context)
+    coin-block-compare
+    coin-better-block?
+    coin-replaces-tip?)
 
   (begin
 
-    ;;; Version of the consensus package.
-    ;;;
-    ;;; ```scheme
-    ;;; (consensus-package-version) ; => "0.1.0"
-    ;;; ```
+    ;;; Version of consensus package.
     (define (consensus-package-version)
       (: -> string?)
       "0.1.0")))

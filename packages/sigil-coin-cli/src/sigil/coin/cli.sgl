@@ -1,47 +1,19 @@
-;;; (sigil coin cli) — the `sigilcoin` binary
-;;;
-;;; Facade over the command modules and the entry point the bundle runs:
-;;;
-;;;   (sigil coin cli args)     flags, chain selection, SGL amounts
-;;;   (sigil coin cli wallet)   keys, `sgl1` addresses, balance, spending
-;;;   (sigil coin cli v2)       v2 presentation and private commit storage
-;;;   (sigil coin cli mine)     `puzzle`, `mine`, `commit`, `reveal`
-;;;   (sigil coin cli operate)  status, peers, sync, run, listen
-;;;
-;;; Every command prints `key: value` lines, one per line, so the output is
-;;; readable in a terminal and greppable in a script without a formatter.
-;;;
-;;; The one thing worth knowing before running anything: SigilCoin is mined
-;;; by writing programs, not by burning electricity. `sigilcoin puzzle`
-;;; prints the puzzle for the next block and the always-legal baseline
-;;; solution; anything shorter than that baseline is a better block.
-;;;
-;;; Under v2 the puzzle is a set of input/output pairs and the answer is a
-;;; function, so the baseline is a lookup table and beating it is the game.
-;;;
-;;; ```scheme
-;;; (cli-run '("puzzle" "--regtest"))
-;;; ```
+;;; (sigil coin cli) — `sigilcoin` command line
 
 (define-library (sigil coin cli)
   (import (sigil process)
           (sigil string)
-          (sigil coin consensus v2)
           (sigil coin cli args)
           (sigil coin cli wallet)
-          (sigil coin cli v2)
+          (sigil coin cli support)
           (sigil coin cli mine)
-          (sigil coin cli operate))
+          (sigil coin cli operate)
+  )
   (export
-    ;; Package metadata
     cli-package-version
-
-    ;; Entry points
     cli-usage
     cli-run
     main
-
-    ;; Shared argument handling
     cli-default-data-dir
     cli-arg
     cli-arg-list
@@ -55,14 +27,10 @@
     cli-daviwils->sgl
     cli-sgl->daviwils
     cli-error-message
-
-    ;; Wallet
     coin-address-hrp
     coin-coinbase-maturity
     coin-address
     coin-address->script-pubkey
-    coin-dust-threshold
-    coin-default-fee
     wallet-key-file
     wallet-legacy-key-file
     wallet-key
@@ -82,82 +50,48 @@
     wallet-mempool-spent-outpoints
     wallet-select-inputs
     wallet-build-transfer
+    coin-dust-threshold
+    coin-default-fee
     run-address
     run-balance
     run-send
-
-    ;; Mining
-    coin-solution-advice
+    cli-complexity
+    cli-puzzle
+    cli-constraint-rule
+    cli-constraint-detail
+    cli-example-lines
+    cli-score-report
+    cli-mismatch-actual
+    cli-solution-advice
+    cli-commit-file
+    cli-commit-record
+    cli-commit-record?
+    cli-commit-record-height
+    cli-commit-record-complexity
+    cli-commit-record-parent
+    cli-commit-record-pubkey
+    cli-commit-record-blind
+    cli-commit-record-commitment
+    cli-commit-record-solution
+    cli-commit-records
+    cli-commit-records-for
+    cli-commit-save
+    cli-commit-prune
+    cli-bytes<?
+    cli-sort-bytes
     coin-validated-tip-height
     coin-validated-tip-header
     coin-header-at-height
+    coin-puzzle-parent
+    coin-puzzle-context
     coin-puzzle-report
     coin-print-puzzle
     coin-block-transaction-fee
     coin-select-block-transactions
     run-puzzle
     run-mine
-
-    ;; Mining, v2
-    coin-v2-max-solution-bytes
-    coin-v2-score-better?
-    coin-v2-score-encode
-    coin-v2-spec-builtin-cap
-    coin-v2-puzzle-seed
-    cli-v2-chain-version
-    cli-v2-complexity
-    cli-v2-puzzle
-    cli-v2-constraint-rule
-    cli-v2-constraint-detail
-    cli-v2-example-lines
-    cli-v2-score-report
-    cli-v2-mismatch-actual
-    cli-v2-solution-advice
-    coin-v2-share-preimage
-    coin-v2-commitment
-    coin-v2-share
-    coin-v2-share?
-    coin-v2-share-pubkey
-    coin-v2-share-signature
-    coin-v2-share-blind
-    coin-v2-share-solution
-    coin-v2-share-encode
-    coin-v2-shares-encode
-    coin-v2-shares-decode
-    coin-v2-share-commitment
-    coin-v2-share-signature-ok?
-    coin-v2-check-share-solution
-    coin-v2-share-quality
-    coin-v2-coop-context
-    coin-v2-commits-encode
-    coin-v2-commits-decode
-    cli-v2-commit-file
-    cli-v2-commit-record
-    cli-v2-commit-record?
-    cli-v2-commit-record-height
-    cli-v2-commit-record-complexity
-    cli-v2-commit-record-parent
-    cli-v2-commit-record-pubkey
-    cli-v2-commit-record-blind
-    cli-v2-commit-record-commitment
-    cli-v2-commit-record-solution
-    cli-v2-commit-records
-    cli-v2-commit-records-for
-    cli-v2-commit-save
-    cli-v2-commit-prune
-    cli-v2-bytes<?
-    cli-v2-sort-bytes
-    coin-puzzle-parent
-    coin-puzzle-version
-    coin-puzzle-context/v2
-    coin-puzzle-report/v2
-    coin-print-puzzle/v2
-    run-puzzle/v2
-    run-mine/v2
     run-commit
     run-reveal
-
-    ;; Node operation
     coin-parse-peer
     coin-print-status
     coin-peer-connector
@@ -167,7 +101,8 @@
     run-block-sync
     run-sync
     run-node
-    run-listen)
+    run-listen
+  )
 
   (begin
 
@@ -190,10 +125,10 @@
       (println "sigilcoin — mine a blockchain by writing the shortest program")
       (println "")
       (println "mining:")
-      (println "  sigilcoin puzzle [--height N] [--v2] [--share] [--complexity C] [CHAIN] [--data-dir DIR]")
-      (println "  sigilcoin mine [--solution EXPR] [--graffiti TEXT] [--address ADDR] [--v2] [--share] [--complexity C] [CHAIN] [--data-dir DIR]")
-      (println "  sigilcoin commit --solution EXPR [--height N] [--complexity C] [--v2] [CHAIN] [--data-dir DIR]")
-      (println "  sigilcoin reveal [--height N] [--commitment HEX] [--v2] [CHAIN] [--data-dir DIR]")
+      (println "  sigilcoin puzzle [--height N] [--share] [--complexity C] [CHAIN] [--data-dir DIR]")
+      (println "  sigilcoin mine [--solution EXPR] [--graffiti TEXT] [--address ADDR] [--share] [--complexity C] [CHAIN] [--data-dir DIR]")
+      (println "  sigilcoin commit --solution EXPR [--height N] [--complexity C] [CHAIN] [--data-dir DIR]")
+      (println "  sigilcoin reveal [--height N] [--commitment HEX] [CHAIN] [--data-dir DIR]")
       (println "")
       (println "how mining works:")
       (println "  A puzzle is k input/output pairs plus one syntactic constraint, both")
@@ -233,7 +168,6 @@
       (println "  sigilcoin listen [--bind HOST] [--port N] [--backlog N] [--max-connections N|0] [--accept-timeout N] [--read-timeout N] [--max-steps N] [--max-tx N] [CHAIN] [--data-dir DIR]")
       (println "")
       (println "CHAIN is --regtest, or --chain sigilcoin-main|sigilcoin-regtest.")
-      (println "--v2 forces the program-by-example surface on a chain still on v1.")
       (println "--complexity C previews a puzzle at a difficulty the chain has not reached.")
       (println "--share derives and checks the wallet pubkey's personalized co-op puzzle.")
       (println "Default chain: sigilcoin-main. Default data dir: ~a."

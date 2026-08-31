@@ -1,6 +1,6 @@
-;;; (sigil coin consensus v2 score) — the 32-bit composite score word
+;;; (sigil coin consensus score) — the 32-bit composite score word
 ;;;
-;;; v2 ranks siblings by the tuple `(L, MB, SB, 15-Q)` in that order, and
+;;; canonical ranks siblings by the tuple `(L, MB, SB, 15-Q)` in that order, and
 ;;; packs the whole tuple into the header's `nonce`:
 ;;;
 ;;;   bit  31              22 21     15 14      8 7    4 3    0
@@ -41,34 +41,33 @@
 ;;; resolution — because a floating-point log would be a divergence risk
 ;;; across hosts for a number every node must agree on to the bit.
 
-(define-library (sigil coin consensus v2 score)
+(define-library (sigil coin consensus score)
   (import (sigil struct)
           (sigil math)
           (sigil coin consensus result)
-          (sigil coin consensus v2 rules))
+          (sigil coin consensus rules))
   (export
     ;; Bucketing
-    coin-v2-bucket7
-    coin-v2-max-bucket
+    coin-bucket7
+    coin-max-bucket
 
     ;; The word
-    coin-v2-score
-    coin-v2-score?
-    coin-v2-score-length
-    coin-v2-score-memory
-    coin-v2-score-steps
-    coin-v2-score-quality
-    coin-v2-score-shares
-    coin-v2-score-encode
-    coin-v2-score-pack
-    coin-v2-score-decode
-    coin-v2-score-valid?
-    coin-v2-score-check
-    coin-v2-max-score-word
+    coin-score
+    coin-score?
+    coin-score-length
+    coin-score-memory
+    coin-score-steps
+    coin-score-quality
+    coin-score-encode
+    coin-score-pack
+    coin-score-decode
+    coin-score-valid?
+    coin-score-check
+    coin-max-score-word
 
     ;; Ranking
-    coin-v2-score-compare
-    coin-v2-score-better?)
+    coin-score-compare
+    coin-score-better?)
 
   (begin
 
@@ -80,7 +79,7 @@
     (define %thresholds '(1000 1122 1260 1414 1587 1782))
 
     ;;; Largest bucket index the 7-bit fields hold.
-    (define coin-v2-max-bucket 127)
+    (define coin-max-bucket 127)
 
     (define (require-count who x)
       (if (not (and (number? x) (exact? x) (integer? x) (>= x 0)))
@@ -99,17 +98,17 @@
     ;;; has passed. Monotone non-decreasing, exact-integer arithmetic only.
     ;;;
     ;;; ```scheme
-    ;;; (coin-v2-bucket7 0)      ; => 0
-    ;;; (coin-v2-bucket7 1)      ; => 1
-    ;;; (coin-v2-bucket7 2)      ; => 7
-    ;;; (coin-v2-bucket7 300)    ; => 50
-    ;;; (coin-v2-bucket7 340)    ; => 51
-    ;;; (coin-v2-bucket7 100000) ; => 100
-    ;;; (coin-v2-bucket7 200000) ; => 106
+    ;;; (coin-bucket7 0)      ; => 0
+    ;;; (coin-bucket7 1)      ; => 1
+    ;;; (coin-bucket7 2)      ; => 7
+    ;;; (coin-bucket7 300)    ; => 50
+    ;;; (coin-bucket7 340)    ; => 51
+    ;;; (coin-bucket7 100000) ; => 100
+    ;;; (coin-bucket7 200000) ; => 106
     ;;; ```
-    (define (coin-v2-bucket7 x)
+    (define (coin-bucket7 x)
       (: integer? -> integer?)
-      (require-count "coin-v2-bucket7" x)
+      (require-count "coin-bucket7" x)
       (if (= x 0)
           0
           (let* ((kk (- (bit-length x) 1))
@@ -121,7 +120,7 @@
                        ((<= (arithmetic-shift (car ts) kk) scaled)
                         (loop (cdr ts) (+ n 1)))
                        (else n)))))
-            (min coin-v2-max-bucket (+ 1 (* 6 kk) (- passed 1))))))
+            (min coin-max-bucket (+ 1 (* 6 kk) (- passed 1))))))
 
     ;; ============================================================
     ;; The word
@@ -137,7 +136,7 @@
 
     ;;; One more than the largest legal score word: the word is a 32-bit
     ;;; unsigned integer.
-    (define coin-v2-max-score-word #x100000000)
+    (define coin-max-score-word #x100000000)
 
     ;;; A decoded score word.
     ;;;
@@ -147,20 +146,15 @@
     ;;; decoded back from the stored `15-Q`.
     ;;;
     ;;; ```scheme
-    ;;; (coin-v2-score-length (coin-v2-score-decode
-    ;;;                         (coin-v2-score-encode 25 80 300 0)))
+    ;;; (coin-score-length (coin-score-decode
+    ;;;                         (coin-score-encode 25 80 300 0)))
     ;;; ; => 25
     ;;; ```
-    (define-struct coin-v2-score
+    (define-struct coin-score
       (length)
       (memory)
       (steps)
       (quality))
-
-    ;; Compatibility accessor for callers not yet renamed. Low field is Q,
-    ;; never raw share count.
-    (define (coin-v2-score-shares score)
-      (coin-v2-score-quality score))
 
     (define (require-range who what x lo hi)
       (if (not (and (number? x) (exact? x) (integer? x)
@@ -174,20 +168,20 @@
     ;;; and `quality` is `Q` in 0..15. Raises on anything outside those
     ;;; domains: every caller packs values it has already validated, so an
     ;;; out-of-range field is a node bug and must not be mistaken for a bad
-    ;;; block. Use `coin-v2-score-check` for words that came off the wire.
+    ;;; block. Use `coin-score-check` for words that came off the wire.
     ;;;
     ;;; ```scheme
-    ;;; (coin-v2-score-pack 1 0 0 15) ; => 0
+    ;;; (coin-score-pack 1 0 0 15) ; => 0
     ;;; ```
-    (define (coin-v2-score-pack length memory steps quality)
+    (define (coin-score-pack length memory steps quality)
       (: integer? integer? integer? integer? -> integer?)
-      (require-range "coin-v2-score-pack" "length" length
-                     1 coin-v2-max-solution-bytes)
-      (require-range "coin-v2-score-pack" "memory bucket" memory
-                     0 coin-v2-max-bucket)
-      (require-range "coin-v2-score-pack" "step bucket" steps
-                     0 coin-v2-max-bucket)
-      (require-range "coin-v2-score-pack" "aggregate quality" quality 0 15)
+      (require-range "coin-score-pack" "length" length
+                     1 coin-max-solution-bytes)
+      (require-range "coin-score-pack" "memory bucket" memory
+                     0 coin-max-bucket)
+      (require-range "coin-score-pack" "step bucket" steps
+                     0 coin-max-bucket)
+      (require-range "coin-score-pack" "aggregate quality" quality 0 15)
       (bitwise-ior
         (arithmetic-shift (- length 1) %length-shift)
         (arithmetic-shift memory %memory-shift)
@@ -201,47 +195,47 @@
     ;;; bucketed here, and only the buckets reach the header.
     ;;;
     ;;; ```scheme
-    ;;; (coin-v2-score-quality (coin-v2-score-decode
-    ;;;                          (coin-v2-score-encode 40 80 300 12)))
+    ;;; (coin-score-quality (coin-score-decode
+    ;;;                          (coin-score-encode 40 80 300 12)))
     ;;; ; => 12
     ;;; ```
-    (define (coin-v2-score-encode length cells steps quality)
+    (define (coin-score-encode length cells steps quality)
       (: integer? integer? integer? integer? -> integer?)
-      (require-count "coin-v2-score-encode" cells)
-      (require-count "coin-v2-score-encode" steps)
-      (coin-v2-score-pack length
-                          (coin-v2-bucket7 cells)
-                          (coin-v2-bucket7 steps)
+      (require-count "coin-score-encode" cells)
+      (require-count "coin-score-encode" steps)
+      (coin-score-pack length
+                          (coin-bucket7 cells)
+                          (coin-bucket7 steps)
                           quality))
 
     ;;; True when `w` is a legal score word: a 32-bit unsigned integer whose
     ;;; low nibble is zero. Every 4-bit `15-Q` value is legal.
     ;;;
     ;;; ```scheme
-    ;;; (coin-v2-score-valid? (coin-v2-score-pack 1 0 0 0)) ; => #t
-    ;;; (coin-v2-score-valid? 1)                            ; => #f
+    ;;; (coin-score-valid? (coin-score-pack 1 0 0 0)) ; => #t
+    ;;; (coin-score-valid? 1)                            ; => #f
     ;;; ```
-    (define (coin-v2-score-valid? w)
+    (define (coin-score-valid? w)
       (: any? -> boolean?)
       (and (number? w) (exact? w) (integer? w)
-           (<= 0 w) (< w coin-v2-max-score-word)
+           (<= 0 w) (< w coin-max-score-word)
            (= 0 (bitwise-and w %nibble-mask))))
 
     ;;; Unpack a legal score word.
     ;;;
-    ;;; Raises on an illegal word; `coin-v2-score-check` is the gate for
+    ;;; Raises on an illegal word; `coin-score-check` is the gate for
     ;;; anything that came off the wire.
     ;;;
     ;;; ```scheme
-    ;;; (coin-v2-score-steps (coin-v2-score-decode
-    ;;;                        (coin-v2-score-pack 10 20 30 2)))
+    ;;; (coin-score-steps (coin-score-decode
+    ;;;                        (coin-score-pack 10 20 30 2)))
     ;;; ; => 30
     ;;; ```
-    (define (coin-v2-score-decode w)
-      (: integer? -> coin-v2-score?)
-      (if (not (coin-v2-score-valid? w))
-          (error "coin-v2-score-decode: not a legal score word"))
-      (coin-v2-score
+    (define (coin-score-decode w)
+      (: integer? -> coin-score?)
+      (if (not (coin-score-valid? w))
+          (error "coin-score-decode: not a legal score word"))
+      (coin-score
         length: (+ 1 (bitwise-and (arithmetic-shift w (- %length-shift))
                                   %length-mask))
         memory: (bitwise-and (arithmetic-shift w (- %memory-shift))
@@ -257,27 +251,27 @@
     ;;; Total: never raises, whatever the header carries. Rejection reasons
     ;;; are `malformed-header` (not a 32-bit unsigned integer at all),
     ;;; `score-reserved-nonzero` (the low nibble is not zero). On success
-    ;;; the value is the decoded `coin-v2-score`.
+    ;;; the value is the decoded `coin-score`.
     ;;;
     ;;; This is a header-level field-range check only. Whether the word
     ;;; describes the block it rides in is `score-mismatch`, and is decided
     ;;; by recomputing the word from the validated body.
     ;;;
     ;;; ```scheme
-    ;;; (coin-result-reason (coin-v2-score-check 1))
+    ;;; (coin-result-reason (coin-score-check 1))
     ;;; ; => score-reserved-nonzero
     ;;; ```
-    (define (coin-v2-score-check w)
+    (define (coin-score-check w)
       (: any? -> coin-result?)
       (cond
         ((not (and (number? w) (exact? w) (integer? w)
-                   (<= 0 w) (< w coin-v2-max-score-word)))
+                   (<= 0 w) (< w coin-max-score-word)))
          (coin-error 'malformed-header
                      "score word is not a 32-bit unsigned integer"))
         ((not (= 0 (bitwise-and w %nibble-mask)))
          (coin-error 'score-reserved-nonzero
                      "the reserved low nibble is not zero"))
-        (else (coin-ok (coin-v2-score-decode w)))))
+        (else (coin-ok (coin-score-decode w)))))
 
     ;; ============================================================
     ;; Ranking
@@ -294,25 +288,25 @@
     ;;; order on `(L, MB, SB, 15-Q)`.
     ;;;
     ;;; ```scheme
-    ;;; (coin-v2-score-compare (coin-v2-score-pack 24 0 0 0)
-    ;;;                        (coin-v2-score-pack 25 0 0 0))
+    ;;; (coin-score-compare (coin-score-pack 24 0 0 0)
+    ;;;                        (coin-score-pack 25 0 0 0))
     ;;; ; => -1
     ;;; ```
-    (define (coin-v2-score-compare a b)
+    (define (coin-score-compare a b)
       (: integer? integer? -> integer?)
-      (require-range "coin-v2-score-compare" "score word" a
-                     0 (- coin-v2-max-score-word 1))
-      (require-range "coin-v2-score-compare" "score word" b
-                     0 (- coin-v2-max-score-word 1))
+      (require-range "coin-score-compare" "score word" a
+                     0 (- coin-max-score-word 1))
+      (require-range "coin-score-compare" "score word" b
+                     0 (- coin-max-score-word 1))
       (cond ((< a b) -1) ((> a b) 1) (else 0)))
 
     ;;; True when `a` strictly outranks `b`.
     ;;;
     ;;; ```scheme
-    ;;; (coin-v2-score-better? (coin-v2-score-pack 24 0 0 0)
-    ;;;                        (coin-v2-score-pack 24 0 0 1))
+    ;;; (coin-score-better? (coin-score-pack 24 0 0 0)
+    ;;;                        (coin-score-pack 24 0 0 1))
     ;;; ; => #f
     ;;; ```
-    (define (coin-v2-score-better? a b)
+    (define (coin-score-better? a b)
       (: integer? integer? -> boolean?)
-      (< (coin-v2-score-compare a b) 0))))
+      (< (coin-score-compare a b) 0))))

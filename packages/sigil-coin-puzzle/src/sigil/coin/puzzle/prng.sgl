@@ -1,0 +1,142 @@
+;;; (sigil coin puzzle prng) — deterministic puzzle generator stream
+;;;
+;;; SplitMix64 stream shared by canonical puzzle generation. Consensus code
+;;; keeps it separate so no removed target-value generator remains.
+
+(define-library (sigil coin puzzle prng)
+  (import (sigil struct)
+          (sigil math))
+  (export
+    puzzle-seed-bytes
+    puzzle-prng
+    puzzle-prng?
+    puzzle-prng-state
+    puzzle-prng-open
+    puzzle-prng-next!
+    puzzle-prng-below!
+    puzzle-prng-word-bits)
+
+  (begin
+
+    ;;; Required generator seed length.
+    (define puzzle-seed-bytes 32)
+
+    ;; ============================================================
+    ;; Deterministic PRNG
+    ;; ============================================================
+    ;;
+    ;; SplitMix64 over a 64-bit state, seeded by FNV-1a over the seed bytes,
+    ;; the height and the retry counter. Every operation masks back to 64
+    ;; bits explicitly, so nothing depends on host word size or bignum
+    ;; behaviour; only exact integer arithmetic is used.
+
+    (define %word-bits 64)
+    (define %word-mask 18446744073709551615)   ; 2^64 - 1
+    (define %fnv-offset 14695981039346656037)  ; FNV-1a 64-bit offset basis
+    (define %fnv-prime 1099511628211)          ; FNV-1a 64-bit prime
+    (define %gamma 11400714819323198485)       ; 0x9E3779B97F4A7C15
+    (define %mix1 13787848793156543929)        ; 0xBF58476D1CE4E5B9
+    (define %mix2 10723151780598845931)        ; 0x94D049BB133111EB
+
+    (define (mask64 n)
+      (bitwise-and n %word-mask))
+
+    (define (shift-right n k)
+      (arithmetic-shift n (- k)))
+
+    ;; State of one deterministic stream.
+    (define-struct puzzle-prng
+      (state mutable: #t))
+
+    ;;; Word width of the PRNG, in bits.
+    ;;;
+    ;;; ```scheme
+    ;;; (puzzle-prng-word-bits) ; => 64
+    ;;; ```
+    (define (puzzle-prng-word-bits)
+      (: -> integer?)
+      %word-bits)
+
+    (define (absorb-byte h b)
+      (mask64 (* %fnv-prime (bitwise-xor h (bitwise-and b 255)))))
+
+    (define (absorb-bytevector h bv)
+      (let ((n (bytevector-length bv)))
+        (let loop ((i 0) (h h))
+          (if (>= i n)
+              h
+              (loop (+ i 1) (absorb-byte h (bytevector-u8-ref bv i)))))))
+
+    ;; Absorb a non-negative integer as self-delimiting LEB128: seven bits
+    ;; per byte, low group first, the high bit set while more groups follow.
+    ;;
+    ;; Self-delimiting matters because several integers are absorbed in a
+    ;; row. Plain little-endian bytes are not injective across a sequence —
+    ;; (height 1, retry 770) and (height 513, retry 3) both absorb 01 02 03 —
+    ;; so two different blocks could share a PRNG stream. LEB128 always emits
+    ;; at least one byte, so 0 still differs from "nothing".
+    (define (absorb-integer h n)
+      (let loop ((h h) (n n))
+        (if (< n 128)
+            (absorb-byte h n)
+            (loop (absorb-byte h (bitwise-ior 128 (bitwise-and n 127)))
+                  (shift-right n 7)))))
+
+    (define (check-inputs seed height retry)
+      (if (not (bytevector? seed))
+          (error "puzzle generator: seed must be a bytevector"))
+      (if (not (= puzzle-seed-bytes (bytevector-length seed)))
+          (error "puzzle generator: seed must be 32 bytes"))
+      (if (not (and (number? height) (exact? height) (integer? height)
+                    (>= height 0)))
+          (error "puzzle generator: height must be a non-negative integer"))
+      (if (not (and (number? retry) (exact? retry) (integer? retry)
+                    (>= retry 0)))
+          (error "puzzle generator: retry must be a non-negative integer"))
+      #t)
+
+    ;;; Open the deterministic stream for one generation attempt.
+    ;;;
+    ;;; The same `(seed, height, retry)` always yields the same sequence of
+    ;;; draws on every machine.
+    ;;;
+    ;;; ```scheme
+    ;;; (puzzle-prng-next! (puzzle-prng-open seed 7 0)) ; => a 64-bit integer
+    ;;; ```
+    (define (puzzle-prng-open seed height retry)
+      (: bytevector? integer? integer? -> puzzle-prng?)
+      (check-inputs seed height retry)
+      (let* ((h (absorb-bytevector %fnv-offset seed))
+             (h (absorb-integer h height))
+             (h (absorb-integer h retry)))
+        (puzzle-prng state: h)))
+
+    ;;; Draw the next 64-bit word. Always in `[0, 2^64)`.
+    ;;;
+    ;;; ```scheme
+    ;;; (< (puzzle-prng-next! g) (expt 2 64)) ; => #t
+    ;;; ```
+    (define (puzzle-prng-next! g)
+      (: puzzle-prng? -> integer?)
+      (let ((s (mask64 (+ (puzzle-prng-state g) %gamma))))
+        (set-puzzle-prng-state! g s)
+        (let* ((z (mask64 (* %mix1 (bitwise-xor s (shift-right s 30)))))
+               (z (mask64 (* %mix2 (bitwise-xor z (shift-right z 27))))))
+          (bitwise-xor z (shift-right z 31)))))
+
+    ;;; Draw an integer in `[0, bound)` for `bound >= 1`.
+    ;;;
+    ;;; ```scheme
+    ;;; (< (puzzle-prng-below! g 10) 10) ; => #t
+    ;;; ```
+    (define (puzzle-prng-below! g bound)
+      (: puzzle-prng? integer? -> integer?)
+      (if (not (and (number? bound) (exact? bound) (integer? bound)
+                    (>= bound 1)))
+          (error "puzzle generator: bound must be a positive integer"))
+      ;; ponytail: plain modulo, so draws are biased by at most
+      ;; bound / 2^64; every bound used here is under 2^20, and the bias is
+      ;; identical on every node, so rejection sampling buys nothing.
+      (modulo (puzzle-prng-next! g) bound))
+
+))

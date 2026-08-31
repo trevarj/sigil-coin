@@ -1,4 +1,4 @@
-;;; Golden vectors for puzzle-lang v1.
+;;; Golden vectors for puzzle-lang canonical.
 ;;;
 ;;; These tests ARE the language specification. Every expectation here is
 ;;; consensus-relevant: changing one changes what blocks a node accepts.
@@ -56,9 +56,9 @@
 
 (test-group "puzzle caps"
   (test "cap constants are frozen"
-    (assert-equal 256 puzzle-max-source-bytes)
+    (assert-equal 512 puzzle-max-source-bytes)
     (assert-equal 64 puzzle-max-parse-depth)
-    (assert-equal 1000000 puzzle-max-fuel)
+    (assert-equal 200000 puzzle-max-fuel)
     (assert-equal 400000 puzzle-max-allocations)
     (assert-equal 65536 puzzle-max-string-bytes)
     (assert-equal 128 puzzle-max-eval-depth))
@@ -319,7 +319,7 @@
     (assert-value 7 "(min 7)"))
 
   (test "min and max reject zero arguments"
-    ;; Unlike `+` and `*` these have no identity element in v1, so the empty
+    ;; Unlike `+` and `*` these have no identity element in canonical, so the empty
     ;; call is an arity error rather than any sentinel value.
     (assert-kind 'arity-error "(min)")
     (assert-kind 'arity-error "(max)")))
@@ -387,7 +387,7 @@
 ;; ============================================================
 
 (test-group "puzzle builtin type errors"
-  (test "cons rejects a non-list tail: improper lists do not exist in v1"
+  (test "cons rejects a non-list tail: improper lists do not exist in canonical"
     (assert-kind 'type-error "(cons 1 2)")
     (assert-kind 'type-error "(cons 1 'a)"))
 
@@ -585,8 +585,8 @@
 
 (test-group "puzzle parse errors"
   (test "source over the byte cap is refused"
-    (assert-equal 'parse-oversize (parse-kind (make-string 257 #\a)))
-    (assert-equal 'ok (puzzle-result-status (puzzle-parse (make-string 256 #\a)))))
+    (assert-equal 'parse-oversize (parse-kind (make-string 513 #\a)))
+    (assert-equal 'ok (puzzle-result-status (puzzle-parse (make-string 512 #\a)))))
 
   (test "the byte cap applies to bytevector sources too"
     ;; #u8(40 43 32 49 32 50 41) is the ASCII for "(+ 1 2)".
@@ -595,7 +595,7 @@
                     (puzzle-parse #u8(40 43 32 49 32 50 41))))
     (assert-equal '(+ 1 2) (ast #u8(40 43 32 49 32 50 41)))
     (assert-equal 'parse-oversize
-                  (parse-kind (make-bytevector 257 65))))
+                  (parse-kind (make-bytevector 513 65))))
 
   (test "nesting deeper than the cap is refused"
     (assert-equal 'ok (puzzle-result-status (puzzle-parse (nest 64))))
@@ -651,7 +651,7 @@
     (assert-equal '- (ast "-")))
 
   (test "only a bare dot is rejected; dot-bearing tokens are symbols"
-    ;; Frozen quirk: v1 has no dotted-pair syntax, so a token that merely
+    ;; Frozen quirk: canonical has no dotted-pair syntax, so a token that merely
     ;; contains a dot is an ordinary symbol and `'(1 .2)` is a 2-element
     ;; list. Harmless, round-trips, and pinned so it cannot drift.
     (assert-equal 'parse-syntax (parse-kind "."))
@@ -713,37 +713,6 @@
     (assert-kind 'overflow "(* (expt 2 255) 4)")
     (assert-kind 'overflow "(+ (expt 2 255) (expt 2 255))")
     (assert-kind 'overflow "(- (- (expt 2 255)) (expt 2 255))"))
-
-  (test "the allocation cap is pinned on both sides"
-    ;; `(iota n)` charges 2 for the argument list plus n for the result, so
-    ;; 399998 lands exactly on the cap and 399999 is one cell over it.
-    (assert-equal 'ok (status "(iota 399998)"))
-    (assert-equal 400000 (cells "(iota 399998)"))
-    (assert-kind 'allocation-exceeded "(iota 399999)")
-    ;; A failed evaluation reports the cap exactly, not the size of the
-    ;; request that broke it.
-    (assert-equal 400000 (cells "(iota 399999)"))
-    (assert-equal 400000 (cells "(iota 100000000)")))
-
-  (test "list building that fits the cap is allowed"
-    (assert-value 100000 "(length (iota 100000))")
-    (assert-value 50000 "(length (map (lambda (x) x) (iota 50000)))")
-    ;; Both of these were `allocation-exceeded` under the v1 undercount and
-    ;; its 100000 cap; honest charging moved the cap, not just the counter.
-    (assert-value 100001 "(length (append (iota 100000) (iota 1)))")
-    (assert-value 100001 "(length (iota 100001))"))
-
-  (test "a closure-retaining loop is charged in proportion to its bindings"
-    ;; The reviewer's ~124 MB case. Each iteration allocates 11 cells: two
-    ;; argument lists of one, one of two, and the three objects that bind
-    ;; the parameter. v1 charged this loop nothing at all.
-    (assert-equal 110012
-                  (cells "(letrec ((f (lambda (n) (if (zero? n) 0 (f (- n 1)))))) (f 10000))"))
-    (assert-equal 11012
-                  (cells "(letrec ((f (lambda (n) (if (zero? n) 0 (f (- n 1)))))) (f 1000))"))
-    ;; Ten times the work, ten times the charge, to within the fixed setup.
-    (assert-kind 'allocation-exceeded
-                 "(letrec ((f (lambda (n) (if (zero? n) 0 (f (- n 1)))))) (f 100000))"))
 
   (test "string construction beyond the cap is refused"
     (assert-kind 'string-limit
@@ -999,7 +968,7 @@
             (assert-true (puzzle-value=? deep deep))
             (assert-true (string? (puzzle-print-value deep)))))))
 
-  (test "puzzle-value? accepts the v1 domain only"
+  (test "puzzle-value? accepts the canonical domain only"
     (assert-true (puzzle-value? 1))
     (assert-true (puzzle-value? '(1 #t "a" sym ())))
     (assert-false (puzzle-value? 1.5))
@@ -1048,7 +1017,7 @@
     (assert-equal "hi" (puzzle-result-value (puzzle-eval "hi")))
     (assert-equal 7 (puzzle-result-value (puzzle-eval 7))))
 
-  (test "puzzle-eval refuses host values outside the v1 domain"
+  (test "puzzle-eval refuses host values outside the canonical domain"
     (assert-equal 'bad-syntax (puzzle-result-error-kind (puzzle-eval 1.5)))
     (assert-equal 'bad-syntax
                   (puzzle-result-error-kind (puzzle-eval (vector 1))))

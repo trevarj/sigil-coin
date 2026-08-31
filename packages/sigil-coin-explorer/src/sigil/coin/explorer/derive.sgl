@@ -1,110 +1,98 @@
-;;; (sigil coin explorer v2) — presentation helpers for consensus v2
+;;; (sigil coin explorer derive) — presentation helpers for consensus canonical
 ;;;
 ;;; Consensus owns every wire type, codec and arithmetic rule. This module
 ;;; only flattens derived puzzle values for pages and reads presentation-only
 ;;; author tags from opaque graffiti.
 
-(define-library (sigil coin explorer v2)
+(define-library (sigil coin explorer derive)
   (import (sigil math)
           (sigil bitcoin utils)
           (sigil coin puzzle)
           (sigil coin puzzle constraints)
-          (sigil coin puzzle examples)
-          (sigil coin consensus v2))
+          (sigil coin puzzle generator)
+          (sigil coin consensus))
   (export
-    explorer-v2-header-version
-    explorer-v2-header?
-    explorer-v2-complexity
-    explorer-v2-score
-    explorer-v2-seed
-    explorer-v2-puzzle
-    explorer-v2-puzzle-view
-    explorer-v2-example-pairs
-    explorer-v2-constraint-text
-    explorer-v2-margin
-    explorer-v2-next-complexity
-    explorer-v2-retarget-height?
-    explorer-v2-check-solution
-    explorer-v2-bucket
-    explorer-v2-author-tag)
+    explorer-complexity
+    explorer-score
+    explorer-seed
+    explorer-puzzle
+    explorer-puzzle-view
+    explorer-example-pairs
+    explorer-constraint-text
+    explorer-margin
+    explorer-next-complexity
+    explorer-retarget-height?
+    explorer-check-solution
+    explorer-bucket
+    explorer-author-tag)
 
   (begin
 
-    ;;; Header version used during the temporary v1/v2 presentation branch.
-    ;;; Wave 3 removes the branch and this constant with it.
-    (define explorer-v2-header-version 5)
-
-    ;;; True when a header declares consensus v2 or later.
-    (define (explorer-v2-header? version)
-      (: any? -> boolean?)
-      (and (number? version) (exact? version) (integer? version)
-           (>= version explorer-v2-header-version)))
-
-    ;;; Decode complexity `C` from a v2 bits field, or `#f` when malformed.
-    (define (explorer-v2-complexity bits)
+    ;;; Decode complexity `C` from a canonical bits field, or `#f` when malformed.
+    (define (explorer-complexity bits)
       (: any? -> any?)
       (guard (e (#t #f))
-        (let ((decoded (coin-v2-bits-decode bits)))
+        (let ((decoded (coin-bits-decode bits)))
           (and (coin-ok? decoded) (coin-result-value decoded)))))
 
     ;;; Flatten a header score as `(L MB SB Q)`, or `#f` when malformed.
     ;;; `Q` is aggregate personalized-share quality, never raw reveal count.
-    (define (explorer-v2-score nonce)
+    (define (explorer-score nonce)
       (: any? -> any?)
       (guard (e (#t #f))
-        (let ((checked (coin-v2-score-check nonce)))
+        (let ((checked (coin-score-check nonce)))
           (and (coin-ok? checked)
                (let ((score (coin-result-value checked)))
-                 (list (coin-v2-score-length score)
-                       (coin-v2-score-memory score)
-                       (coin-v2-score-steps score)
-                       (coin-v2-score-quality score)))))))
+                 (list (coin-score-length score)
+                       (coin-score-memory score)
+                       (coin-score-steps score)
+                       (coin-score-quality score)))))))
 
     ;;; Derive a puzzle seed as lowercase hex, or `#f` for bad input.
-    (define (explorer-v2-seed parent-hash height complexity)
+    (define (explorer-seed parent-hash height complexity)
       (: any? any? any? -> any?)
       (guard (e (#t #f))
         (and (bytevector? parent-hash)
              (number? height)
              (number? complexity)
              (hex-encode-bytes
-               (coin-v2-puzzle-seed parent-hash height complexity)))))
+               (coin-puzzle-seed parent-hash height complexity)))))
 
     ;;; Derive one global producer puzzle, or `#f` for bad input.
-    (define (explorer-v2-puzzle parent-hash height complexity)
+    (define (explorer-puzzle parent-hash height complexity)
       (: any? any? any? -> any?)
       (guard (e (#t #f))
         (and (bytevector? parent-hash)
              (number? height)
              (number? complexity)
-             (coin-v2-puzzle-for parent-hash height complexity))))
+             (coin-puzzle-for parent-hash height complexity))))
 
     ;;; Flatten canonical puzzle examples into source-text pairs.
-    (define (explorer-v2-example-pairs spec)
+    (define (explorer-example-pairs spec)
       (: any? -> list?)
       (guard (e (#t '()))
-        (if (not (pbe-spec? spec))
+        (if (not (puzzle-spec? spec))
             '()
             (map (lambda (pair)
                    (cons (puzzle-print-value (car pair))
                          (puzzle-print-value (cdr pair))))
-                 (pbe-spec-examples spec)))))
+                 (puzzle-spec-examples spec)))))
 
     ;;; Flatten a puzzle as `(par constraint text k examples)`, or `#f`.
-    (define (explorer-v2-puzzle-view spec)
+    (define (explorer-puzzle-view spec)
       (: any? -> any?)
       (guard (e (#t #f))
-        (and (pbe-spec? spec)
-             (let ((constraint (pbe-spec-constraint spec)))
-               (list (pbe-spec-par spec)
+        (and (puzzle-spec? spec)
+             (let ((constraint (puzzle-spec-constraint spec)))
+               (list (puzzle-spec-par spec)
                      constraint
-                     (explorer-v2-constraint-text
-                       constraint (coin-v2-spec-builtin-cap spec))
-                     (pbe-spec-k spec)
-                     (explorer-v2-example-pairs spec))))))
+                     (explorer-constraint-text
+                       constraint (coin-spec-builtin-cap spec))
+                     (puzzle-spec-k spec)
+                     (explorer-example-pairs spec))))))
 
     ;;; Describe a rotating puzzle constraint for presentation.
-    (define (explorer-v2-constraint-text constraint builtin-cap)
+    (define (explorer-constraint-text constraint builtin-cap)
       (: any? any? -> string?)
       (cond
         ((not (and (number? constraint) (exact? constraint)
@@ -126,47 +114,47 @@
         (else "unknown")))
 
     ;;; Compute producer margin in milli-units, or `#f` when unavailable.
-    (define (explorer-v2-margin par length)
+    (define (explorer-margin par length)
       (: any? any? -> any?)
       (guard (e (#t #f))
         (and (number? par) (> par 0)
              (number? length) (> length 0)
-             (coin-v2-margin par length))))
+             (coin-margin par length))))
 
     ;;; Compute complexity for `height`, or `#f` when inputs are incomplete.
-    (define (explorer-v2-next-complexity height parent-complexity margins)
+    (define (explorer-next-complexity height parent-complexity margins)
       (: any? any? any? -> any?)
       (guard (e (#t #f))
-        (coin-v2-complexity-for height parent-complexity margins)))
+        (coin-complexity-for height parent-complexity margins)))
 
-    ;;; True at a v2 retarget height.
-    (define (explorer-v2-retarget-height? height)
+    ;;; True at a canonical retarget height.
+    (define (explorer-retarget-height? height)
       (: any? -> boolean?)
       (guard (e (#t #f))
-        (coin-v2-retarget-height? height)))
+        (coin-retarget-height? height)))
 
     ;;; Run source against `spec`, returning `(steps . cells)` on success.
-    (define (explorer-v2-check-solution spec solution)
+    (define (explorer-check-solution spec solution)
       (: any? any? -> any?)
       (guard (e (#t #f))
-        (let ((checked (coin-v2-check-solution spec solution)))
+        (let ((checked (coin-check-solution spec solution)))
           (and (coin-ok? checked)
                (let ((report (coin-result-value checked)))
                  (cons (puzzle-report-steps report)
                        (puzzle-report-cells report)))))))
 
     ;;; Bucket a non-negative resource count, or `#f` when malformed.
-    (define (explorer-v2-bucket count)
+    (define (explorer-bucket count)
       (: any? -> any?)
       (guard (e (#t #f))
-        (and (number? count) (coin-v2-bucket7 count))))
+        (and (number? count) (coin-bucket7 count))))
 
     ;;; Read a leading `/name/` convention from opaque graffiti bytes.
     ;;; Result stays bytes so renderers must sanitize and escape it.
     (define %max-author-bytes 64)
     (define %slash 47)
 
-    (define (explorer-v2-author-tag graffiti)
+    (define (explorer-author-tag graffiti)
       (: any? -> any?)
       (guard (e (#t #f))
         (and (bytevector? graffiti)

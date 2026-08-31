@@ -1,4 +1,4 @@
-;;; (sigil coin puzzle) — SigilCoin puzzle language v1
+;;; (sigil coin puzzle) — SigilCoin puzzle language canonical
 ;;;
 ;;; A frozen, consensus-critical mini-language. Miners publish a solution
 ;;; expression (at most `puzzle-max-source-bytes` bytes) that every node
@@ -11,7 +11,7 @@
 ;;;                   caps make abuse impossible
 ;;;
 ;;; The language deliberately excludes I/O, crypto, host `eval`, floats,
-;;; mutation, `call/cc`, `define` and macros. Semantics are frozen at v1: any
+;;; mutation, `call/cc`, `define` and macros. Semantics are frozen at canonical: any
 ;;; behavioural change here is a chain split.
 ;;;
 ;;; Grammar (the whole language):
@@ -36,8 +36,6 @@
     puzzle-max-source-bytes
     puzzle-max-parse-depth
     puzzle-max-fuel
-    puzzle-v2-max-source-bytes
-    puzzle-v2-max-fuel
     puzzle-max-integer
     puzzle-max-allocations
     puzzle-max-string-bytes
@@ -61,7 +59,7 @@
     puzzle-eval
     puzzle-run
 
-    ;; Program-by-example front end (v2)
+    ;; Program-by-example front end (canonical)
     puzzle-report
     puzzle-report?
     puzzle-report-status
@@ -117,30 +115,14 @@
 
     ;;; Maximum solution source size, in bytes. Source is ASCII-only, so a
     ;;; byte is a character.
-    (define puzzle-max-source-bytes 256)
+    (define puzzle-max-source-bytes 512)
 
     ;;; Maximum datum nesting the parser accepts. A quote shorthand counts as
     ;;; one level, matching the `(quote ...)` form it expands to.
     (define puzzle-max-parse-depth 64)
 
     ;;; Maximum evaluator steps ("fuel") for one evaluation.
-    (define puzzle-max-fuel 1000000)
-
-    ;;; Maximum program-by-example solution source size, in bytes.
-    ;;;
-    ;;; v2 solutions are functions, so the liveness escape is a `k`-branch
-    ;;; lookup table (see `(sigil coin puzzle examples)`). Its exact `k = 8`
-    ;;; personalized bound is 458 bytes. Only `puzzle-run-examples` and
-    ;;; `puzzle-parse/limit` honour this cap; the v1 entry points keep
-    ;;; `puzzle-max-source-bytes`, so nothing about v1 moves.
-    (define puzzle-v2-max-source-bytes 512)
-
-    ;;; Maximum evaluator steps for one program-by-example evaluation.
-    ;;;
-    ;;; One machine serves the solution's own evaluation and all `k`
-    ;;; applications, so validation cost is bounded by this number
-    ;;; regardless of `k`.
-    (define puzzle-v2-max-fuel 200000)
+    (define puzzle-max-fuel 200000)
 
     ;;; Exclusive bound on integer magnitude: every literal, intermediate and
     ;;; result must satisfy `(< (abs n) puzzle-max-integer)`.
@@ -186,7 +168,7 @@
     ;;;     each arithmetic result costs at least one step, so fuel bounds
     ;;;     them at `32 * puzzle-max-fuel` bytes of churn.
     ;;;   * parsing — the AST is built once from at most
-    ;;;     `puzzle-max-source-bytes` (256) bytes of source.
+    ;;;     `puzzle-max-source-bytes` (512) bytes of source.
     ;;;   * failure paths — the abort struct and its message are allocated
     ;;;     once, as evaluation ends.
     ;;;
@@ -198,20 +180,15 @@
     ;;; Fuel alone does not give that ceiling. The densest measured programs
     ;;; allocate about 1.4 cells per step and `map` can reach 3, so
     ;;; `puzzle-max-fuel` on its own permits roughly 3e6 cells, near 140 MB —
-    ;;; consistent with the 124 MB RSS a reviewer measured for a
-    ;;; closure-retaining `letrec` loop that the v1 counter charged zero for.
-    ;;; This cap, not fuel, is what bounds memory.
+    ;;; consistent with a separately measured 124 MB RSS for a dense
+    ;;; closure-retaining `letrec` loop. This cap, not fuel, is what bounds
+    ;;; memory.
     ;;;
-    ;;; CALIBRATION: 400000 was chosen against measurement, not carried over.
-    ;;; Across 300 generated puzzles, the heaviest generated source charges
-    ;;; 356 cells and the heaviest quoting solution 380, so the cap leaves
-    ;;; legitimate golf programs about 1050x headroom; the v1 cap of 100000
-    ;;; over an observed peak of 80 left 1250x. What moves is which programs
-    ;;; are legal: pure list building gets cheaper relative to the cap
-    ;;; (`(iota 100001)` and `(append (iota 100000) (iota 1))` were refused
-    ;;; and now succeed), while closure- and binding-heavy loops get dearer
-    ;;; (a tail `letrec` countdown now stops at about 36000 iterations
-    ;;; instead of running to fuel exhaustion).
+    ;;; CALIBRATION: 400000 was chosen against measurement. Across 300
+    ;;; generated puzzles, the heaviest generated source charged 356 cells
+    ;;; and the heaviest fallback charged 380, leaving legitimate synthesis
+    ;;; programs about 1050x headroom. Pure list building remains cheap while
+    ;;; closure- and binding-heavy loops are charged for every retained object.
     ;;;
     ;;; The bound is a pure function of the program and its inputs — no host
     ;;; word size, allocator, GC or build flag enters it — so every node
@@ -344,7 +321,7 @@
       (or (puzzle-closure? value)
           (puzzle-builtin? value)))
 
-    ;;; True when `value` inhabits the v1 datum domain: exact integer,
+    ;;; True when `value` inhabits the canonical datum domain: exact integer,
     ;;; boolean, string, symbol, or proper list of those.
     ;;;
     ;;; Procedures are deliberately excluded. They are runtime results, never
@@ -367,7 +344,7 @@
               (cond
                 ((null? v) (loop rest))
                 ((puzzle--atom? v) (loop rest))
-                ;; Only proper lists are values: an improper tail is not a v1
+                ;; Only proper lists are values: an improper tail is not a canonical
                 ;; datum, so `(1 . 2)` is rejected here as it is by the parser.
                 ((pair? v)
                  (if (or (null? (cdr v)) (pair? (cdr v)))
@@ -638,7 +615,7 @@
       (cond
         ((string=? token "#t") #t)
         ((string=? token "#f") #f)
-        ((string=? token ".") (fail 'parse-syntax "dotted pairs are not v1"))
+        ((string=? token ".") (fail 'parse-syntax "dotted pairs are not canonical"))
         ((puzzle--integer-token? token)
          (let ((value (string->number token)))
            (if (not (and (number? value) (exact? value) (integer? value)))
@@ -661,7 +638,7 @@
 
     ;; A symbol may not start with `#` or a digit, and may not look like a
     ;; number. Everything else non-delimiting is allowed; there is no comment
-    ;; syntax in v1.
+    ;; syntax in canonical.
     (define (puzzle--symbol-token? token)
       (let ((n (string-length token)))
         (and (> n 0)
@@ -688,8 +665,8 @@
 
     ;;; Parse solution source under an explicit byte cap.
     ;;;
-    ;;; `puzzle-parse` is this with `puzzle-max-source-bytes`; the v2
-    ;;; program-by-example path passes `puzzle-v2-max-source-bytes`. Nothing
+    ;;; `puzzle-parse` is this with `puzzle-max-source-bytes`; the canonical
+    ;;; program-by-example path passes `puzzle-max-source-bytes`. Nothing
     ;;; else about parsing differs, so one grammar serves both.
     ;;;
     ;;; ```scheme
@@ -723,7 +700,7 @@
       (cells default: 0 mutable: #t)
       (string-bytes default: 0 mutable: #t)
       ;; The budget the machine opened with, so `steps-used` is exact for
-      ;; both the v1 fuel cap and the v2 one.
+      ;; every entry point reports use against its configured fuel budget.
       (budget default: 0))
 
     (define (spend! m cost)
@@ -882,7 +859,7 @@
             (fail 'bad-syntax "quoted datum is too large"))
         (alloc! m (* 4 size))
         (if (not (puzzle-value? datum))
-            (fail 'bad-syntax "quoted datum is not a v1 value"))
+            (fail 'bad-syntax "quoted datum is not a canonical value"))
         datum))
 
     (define (ev-if m rest env depth)
@@ -1407,7 +1384,7 @@
                                 arity-max: (car (cdr (cdr spec)))
                                 proc: (car (cdr (cdr (cdr spec)))))))))))
 
-    ;;; Names of every v1 builtin, in their frozen order.
+    ;;; Names of every canonical builtin, in their frozen order.
     ;;;
     ;;; ```scheme
     ;;; (length (puzzle-builtin-names)) ; => 41
@@ -1420,7 +1397,7 @@
     ;; Public entry points
     ;; ============================================================
 
-    ;;; Evaluate a parsed AST under the v1 caps.
+    ;;; Evaluate a parsed AST under the canonical caps.
     ;;;
     ;;; Always returns a `puzzle-result`; no host exception escapes. On
     ;;; failure `error-kind` is one of `bad-syntax`, `unbound-variable`,
@@ -1458,7 +1435,7 @@
             parsed)))
 
     ;; ============================================================
-    ;; Program-by-example front end (v2)
+    ;; Program-by-example front end (canonical)
     ;; ============================================================
 
     ;;; Outcome of running a program-by-example solution.
@@ -1527,8 +1504,8 @@
     ;;; Run a program-by-example solution against its `(input . output)`
     ;;; pairs.
     ;;;
-    ;;; Source is capped at `puzzle-v2-max-source-bytes` and the whole check
-    ;;; runs on a single machine with `puzzle-v2-max-fuel` steps: the source
+    ;;; Source is capped at `puzzle-max-source-bytes` and the whole check
+    ;;; runs on a single machine with `puzzle-max-fuel` steps: the source
     ;;; is parsed, evaluated to a 1-arity procedure, and applied to each
     ;;; input in order. A result that is a procedure, is not a
     ;;; `puzzle-value?`, or is not `puzzle-value=?` to the expected output
@@ -1542,10 +1519,10 @@
     ;;; ```
     (define (puzzle-run-examples source pairs)
       (: any? list? -> puzzle-report?)
-      (let ((m (puzzle--machine fuel: puzzle-v2-max-fuel
-                                budget: puzzle-v2-max-fuel)))
+      (let ((m (puzzle--machine fuel: puzzle-max-fuel
+                                budget: puzzle-max-fuel)))
         (guard (e (#t (puzzle--abort->report e m)))
-          (let* ((ast (puzzle--parse-datum source puzzle-v2-max-source-bytes))
+          (let* ((ast (puzzle--parse-datum source puzzle-max-source-bytes))
                  (proc (ev m ast '() 1)))
             (if (not (puzzle--one-arity? proc))
                 (puzzle--report-error m 'solution-not-a-procedure #f

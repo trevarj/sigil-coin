@@ -1,24 +1,23 @@
-;;; (sigil coin consensus v2 retarget) — margin retargeting and the `bits` codec
+;;; (sigil coin consensus retarget) — margin retargeting and the `bits` codec
 ;;;
-;;; v1 had no difficulty at all: a puzzle was as hard as the generator
-;;; happened to make it. v2 carries a 12-bit complexity parameter `C` in the
-;;; header's `bits` field and retargets it every 16 blocks on the median
+;;; The chain carries a 12-bit complexity parameter `C` in the header's
+;;; `bits` field and retargets it every 16 blocks on the median
 ;;; RELATIVE margin between par and what miners actually achieved.
 ;;;
 ;;;   m_i = clamp( floor(1000 * (par_i - L_i) / par_i), -1000, 1000 )
 ;;;   f   = clamp(1000 + median(m) - 100, 250, 4000)
 ;;;   C'  = clamp(floor(C * f / 1000), 16, 4095)
 ;;;
-;;; The margin is RELATIVE because the v1 survey found par ranging 25..149
+;;; The margin is RELATIVE because the canonical survey found par ranging 25..149
 ;;; bytes: an absolute "beat par by N" threshold is non-uniform by a factor
 ;;; of six across that range and would mean something different at every
 ;;; height. The target is 100 milli-units, i.e. the retarget aims for the
-;;; median accepted solution 10.0% under par, which is roughly what v1's
+;;; median accepted solution 10.0% under par, which is roughly what the
 ;;; structural golfer achieved.
 ;;;
 ;;; `C` MOVES GRAMMAR WIDTH, EXAMPLE COUNT AND CONSTRAINT TIER. It never
 ;;; moves an evaluator cap. That is the survey's hard conclusion: validation
-;;; cost must be a constant of the protocol, not a function of difficulty,
+;;; cost must be a constant of the canonical, not a function of difficulty,
 ;;; because every node re-evaluates every solution and only the miner is
 ;;; paid for the work.
 ;;;
@@ -42,37 +41,37 @@
 ;;; 0.25x..4x, and a bound that is currently slack is cheaper to keep than
 ;;; to re-derive if the margin domain ever widens.
 
-(define-library (sigil coin consensus v2 retarget)
+(define-library (sigil coin consensus retarget)
   (import (sigil math)
           (sigil list)
-          (sigil coin puzzle examples)
+          (sigil coin puzzle generator)
           (sigil coin consensus result))
   (export
     ;; Parameters
-    coin-v2-retarget-window
-    coin-v2-target-margin
-    coin-v2-margin-clamp
-    coin-v2-factor-min
-    coin-v2-factor-max
-    coin-v2-complexity-min
-    coin-v2-complexity-max
-    coin-v2-complexity-genesis
+    coin-retarget-window
+    coin-target-margin
+    coin-margin-clamp
+    coin-factor-min
+    coin-factor-max
+    coin-complexity-min
+    coin-complexity-max
+    coin-complexity-genesis
 
     ;; Signal
-    coin-v2-margin
-    coin-v2-margin-median
+    coin-margin
+    coin-margin-median
 
     ;; Adjustment
-    coin-v2-retarget-height?
-    coin-v2-next-complexity
-    coin-v2-complexity-for
-    coin-v2-complexity-at
+    coin-retarget-height?
+    coin-next-complexity
+    coin-complexity-for
+    coin-complexity-at
 
     ;; `bits` codec
-    coin-v2-bits-prefix
-    coin-v2-bits-encode
-    coin-v2-bits-decode
-    coin-v2-check-bits)
+    coin-bits-prefix
+    coin-bits-encode
+    coin-bits-decode
+    coin-check-bits)
 
   (begin
 
@@ -84,28 +83,28 @@
     ;;;
     ;;; ~13 days at mainnet spacing. Bitcoin's 2016 would be 4.6 years at
     ;;; 20-hour spacing, which is not feedback.
-    (define coin-v2-retarget-window 16)
+    (define coin-retarget-window 16)
 
     ;;; The margin the retarget aims for, in milli-units: 10.0% under par.
-    (define coin-v2-target-margin 100)
+    (define coin-target-margin 100)
 
     ;;; Absolute bound on one block's margin signal, in milli-units.
-    (define coin-v2-margin-clamp 1000)
+    (define coin-margin-clamp 1000)
 
     ;;; Minimum adjustment factor, in milli-units: 0.25x per window.
-    (define coin-v2-factor-min 250)
+    (define coin-factor-min 250)
 
     ;;; Maximum adjustment factor, in milli-units: 4x per window.
-    (define coin-v2-factor-max 4000)
+    (define coin-factor-max 4000)
 
     ;;; Floor of `C`. Still a real puzzle: tier 0, `k = 3`, `w = 6`.
-    (define coin-v2-complexity-min puzzle-complexity-min)
+    (define coin-complexity-min puzzle-complexity-min)
 
     ;;; Ceiling of `C`: it lives in 12 bits of `bits`.
-    (define coin-v2-complexity-max puzzle-complexity-max)
+    (define coin-complexity-max puzzle-complexity-max)
 
     ;;; `C` at genesis, and throughout the first, partial window.
-    (define coin-v2-complexity-genesis puzzle-complexity-genesis)
+    (define coin-complexity-genesis puzzle-complexity-genesis)
 
     (define (clamp x lo hi)
       (cond ((< x lo) lo) ((> x hi) hi) (else x)))
@@ -125,8 +124,8 @@
 
     (define (require-complexity who c)
       (if (not (and (number? c) (exact? c) (integer? c)
-                    (<= coin-v2-complexity-min c)
-                    (<= c coin-v2-complexity-max)))
+                    (<= coin-complexity-min c)
+                    (<= c coin-complexity-max)))
           (error (string-append who ": complexity out of range")))
       c)
 
@@ -141,36 +140,36 @@
     ;;; than par cannot dominate the window's median on its own.
     ;;;
     ;;; ```scheme
-    ;;; (coin-v2-margin 100 90)  ; => 100
-    ;;; (coin-v2-margin 100 100) ; => 0
-    ;;; (coin-v2-margin 100 101) ; => -10
-    ;;; (coin-v2-margin 24 512)  ; => -1000
+    ;;; (coin-margin 100 90)  ; => 100
+    ;;; (coin-margin 100 100) ; => 0
+    ;;; (coin-margin 100 101) ; => -10
+    ;;; (coin-margin 24 512)  ; => -1000
     ;;; ```
-    (define (coin-v2-margin par length)
+    (define (coin-margin par length)
       (: integer? integer? -> integer?)
-      (require-positive "coin-v2-margin" "par" par)
-      (require-positive "coin-v2-margin" "length" length)
+      (require-positive "coin-margin" "par" par)
+      (require-positive "coin-margin" "length" length)
       (clamp (floor-div (* 1000 (- par length)) par)
-             (- coin-v2-margin-clamp)
-             coin-v2-margin-clamp))
+             (- coin-margin-clamp)
+             coin-margin-clamp))
 
     ;;; The window's median margin: sort the 16 values ascending and take
     ;;; index 8, the upper median.
     ;;;
-    ;;; Requires exactly `coin-v2-retarget-window` values. A partial window
+    ;;; Requires exactly `coin-retarget-window` values. A partial window
     ;;; is not a smaller window, it is a different rule, and §9.4 has none:
     ;;; the early chain simply does not retarget.
     ;;;
     ;;; ```scheme
-    ;;; (coin-v2-margin-median '(0 0 0 0 0 0 0 0 5 5 5 5 5 5 5 5)) ; => 5
+    ;;; (coin-margin-median '(0 0 0 0 0 0 0 0 5 5 5 5 5 5 5 5)) ; => 5
     ;;; ```
-    (define (coin-v2-margin-median margins)
+    (define (coin-margin-median margins)
       (: list? -> integer?)
       (if (not (and (list? margins)
-                    (= coin-v2-retarget-window (length margins))))
-          (error "coin-v2-margin-median: expected a full window"))
+                    (= coin-retarget-window (length margins))))
+          (error "coin-margin-median: expected a full window"))
       (list-ref (list-sort < margins)
-                (quotient coin-v2-retarget-window 2)))
+                (quotient coin-retarget-window 2)))
 
     ;; ============================================================
     ;; Adjustment
@@ -179,33 +178,33 @@
     ;;; True at the heights a retarget fires: `H mod 16 = 0` and `H >= 16`.
     ;;;
     ;;; ```scheme
-    ;;; (coin-v2-retarget-height? 0)  ; => #f
-    ;;; (coin-v2-retarget-height? 16) ; => #t
-    ;;; (coin-v2-retarget-height? 17) ; => #f
+    ;;; (coin-retarget-height? 0)  ; => #f
+    ;;; (coin-retarget-height? 16) ; => #t
+    ;;; (coin-retarget-height? 17) ; => #f
     ;;; ```
-    (define (coin-v2-retarget-height? height)
+    (define (coin-retarget-height? height)
       (: integer? -> boolean?)
       (and (number? height) (exact? height) (integer? height)
-           (>= height coin-v2-retarget-window)
-           (= 0 (modulo height coin-v2-retarget-window))))
+           (>= height coin-retarget-window)
+           (= 0 (modulo height coin-retarget-window))))
 
     ;;; The complexity a retarget produces from the previous one and a full
     ;;; window of margins.
     ;;;
     ;;; ```scheme
-    ;;; (coin-v2-next-complexity 128 '(0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0))
+    ;;; (coin-next-complexity 128 '(0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0))
     ;;; ; => 115
     ;;; ```
-    (define (coin-v2-next-complexity complexity margins)
+    (define (coin-next-complexity complexity margins)
       (: integer? list? -> integer?)
-      (require-complexity "coin-v2-next-complexity" complexity)
-      (let* ((median (coin-v2-margin-median margins))
-             (factor (clamp (+ 1000 (- median coin-v2-target-margin))
-                            coin-v2-factor-min
-                            coin-v2-factor-max)))
+      (require-complexity "coin-next-complexity" complexity)
+      (let* ((median (coin-margin-median margins))
+             (factor (clamp (+ 1000 (- median coin-target-margin))
+                            coin-factor-min
+                            coin-factor-max)))
         (clamp (quotient (* complexity factor) 1000)
-               coin-v2-complexity-min
-               coin-v2-complexity-max)))
+               coin-complexity-min
+               coin-complexity-max)))
 
     ;;; `C(height)` from the parent's complexity and, at a retarget height,
     ;;; the window of margins for heights `height-16 .. height-1`.
@@ -215,48 +214,48 @@
     ;;; out of 16 that do not retarget, and `margins` may be `#f` there.
     ;;;
     ;;; ```scheme
-    ;;; (coin-v2-complexity-for 0 128 #f)  ; => 128
-    ;;; (coin-v2-complexity-for 17 200 #f) ; => 200
+    ;;; (coin-complexity-for 0 128 #f)  ; => 128
+    ;;; (coin-complexity-for 17 200 #f) ; => 200
     ;;; ```
-    (define (coin-v2-complexity-for height parent-complexity margins)
+    (define (coin-complexity-for height parent-complexity margins)
       (: integer? any? any? -> integer?)
       (cond
         ((not (and (number? height) (exact? height) (integer? height)
                    (>= height 0)))
-         (error "coin-v2-complexity-for: height out of range"))
-        ((= height 0) coin-v2-complexity-genesis)
-        ((not (coin-v2-retarget-height? height))
-         (require-complexity "coin-v2-complexity-for" parent-complexity))
+         (error "coin-complexity-for: height out of range"))
+        ((= height 0) coin-complexity-genesis)
+        ((not (coin-retarget-height? height))
+         (require-complexity "coin-complexity-for" parent-complexity))
         (else
-          (coin-v2-next-complexity
-            (require-complexity "coin-v2-complexity-for" parent-complexity)
+          (coin-next-complexity
+            (require-complexity "coin-complexity-for" parent-complexity)
             margins))))
 
     ;;; `C(height)` from chain history alone: `margins` holds one margin per
     ;;; height from 0 up to at least `height - 1`, in ascending order.
     ;;;
     ;;; The whole-history fold is the definition; a node uses
-    ;;; `coin-v2-complexity-for` incrementally and gets the same answer,
+    ;;; `coin-complexity-for` incrementally and gets the same answer,
     ;;; which is what the tests check. Genesis and the first partial window
-    ;;; are `coin-v2-complexity-genesis` by rule, not by an empty median.
+    ;;; are `coin-complexity-genesis` by rule, not by an empty median.
     ;;;
     ;;; ```scheme
-    ;;; (coin-v2-complexity-at 15 '()) ; => 128
+    ;;; (coin-complexity-at 15 '()) ; => 128
     ;;; ```
-    (define (coin-v2-complexity-at height margins)
+    (define (coin-complexity-at height margins)
       (: integer? list? -> integer?)
       (if (not (and (number? height) (exact? height) (integer? height)
                     (>= height 0)))
-          (error "coin-v2-complexity-at: height out of range"))
-      (if (and (>= height coin-v2-retarget-window)
+          (error "coin-complexity-at: height out of range"))
+      (if (and (>= height coin-retarget-window)
                (< (length margins) height))
-          (error "coin-v2-complexity-at: not enough margins for the height"))
-      (let loop ((h 1) (complexity coin-v2-complexity-genesis))
+          (error "coin-complexity-at: not enough margins for the height"))
+      (let loop ((h 1) (complexity coin-complexity-genesis))
         (if (> h height)
             complexity
             (loop (+ h 1)
-                  (if (coin-v2-retarget-height? h)
-                      (coin-v2-next-complexity
+                  (if (coin-retarget-height? h)
+                      (coin-next-complexity
                         complexity
                         (window-ending-at margins h))
                       complexity)))))
@@ -268,7 +267,7 @@
         (cond
           ((null? xs) (reverse acc))
           ((>= i h) (reverse acc))
-          ((< i (- h coin-v2-retarget-window)) (loop (cdr xs) (+ i 1) acc))
+          ((< i (- h coin-retarget-window)) (loop (cdr xs) (+ i 1) acc))
           (else (loop (cdr xs) (+ i 1) (cons (car xs) acc))))))
 
     ;; ============================================================
@@ -281,17 +280,17 @@
     ;;; the max-target compact number any Bitcoin-side reader of the seam
     ;;; already tolerates. No proof of work runs anywhere in SigilCoin, so
     ;;; repurposing the field cannot accidentally impose real hashing.
-    (define coin-v2-bits-prefix #x207f0000)
+    (define coin-bits-prefix #x207f0000)
 
     ;;; Encode a complexity as the header's `bits` field.
     ;;;
     ;;; ```scheme
-    ;;; (coin-v2-bits-encode 128) ; => 543883392
+    ;;; (coin-bits-encode 128) ; => 543883392
     ;;; ```
-    (define (coin-v2-bits-encode complexity)
+    (define (coin-bits-encode complexity)
       (: integer? -> integer?)
-      (require-complexity "coin-v2-bits-encode" complexity)
-      (bitwise-ior coin-v2-bits-prefix complexity))
+      (require-complexity "coin-bits-encode" complexity)
+      (bitwise-ior coin-bits-prefix complexity))
 
     ;;; Decode a header's `bits` field to a complexity.
     ;;;
@@ -301,27 +300,27 @@
     ;;; success the value is `C`.
     ;;;
     ;;; ```scheme
-    ;;; (coin-result-value (coin-v2-bits-decode #x207f0080)) ; => 128
-    ;;; (coin-result-reason (coin-v2-bits-decode #x207fffff))
+    ;;; (coin-result-value (coin-bits-decode #x207f0080)) ; => 128
+    ;;; (coin-result-reason (coin-bits-decode #x207fffff))
     ;;; ; => bits-reserved-nonzero
     ;;; ```
-    (define (coin-v2-bits-decode bits)
+    (define (coin-bits-decode bits)
       (: any? -> coin-result?)
       (cond
         ((not (and (number? bits) (exact? bits) (integer? bits)
                    (<= 0 bits) (< bits #x100000000)))
          (coin-error 'malformed-header
                      "bits is not a 32-bit unsigned integer"))
-        ((not (= coin-v2-bits-prefix
+        ((not (= coin-bits-prefix
                  (bitwise-and bits #xffff0000)))
-         (coin-error 'bits-prefix "bits does not carry the v2 prefix"))
+         (coin-error 'bits-prefix "bits does not carry the canonical prefix"))
         ((not (= 0 (bitwise-and bits #xf000)))
          (coin-error 'bits-reserved-nonzero
                      "the reserved bits 15:12 are not zero"))
         (else
           (let ((complexity (bitwise-and bits #xfff)))
-            (if (or (< complexity coin-v2-complexity-min)
-                    (> complexity coin-v2-complexity-max))
+            (if (or (< complexity coin-complexity-min)
+                    (> complexity coin-complexity-max))
                 (coin-error 'complexity-range "complexity is out of range")
                 (coin-ok complexity))))))
 
@@ -334,14 +333,14 @@
     ;;; value wins, always, and disagreement is `complexity-mismatch`.
     ;;;
     ;;; ```scheme
-    ;;; (coin-ok? (coin-v2-check-bits #x207f0080 128))          ; => #t
-    ;;; (coin-result-reason (coin-v2-check-bits #x207f0080 129))
+    ;;; (coin-ok? (coin-check-bits #x207f0080 128))          ; => #t
+    ;;; (coin-result-reason (coin-check-bits #x207f0080 129))
     ;;; ; => complexity-mismatch
     ;;; ```
-    (define (coin-v2-check-bits bits expected)
+    (define (coin-check-bits bits expected)
       (: any? integer? -> coin-result?)
-      (require-complexity "coin-v2-check-bits" expected)
-      (let ((decoded (coin-v2-bits-decode bits)))
+      (require-complexity "coin-check-bits" expected)
+      (let ((decoded (coin-bits-decode bits)))
         (cond
           ((coin-failed? decoded) decoded)
           ((not (= expected (coin-result-value decoded)))

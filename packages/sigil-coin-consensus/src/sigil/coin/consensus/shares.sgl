@@ -1,4 +1,4 @@
-;;; (sigil coin consensus v2 shares) — co-op shares, commit-reveal, the split
+;;; (sigil coin consensus shares) — co-op shares, commit-reveal, the split
 ;;;
 ;;; A block's producer solves puzzle `H` alone, but he is not the only
 ;;; miner who solved it. §6 lets up to eight other miners publish their own
@@ -25,31 +25,15 @@
 ;;; commitment nobody can open earns nothing, because the opening needs a
 ;;; signature only the sharer can produce.
 ;;;
-;;; ONE DEVIATION FROM THE SPECIFICATION, AND WHY.
+;;; WHY THE BLIND RIDES IN THE REVEAL.
 ;;;
-;;;   §6.2 gives the share record as `pubkey || signature || len ||
-;;;   solution`, and §7.1 says the 32-byte commitment blind "is never
-;;;   published". Those two sentences cannot both hold: §6.4 check 4
-;;;   requires a validator to recompute `SHA256d(tag || share_preimage ||
-;;;   blind)` and find it in the parent's COMMITS, and no validator can do
-;;;   that without the blind. Dropping check 4 is not an option — it is the
-;;;   only thing that makes the carrier payment unfakeable, and the carrier
-;;;   payment is the only in-protocol reason a producer carries anyone
-;;;   else's commitments.
-;;;
-;;;   So the blind is published, in the reveal, where it costs nothing: at
-;;;   reveal time the solution it was hiding is public anyway. The record
-;;;   becomes `pubkey 33 || signature 64 || blind 32 || len 2 || solution`,
-;;;   the blind stays miner-chosen and stays secret for the whole interval
-;;;   in which it has to hide anything, and §6.3's signed preimage is
-;;;   untouched — the blind is deliberately NOT signed, because a producer
-;;;   who altered it would only make the share unincludable, never
-;;;   steerable.
-;;;
-;;;   The cost is 32 bytes per share in two DERIVED numbers: the SHARES push
-;;;   grows 4889 -> 5145 and the worst-case coinbase scriptSig 6332 -> 6588.
-;;;   §6.6's actual design constraint survives — the worst-case coinbase is
-;;;   ~6976 bytes, still under 7 KB against the 16384-byte block cap.
+;;; The commitment blind stays secret while the solution is hidden, then is
+;;; published with the reveal so validators can recompute the commitment
+;;; carried by the parent. Withholding it would make the carrier payment
+;;; uncheckable. The record is `pubkey 33 || signature 64 || blind 32 || len 2
+;;; || solution`; the blind is deliberately not signed because changing it
+;;; only makes the share unincludable, never steerable. The worst-case
+;;; coinbase remains below 7 KB inside the 16384-byte block cap.
 ;;;
 ;;; NOTHING HERE RAISES ON NETWORK DATA. Every check returns a
 ;;; `coin-result`; the encoders raise, because they are only ever handed
@@ -62,7 +46,7 @@
 ;;; evaluating the first seven. The ceiling is 8 x 200000 evaluator steps
 ;;; plus 8 ECDSA verifications.
 
-(define-library (sigil coin consensus v2 shares)
+(define-library (sigil coin consensus shares)
   (import (sigil struct)
           (sigil math)
           (sigil bitcoin utils)
@@ -70,75 +54,75 @@
           (sigil bitcoin script)
           (sigil bitcoin tx)
           (sigil secp256k1)
-          (sigil coin puzzle examples)
+          (sigil coin puzzle generator)
           (sigil coin consensus result)
-          (sigil coin consensus v2 rules)
-          (sigil coin consensus v2 seed)
-          (sigil coin consensus v2 solution))
+          (sigil coin consensus rules)
+          (sigil coin consensus seed)
+          (sigil coin consensus solution))
   (export
     ;; Wire sizes
-    coin-v2-share-pubkey-bytes
-    coin-v2-share-signature-bytes
-    coin-v2-share-blind-bytes
-    coin-v2-commitment-bytes
-    coin-v2-share-fixed-bytes
-    coin-v2-max-share-bytes
-    coin-v2-max-shares-bytes
-    coin-v2-max-commits-bytes
-    coin-v2-empty-shares
-    coin-v2-empty-commits
+    coin-share-pubkey-bytes
+    coin-share-signature-bytes
+    coin-share-blind-bytes
+    coin-commitment-bytes
+    coin-share-fixed-bytes
+    coin-max-share-bytes
+    coin-max-shares-bytes
+    coin-max-commits-bytes
+    coin-empty-shares
+    coin-empty-commits
 
     ;; Preimages
-    coin-v2-share-tag
-    coin-v2-share-puzzle-tag
-    coin-v2-commit-tag
-    coin-v2-share-puzzle-seed
-    coin-v2-pubkey-anchor-output
-    coin-v2-anchor-output-pubkey
-    coin-v2-share-puzzle
-    coin-v2-share-preimage
-    coin-v2-commitment
-    coin-v2-share-commitment
-    coin-v2-share-script
+    coin-share-tag
+    coin-share-puzzle-tag
+    coin-commit-tag
+    coin-share-puzzle-seed
+    coin-pubkey-anchor-output
+    coin-anchor-output-pubkey
+    coin-share-puzzle
+    coin-share-preimage
+    coin-commitment
+    coin-share-commitment
+    coin-share-script
 
     ;; The share record and its codec
-    coin-v2-share
-    coin-v2-share?
-    coin-v2-share-pubkey
-    coin-v2-share-signature
-    coin-v2-share-blind
-    coin-v2-share-solution
-    coin-v2-share-encode
-    coin-v2-shares-encode
-    coin-v2-shares-decode
+    coin-share
+    coin-share?
+    coin-share-pubkey
+    coin-share-signature
+    coin-share-blind
+    coin-share-solution
+    coin-share-encode
+    coin-shares-encode
+    coin-shares-decode
 
     ;; Commitments
-    coin-v2-commits-encode
-    coin-v2-commits-decode
+    coin-commits-encode
+    coin-commits-decode
 
     ;; Validation
-    coin-v2-coop-context
-    coin-v2-coop-context?
-    coin-v2-coop-context-parent-prev-hash
-    coin-v2-coop-context-puzzle-height
-    coin-v2-coop-context-complexity
-    coin-v2-coop-context-spec
-    coin-v2-coop-context-commits
-    coin-v2-share-signature-ok?
-    coin-v2-share-margin-milli
-    coin-v2-share-contribution
-    coin-v2-quality
-    coin-v2-share-quality
-    coin-v2-shares-quality
-    coin-v2-check-share-solution
-    coin-v2-check-shares
+    coin-coop-context
+    coin-coop-context?
+    coin-coop-context-parent-prev-hash
+    coin-coop-context-puzzle-height
+    coin-coop-context-complexity
+    coin-coop-context-spec
+    coin-coop-context-commits
+    coin-share-signature-ok?
+    coin-share-margin-milli
+    coin-share-contribution
+    coin-quality
+    coin-share-quality
+    coin-shares-quality
+    coin-check-share-solution
+    coin-check-shares
 
     ;; The reward split
-    coin-v2-producer-weight
-    coin-v2-split-weight-total
-    coin-v2-split-unit
-    coin-v2-split-plan
-    coin-v2-check-split)
+    coin-producer-weight
+    coin-split-weight-total
+    coin-split-unit
+    coin-split-plan
+    coin-check-split)
 
   (begin
 
@@ -189,30 +173,30 @@
     ;; ============================================================
 
     ;;; Bytes of a compressed secp256k1 public key in a share.
-    (define coin-v2-share-pubkey-bytes 33)
+    (define coin-share-pubkey-bytes 33)
 
     ;;; Bytes of a fixed-width compact `r||s` ECDSA signature in a share.
-    (define coin-v2-share-signature-bytes 64)
+    (define coin-share-signature-bytes 64)
 
     ;;; Bytes of the commitment blind carried in a share.
-    (define coin-v2-share-blind-bytes 32)
+    (define coin-share-blind-bytes 32)
 
     ;;; Bytes of one commitment: a SHA256d digest.
-    (define coin-v2-commitment-bytes 32)
+    (define coin-commitment-bytes 32)
 
     ;; The two-byte little-endian solution length.
     (define %length-bytes 2)
 
     ;;; Fixed-width prefix of one share record, in bytes: 131.
-    (define coin-v2-share-fixed-bytes
-      (+ coin-v2-share-pubkey-bytes
-         coin-v2-share-signature-bytes
-         coin-v2-share-blind-bytes
+    (define coin-share-fixed-bytes
+      (+ coin-share-pubkey-bytes
+         coin-share-signature-bytes
+         coin-share-blind-bytes
          %length-bytes))
 
     ;;; Largest one share record can be, in bytes: 643.
-    (define coin-v2-max-share-bytes
-      (+ coin-v2-share-fixed-bytes coin-v2-max-solution-bytes))
+    (define coin-max-share-bytes
+      (+ coin-share-fixed-bytes coin-max-solution-bytes))
 
     ;;; Largest legal SHARES push, in bytes: 5145.
     ;;;
@@ -220,44 +204,44 @@
     ;;; cap and the format cannot disagree.
     ;;;
     ;;; ```scheme
-    ;;; coin-v2-max-shares-bytes ; => 5145
+    ;;; coin-max-shares-bytes ; => 5145
     ;;; ```
-    (define coin-v2-max-shares-bytes
-      (+ 1 (* coin-v2-max-shares coin-v2-max-share-bytes)))
+    (define coin-max-shares-bytes
+      (+ 1 (* coin-max-shares coin-max-share-bytes)))
 
     ;;; Largest legal COMMITS push, in bytes: 513.
     ;;;
     ;;; ```scheme
-    ;;; coin-v2-max-commits-bytes ; => 513
+    ;;; coin-max-commits-bytes ; => 513
     ;;; ```
-    (define coin-v2-max-commits-bytes
-      (+ 1 (* coin-v2-max-commitments coin-v2-commitment-bytes)))
+    (define coin-max-commits-bytes
+      (+ 1 (* coin-max-commitments coin-commitment-bytes)))
 
     ;;; The SHARES push of a block carrying no reveals: `R = 0`.
     ;;;
     ;;; Never a zero-length push. The count byte is always present, which is
     ;;; what makes the coinbase canonicality re-encode unambiguous (§6.6).
-    (define coin-v2-empty-shares (make-bytevector 1 0))
+    (define coin-empty-shares (make-bytevector 1 0))
 
     ;;; The COMMITS push of a block carrying no commitments: `K = 0`.
-    (define coin-v2-empty-commits (make-bytevector 1 0))
+    (define coin-empty-commits (make-bytevector 1 0))
 
     ;; ============================================================
     ;; Preimages
     ;; ============================================================
 
     ;;; Domain tag of a share signature preimage. 18 ASCII bytes.
-    (define coin-v2-share-tag "SigilCoin/share/v2")
+    (define coin-share-tag "SigilCoin/share/1")
 
     ;;; Domain tag of a personalized share puzzle seed.
-    (define coin-v2-share-puzzle-tag "SigilCoin/share-puzzle/v2")
+    (define coin-share-puzzle-tag "SigilCoin/share-puzzle/1")
 
     ;;; Domain tag of a commitment preimage. 19 ASCII bytes.
-    (define coin-v2-commit-tag "SigilCoin/commit/v2")
+    (define coin-commit-tag "SigilCoin/commit/1")
 
-    (define %share-tag-bytes (ascii->bytes coin-v2-share-tag))
-    (define %share-puzzle-tag-bytes (ascii->bytes coin-v2-share-puzzle-tag))
-    (define %commit-tag-bytes (ascii->bytes coin-v2-commit-tag))
+    (define %share-tag-bytes (ascii->bytes coin-share-tag))
+    (define %share-puzzle-tag-bytes (ascii->bytes coin-share-puzzle-tag))
+    (define %commit-tag-bytes (ascii->bytes coin-commit-tag))
     (define %anchor-alphabet "abcdefghijklmnop")
 
     (define %max-height #xffffffff)
@@ -283,25 +267,25 @@
     ;;;
     ;;; ```scheme
     ;;; (bytevector-length
-    ;;;   (coin-v2-share-puzzle-seed (make-bytevector 32 0) pubkey)) ; => 32
+    ;;;   (coin-share-puzzle-seed (make-bytevector 32 0) pubkey)) ; => 32
     ;;; ```
-    (define (coin-v2-share-puzzle-seed global-seed pubkey)
+    (define (coin-share-puzzle-seed global-seed pubkey)
       (: bytevector? bytevector? -> bytevector?)
-      (require-bytevector-length "coin-v2-share-puzzle-seed" global-seed 32)
-      (require-bytevector-length "coin-v2-share-puzzle-seed" pubkey
-                                 coin-v2-share-pubkey-bytes)
+      (require-bytevector-length "coin-share-puzzle-seed" global-seed 32)
+      (require-bytevector-length "coin-share-puzzle-seed" pubkey
+                                 coin-share-pubkey-bytes)
       (hash256 (bytevector-append %share-puzzle-tag-bytes global-seed pubkey)))
 
     ;;; Encode a full compressed pubkey injectively as 66 `a`..`p` nibbles.
     ;;;
     ;;; The result is digit-free and self-evaluating as a string literal, so
     ;;; every rotating constraint can carry it without quote or truncation.
-    (define (coin-v2-pubkey-anchor-output pubkey)
+    (define (coin-pubkey-anchor-output pubkey)
       (: bytevector? -> string?)
-      (require-bytevector-length "coin-v2-pubkey-anchor-output" pubkey
-                                 coin-v2-share-pubkey-bytes)
+      (require-bytevector-length "coin-pubkey-anchor-output" pubkey
+                                 coin-share-pubkey-bytes)
       (let loop ((i 0) (out ""))
-        (if (= i coin-v2-share-pubkey-bytes)
+        (if (= i coin-share-pubkey-bytes)
             out
             (let ((b (bytevector-u8-ref pubkey i)))
               (loop (+ i 1)
@@ -313,13 +297,13 @@
                                  (+ 1 (modulo b 16)))))))))
 
     ;;; Decode the exact anchor form back to its compressed pubkey bytes.
-    (define (coin-v2-anchor-output-pubkey encoded)
+    (define (coin-anchor-output-pubkey encoded)
       (: string? -> bytevector?)
-      (if (not (pbe-anchor-output? encoded))
-          (error "coin-v2-anchor-output-pubkey: malformed anchor output"))
-      (let ((out (make-bytevector coin-v2-share-pubkey-bytes 0)))
+      (if (not (puzzle-anchor-output? encoded))
+          (error "coin-anchor-output-pubkey: malformed anchor output"))
+      (let ((out (make-bytevector coin-share-pubkey-bytes 0)))
         (let loop ((i 0))
-          (if (= i coin-v2-share-pubkey-bytes)
+          (if (= i coin-share-pubkey-bytes)
               out
               (let ((hi (- (char->integer (string-ref encoded (* i 2)))
                            (char->integer #\a)))
@@ -356,17 +340,17 @@
     ;;;
     ;;; ```scheme
     ;;; (bytevector-length
-    ;;;   (coin-v2-share-preimage (make-bytevector 32 7) 1 128 "car" pubkey))
+    ;;;   (coin-share-preimage (make-bytevector 32 7) 1 128 "car" pubkey))
     ;;; ; => 32
     ;;; ```
-    (define (coin-v2-share-preimage parent-prev-hash puzzle-height complexity
+    (define (coin-share-preimage parent-prev-hash puzzle-height complexity
                                     solution pubkey)
       (: bytevector? integer? integer? any? bytevector? -> bytevector?)
-      (require-bytevector-length "coin-v2-share-preimage" parent-prev-hash 32)
-      (require-bytevector-length "coin-v2-share-preimage" pubkey
-                                 coin-v2-share-pubkey-bytes)
-      (require-height "coin-v2-share-preimage" puzzle-height)
-      (require-complexity "coin-v2-share-preimage" complexity)
+      (require-bytevector-length "coin-share-preimage" parent-prev-hash 32)
+      (require-bytevector-length "coin-share-preimage" pubkey
+                                 coin-share-pubkey-bytes)
+      (require-height "coin-share-preimage" puzzle-height)
+      (require-complexity "coin-share-preimage" complexity)
       (hash256
         (bytevector-append %share-tag-bytes
                            parent-prev-hash
@@ -384,13 +368,13 @@
     ;;; is opened only by the reveal that publishes the program anyway.
     ;;;
     ;;; ```scheme
-    ;;; (bytevector-length (coin-v2-commitment preimage blind)) ; => 32
+    ;;; (bytevector-length (coin-commitment preimage blind)) ; => 32
     ;;; ```
-    (define (coin-v2-commitment share-preimage blind)
+    (define (coin-commitment share-preimage blind)
       (: bytevector? bytevector? -> bytevector?)
-      (require-bytevector-length "coin-v2-commitment" share-preimage 32)
-      (require-bytevector-length "coin-v2-commitment" blind
-                                 coin-v2-share-blind-bytes)
+      (require-bytevector-length "coin-commitment" share-preimage 32)
+      (require-bytevector-length "coin-commitment" blind
+                                 coin-share-blind-bytes)
       (hash256
         (bytevector-append %commit-tag-bytes share-preimage blind)))
 
@@ -400,12 +384,12 @@
     ;;; script-choice surface for a producer to exploit.
     ;;;
     ;;; ```scheme
-    ;;; (bytevector-length (coin-v2-share-script pubkey)) ; => 22
+    ;;; (bytevector-length (coin-share-script pubkey)) ; => 22
     ;;; ```
-    (define (coin-v2-share-script pubkey)
+    (define (coin-share-script pubkey)
       (: bytevector? -> bytevector?)
-      (require-bytevector-length "coin-v2-share-script" pubkey
-                                 coin-v2-share-pubkey-bytes)
+      (require-bytevector-length "coin-share-script" pubkey
+                                 coin-share-pubkey-bytes)
       (script-p2wpkh (hash160 pubkey)))
 
     ;; ============================================================
@@ -419,28 +403,28 @@
     ;;;
     ;;; ```scheme
     ;;; (bytevector-length
-    ;;;   (coin-v2-share-pubkey
-    ;;;     (coin-v2-share pubkey: pk signature: sig
+    ;;;   (coin-share-pubkey
+    ;;;     (coin-share pubkey: pk signature: sig
     ;;;                    blind: bl solution: #u8(49))))
     ;;; ; => 33
     ;;; ```
-    (define-struct coin-v2-share
+    (define-struct coin-share
       (pubkey bytevector?)
       (signature bytevector?)
       (blind bytevector?)
       (solution bytevector?))
 
     (define (share-fields-ok? share)
-      (and (coin-v2-share? share)
-           (= coin-v2-share-pubkey-bytes
-              (bytevector-length (coin-v2-share-pubkey share)))
-           (= coin-v2-share-signature-bytes
-              (bytevector-length (coin-v2-share-signature share)))
-           (= coin-v2-share-blind-bytes
-              (bytevector-length (coin-v2-share-blind share)))
-           (<= 1 (bytevector-length (coin-v2-share-solution share)))
-           (<= (bytevector-length (coin-v2-share-solution share))
-               coin-v2-max-solution-bytes)))
+      (and (coin-share? share)
+           (= coin-share-pubkey-bytes
+              (bytevector-length (coin-share-pubkey share)))
+           (= coin-share-signature-bytes
+              (bytevector-length (coin-share-signature share)))
+           (= coin-share-blind-bytes
+              (bytevector-length (coin-share-blind share)))
+           (<= 1 (bytevector-length (coin-share-solution share)))
+           (<= (bytevector-length (coin-share-solution share))
+               coin-max-solution-bytes)))
 
     ;;; Encode one share record: `pubkey || signature || blind || u16le len
     ;;; || solution`.
@@ -449,35 +433,35 @@
     ;;; data, and a silent truncation would produce an unincludable share.
     ;;;
     ;;; ```scheme
-    ;;; (bytevector-length (coin-v2-share-encode share)) ; => 134
+    ;;; (bytevector-length (coin-share-encode share)) ; => 134
     ;;; ```
-    (define (coin-v2-share-encode share)
-      (: coin-v2-share? -> bytevector?)
+    (define (coin-share-encode share)
+      (: coin-share? -> bytevector?)
       (if (not (share-fields-ok? share))
-          (error "coin-v2-share-encode: share field out of range"))
-      (let ((solution (coin-v2-share-solution share)))
-        (bytevector-append (coin-v2-share-pubkey share)
-                           (coin-v2-share-signature share)
-                           (coin-v2-share-blind share)
+          (error "coin-share-encode: share field out of range"))
+      (let ((solution (coin-share-solution share)))
+        (bytevector-append (coin-share-pubkey share)
+                           (coin-share-signature share)
+                           (coin-share-blind share)
                            (u16-le (bytevector-length solution))
                            solution)))
 
     ;;; Encode the SHARES push: `u8 R` then `R` records (§6.2).
     ;;;
     ;;; Raises unless the shares are in strictly ascending pubkey order and
-    ;;; at most `coin-v2-max-shares` of them. The ordering is canonical —
+    ;;; at most `coin-max-shares` of them. The ordering is canonical —
     ;;; one encoding per set — it forces distinct payout keys, and it makes
     ;;; duplicate detection a linear scan.
     ;;;
     ;;; ```scheme
-    ;;; (coin-v2-shares-encode '()) ; => #u8(0)
+    ;;; (coin-shares-encode '()) ; => #u8(0)
     ;;; ```
-    (define (coin-v2-shares-encode shares)
+    (define (coin-shares-encode shares)
       (: list? -> bytevector?)
       (if (not (list? shares))
-          (error "coin-v2-shares-encode: expected a list of shares"))
-      (if (> (length shares) coin-v2-max-shares)
-          (error "coin-v2-shares-encode: more than eight shares"))
+          (error "coin-shares-encode: expected a list of shares"))
+      (if (> (length shares) coin-max-shares)
+          (error "coin-shares-encode: more than eight shares"))
       (let loop ((xs shares) (previous #f) (out (make-bytevector 1 0)))
         (if (null? xs)
             (begin
@@ -485,29 +469,29 @@
               out)
             (let ((share (car xs)))
               (if (and previous
-                       (>= 0 (bytes-compare (coin-v2-share-pubkey share)
+                       (>= 0 (bytes-compare (coin-share-pubkey share)
                                             previous)))
-                  (error "coin-v2-shares-encode: shares are not in ascending pubkey order"))
+                  (error "coin-shares-encode: shares are not in ascending pubkey order"))
               (loop (cdr xs)
-                    (coin-v2-share-pubkey share)
-                    (bytevector-append out (coin-v2-share-encode share)))))))
+                    (coin-share-pubkey share)
+                    (bytevector-append out (coin-share-encode share)))))))
 
     ;;; Decode the SHARES push.
     ;;;
     ;;; Total: any input, however hostile, yields a `coin-result`. This is
     ;;; the STRUCTURAL half only — sizes, counts, and no trailing byte.
     ;;; Ordering, keys, commitments, signatures, dedup and the programs
-    ;;; themselves are `coin-v2-check-shares`, because §6.4 orders those
+    ;;; themselves are `coin-check-shares`, because §6.4 orders those
     ;;; against a validation cost this decoder has no business paying.
     ;;;
     ;;; Rejection reasons are `shares-malformed` and `shares-oversize`. On
-    ;;; success the value is a list of `coin-v2-share` in wire order.
+    ;;; success the value is a list of `coin-share` in wire order.
     ;;;
     ;;; ```scheme
-    ;;; (coin-result-value (coin-v2-shares-decode #u8(0))) ; => ()
-    ;;; (coin-result-reason (coin-v2-shares-decode #u8())) ; => shares-malformed
+    ;;; (coin-result-value (coin-shares-decode #u8(0))) ; => ()
+    ;;; (coin-result-reason (coin-shares-decode #u8())) ; => shares-malformed
     ;;; ```
-    (define (coin-v2-shares-decode bytes)
+    (define (coin-shares-decode bytes)
       (: any? -> coin-result?)
       (guard (e (#t (coin-error 'internal-error "the shares decoder raised")))
         (cond
@@ -515,9 +499,9 @@
            (coin-error 'shares-malformed "shares must be bytes"))
           ((= 0 (bytevector-length bytes))
            (coin-error 'shares-malformed "shares push is empty"))
-          ((> (bytevector-length bytes) coin-v2-max-shares-bytes)
+          ((> (bytevector-length bytes) coin-max-shares-bytes)
            (coin-error 'shares-oversize "shares exceed the byte cap"))
-          ((> (bytevector-u8-ref bytes 0) coin-v2-max-shares)
+          ((> (bytevector-u8-ref bytes 0) coin-max-shares)
            (coin-error 'shares-oversize "more than eight shares"))
           (else
             (let ((n (bytevector-length bytes))
@@ -529,23 +513,23 @@
                        (coin-ok (reverse acc))
                        (coin-error 'shares-malformed
                                    "trailing bytes after the last share")))
-                  ((> (+ offset coin-v2-share-fixed-bytes) n)
+                  ((> (+ offset coin-share-fixed-bytes) n)
                    (coin-error 'shares-malformed "share record is truncated"))
                   (else
                     (let* ((pubkey-at offset)
                            (signature-at (+ pubkey-at
-                                            coin-v2-share-pubkey-bytes))
+                                            coin-share-pubkey-bytes))
                            (blind-at (+ signature-at
-                                        coin-v2-share-signature-bytes))
-                           (length-at (+ blind-at coin-v2-share-blind-bytes))
+                                        coin-share-signature-bytes))
+                           (length-at (+ blind-at coin-share-blind-bytes))
                            (solution-at (+ length-at %length-bytes))
                            (len (read-u16-le bytes length-at
-                                             "coin-v2-shares-decode")))
+                                             "coin-shares-decode")))
                       (cond
                         ((= 0 len)
                          (coin-error 'shares-malformed
                                      "share solution is empty"))
-                        ((> len coin-v2-max-solution-bytes)
+                        ((> len coin-max-solution-bytes)
                          (coin-error 'shares-malformed
                                      "share solution exceeds the byte cap"))
                         ((> (+ solution-at len) n)
@@ -555,7 +539,7 @@
                           (loop
                             (+ i 1)
                             (+ solution-at len)
-                            (cons (coin-v2-share
+                            (cons (coin-share
                                     pubkey: (bytevector-copy
                                               bytes pubkey-at signature-at)
                                     signature: (bytevector-copy
@@ -574,27 +558,27 @@
     ;;; Encode the COMMITS push: `u8 K` then `K` 32-byte commitments (§7.1).
     ;;;
     ;;; Raises unless the commitments are 32 bytes each, at most
-    ;;; `coin-v2-max-commitments` of them, and in strictly ascending order.
+    ;;; `coin-max-commitments` of them, and in strictly ascending order.
     ;;;
     ;;; ```scheme
-    ;;; (coin-v2-commits-encode '()) ; => #u8(0)
+    ;;; (coin-commits-encode '()) ; => #u8(0)
     ;;; ```
-    (define (coin-v2-commits-encode commitments)
+    (define (coin-commits-encode commitments)
       (: list? -> bytevector?)
       (if (not (list? commitments))
-          (error "coin-v2-commits-encode: expected a list of commitments"))
-      (if (> (length commitments) coin-v2-max-commitments)
-          (error "coin-v2-commits-encode: more than sixteen commitments"))
+          (error "coin-commits-encode: expected a list of commitments"))
+      (if (> (length commitments) coin-max-commitments)
+          (error "coin-commits-encode: more than sixteen commitments"))
       (let loop ((xs commitments) (previous #f) (out (make-bytevector 1 0)))
         (if (null? xs)
             (begin
               (bytevector-u8-set! out 0 (length commitments))
               out)
             (let ((commitment (car xs)))
-              (require-bytevector-length "coin-v2-commits-encode" commitment
-                                         coin-v2-commitment-bytes)
+              (require-bytevector-length "coin-commits-encode" commitment
+                                         coin-commitment-bytes)
               (if (and previous (>= 0 (bytes-compare commitment previous)))
-                  (error "coin-v2-commits-encode: commitments are not in ascending order"))
+                  (error "coin-commits-encode: commitments are not in ascending order"))
               (loop (cdr xs)
                     commitment
                     (bytevector-append out commitment))))))
@@ -610,9 +594,9 @@
     ;;; the whole of its validation and belongs with the parse.
     ;;;
     ;;; ```scheme
-    ;;; (coin-result-value (coin-v2-commits-decode #u8(0))) ; => ()
+    ;;; (coin-result-value (coin-commits-decode #u8(0))) ; => ()
     ;;; ```
-    (define (coin-v2-commits-decode bytes)
+    (define (coin-commits-decode bytes)
       (: any? -> coin-result?)
       (guard (e (#t (coin-error 'internal-error
                                 "the commits decoder raised")))
@@ -621,12 +605,12 @@
            (coin-error 'commits-malformed "commits must be bytes"))
           ((= 0 (bytevector-length bytes))
            (coin-error 'commits-malformed "commits push is empty"))
-          ((> (bytevector-length bytes) coin-v2-max-commits-bytes)
+          ((> (bytevector-length bytes) coin-max-commits-bytes)
            (coin-error 'commits-oversize "commits exceed the byte cap"))
-          ((> (bytevector-u8-ref bytes 0) coin-v2-max-commitments)
+          ((> (bytevector-u8-ref bytes 0) coin-max-commitments)
            (coin-error 'commits-oversize "more than sixteen commitments"))
           ((not (= (bytevector-length bytes)
-                   (+ 1 (* coin-v2-commitment-bytes
+                   (+ 1 (* coin-commitment-bytes
                            (bytevector-u8-ref bytes 0)))))
            (coin-error 'commits-malformed
                        "commits length does not match the count"))
@@ -635,10 +619,10 @@
               (let loop ((i 0) (previous #f) (acc '()))
                 (if (= i count)
                     (coin-ok (reverse acc))
-                    (let* ((at (+ 1 (* i coin-v2-commitment-bytes)))
+                    (let* ((at (+ 1 (* i coin-commitment-bytes)))
                            (commitment (bytevector-copy
                                          bytes at
-                                         (+ at coin-v2-commitment-bytes))))
+                                         (+ at coin-commitment-bytes))))
                       (if (and previous
                                (>= 0 (bytes-compare commitment previous)))
                           (coin-error 'commits-unordered
@@ -660,9 +644,9 @@
     ;;; comes from the validated parent, so no further state is needed.
     ;;;
     ;;; ```scheme
-    ;;; (coin-v2-coop-context-puzzle-height context) ; => 0
+    ;;; (coin-coop-context-puzzle-height context) ; => 0
     ;;; ```
-    (define-struct coin-v2-coop-context
+    (define-struct coin-coop-context
       (parent-prev-hash bytevector?)
       (puzzle-height integer?)
       (complexity integer?)
@@ -676,31 +660,31 @@
     ;;; Generation stays bounded and retains a verified table solution.
     ;;;
     ;;; ```scheme
-    ;;; (pbe-spec? (coin-v2-share-puzzle context pubkey)) ; => #t
+    ;;; (puzzle-spec? (coin-share-puzzle context pubkey)) ; => #t
     ;;; ```
-    (define (coin-v2-share-puzzle context pubkey)
-      (: coin-v2-coop-context? bytevector? -> pbe-spec?)
-      (if (not (coin-v2-coop-context? context))
-          (error "coin-v2-share-puzzle: expected a co-op context"))
-      (let ((global (coin-v2-coop-context-spec context)))
-        (if (not (pbe-spec? global))
-            (error "coin-v2-share-puzzle: context has no global puzzle"))
-        (if (not (and (= (pbe-spec-height global)
-                         (coin-v2-coop-context-puzzle-height context))
-                      (= (pbe-spec-complexity global)
-                         (coin-v2-coop-context-complexity context))))
-            (error "coin-v2-share-puzzle: global puzzle does not match context"))
-        (pbe-for/constraint/anchor
-          (coin-v2-share-puzzle-seed
-            (coin-v2-puzzle-seed
-              (coin-v2-coop-context-parent-prev-hash context)
-              (coin-v2-coop-context-puzzle-height context)
-              (coin-v2-coop-context-complexity context))
+    (define (coin-share-puzzle context pubkey)
+      (: coin-coop-context? bytevector? -> puzzle-spec?)
+      (if (not (coin-coop-context? context))
+          (error "coin-share-puzzle: expected a co-op context"))
+      (let ((global (coin-coop-context-spec context)))
+        (if (not (puzzle-spec? global))
+            (error "coin-share-puzzle: context has no global puzzle"))
+        (if (not (and (= (puzzle-spec-height global)
+                         (coin-coop-context-puzzle-height context))
+                      (= (puzzle-spec-complexity global)
+                         (coin-coop-context-complexity context))))
+            (error "coin-share-puzzle: global puzzle does not match context"))
+        (puzzle-for/constraint/anchor
+          (coin-share-puzzle-seed
+            (coin-puzzle-seed
+              (coin-coop-context-parent-prev-hash context)
+              (coin-coop-context-puzzle-height context)
+              (coin-coop-context-complexity context))
             pubkey)
-          (coin-v2-coop-context-puzzle-height context)
-          (coin-v2-coop-context-complexity context)
-          (pbe-spec-constraint global)
-          (coin-v2-pubkey-anchor-output pubkey))))
+          (coin-coop-context-puzzle-height context)
+          (coin-coop-context-complexity context)
+          (puzzle-spec-constraint global)
+          (coin-pubkey-anchor-output pubkey))))
 
     ;;; True when `share`'s signature verifies against its §6.3 preimage.
     ;;;
@@ -712,20 +696,20 @@
     ;;; secp256k1 module bound, yields `#f` rather than a raise.
     ;;;
     ;;; ```scheme
-    ;;; (coin-v2-share-signature-ok? context share) ; => #t
+    ;;; (coin-share-signature-ok? context share) ; => #t
     ;;; ```
-    (define (coin-v2-share-signature-ok? context share)
-      (: coin-v2-coop-context? coin-v2-share? -> boolean?)
+    (define (coin-share-signature-ok? context share)
+      (: coin-coop-context? coin-share? -> boolean?)
       (guard (e (#t #f))
         (and (secp256k1-ecdsa-verify
-               (coin-v2-share-signature share)
-               (coin-v2-share-preimage
-                 (coin-v2-coop-context-parent-prev-hash context)
-                 (coin-v2-coop-context-puzzle-height context)
-                 (coin-v2-coop-context-complexity context)
-                 (coin-v2-share-solution share)
-                 (coin-v2-share-pubkey share))
-               (coin-v2-share-pubkey share))
+               (coin-share-signature share)
+               (coin-share-preimage
+                 (coin-coop-context-parent-prev-hash context)
+                 (coin-coop-context-puzzle-height context)
+                 (coin-coop-context-complexity context)
+                 (coin-share-solution share)
+                 (coin-share-pubkey share))
+               (coin-share-pubkey share))
              #t)))
 
     ;; §13 prefixes a share's solution failures so a node log distinguishes
@@ -749,99 +733,99 @@
     ;;; revealable in a block whose puzzle context is `context`.
     ;;;
     ;;; ```scheme
-    ;;; (bytevector-length (coin-v2-share-commitment context share)) ; => 32
+    ;;; (bytevector-length (coin-share-commitment context share)) ; => 32
     ;;; ```
-    (define (coin-v2-share-commitment context share)
-      (: coin-v2-coop-context? coin-v2-share? -> bytevector?)
-      (coin-v2-commitment
-        (coin-v2-share-preimage
-          (coin-v2-coop-context-parent-prev-hash context)
-          (coin-v2-coop-context-puzzle-height context)
-          (coin-v2-coop-context-complexity context)
-          (coin-v2-share-solution share)
-          (coin-v2-share-pubkey share))
-        (coin-v2-share-blind share)))
+    (define (coin-share-commitment context share)
+      (: coin-coop-context? coin-share? -> bytevector?)
+      (coin-commitment
+        (coin-share-preimage
+          (coin-coop-context-parent-prev-hash context)
+          (coin-coop-context-puzzle-height context)
+          (coin-coop-context-complexity context)
+          (coin-share-solution share)
+          (coin-share-pubkey share))
+        (coin-share-blind share)))
 
     ;;; Relative improvement below personalized par, in milli-units.
     ;;;
     ;;; ```scheme
-    ;;; (coin-v2-share-margin-milli 100 95) ; => 50
+    ;;; (coin-share-margin-milli 100 95) ; => 50
     ;;; ```
-    (define (coin-v2-share-margin-milli par length)
+    (define (coin-share-margin-milli par length)
       (: integer? integer? -> integer?)
       (if (not (and (number? par) (exact? par) (integer? par) (> par 0)
                     (number? length) (exact? length) (integer? length)
                     (> length 0) (< length par)))
-          (error "coin-v2-share-margin-milli: share must be strictly under par"))
+          (error "coin-share-margin-milli: share must be strictly under par"))
       (quotient (* 1000 (- par length)) par))
 
     ;;; Contribution of one valid under-par share: 1..4.
     ;;;
     ;;; ```scheme
-    ;;; (coin-v2-share-contribution 49) ; => 1
-    ;;; (coin-v2-share-contribution 150) ; => 4
+    ;;; (coin-share-contribution 49) ; => 1
+    ;;; (coin-share-contribution 150) ; => 4
     ;;; ```
-    (define (coin-v2-share-contribution margin-milli)
+    (define (coin-share-contribution margin-milli)
       (: integer? -> integer?)
       (if (not (and (number? margin-milli) (exact? margin-milli)
                     (integer? margin-milli) (> margin-milli 0)))
-          (error "coin-v2-share-contribution: margin must be positive"))
+          (error "coin-share-contribution: margin must be positive"))
       (+ 1 (min 3 (quotient margin-milli 50))))
 
     ;;; Aggregate quality `Q`, saturated at 15.
     ;;;
     ;;; ```scheme
-    ;;; (coin-v2-quality '(4 4 4 4)) ; => 15
+    ;;; (coin-quality '(4 4 4 4)) ; => 15
     ;;; ```
-    (define (coin-v2-quality contributions)
+    (define (coin-quality contributions)
       (: list? -> integer?)
       (if (not (list? contributions))
-          (error "coin-v2-quality: expected contributions"))
+          (error "coin-quality: expected contributions"))
       (let loop ((xs contributions) (total 0))
         (if (null? xs)
             (min 15 total)
             (let ((x (car xs)))
               (if (not (and (number? x) (exact? x) (integer? x)
                             (<= 1 x 4)))
-                  (error "coin-v2-quality: contribution out of range"))
+                  (error "coin-quality: contribution out of range"))
               (loop (cdr xs) (+ total x))))))
 
     ;;; Quality contribution of one already-validated share.
-    (define (coin-v2-share-quality context share)
-      (: coin-v2-coop-context? coin-v2-share? -> integer?)
-      (let* ((spec (coin-v2-share-puzzle context
-                                         (coin-v2-share-pubkey share)))
+    (define (coin-share-quality context share)
+      (: coin-coop-context? coin-share? -> integer?)
+      (let* ((spec (coin-share-puzzle context
+                                         (coin-share-pubkey share)))
              (source-size
-               (bytevector-length (coin-v2-share-solution share))))
-        (coin-v2-share-contribution
-          (coin-v2-share-margin-milli (pbe-spec-par spec) source-size))))
+               (bytevector-length (coin-share-solution share))))
+        (coin-share-contribution
+          (coin-share-margin-milli (puzzle-spec-par spec) source-size))))
 
     ;;; Aggregate quality of an already-validated share list.
-    (define (coin-v2-shares-quality context shares)
-      (: coin-v2-coop-context? list? -> integer?)
-      (coin-v2-quality
-        (map (lambda (share) (coin-v2-share-quality context share)) shares)))
+    (define (coin-shares-quality context shares)
+      (: coin-coop-context? list? -> integer?)
+      (coin-quality
+        (map (lambda (share) (coin-share-quality context share)) shares)))
 
     ;;; Validate one share's source against its personalized puzzle.
     ;;;
     ;;; This excludes signature and commitment checks, which remain block-level
     ;;; breadth-first passes. It is public so miners can verify candidate work
     ;;; before signing it.
-    (define (coin-v2-check-share-solution context share)
-      (: coin-v2-coop-context? coin-v2-share? -> coin-result?)
+    (define (coin-check-share-solution context share)
+      (: coin-coop-context? coin-share? -> coin-result?)
       (guard (e (#t (coin-error 'internal-error
                                 "the personalized share check raised")))
         (let* ((personalized
-                 (coin-v2-share-puzzle context
-                                       (coin-v2-share-pubkey share)))
+                 (coin-share-puzzle context
+                                       (coin-share-pubkey share)))
                (source-size
-                 (bytevector-length (coin-v2-share-solution share))))
-          (if (>= source-size (pbe-spec-par personalized))
+                 (bytevector-length (coin-share-solution share))))
+          (if (>= source-size (puzzle-spec-par personalized))
               (coin-error 'share-not-under-par
                           "share is not strictly below personalized par")
-              (let ((checked (coin-v2-check-solution
+              (let ((checked (coin-check-solution
                                personalized
-                               (coin-v2-share-solution share))))
+                               (coin-share-solution share))))
                 (if (coin-failed? checked)
                     (coin-error (share-reason (coin-result-reason checked))
                                 (coin-result-detail checked))
@@ -862,7 +846,7 @@
     ;;; `producer-solution` is the block's own SOLUTION push, which the
     ;;; shares must all differ from; `shares` is the decoded SHARES list.
     ;;; On success the value is that same list. Its length is `R` for the
-    ;;; reward split; `coin-v2-shares-quality` derives ranking value `Q`.
+    ;;; reward split; `coin-shares-quality` derives ranking value `Q`.
     ;;;
     ;;; The checks run in §6.4's order, but BREADTH-FIRST — every share
     ;;; clears check `n` before any share attempts check `n+1`:
@@ -882,29 +866,29 @@
     ;;; Total: never raises, whatever the shares carry.
     ;;;
     ;;; ```scheme
-    ;;; (coin-result-value (coin-v2-check-shares context #u8(49) '())) ; => ()
+    ;;; (coin-result-value (coin-check-shares context #u8(49) '())) ; => ()
     ;;; ```
-    (define (coin-v2-check-shares context producer-solution shares)
-      (: coin-v2-coop-context? any? list? -> coin-result?)
+    (define (coin-check-shares context producer-solution shares)
+      (: coin-coop-context? any? list? -> coin-result?)
       (guard (e (#t (coin-error 'internal-error "the share check raised")))
         (cond
-          ((not (coin-v2-coop-context? context))
+          ((not (coin-coop-context? context))
            (coin-error 'internal-error "expected a co-op context"))
           ((not (list? shares))
            (coin-error 'internal-error "expected a list of shares"))
           ((null? shares) (coin-ok '()))
-          ((> (length shares) coin-v2-max-shares)
+          ((> (length shares) coin-max-shares)
            (coin-error 'shares-oversize "more than eight shares"))
           ;; A share reveals puzzle `P = H-1`. At `H = 0` there is no such
           ;; puzzle and no parent to have carried the commitment.
-          ((< (coin-v2-coop-context-puzzle-height context) 0)
+          ((< (coin-coop-context-puzzle-height context) 0)
            (coin-error 'shares-at-genesis "genesis carries no shares"))
-          ((not (pbe-spec? (coin-v2-coop-context-spec context)))
+          ((not (puzzle-spec? (coin-coop-context-spec context)))
            (coin-error 'internal-error "co-op context has no puzzle spec"))
           (else
             (let* ((producer (solution-bytes producer-solution))
-                   (spec (coin-v2-coop-context-spec context))
-                   (commits (coin-v2-coop-context-commits context))
+                   (spec (coin-coop-context-spec context))
+                   (commits (coin-coop-context-commits context))
                    (failure
                      (or
                        ;; 2. every key is a point on the curve. The
@@ -916,7 +900,7 @@
                          (lambda (share previous)
                            (and (not (guard (e (#t #f))
                                        (and (secp256k1-pubkey-parse
-                                              (coin-v2-share-pubkey share))
+                                              (coin-share-pubkey share))
                                             #t)))
                                 (coin-error 'share-bad-pubkey
                                             "share pubkey is not a valid compressed point"))))
@@ -928,8 +912,8 @@
                          (lambda (share previous)
                            (and previous
                                 (>= 0 (bytes-compare
-                                        (coin-v2-share-pubkey share)
-                                        (coin-v2-share-pubkey previous)))
+                                        (coin-share-pubkey share)
+                                        (coin-share-pubkey previous)))
                                 (coin-error 'shares-unordered
                                             "shares are not in strictly ascending pubkey order"))))
                        ;; 4. the parent carried this exact commitment. This
@@ -939,7 +923,7 @@
                          shares
                          (lambda (share previous)
                            (and (not (member-bytes?
-                                       (coin-v2-share-commitment
+                                       (coin-share-commitment
                                          context share)
                                        commits))
                                 (coin-error 'share-uncommitted
@@ -949,7 +933,7 @@
                        (each-share
                          shares
                          (lambda (share previous)
-                           (and (not (coin-v2-share-signature-ok?
+                           (and (not (coin-share-signature-ok?
                                        context share))
                                 (coin-error 'share-bad-signature
                                             "share signature does not verify"))))
@@ -959,18 +943,18 @@
                          (cond
                            ((null? xs) #f)
                            ((member-bytes?
-                              (coin-v2-share-solution (car xs)) seen)
+                              (coin-share-solution (car xs)) seen)
                             (coin-error 'share-duplicate-solution
                                         "share repeats a solution already in this block"))
                            (else
                              (loop (cdr xs)
-                                   (cons (coin-v2-share-solution (car xs))
+                                   (cons (coin-share-solution (car xs))
                                          seen)))))
                        ;; 7. and only now, each pubkey-personalized task.
                        (each-share
                          shares
                          (lambda (share previous)
-                           (let ((checked (coin-v2-check-share-solution
+                           (let ((checked (coin-check-share-solution
                                             context share)))
                              (and (coin-failed? checked) checked)))))))
               (or failure (coin-ok shares)))))))
@@ -981,7 +965,7 @@
 
     ;;; The producer's weight in the split: 2. Each share and the carrier
     ;;; are worth 1 (§6.5).
-    (define coin-v2-producer-weight 2)
+    (define coin-producer-weight 2)
 
     (define (require-value who value)
       (if (not (and (number? value) (exact? value) (integer? value)
@@ -991,7 +975,7 @@
 
     (define (require-share-count who count)
       (if (not (and (number? count) (exact? count) (integer? count)
-                    (<= 0 count coin-v2-max-shares)))
+                    (<= 0 count coin-max-shares)))
           (error (string-append who ": share count out of range")))
       count)
 
@@ -999,25 +983,25 @@
     ;;; where the carrier exists exactly when `R >= 1`.
     ;;;
     ;;; ```scheme
-    ;;; (coin-v2-split-weight-total 0) ; => 2
-    ;;; (coin-v2-split-weight-total 8) ; => 11
+    ;;; (coin-split-weight-total 0) ; => 2
+    ;;; (coin-split-weight-total 8) ; => 11
     ;;; ```
-    (define (coin-v2-split-weight-total share-count)
+    (define (coin-split-weight-total share-count)
       (: integer? -> integer?)
-      (require-share-count "coin-v2-split-weight-total" share-count)
-      (+ coin-v2-producer-weight
+      (require-share-count "coin-split-weight-total" share-count)
+      (+ coin-producer-weight
          share-count
          (if (> share-count 0) 1 0)))
 
     ;;; One weight-unit of the reward: `u = floor(V / Wtot)`.
     ;;;
     ;;; ```scheme
-    ;;; (coin-v2-split-unit 5000000000 8) ; => 454545454
+    ;;; (coin-split-unit 5000000000 8) ; => 454545454
     ;;; ```
-    (define (coin-v2-split-unit value share-count)
+    (define (coin-split-unit value share-count)
       (: integer? integer? -> integer?)
-      (require-value "coin-v2-split-unit" value)
-      (quotient value (coin-v2-split-weight-total share-count)))
+      (require-value "coin-split-unit" value)
+      (quotient value (coin-split-weight-total share-count)))
 
     ;;; The exact coinbase outputs a block owes (§6.5).
     ;;;
@@ -1038,17 +1022,17 @@
     ;;; unchanged.
     ;;;
     ;;; ```scheme
-    ;;; (car (car (coin-v2-split-plan 100 '() #f))) ; => 100
+    ;;; (car (car (coin-split-plan 100 '() #f))) ; => 100
     ;;; ```
-    (define (coin-v2-split-plan value shares carrier-script)
+    (define (coin-split-plan value shares carrier-script)
       (: integer? list? any? -> list?)
-      (require-value "coin-v2-split-plan" value)
-      (let* ((count (require-share-count "coin-v2-split-plan" (length shares)))
+      (require-value "coin-split-plan" value)
+      (let* ((count (require-share-count "coin-split-plan" (length shares)))
              (carrier (if (> count 0) 1 0))
-             (unit (coin-v2-split-unit value count))
+             (unit (coin-split-unit value count))
              (producer (- value (* count unit) (* carrier unit))))
         (if (and (= 1 carrier) (not (bytevector? carrier-script)))
-            (error "coin-v2-split-plan: a block with shares needs a carrier script"))
+            (error "coin-split-plan: a block with shares needs a carrier script"))
         (cons (cons producer #f)
               (let loop ((xs shares) (acc '()))
                 (if (null? xs)
@@ -1057,8 +1041,8 @@
                                  acc))
                     (loop (cdr xs)
                           (cons (cons unit
-                                      (coin-v2-share-script
-                                        (coin-v2-share-pubkey (car xs))))
+                                      (coin-share-script
+                                        (coin-share-pubkey (car xs))))
                                 acc)))))))
 
     (define (outputs-of tx)
@@ -1075,9 +1059,9 @@
     ;;; `coinbase-output-value`. On success the value is the split plan.
     ;;;
     ;;; ```scheme
-    ;;; (coin-ok? (coin-v2-check-split coinbase 5000000000 '() #f)) ; => #t
+    ;;; (coin-ok? (coin-check-split coinbase 5000000000 '() #f)) ; => #t
     ;;; ```
-    (define (coin-v2-check-split tx value shares carrier-script)
+    (define (coin-check-split tx value shares carrier-script)
       (: any? integer? list? any? -> coin-result?)
       (guard (e (#t (coin-error 'internal-error "the split check raised")))
         (let ((outputs (outputs-of tx)))
@@ -1088,13 +1072,13 @@
                        (>= value 0)))
              (coin-error 'coinbase-output-value
                          "block value is not a non-negative integer"))
-            ((> (length shares) coin-v2-max-shares)
+            ((> (length shares) coin-max-shares)
              (coin-error 'shares-oversize "more than eight shares"))
             ((and (pair? shares) (not (bytevector? carrier-script)))
              (coin-error 'internal-error
                          "a block with shares needs a carrier script"))
             (else
-              (let ((plan (coin-v2-split-plan value shares carrier-script)))
+              (let ((plan (coin-split-plan value shares carrier-script)))
                 (if (not (= (length outputs) (length plan)))
                     (coin-error 'coinbase-output-shape
                                 "coinbase output count does not match the split")

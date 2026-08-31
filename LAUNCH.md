@@ -5,9 +5,10 @@ public node up: after that, changing any of them splits the network or
 invalidates the chain. Operational detail lives in
 [`deploy/RUNBOOK.md`](deploy/RUNBOOK.md).
 
-Current state: **nothing here has ever run on a public network.** The genesis
-quote, the derived genesis constants, the seed hostname, the repository URL
-and the explorer hostname are all decided and in the tree. See
+Current state: **nothing here has ever run on a public network.** Genesis quote
+is chosen, but mainnet timestamp and derived constants are provisional until
+operator chooses launch day. Seed hostname, repository URL and explorer
+hostname are in tree. See
 [Decisions still owed](#decisions-still-owed-by-the-operator) for what is
 left.
 
@@ -23,7 +24,6 @@ surface it.
 
 - [ ] No open work on `src/sigil/coin/puzzle.sgl` or
       `src/sigil/coin/puzzle/generator.sgl`. Merge or abandon it now.
-- [ ] `puzzle-generator-version` is `1` and stays `1` through launch.
 - [ ] Full suite green:
       `nix develop /home/trev/Workspace/sigil -c sigil test --redirects ./dev-redirects.sgl --no-color`
 - [ ] Tag the freeze so the launch commit is nameable, and say in the tag
@@ -31,7 +31,8 @@ surface it.
 
 After this point a change to either file is a hard fork requiring every node
 to upgrade in lockstep. Treat "we should add one more builtin" as a
-post-launch v2 discussion, not a launch blocker.
+post-launch discussion, not a launch blocker. `docs/consensus.md` is the sole
+normative protocol specification.
 
 The same freeze applies to `sigil-coin-consensus`: emission, the solution
 rules, the coinbase codec and fork choice.
@@ -46,31 +47,30 @@ the genesis hash: change one byte and every constant below changes.
 - [ ] Pick the genesis timestamp, UTC, in the recent past. It must be far
       enough back that genesis, and a first block 20 hours later, both clear
       the 7200-second future-drift rule on any node with a sane clock.
-- [x] Edit `QUOTE` and `TIME` in `deploy/genesis-constants.sgl` and run it
+- [ ] On launch day, edit `QUOTE` and `TIME` in `deploy/genesis-constants.sgl` and run it
       from the repository root:
 
       nix develop /home/trev/Workspace/sigil -c \
         sigil deploy/genesis-constants.sgl --redirects ./dev-redirects.sgl
 
-      Verified output for the launch quote:
+      Current coherent provisional output:
 
       quote: Sigil - Practical Symbolic Power
       quote-bytes: 32
       time: 1785542400
-      header-hex: 04000000000000000000000000000000000000000000000000000000000000000000000099a5066258b8dc1726a6d0dcb92472129769a290b29421f39c823e692b5e7a6b00376d6affff7f2031000000
-      hash: 210ca3a6564da8187b4f935daad4e1ed809ef6db7faef3ed4e46ae78007dee9d
-      id: 9dee7d0078ae464eedf3ae7fdbf69e80ede1d4aa5d934f7b18a84d56a6a30c21
+      header-hex: 050000000000000000000000000000000000000000000000000000000000000000000000b4a701bee9f07241ca026ac90bd801e769d5ca4024be0fe3fd18b7ebd26f7d6500376d6a80007f20f0a55516
+      hash: a4db344771ff4af14b854e9cf0ed348c7199268d1f82f2c2782380f425dca5fb
+      id: fba5dc25f4802378c2f2821f8d2699718c34edf09c4e854bf14aff714734dba4
 
 - [x] Check `quote-bytes` against the 400-byte graffiti cap. 32 bytes used,
       368 to spare. It is a BYTE
       count of the UTF-8 the coinbase actually carries, not a character
       count, so a quote with any non-ASCII in it costs more than it looks.
 
-- [x] Paste all four into
-      `packages/sigil-coin-node/src/sigil/coin/node/chain.sgl`:
-      `coin-genesis-quote`, `coin-genesis-time`,
-      `coin-genesis-header-constant` (the `header-hex` line) and
-      `coin-genesis-id-constant` (the `id` line).
+- [ ] Paste final four values into
+      `packages/sigil-coin-node/src/sigil/coin/node/chain.sgl` (quote/time) and
+      `packages/sigil-coin-node/src/sigil/coin/node/genesis.sgl`
+      (header/id constants).
 - [ ] Re-run the suite. `test-node.sgl` rebuilds genesis from the quote and
       asserts the constants, so a mismatch fails there rather than shipping.
 - [ ] Leave the regtest constants alone. A distinct regtest genesis is what
@@ -314,7 +314,7 @@ table can be deferred past step 5.
 | --- | --- | --- |
 | 1 | ~~The genesis quote~~ — RESOLVED: `Sigil - Practical Symbolic Power`, the operator's own words, so no third-party permission is needed. 32 UTF-8 bytes, 368 under the 400-byte graffiti cap. | `coin-genesis-quote` in `packages/sigil-coin-node/src/sigil/coin/node/chain.sgl` |
 | 2 | The genesis timestamp | `coin-genesis-time`, currently `1785542400` (2026-08-01T00:00:00Z). Still the value the constants below were derived from; changing it means regenerating them. |
-| 3 | ~~The two derived genesis constants~~ — RESOLVED. Regenerated from the launch quote with `deploy/genesis-constants.sgl`: header `04…2b5e7a6b00376d6affff7f2031000000`, id `9dee7d0078ae464eedf3ae7fdbf69e80ede1d4aa5d934f7b18a84d56a6a30c21`. `test-node.sgl` rebuilds genesis from the quote and asserts both. | `coin-genesis-header-constant` and `coin-genesis-id-constant` in `chain.sgl` |
+| 3 | Final mainnet genesis constants, regenerated after launch timestamp choice. Current source constants are coherent placeholders. | `coin-genesis-header-constant` and `coin-genesis-id-constant` in `genesis.sgl` |
 | 4 | ~~The real seed DNS name~~ — RESOLVED: `seed.sigilcoin.lol:19444`, on the operator's own domain. The A/AAAA records still have to exist before step 5. | `sigilcoin-main-chain` seed peers in `chain.sgl` |
 | 5 | ~~Where the repository is published~~ — RESOLVED and confirmed: `https://github.com/trevarj/sigil-coin`, the operator's account. Every `package.sgl` and the announcement now say so. | `package.sgl` files, the step 6 announcement |
 | 6 | ~~`depsHash`~~ — RESOLVED. There is no vendoring derivation and no hash to fill in: every `from-git` dependency is a pinned flake input, so Nix fetches it and the sandbox stays offline. Bumping one is `nix flake update <input>` in `deploy/`. | — |

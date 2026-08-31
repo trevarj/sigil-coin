@@ -1,0 +1,519 @@
+;;; Canonical explorer end-to-end coverage.
+;;;
+;;; Blocks below are built by canonical producer/co-op builders, accepted and
+;;; validated by a real node, then read from that node's SQLite database through
+;;; explorer routes and real HTTP sockets.
+
+(import (sigil test)
+        (sigil fs)
+        (sigil io)
+        (sigil math)
+        (sigil time)
+        (sigil array)
+        (sigil string)
+        (sigil process)
+        (sigil socket)
+        (sigil sqlite)
+        (sigil json)
+        (sigil secp256k1)
+        (sigil bitcoin utils)
+        (sigil bitcoin encoding)
+        (sigil bitcoin primitives)
+        (sigil bitcoin script)
+        (sigil bitcoin tx)
+        (sigil bitcoin consensus)
+        (sigil bitcoin node)
+        (sigil coin puzzle)
+        (sigil coin puzzle generator)
+        (sigil coin consensus)
+        (sigil coin node)
+        (sigil coin explorer))
+
+(define (fresh-dir)
+  (let ((dir (make-temp-directory)))
+    (unless dir (error "test-explorer-e2e: could not create temp directory"))
+    dir))
+
+(define (has? text part) (string-contains? text part))
+(define (seconds-now) (current-second))
+(define (dict-get value key) (dict-ref value (string->keyword key)))
+(define (json-list value) (if (list? value) value (array->list value)))
+
+(define (paid-to b address)
+  (let loop ((outputs (explorer-block-outputs b)) (total 0))
+    (cond ((null? outputs) total)
+          ((equal? address (explorer-output-address (car outputs)))
+           (loop (cdr outputs) (+ total (explorer-output-value (car outputs)))))
+          (else (loop (cdr outputs) total)))))
+
+(define %miner-a "sgl1q70nakelv6wvuk2e63ah8lg68kq3nx7q2g3taul")
+(define %miner-b "sgl1qw508d6qejxtdg4y5r3zarvary0c5xw7kr43pwr")
+(define %script-a (explorer-address->script %miner-a))
+(define %script-b (explorer-address->script %miner-b))
+
+(define %hostile-tag "<img src=x onerror=\"y\">")
+(define %hostile-blind
+  (bytevector-append (string->utf8 "<blind>&\"'") (make-bytevector 22 #xff)))
+(define %hostile-graffiti
+  (bytevector-append
+    (string->utf8
+      (string-append "/" %hostile-tag
+                     "/ <script>alert(1)</script> & \"quoted\" 'single'"))
+    #u8(#x00 #x1b #xff #x80)))
+
+(define (bytes<? a b)
+  (let loop ((i 0))
+    (cond ((>= i (bytevector-length a)) #f)
+          ((< (bytevector-u8-ref a i) (bytevector-u8-ref b i)) #t)
+          ((> (bytevector-u8-ref a i) (bytevector-u8-ref b i)) #f)
+          (else (loop (+ i 1))))))
+
+(define (sort-bytes xs key)
+  (let loop ((rest xs) (out '()))
+    (if (null? rest)
+        out
+        (loop (cdr rest)
+              (let insert ((ys out))
+                (cond ((null? ys) (list (car rest)))
+                      ((bytes<? (key (car rest)) (key (car ys)))
+                       (cons (car rest) ys))
+                      (else (cons (car ys) (insert (cdr ys))))))))))
+
+(define (signed-share secret-byte source context blind)
+  (let* ((secret (make-bytevector 32 secret-byte))
+         (pubkey (secp256k1-pubkey-create secret))
+         (solution (string->utf8 source))
+         (preimage (coin-share-preimage
+                     (coin-coop-context-parent-prev-hash context)
+                     (coin-coop-context-puzzle-height context)
+                     (coin-coop-context-complexity context)
+                     solution
+                     pubkey)))
+    (coin-share pubkey: pubkey
+                signature: (secp256k1-ecdsa-sign secret preimage)
+                blind: blind
+                solution: solution)))
+
+;; Known short solutions for the personalized H1 tasks of keys 1 and 6. First
+;; remains valid with hostile source in a dead branch.
+(define %share-source-1
+  "(lambda(x)(if(equal? x \"@\")\"adbliemffghlbcgeeajjfndonfkklkafgfnhbobidegaeibjppjmbhpfojnfnnahip\"(cons x(list x x))))")
+(define %share-source-6
+  "(lambda(x)(if(equal? x \"@\")\"adpaagkbinfgfdmeonpfdjbppcdkgbpadppidncdhoiiaoogbbihpkjpdhjkacioak\"(+(* x 6)52)))")
+
+;; Full-workspace harness omits optional native secp256k1; package harness
+;; binds it and runs this integration suite.
+(define %native-secp256k1?
+  (guard (err (#t #f))
+    (and (secp256k1-seckey-verify? (make-bytevector 32 1)) #t)))
+
+(define %genesis-block
+  (coin-genesis-block coin-regtest-genesis-quote coin-regtest-genesis-time))
+(define %genesis-header (block-header-field %genesis-block))
+(define %spacing coin-regtest-min-block-spacing)
+
+;; Build once without commitments to derive H1's share context, then rebuild
+;; same H1 with commitments. Context excludes its own commitment list.
+(define %prototype-parent
+  (coin-build-block %genesis-header
+                    1
+                    coin-genesis-complexity
+                    #f
+                    "/producer/ prototype"
+                    %script-a
+                    (+ coin-regtest-genesis-time %spacing)))
+(define %share-context (coin-parent-context %prototype-parent))
+(define %shares
+  (if %native-secp256k1?
+      (sort-bytes
+        (list (signed-share 1 %share-source-1 %share-context %hostile-blind)
+              (signed-share 6 %share-source-6 %share-context
+                            (make-bytevector 32 106)))
+        coin-share-pubkey)
+      '()))
+(define %commitments
+  (sort-bytes (map (lambda (share)
+                     (coin-share-commitment %share-context share))
+                   %shares)
+              (lambda (x) x)))
+(define %producer-block
+  (coin-build-block %genesis-header
+                    1
+                    coin-genesis-complexity
+                    #f
+                    "/producer/ commitments"
+                    %script-a
+                    (+ coin-regtest-genesis-time %spacing)
+                    '()
+                    0
+                    %commitments))
+(define %hostile-producer-solution
+  (string-append
+    "(if #f \"<script>producer</script>\" "
+    (puzzle-spec-hidden-source
+      (coin-puzzle-for (block-header-hash (block-header-field %producer-block))
+                       2
+                       coin-genesis-complexity))
+    ")"))
+(define %coop-block
+  (and %native-secp256k1?
+       (coin-build-coop-block
+         %producer-block
+         2
+         coin-genesis-complexity
+         %hostile-producer-solution
+         %shares
+         %hostile-graffiti
+         %script-b
+         (+ (block-header-time (block-header-field %producer-block)) %spacing))))
+
+(define (submit-block n b)
+  (node-ingest-headers n (list (block-header-field b)))
+  (node-store-block n b)
+  (node-validate-blocks n))
+
+(define %dir (fresh-dir))
+(define %node-built
+  (and %native-secp256k1?
+       (let ((n (node-open sigilcoin-regtest-chain %dir)))
+         (let ((first (submit-block n %producer-block))
+               (second (submit-block n %coop-block))
+               (status #f))
+           (set! status (node-status n))
+           (node-close n)
+           (list first second status)))))
+
+(define (with-store proc)
+  (let* ((store (explorer-open sigilcoin-regtest-chain %dir))
+         (value (proc store)))
+    (explorer-close store)
+    value))
+
+(define (response path)
+  (explorer-respond sigilcoin-regtest-chain %dir path))
+(define (body-of path) (explorer-response-body (response path)))
+(define (status-of path) (explorer-response-status (response path)))
+(define (json-of path) (json-decode (body-of path)))
+
+(define %routes
+  (list "/" "/blocks" "/difficulty" "/block/1" "/block/2"
+        "/block/nope" (string-append "/address/" %miner-a)
+        (string-append "/address/" %miner-b) "/address/nope"
+        "/api/summary" "/api/blocks" "/api/difficulty" "/api/block/2"
+        "/api/block/nope" (string-append "/api/address/" %miner-a)
+        "/api/nope" "/nope"))
+
+(when %native-secp256k1?
+  (test-group "canonical node to explorer"
+  (test "producer and co-op blocks validate through the live node"
+    (assert-equal 1 (car %node-built))
+    (assert-equal 1 (car (cdr %node-built)))
+    (assert-equal 2
+                  (node-status-snapshot-best-block-height
+                    (car (cdr (cdr %node-built)))))
+    (assert-equal 2
+                  (node-status-snapshot-validated-block-count
+                    (car (cdr (cdr %node-built))))))
+
+  (test "explorer derives valid personalized shares, Q, carrier, and split"
+    (with-store
+      (lambda (store)
+        (let* ((b (explorer-block-by-height store 2))
+               (shares (explorer-block-shares b))
+               (outputs (explorer-block-outputs b)))
+          (assert-equal #f (explorer-block-problem b))
+          (assert-equal 2 (explorer-block-share-count b))
+          (assert-equal 2 (length shares))
+          (for-each
+            (lambda (share)
+              (assert-equal #f (explorer-share-problem share))
+              (assert-true (> (explorer-share-margin share) 0))
+              (assert-true (> (explorer-share-contribution share) 0))
+              (assert-true (number? (explorer-share-steps share)))
+              (assert-true (number? (explorer-share-cells share))))
+            shares)
+          (assert-equal (coin-shares-quality %share-context %shares)
+                        (explorer-block-score-quality b))
+          (assert-equal '(producer share share carrier)
+                        (map explorer-output-role outputs))
+          (assert-equal (coin-block-reward 2)
+                        (explorer-block-total-output b))
+          (for-each (lambda (output)
+                      (assert-equal (explorer-output-expected output)
+                                    (explorer-output-value output)))
+                    outputs)
+          (assert-equal %miner-a
+                        (explorer-output-address (list-ref outputs 3)))
+          (assert-equal (map explorer-share-payout shares)
+                        (map explorer-output-value
+                             (list (list-ref outputs 1)
+                                   (list-ref outputs 2))))))))
+
+  (test "rendered co-op block exposes canonical fields"
+    (let ((page (body-of "/block/2")))
+      (assert-equal 200 (status-of "/block/2"))
+      (assert-true (has? page "<h2>Co-op shares</h2>"))
+      (assert-true (has? page "aggregate Q"))
+      (assert-true (has? page "carrier (the previous producer)"))
+      (assert-true (has? page "<h2>Reward split</h2>"))
+      (assert-true (has? page "personal par"))))
+
+  (test "address balances come from live-node UTXOs"
+    (with-store
+      (lambda (store)
+        (let* ((b1 (explorer-block-by-height store 1))
+               (b2 (explorer-block-by-height store 2))
+               (a-expected (+ (paid-to b1 %miner-a) (paid-to b2 %miner-a))))
+          (assert-equal a-expected
+                        (explorer-address-balance store %script-a))
+          (assert-true (> (explorer-address-balance store %script-b) 0))
+          (assert-equal a-expected
+                        (dict-get
+                          (json-of (string-append "/api/address/" %miner-a))
+                          "balance")))))))
+
+(test-group "consensus-valid hostile block stays inert"
+  (test "hostile share, program, author, and UTF-8 reached validated block"
+    (let* ((payload-result (coin-block-coinbase-payload %coop-block))
+           (payload (coin-result-value payload-result))
+           (decoded (coin-shares-decode (coin-coinbase-payload-shares payload))))
+      (assert-true (coin-ok? payload-result))
+      (assert-true (coin-ok? decoded))
+      (assert-true
+        (has? (utf8->string (coin-coinbase-payload-solution payload))
+              "<script>producer</script>"))
+      (assert-true (member %hostile-blind
+                           (map coin-share-blind (coin-result-value decoded))))
+      (assert-equal %hostile-graffiti
+                    (coin-coinbase-payload-graffiti payload))))
+
+  (test "HTML escapes every attacker-controlled field"
+    (let ((page (body-of "/block/2")))
+      (assert-true (has? page "&lt;script&gt;"))
+      (assert-true (has? page "&lt;script&gt;alert(1)&lt;/script&gt;"))
+      (assert-true (has? page "&lt;img src=x onerror=&quot;y&quot;&gt;"))
+      (assert-true (has? page (hex-encode %hostile-blind)))
+      (assert-true (not (has? page "<script>")))
+      (assert-true (not (has? page "<img")))
+      (let ((bytes (string->utf8 page)))
+        (let loop ((i 0))
+          (when (< i (bytevector-length bytes))
+            (let ((b (bytevector-u8-ref bytes i)))
+              (assert-true (or (>= b #x20) (= b #x0a)))
+              (loop (+ i 1))))))))
+
+  (test "JSON remains valid and preserves sanitized hostile text"
+    (let* ((value (json-of "/api/block/2"))
+           (shares (json-list (dict-get value "shares"))))
+      (assert-equal %hostile-tag (dict-get value "author"))
+      (assert-true (has? (dict-get value "graffiti")
+                         "<script>alert(1)</script>"))
+      (assert-true (has? (dict-get value "solution")
+                         "<script>producer</script>"))
+      (assert-true (member (hex-encode %hostile-blind)
+                           (map (lambda (share) (dict-get share "blind"))
+                                shares))))))
+
+(test-group "real node database stays read-only"
+  (test "route sweep cannot change or create node data"
+    (let* ((path (explorer-db-path sigilcoin-regtest-chain %dir))
+           (before (read-file-bytes path)))
+      (for-each response %routes)
+      (assert-equal before (read-file-bytes path))
+      (let ((n (node-open sigilcoin-regtest-chain %dir)))
+        (assert-equal 2
+                      (node-status-snapshot-best-block-height (node-status n)))
+        (node-close n))))
+
+  (test "real node database opens query-only"
+    (with-store
+      (lambda (store)
+        (let ((db (explorer-store-db store)))
+          (assert-equal 1 (cdr (car (car (sqlite-query db "PRAGMA query_only")))))
+          (assert-equal #f (sqlite-exec db "DELETE FROM headers"))))))
+
+  (test "every missing-database route is 503 and creates nothing"
+    (let* ((dir (fresh-dir))
+           (path (explorer-db-path sigilcoin-regtest-chain dir)))
+      (for-each
+        (lambda (route)
+          (assert-equal 503
+                        (explorer-response-status
+                          (explorer-respond sigilcoin-regtest-chain dir route))))
+        %routes)
+      (assert-true (not (file-exists? path))))))
+
+(define (socket-request method target)
+  (let ((listener (tcp-listen 0 host: "127.0.0.1")))
+    (let* ((port (car (cdr (socket-local-address listener))))
+           (client (tcp-connect "127.0.0.1" port)))
+      (socket-send-all client
+                       (string-append method " " target " HTTP/1.1\r\n"
+                                      "Host: 127.0.0.1\r\n\r\n"))
+      (explorer-serve-connection sigilcoin-regtest-chain %dir
+                                 (tcp-accept listener))
+      (let ((answer (socket-read-all client)))
+        (socket-close client)
+        (socket-close listener)
+        answer))))
+
+(test-group "HTTP front door over real sockets"
+  (test "summary, block, and difficulty JSON cross socket boundary"
+    (let ((summary (socket-request "GET" "/api/summary"))
+          (block (socket-request "GET" "/api/block/2"))
+          (difficulty (socket-request "GET" "/api/difficulty")))
+      (assert-true (has? summary "HTTP/1.1 200 OK"))
+      (assert-true (has? summary "\"tip_height\":2"))
+      (assert-true (has? block "\"height\":2"))
+      (assert-true (has? block "\"share_count\":2"))
+      (assert-true (has? difficulty "Content-Type: application/json"))
+      (assert-true (has? difficulty "\"history\":"))))
+
+  (test "HEAD has GET headers and no body"
+    (let ((answer (socket-request "HEAD" "/block/2")))
+      (assert-true (has? answer "HTTP/1.1 200 OK"))
+      (assert-true (has? answer "Content-Length: "))
+      (assert-true (string-ends-with? answer "\r\n\r\n"))
+      (assert-true (not (has? answer "<html")))))
+
+  (test "unknown API path stays JSON across socket"
+    (let ((answer (socket-request "GET" "/api/nope")))
+      (assert-true (has? answer "HTTP/1.1 404 Not Found"))
+      (assert-true (has? answer "Content-Type: application/json"))
+      (assert-true (has? answer "\"error\":\"not-found\""))))
+
+  (test "silent request receives bounded timeout"
+    (let ((listener (tcp-listen 0 host: "127.0.0.1")))
+      (let* ((port (car (cdr (socket-local-address listener))))
+             (client (tcp-connect "127.0.0.1" port))
+             (started (seconds-now)))
+        (explorer-serve-connection sigilcoin-regtest-chain %dir
+                                   (tcp-accept listener)
+                                   timeout: 200)
+        (let ((answer (socket-read-all client))
+              (elapsed (- (seconds-now) started)))
+          (socket-close client)
+          (socket-close listener)
+          (assert-true (has? answer "408 Request Timeout"))
+          (assert-true (< elapsed 3)))))))
+
+(define %explorer-script
+  (let loop ((candidates
+               (list "packages/sigil-coin-explorer/test/explorer-peer.sgl"
+                     "test/explorer-peer.sgl"
+                     "../test/explorer-peer.sgl")))
+    (cond ((null? candidates)
+           (error "test-explorer-e2e: cannot find explorer-peer.sgl"))
+          ((file-exists? (car candidates)) (car candidates))
+          (else (loop (cdr candidates))))))
+
+(define %explorer-command
+  (let loop ((paths (library-paths)) (out '()))
+    (if (null? paths)
+        (append (reverse out) (list %explorer-script "--"))
+        (loop (cdr paths) (cons (car paths) (cons "-L" out))))))
+
+(define (spawn-peer args)
+  (let ((p (apply process-spawn
+                  "sigil"
+                  die-with-parent: #t
+                  (append %explorer-command args))))
+    (unless p (error "test-explorer-e2e: could not spawn explorer peer"))
+    p))
+
+(define %explorer-binary
+  (let loop ((candidates
+               (list "build/dev/bin/sigilcoin-explorer"
+                     "../../build/dev/bin/sigilcoin-explorer")))
+    (cond ((null? candidates)
+           (error "test-explorer-e2e: cannot find explorer binary"))
+          ((file-exists? (car candidates)) (car candidates))
+          (else (loop (cdr candidates))))))
+
+(define (spawn-explorer args)
+  (let ((p (apply process-spawn %explorer-binary die-with-parent: #t args)))
+    (unless p (error "test-explorer-e2e: could not spawn explorer binary"))
+    p))
+
+(define (explorer-lines p)
+  (let loop ((lines '()))
+    (let ((line (read-line (process-stdout p))))
+      (if (eof-object? line)
+          (reverse lines)
+          (loop (cons line lines))))))
+
+(define (printed? lines text)
+  (let loop ((xs lines))
+    (cond ((null? xs) #f)
+          ((has? (car xs) text) #t)
+          (else (loop (cdr xs))))))
+
+(define (explorer-port offset)
+  (+ 18700 offset (* 3 (modulo (process-id) 150))))
+
+(define (connect-explorer port)
+  (let loop ((tries 0))
+    (let ((sock (guard (err (#t #f)) (tcp-connect "127.0.0.1" port))))
+      (cond (sock sock)
+            ((> tries 200) #f)
+            (else (sleep 0.1) (loop (+ tries 1)))))))
+
+(define (http-get port target)
+  (let ((sock (connect-explorer port)))
+    (and sock
+         (begin
+           (socket-send-all sock
+                            (string-append "GET " target " HTTP/1.1\r\n"
+                                           "Host: 127.0.0.1\r\n\r\n"))
+           (let ((answer (socket-read-all sock)))
+             (socket-close sock)
+             answer)))))
+
+(test-group "explorer executable and accept loop"
+  (test "--help and --version exit without serving"
+    (let* ((help (spawn-explorer (list "--help")))
+           (help-lines (explorer-lines help))
+           (help-code (process-wait help))
+           (version (spawn-explorer (list "--version")))
+           (version-lines (explorer-lines version))
+           (version-code (process-wait version)))
+      (assert-equal 0 help-code)
+      (assert-true (printed? help-lines "usage:"))
+      (assert-true (printed? help-lines "--data-dir"))
+      (assert-true (not (printed? help-lines "http://")))
+      (assert-equal 0 version-code)
+      (assert-true (printed? version-lines "sigilcoin-explorer 0.1.0"))))
+
+  (test "bounded serving exits after one real request"
+    (let* ((port (explorer-port 1))
+           (child (spawn-peer
+                    (list "--bounded" %dir (number->string port))))
+           (answer (http-get port "/api/summary"))
+           (code (process-wait child)))
+      (assert-true (string? answer))
+      (assert-true (has? answer "\"tip_height\":2"))
+      (assert-equal 0 code)))
+
+  (test "slow client does not delay normal clients"
+    (let* ((port (explorer-port 2))
+           (child (spawn-explorer
+                    (list "--regtest" "--data-dir" %dir
+                          "--port" (number->string port))))
+           (silent (connect-explorer port)))
+      (assert-true (socket? silent))
+      (let* ((started (seconds-now))
+             (summary (http-get port "/api/summary"))
+             (elapsed (- (seconds-now) started)))
+        (assert-true (string? summary))
+        (assert-true (has? summary "HTTP/1.1 200 OK"))
+        (assert-true (has? summary "\"tip_height\":2"))
+        (assert-true (< elapsed 3)))
+      (let ((block (http-get port "/block/2")))
+        (assert-true (string? block))
+        (assert-true (has? block "HTTP/1.1 200 OK")))
+      (socket-close silent)
+      (process-kill! child)
+      (assert-true #t))))
+)
+
+(run-tests)

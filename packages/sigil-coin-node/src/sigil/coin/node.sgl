@@ -1,76 +1,57 @@
-;;; (sigil coin node) — SigilCoin chain configuration
-;;;
-;;; Facade over the modules that turn SigilCoin's consensus rules into
-;;; something `sigil-bitcoin-node` can run:
-;;;
-;;;   (sigil coin node rules)    header acceptance and fork choice
-;;;   (sigil coin node body)     block-body validation and emission
-;;;   (sigil coin node genesis)  the deterministic genesis builder
-;;;   (sigil coin node chain)    the mainnet and regtest chain configs
-;;;   (sigil coin node miner)    assembling a block to submit
-;;;
-;;; A node opens a SigilCoin chain the same way it opens a Bitcoin one:
-;;;
-;;; ```scheme
-;;; (import (sigil bitcoin node) (sigil coin node))
-;;; (define n (node-open sigilcoin-regtest-chain "/tmp/sigilcoin"))
-;;; (header-rules? (chain-config-header-rules sigilcoin-regtest-chain)) ; => #t
-;;; ```
-;;;
-;;; The rules record lives in the config's `extensions`, so nothing in
-;;; `sigil-bitcoin` needs to know what a puzzle is.
+;;; (sigil coin node) — SigilCoin chain configuration and runtime
 
 (define-library (sigil coin node)
   (import (sigil coin node rules)
           (sigil coin node body)
+          (sigil coin node miner)
           (sigil coin node genesis)
-          (sigil coin node chain)
-          (sigil coin node miner))
+          (sigil coin node chain))
   (export
-    ;; Package metadata
     node-package-version
-
-    ;; Header rules
     coin-header-version
-    coin-header-bits
-    coin-header-solution-length
-    coin-header-solution-length-ok?
+    coin-header-score
+    coin-header-score-ok?
+    coin-header-complexity
+    coin-node-puzzle-cache
+    coin-node-puzzle
+    coin-node-puzzle-cache-size
+    coin-header-height
+    coin-window-margins
+    coin-required-complexity
     coin-rank-base
-    coin-solution-saving
+    coin-score-saving
     coin-rank-encode
     coin-rank-accumulated
     coin-rank-tip-saving
-    coin-block-solution-length
     coin-chain-work
     coin-better-chain?
     coin-accept-header?
     coin-header-rules
-
-    ;; Block-body rules
-    coin-min-coinbase-script-bytes
-    coin-max-coinbase-script-bytes
-    coin-coinbase-script-bounds
+    coin-score-for-solution
+    coin-parent-context
+    coin-block-score
     coin-connect-block
     coin-block-rules
-
-    ;; Genesis
+    coin-block-rules-for-genesis
+    coin-table-solution
+    coin-mining-coinbase
+    coin-mining-coinbase/coop
+    coin-build-block
+    coin-build-coop-block
+    coin-genesis-complexity
+    coin-genesis-bits
     coin-genesis-solution
+    coin-genesis-score
     coin-genesis-script-pubkey
     coin-genesis-coinbase
     coin-genesis-block
     coin-genesis-header
     coin-genesis-hash
     coin-genesis-header-hex
-
-    ;; Mining
-    coin-mining-bytes
-    coin-generator-solution
-    coin-mining-coinbase
-    coin-build-block
-    coin-next-block-time
-    coin-mine-block
-
-    ;; Chain configs
+    coin-genesis-header-constant
+    coin-regtest-genesis-header-constant
+    coin-genesis-id-constant
+    coin-regtest-genesis-id-constant
     coin-target-block-spacing
     coin-regtest-min-block-spacing
     coin-chain-min-block-spacing
@@ -79,20 +60,13 @@
     coin-genesis-time
     coin-regtest-genesis-quote
     coin-regtest-genesis-time
-    coin-genesis-header-constant
-    coin-regtest-genesis-header-constant
-    coin-genesis-id-constant
-    coin-regtest-genesis-id-constant
     sigilcoin-consensus-params
     sigilcoin-main-chain
-    sigilcoin-regtest-chain)
+    sigilcoin-regtest-chain
+  )
 
   (begin
-
-    ;;; Version of the node package.
-    ;;;
-    ;;; Example:
-    ;;;   (node-package-version) ;=> "0.1.0"
+    ;;; Version of node package.
     (define (node-package-version)
       (: -> string?)
       "0.1.0")))

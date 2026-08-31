@@ -242,13 +242,13 @@
         (println "max-supply: ~a SGL" (cli-daviwils->sgl coin-max-supply)))
       status)
 
-    ;; The stored work encodes the tip's solution length as a saving, so the
-    ;; length itself is recoverable for display.
+    ;; Recover header score from rank's low saving digit for display.
     (define (coin-solution-bytes-of work)
-      (let ((saving (coin-rank-tip-saving work)))
-        (if (<= saving 0)
-            0
-            (+ 1 (- coin-max-solution-bytes saving)))))
+      (let* ((saving (coin-rank-tip-saving work))
+             (word (- coin-max-score-word saving)))
+        (if (coin-score-valid? word)
+            (coin-score-length (coin-score-decode word))
+            0)))
 
     ;;; Print the node's view of the chain.
     ;;;

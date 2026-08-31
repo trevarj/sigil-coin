@@ -1,6 +1,6 @@
 ;;; Two SigilCoin nodes, two processes, one socket.
 ;;;
-;;; `test-chain.sgl` drives one node through the entry points a peer would
+;;; The node suite drives one node through the entry points a peer would
 ;;; drive. This file puts the second node in its own OPERATING SYSTEM
 ;;; PROCESS and makes the two talk over loopback TCP: separate VMs, separate
 ;;; data directories, separate SQLite handles, no shared memory. That second
@@ -38,7 +38,8 @@
         (sigil bitcoin consensus)
         (sigil bitcoin p2p)
         (sigil bitcoin node)
-        (sigil coin puzzle generator)
+        (sigil secp256k1)
+        (sigil coin puzzle)
         (sigil coin consensus)
         (sigil coin node))
 
@@ -71,12 +72,19 @@
 ;; leave block messages unread in the socket.
 (define %sync-batch "64")
 
+;; Every external resource is registered immediately. Cleanup wraps the whole
+;; harness, so failed assertions cannot leave children, sockets or data dirs.
+(define %children '())
+(define %listeners '())
+(define %nodes '())
+(define %dirs '())
+
 ;; ============================================================
 ;; Scripts and keys
 ;; ============================================================
 
 ;; `OP_RETURN "sg"`: unspendable, so blocks mined only for their height stay
-;; out of every balance. The script `test-chain.sgl` mines to.
+;; out of every balance. The script the single-node fixtures mine to.
 (define %elsewhere #u8(#x6a #x02 #x73 #x67))
 
 ;; `OP_TRUE`: a coinbase anyone can spend with an empty scriptSig.
@@ -139,6 +147,7 @@
                   (append %peer-command args))))
     (unless p
       (error "test-network: could not spawn the peer process"))
+    (set! %children (cons p %children))
     p))
 
 ;;; Everything a peer process printed, as a list of lines.
@@ -195,7 +204,9 @@
         (let ((listener (guard (err (else #f))
                           (tcp-listen port 8 "127.0.0.1"))))
           (if listener
-              (cons port listener)
+              (begin
+                (set! %listeners (cons listener %listeners))
+                (cons port listener))
               (loop (+ %port-base
                        (modulo (+ 1 (- port %port-base)) %port-span))
                     (+ tries 1)))))))
@@ -204,7 +215,7 @@
   (string-append "127.0.0.1:" (number->string port)))
 
 ;; SQLite rows come back keyed by column name; take either a string or a
-;; symbol key, as `test-chain.sgl` does.
+;; symbol key, as the single-node fixtures do.
 (define (row-value row key)
   (let ((entry (assoc key row)))
     (if entry
@@ -294,12 +305,26 @@
   (let ((dir (make-temp-directory)))
     (unless dir
       (error "test-network: could not create a temp directory"))
+    (set! %dirs (cons dir %dirs))
     dir))
 
 ;; `(sigil fs)` deletes one empty directory at a time, and a node directory
 ;; holds a database, its journals and a wallet key.
 (define (remove-tree dir)
   (process-run "rm" "-rf" dir))
+
+(define (cleanup)
+  (for-each (lambda (p)
+              (guard (err (else #f)) (process-kill! p))
+              (guard (err (else #f)) (process-wait p)))
+            %children)
+  (for-each (lambda (s)
+              (guard (err (else #f)) (socket-close s)))
+            %listeners)
+  (for-each (lambda (n)
+              (guard (err (else #f)) (node-close n)))
+            %nodes)
+  (for-each remove-tree %dirs))
 
 ;; The wallet key a peer's data directory holds, planted rather than
 ;; generated so the address it pays to can be checked in.
@@ -335,10 +360,15 @@
 ;; ============================================================
 
 (define (open-node dir)
-  (node-open sigilcoin-regtest-chain dir))
+  (let ((n (node-open sigilcoin-regtest-chain dir)))
+    (set! %nodes (cons n %nodes))
+    n))
 
 (define (block-hash b)
   (block-header-hash (block-header-field b)))
+
+(define (coin-next-block-time parent spacing)
+  (+ (block-header-time parent) (max 1 spacing)))
 
 (define (height-of n)
   (node-status-snapshot-best-height (node-status n)))
@@ -365,11 +395,41 @@
   (node-store-block n b)
   (node-validate-blocks n))
 
+(define (header-row->header row)
+  (block-header-parse (hex-decode (row-value row "header_hex"))))
+
+(define (stored-header n hash)
+  (let ((rows (sqlite-query (node-db n)
+                            "SELECT header_hex FROM headers WHERE hash = ?"
+                            hash)))
+    (and (not (null? rows)) (header-row->header (car rows)))))
+
+;; Canonical validated history through active tip, oldest first.
+(define (validated-headers n)
+  (let loop ((height (best-block-height n))
+             (header (if (= 0 (best-block-height n))
+                         (chain-config-genesis-header (node-config n))
+                         (stored-header n (best-block-hash n))))
+             (out '()))
+    (if (= height 0)
+        (cons header out)
+        (loop (- height 1)
+              (stored-header n
+                (hex-encode (block-header-previous-block header)))
+              (cons header out)))))
+
 (define (mine-blocks n count payout)
   (let loop ((i 0) (blocks '()))
     (if (>= i count)
         (reverse blocks)
-        (let ((b (coin-mine-block n #f "two-node" payout)))
+        (let* ((headers (validated-headers n))
+               (parent (car (reverse headers)))
+               (height (length headers))
+               (complexity (coin-required-complexity headers height))
+               (b (coin-build-block
+                    parent height complexity #f "two-node" payout
+                    (coin-next-block-time parent
+                                          coin-regtest-min-block-spacing))))
           (unless (= 1 (submit n b))
             (error (string-append "test-network: a block did not validate: "
                                   (last-error n))))
@@ -413,13 +473,15 @@
 ;; spaces, which the reader skips — a worse block by SigilCoin's only
 ;; measure, and legal by every other rule. Ranking blocks needs a ladder of
 ;; lengths for a fixed puzzle, and the generator publishes at most two.
-(define (solution-ladder parent-hash height)
-  (let ((best (puzzle-spec-solution (coin-puzzle-for parent-hash height))))
+(define (solution-ladder parent-hash height complexity)
+  (let ((best (utf8->string
+                (coin-table-solution parent-hash height complexity))))
     (list (string-append "  " best) (string-append " " best) best)))
 
-(define (build-at parent height solution graffiti payout)
+(define (build-at parent height complexity solution graffiti payout)
   (coin-build-block parent
                     height
+                    complexity
                     solution
                     graffiti
                     payout
@@ -511,6 +573,110 @@
       (remove-tree dir-b))))
 
 ;; ============================================================
+;; Composite quality over the network
+;; ============================================================
+
+(define %genesis-block
+  (coin-genesis-block coin-regtest-genesis-quote coin-regtest-genesis-time))
+(define %genesis-header (block-header-field %genesis-block))
+
+(define %share-source
+  "(lambda(x)(if(equal? x \"@\")\"adbliemffghlbcgeeajjfndonfkklkafgfnhbobidegaeibjppjmbhpfojnfnnahip\"(cons x(list x x))))")
+
+;; Full-workspace runner omits optional native secp256k1; package runner binds
+;; it and executes Q/replay integration.
+(define %native-secp256k1?
+  (guard (err (#t #f))
+    (and (secp256k1-seckey-verify? (make-bytevector 32 1)) #t)))
+
+(define (signed-share context)
+  (let* ((secret (make-bytevector 32 1))
+         (pubkey (secp256k1-pubkey-create secret))
+         (bytes (string->utf8 %share-source))
+         (preimage (coin-share-preimage
+                     (coin-coop-context-parent-prev-hash context)
+                     (coin-coop-context-puzzle-height context)
+                     (coin-coop-context-complexity context)
+                     bytes
+                     pubkey)))
+    (coin-share pubkey: pubkey
+                signature: (secp256k1-ecdsa-sign secret preimage)
+                blind: (make-bytevector 32 101)
+                solution: bytes)))
+
+(define (block-from-coinbase parent height complexity score coinbase)
+  (block header-field:
+           (block-header version: coin-header-version
+                         previous-block: (block-header-hash parent)
+                         merkle-root: (merkle-root
+                                        (list (transaction-txid coinbase)))
+                         time: (coin-next-block-time
+                                 parent coin-regtest-min-block-spacing)
+                         bits: (coin-bits-encode complexity)
+                         nonce: score)
+         transactions: (list coinbase)))
+
+(when %native-secp256k1?
+  (test-group "sigilcoin composite score and replay"
+  (test "aggregate Q reorganises and replay rejection does not poison"
+    (let* ((dir (fresh-dir))
+           (base (coin-build-block %genesis-header 1 coin-genesis-complexity
+                                   #f "base" %elsewhere
+                                   (+ coin-regtest-genesis-time 1)))
+           (share (signed-share (coin-parent-context base)))
+           (commitment (coin-share-commitment
+                         (coin-parent-context base) share))
+           (parent (coin-build-block %genesis-header 1
+                                     coin-genesis-complexity #f "commit"
+                                     %elsewhere
+                                     (+ coin-regtest-genesis-time 1)
+                                     '() 0 (list commitment)))
+           (q0 (coin-build-block (block-header-field parent) 2
+                                 coin-genesis-complexity #f "solo"
+                                 %elsewhere
+                                 (+ coin-regtest-genesis-time 2)))
+           (q1 (coin-build-coop-block parent 2 coin-genesis-complexity #f
+                                      (list share) "coop" %elsewhere
+                                      (+ coin-regtest-genesis-time 2)))
+           (score0 (coin-score-decode
+                     (block-header-nonce (block-header-field q0))))
+           (score1 (coin-score-decode
+                     (block-header-nonce (block-header-field q1))))
+           (n (open-node dir)))
+      (assert-equal (coin-score-length score0) (coin-score-length score1))
+      (assert-equal (coin-score-memory score0) (coin-score-memory score1))
+      (assert-equal (coin-score-steps score0) (coin-score-steps score1))
+      (assert-true (> (coin-score-quality score1)
+                      (coin-score-quality score0)))
+      (assert-equal 1 (submit n parent))
+      (assert-equal 1 (submit n q0))
+      (assert-equal 1 (submit n q1))
+      (assert-true (tip-is? n q1))
+      ;; Reusing H1's signed share at H3 is a replay.
+      (let* ((h3 3)
+             (parent-header (block-header-field q1))
+             (solution (coin-table-solution
+                         (block-header-hash parent-header)
+                         h3 coin-genesis-complexity))
+             (scored (coin-result-value
+                       (coin-score-for-solution
+                         (block-header-hash parent-header)
+                         h3 coin-genesis-complexity solution 0)))
+             (coinbase (coin-mining-coinbase/coop
+                         h3 solution (list share) '() "replay" %elsewhere
+                         (coin-carrier-script q1) 0))
+             (replay (block-from-coinbase parent-header h3
+                                           coin-genesis-complexity
+                                           scored coinbase)))
+        (assert-equal 0 (submit n replay))
+        (assert-true (string-contains? (last-error n) "share"))
+        ;; Honest H3 still confirms after rejected replay.
+        (let ((honest (car (mine-blocks n 1 %elsewhere))))
+          (assert-true (tip-is? n honest))
+          (assert-equal 3 (validated-count n))))
+      (node-close n)))))
+
+;; ============================================================
 ;; Spending across nodes
 ;; ============================================================
 ;;
@@ -543,12 +709,12 @@
                        outputs: (list (txout value: (coin-block-reward 1)
                                              script-pubkey: to-script))
                        lock-time: 0))
+           (history (validated-headers a))
+           (complexity (coin-required-complexity history 101))
            (payment (coin-build-block parent
                                       101
-                                      (puzzle-spec-solution
-                                        (coin-puzzle-for
-                                          (block-header-hash parent)
-                                          101))
+                                      complexity
+                                      #f
                                       "payment"
                                       %anyone
                                       (coin-next-block-time
@@ -618,16 +784,20 @@
            (a (open-node dir-a))
            (blocks (mine-blocks a 2 %elsewhere))
            (parent (block-header-field (list-ref blocks 1)))
-           (ladder (solution-ladder (block-header-hash parent) 3))
-           (long (build-at parent 3 (car ladder) "par" %elsewhere))
-           (shorter (build-at parent 3 (cadr ladder) "golfed" %elsewhere))
-           (shortest (build-at parent 3 (caddr ladder) "late" %elsewhere)))
-      ;; Three legal blocks at one height, strictly ordered by the only
-      ;; thing SigilCoin ranks by.
-      (assert-true (> (coin-block-solution-length long)
-                      (coin-block-solution-length shorter)))
-      (assert-true (> (coin-block-solution-length shorter)
-                      (coin-block-solution-length shortest)))
+           (complexity coin-genesis-complexity)
+           (ladder (solution-ladder (block-header-hash parent) 3 complexity))
+           (long (build-at parent 3 complexity (car ladder) "par" %elsewhere))
+           (shorter (build-at parent 3 complexity (cadr ladder) "golfed" %elsewhere))
+           (equal (build-at parent 3 complexity (cadr ladder) "equal" %elsewhere))
+           (shortest (build-at parent 3 complexity (caddr ladder) "late" %elsewhere)))
+      ;; Composite score orders better programs and leaves exact ties
+      ;; incomparable, independent of block hash or graffiti.
+      (assert-true (> (block-header-nonce (block-header-field long))
+                      (block-header-nonce (block-header-field shorter))))
+      (assert-equal (block-header-nonce (block-header-field shorter))
+                    (block-header-nonce (block-header-field equal)))
+      (assert-true (> (block-header-nonce (block-header-field shorter))
+                      (block-header-nonce (block-header-field shortest))))
       (assert-equal 1 (submit a long))
       (assert-true (tip-is? a long))
       ;; The peer takes the longer solution from the node that mined it.
@@ -669,6 +839,22 @@
                           (map (lambda (r) (row-value r "created_by"))
                                (active-utxos b)))
             (node-close b))
+          ;; Equal-score sibling is first-seen: it cannot replace `shorter`
+          ;; locally or over TCP, regardless of its different block hash.
+          (let ((d (node-with-blocks dir-d blocks)))
+            (assert-equal 1 (submit d equal))
+            (assert-equal 0 (submit c equal))
+            (let* ((endpoint-d (open-endpoint))
+                   (port-d (car endpoint-d))
+                   (listener-d (cdr endpoint-d)))
+              (sync-peer-ok d listener-d port-d dir-b 1)
+              (socket-close listener-d))
+            (let ((b (open-node dir-b)))
+              (assert-true (tip-is? b shorter))
+              (node-close b))
+            ;; Keep this node for the post-settlement better sibling.
+            (assert-equal 1 (submit d shortest))
+            (node-close d))
           ;; A child settles height 3 on both nodes.
           (let ((child (car (mine-blocks c 1 %elsewhere))))
             (assert-equal 4 (best-block-height c))
@@ -683,18 +869,14 @@
             (assert-equal 4 (best-block-height c))
             (assert-true (tip-is? c child))
             (node-close c)
-            ;; And the peer refuses it over the wire, offered by a third
-            ;; node whose own tip it is.
-            (let ((d (node-with-blocks dir-d blocks)))
-              (assert-equal 1 (submit d shortest))
+            ;; Peer refuses it over wire, offered by node whose tip is the
+            ;; late better sibling.
+            (let ((d (open-node dir-d)))
               (assert-true (tip-is? d shortest))
               (let* ((endpoint-d (open-endpoint))
                      (port-d (car endpoint-d))
                      (listener-d (cdr endpoint-d)))
                 (let ((lines (sync-peer-ok d listener-d port-d dir-b 1)))
-                  ;; The header may become the best one the peer has — that
-                  ;; is what committing the solution length to the header
-                  ;; buys — but the validated chain does not move.
                   (assert-equal "4" (peer-field lines "best-block-height"))
                   (assert-equal (hex-encode (block-hash child))
                                 (peer-field lines "best-block-hash")))
@@ -712,6 +894,57 @@
       (remove-tree dir-d))))
 
 ;; ============================================================
+;; Bodyless best-header liveness
+;; ============================================================
+
+(define (request-blocks-from-silent-peer n)
+  (node-download-blocks n
+                        (lambda () (error "silent peer"))
+                        (lambda (envelope) #t)
+                        0
+                        8))
+
+(test-group "sigilcoin bodyless header"
+  (test "give-up releases best-header slot and late body restores reorg"
+    (let* ((dir (fresh-dir))
+           (n (open-node dir))
+           (blocks (mine-blocks n 2 %elsewhere))
+           (parent (block-header-field (list-ref blocks 1)))
+           (complexity coin-genesis-complexity)
+           (ladder (solution-ladder (block-header-hash parent) 3 complexity))
+           (incumbent (build-at parent 3 complexity (car ladder)
+                                "incumbent" %elsewhere))
+           (late (build-at parent 3 complexity (caddr ladder)
+                           "late-body" %elsewhere))
+           (late-hash (hex-encode (block-hash late))))
+      (assert-equal 1 (submit n incumbent))
+      (assert-equal 1
+                    (node-ingest-headers n (list (block-header-field late))))
+      (assert-equal late-hash
+                    (node-status-snapshot-best-hash (node-status n)))
+      (request-blocks-from-silent-peer n)
+      (assert-equal late-hash
+                    (node-status-snapshot-best-hash (node-status n)))
+      (let loop ((attempts 1))
+        (cond ((not (string=? late-hash
+                              (node-status-snapshot-best-hash
+                                (node-status n))))
+               (assert-true (> attempts 1)))
+              ((> attempts 32)
+               (error "bodyless header never released best-header slot"))
+              (else
+               (request-blocks-from-silent-peer n)
+               (loop (+ attempts 1)))))
+      (assert-true (tip-is? n incumbent))
+      ;; Give-up deprioritises, never invalidates. Late body remains eligible
+      ;; and performs same honest reorganisation it would have on time.
+      (node-store-block n late)
+      (assert-equal 1 (node-validate-blocks n))
+      (assert-true (tip-is? n late))
+      (assert-equal 3 (validated-count n))
+      (node-close n))))
+
+;; ============================================================
 ;; An invalid block from a peer
 ;; ============================================================
 
@@ -726,8 +959,8 @@
            (parent (block-header-field honest-tip))
            (honest (build-at parent
                              4
-                             (puzzle-spec-solution
-                               (coin-puzzle-for (block-header-hash parent) 4))
+                             coin-genesis-complexity
+                             #f
                              "lie"
                              %elsewhere))
            (header (block-header-field honest))
@@ -743,11 +976,14 @@
                                           (block-header-merkle-root header)
                                         time: (block-header-time header)
                                         bits: (block-header-bits header)
-                                        nonce: 1)
+                                        nonce: (coin-score-pack 1 0 0 15))
                         transactions: (block-transactions honest))))
-      (assert-true (> (coin-block-solution-length liar)
-                      (coin-header-solution-length
-                        (block-header-field liar))))
+      (assert-true (> (coin-score-length
+                        (coin-score-decode
+                          (block-header-nonce (block-header-field honest))))
+                      (coin-score-length
+                        (coin-score-decode
+                          (block-header-nonce (block-header-field liar))))))
       ;; The peer starts on the honest chain.
       (let* ((endpoint (open-endpoint))
              (port (car endpoint))
@@ -792,7 +1028,7 @@
           (assert-equal "invalid" (row-value row "status"))
           (assert-equal 0 (row-value row "validated"))
           (assert-true (string-contains? (row-value row "last_error")
-                                         "solution-length-mismatch")))
+                                         "score-mismatch")))
         ;; The lie is permanent: the header is marked invalid, so the branch
         ;; cannot be retried into the peer.
         (assert-equal 0
@@ -822,4 +1058,7 @@
       (remove-tree dir-b)
       (remove-tree dir-bad))))
 
-(run-tests)
+(dynamic-wind
+  (lambda () #t)
+  (lambda () (run-tests))
+  cleanup)

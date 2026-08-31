@@ -1,7 +1,7 @@
 ;;; (sigil coin explorer) — the read-only SigilCoin chain explorer
 ;;;
-;;; Facade over the explorer's modules. Consensus v2 owns all wire codecs;
-;;; `(sigil coin explorer v2)` contains presentation helpers only.
+;;; Facade over the explorer's modules. Consensus canonical owns all wire codecs;
+;;; `(sigil coin explorer derive)` contains presentation helpers only.
 ;;;
 ;;;   (sigil coin explorer store)   read-only reads from a node's database
 ;;;   (sigil coin explorer render)  escaping, HTML pages, JSON bodies
@@ -65,7 +65,6 @@
     explorer-block-solution-length
     explorer-block-graffiti
     explorer-block-par
-    explorer-block-target
     explorer-block-seed
     explorer-block-reward
     explorer-block-payout-script
@@ -75,9 +74,7 @@
     explorer-block-problem
     explorer-block-under-par
 
-    ;; Store: blocks, v2
-    explorer-block-version
-    explorer-block-v2?
+    ;; Store: blocks, canonical
     explorer-block-complexity
     explorer-block-constraint
     explorer-block-constraint-text
@@ -142,11 +139,9 @@
     explorer-summary-next-height
     explorer-summary-next-reward
     explorer-summary-next-halving-height
-    explorer-summary-puzzle-target
     explorer-summary-puzzle-par
     explorer-summary-puzzle-seed
     explorer-summary-empty
-    explorer-summary-version
     explorer-summary-complexity
     explorer-summary-next-complexity
     explorer-summary-next-retarget-height
