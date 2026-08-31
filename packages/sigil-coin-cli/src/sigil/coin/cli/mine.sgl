@@ -23,6 +23,7 @@
           (only (sigil coin consensus shares)
                 coin-check-share-solution/spec)
           (sigil coin node)
+          (sigil coin cli history)
           (sigil coin cli args)
           (sigil coin cli wallet)
           (sigil coin cli support))
@@ -340,15 +341,6 @@
       (let ((digits (number->string w 16)))
         (string-append "0x" (string-pad digits 8 #\0))))
 
-    ;; Canonical validated history through the parent, oldest first.
-    (define (coin-validated-headers n)
-      (let ((tip (coin-validated-tip-height n)))
-        (let loop ((height 0) (out '()))
-          (if (> height tip)
-              (reverse out)
-              (loop (+ height 1)
-                    (cons (coin-header-at-height n height) out))))))
-
     ;;; Everything a command needs for one puzzle height.
     (define (coin-puzzle-context n args)
       (: node? list? -> list?)
@@ -368,7 +360,7 @@
                              (cli-complexity (block-header-bits parent)
                                              override)
                              (coin-required-complexity
-                               (coin-validated-headers n)
+                               (coin-canonical-history n parent height)
                                height))))
         (list (cons 'height height)
               (cons 'parent parent)
@@ -525,6 +517,233 @@
              (filter (lambda (record) (record-for-context? record context))
                      (cli-commit-records data-dir)))))
 
+    (define (result-reason result)
+      (string-append
+        (symbol->string (coin-result-reason result))
+        (let ((detail (coin-result-detail result)))
+          (if (and (string? detail) (not (string=? detail "")))
+              (string-append ": " detail)
+              ""))))
+
+    ;; Accept either one record (`commitment:` / `share:` output) or a whole
+    ;; canonical push (`commits-push:` / `shares-push:` output).
+    (define (decode-commit-input text)
+      (guard (e (#t (cons '() "malformed hexadecimal")))
+        (let* ((bytes (hex-decode text))
+               (push (if (= coin-commitment-bytes (bytevector-length bytes))
+                         (bytevector-append #u8(1) bytes)
+                         bytes))
+               (decoded (coin-commits-decode push)))
+          (if (coin-ok? decoded)
+              (cons (coin-result-value decoded) #f)
+              (cons '() (result-reason decoded))))))
+
+    (define (decode-share-input text)
+      (guard (e (#t (cons '() "malformed hexadecimal")))
+        (let* ((bytes (hex-decode text))
+               (push-result (coin-shares-decode bytes))
+               (decoded (if (coin-ok? push-result)
+                            push-result
+                            (coin-shares-decode
+                              (bytevector-append #u8(1) bytes)))))
+          (if (coin-ok? decoded)
+              (cons (coin-result-value decoded) #f)
+              (cons '() (result-reason decoded))))))
+
+    ;; Return `(records . rejections)`. A rejection is `(id . reason)`.
+    (define (decode-inputs texts prefix decode)
+      (let loop ((xs texts) (index 1) (records '()) (rejected '()))
+        (if (null? xs)
+            (cons (reverse records) (reverse rejected))
+            (let ((decoded (decode (car xs))))
+              (if (cdr decoded)
+                  (loop (cdr xs) (+ index 1) records
+                        (cons (cons (string-append
+                                     prefix "-input-" (number->string index))
+                                    (cdr decoded))
+                              rejected))
+                  (loop (cdr xs) (+ index 1)
+                        (append (reverse (car decoded)) records)
+                        rejected))))))
+
+    (define (bytes-member? value values)
+      (cond ((null? values) #f)
+            ((equal? value (car values)) #t)
+            (else (bytes-member? value (cdr values)))))
+
+    ;; Consensus order, exact dedup, then K16.
+    (define (select-commitments values rejections)
+      (let loop ((xs (cli-sort-bytes values)) (accepted '())
+                 (rejected rejections))
+        (cond
+          ((null? xs) (cons (reverse accepted) (reverse rejected)))
+          ((bytes-member? (car xs) accepted)
+           (loop (cdr xs) accepted
+                 (cons (cons (hex (car xs)) "duplicate") rejected)))
+          ((>= (length accepted) coin-max-commitments)
+           (loop (cdr xs) accepted
+                 (cons (cons (hex (car xs)) "commitment cap is 16")
+                       rejected)))
+          (else (loop (cdr xs) (cons (car xs) accepted) rejected)))))
+
+    (define (share-id share) (hex (coin-share-pubkey share)))
+
+    ;; A validated candidate is `(share contribution)`. Higher consensus
+    ;; contribution wins; commitment and canonical record bytes break ties.
+    (define (valid-share<? context a b)
+      (let* ((as (car a)) (bs (car b))
+             (ap (coin-share-pubkey as)) (bp (coin-share-pubkey bs))
+             (aq (list-ref a 1)) (bq (list-ref b 1))
+             (ac (coin-share-commitment context as))
+             (bc (coin-share-commitment context bs)))
+        (or (cli-bytes<? ap bp)
+            (and (equal? ap bp)
+                 (or (> aq bq)
+                     (and (= aq bq)
+                          (or (cli-bytes<? ac bc)
+                              (and (equal? ac bc)
+                                   (cli-bytes<? (coin-share-encode as)
+                                                (coin-share-encode bs))))))))))
+
+    (define (sort-valid-shares context candidates)
+      (let loop ((xs candidates) (out '()))
+        (if (null? xs)
+            out
+            (loop
+              (cdr xs)
+              (let insert ((ys out))
+                (cond ((null? ys) (list (car xs)))
+                      ((valid-share<? context (car xs) (car ys))
+                       (cons (car xs) ys))
+                      (else (cons (car ys) (insert (cdr ys))))))))))
+
+    ;; Validate every raw candidate before it can consume a pubkey or R8 slot.
+    (define (validate-share-candidates context producer shares rejections)
+      (let loop ((xs shares) (valid '())
+                 (rejected (reverse rejections)))
+        (if (null? xs)
+            (cons (reverse valid) (reverse rejected))
+            (let* ((share (car xs))
+                   (checked (and context
+                                 (coin-check-shares
+                                   context producer (list share)))))
+              (if (and checked (coin-ok? checked))
+                  (loop (cdr xs)
+                        (cons (list share
+                                    (coin-share-quality context share))
+                              valid)
+                        rejected)
+                  (loop (cdr xs) valid
+                        (cons (cons (share-id share)
+                                    (if checked
+                                        (string-append
+                                          (result-reason checked)
+                                          (if (eq? (coin-result-reason checked)
+                                                   'share-uncommitted)
+                                              " (expired or wrong branch)"
+                                              ""))
+                                        "no eligible parent commitments"))
+                              rejected)))))))
+
+    ;; Choose one best validated candidate per pubkey, then enforce set-level
+    ;; source uniqueness and R8 in canonical pubkey order.
+    (define (select-valid-shares context producer validated)
+      (let dedup ((xs (sort-valid-shares context (car validated)))
+                  (previous #f) (unique '())
+                  (rejected (reverse (cdr validated))))
+        (if (null? xs)
+            (let cap ((rest (reverse unique))
+                      (solutions (list (string->utf8 producer)))
+                      (accepted '()) (rejected rejected))
+              (if (null? rest)
+                  (cons (reverse accepted) (reverse rejected))
+                  (let* ((share (car (car rest)))
+                         (solution (coin-share-solution share)))
+                    (cond
+                      ((bytes-member? solution solutions)
+                       (cap (cdr rest) solutions accepted
+                            (cons (cons (share-id share)
+                                        "duplicate solution")
+                                  rejected)))
+                      ((>= (length accepted) coin-max-shares)
+                       (cap (cdr rest) solutions accepted
+                            (cons (cons (share-id share)
+                                        "share cap is 8")
+                                  rejected)))
+                      (else
+                        (cap (cdr rest) (cons solution solutions)
+                             (cons share accepted) rejected))))))
+            (let* ((candidate (car xs))
+                   (pubkey (coin-share-pubkey (car candidate))))
+              (if (and previous (equal? pubkey previous))
+                  (dedup (cdr xs) previous unique
+                         (cons (cons (share-id (car candidate))
+                                     "duplicate pubkey (nonchosen valid candidate)")
+                               rejected))
+                  (dedup (cdr xs) pubkey (cons candidate unique)
+                         rejected))))))
+
+    ;; Consensus rechecks the selected aggregate and remains final authority.
+    (define (validate-shares context producer shares rejections)
+      (let* ((validated (validate-share-candidates
+                          context producer shares rejections))
+             (selected (select-valid-shares context producer validated))
+             (ordered (car selected)))
+        (if (null? ordered)
+            (list ordered (cdr selected) 0)
+            (let ((checked (coin-check-shares context producer ordered)))
+              (unless (coin-ok? checked)
+                (error (string-append
+                         "mine: accepted reveal set failed consensus: "
+                         (result-reason checked))))
+              (list ordered (cdr selected)
+                    (coin-shares-quality context ordered))))))
+
+    (define (validated-parent-block n parent)
+      (let ((rows (sqlite-query
+                    (node-db n)
+                    "SELECT block_hex FROM blocks WHERE hash = ? AND validated = 1 AND block_hex IS NOT NULL LIMIT 1"
+                    (hex (block-header-hash parent)))))
+        (and (pair? rows)
+             (block-parse (hex-decode (row-ref (car rows) "block_hex"))))))
+
+    (define (print-contributions commitments commit-rejected shares
+                                    share-rejected context quality)
+      (for-each (lambda (commitment)
+                  (println "accepted-commitment: ~a" (hex commitment)))
+                commitments)
+      (for-each (lambda (entry)
+                  (println "rejected-commitment: ~a reason=~a"
+                           (car entry) (cdr entry)))
+                commit-rejected)
+      (for-each (lambda (share)
+                  (println "accepted-share: ~a quality=~a"
+                           (share-id share)
+                           (coin-share-quality context share)))
+                shares)
+      (for-each (lambda (entry)
+                  (println "rejected-share: ~a reason=~a"
+                           (car entry) (cdr entry)))
+                share-rejected)
+      (println "aggregate-q: ~a" quality))
+
+    (define (print-payouts b shares)
+      (let ((outputs (transaction-outputs (car (block-transactions b))))
+            (count (length shares)))
+        (let loop ((xs outputs) (index 0))
+          (unless (null? xs)
+            (let ((role (cond ((= index 0) "producer")
+                              ((<= index count) "share")
+                              (else "carrier"))))
+              (println "payout: role=~a~a value=~a SGL"
+                       role
+                       (if (string=? role "share")
+                           (string-append " id="
+                             (share-id (list-ref shares (- index 1))))
+                           "")
+                       (cli-daviwils->sgl (txout-value (car xs))))
+              (loop (cdr xs) (+ index 1)))))))
+
     ;;; Check a candidate, then submit canonical producer work.
     ;;; `--share` checks personalized work without publishing its source.
     (define (run-mine args)
@@ -548,38 +767,42 @@
                                      (cli-score-report spec solution 0)))
                    (under-par? (< (cdr (assq 'length preliminary))
                                   (puzzle-spec-par spec)))
-                   (quality (if (and share? under-par?)
-                                (list-ref
-                                  (require-share-solution
-                                    "mine" coop pubkey
-                                    (make-bytevector coin-share-blind-bytes 0)
-                                    solution spec)
-                                  3)
-                                0))
-                   (score (if (= quality 0)
-                              preliminary
-                              (cli-score-report spec solution quality)))
-                   (baseline (cli-score-report spec fallback 0)))
-              (println "height: ~a" height)
-              (when share?
-                (println "personalized-pubkey: ~a" (hex pubkey)))
-              (println "complexity: ~a" (report-ref context 'complexity))
-              (println "constraint: ~a"
-                       (cli-constraint-detail
-                         (puzzle-spec-constraint spec)
-                         (coin-spec-builtin-cap spec)))
-              (println "examples-reproduced: ~a of ~a"
-                       (puzzle-spec-k spec) (puzzle-spec-k spec))
-              (print-score score (puzzle-spec-par spec))
-              (println "fallback-score: ~a"
-                       (score-word->string (cdr (assq 'word baseline))))
-              (println "outranks-fallback: ~a"
-                       (if (coin-score-better? (cdr (assq 'word score))
-                                               (cdr (assq 'word baseline)))
-                           "yes" "no"))
+                   (preview-quality
+                     (if (and share? under-par?)
+                         (list-ref
+                           (require-share-solution
+                             "mine" coop pubkey
+                             (make-bytevector coin-share-blind-bytes 0)
+                             solution spec)
+                           3)
+                         0)))
               (if share?
-                  (begin
-                    (println "share-eligible: ~a" (if under-par? "yes" "no"))
+                  (let ((score (if (= preview-quality 0)
+                                   preliminary
+                                   (cli-score-report
+                                     spec solution preview-quality)))
+                        (baseline (cli-score-report spec fallback 0)))
+                    (println "height: ~a" height)
+                    (println "personalized-pubkey: ~a" (hex pubkey))
+                    (println "complexity: ~a"
+                             (report-ref context 'complexity))
+                    (println "constraint: ~a"
+                             (cli-constraint-detail
+                               (puzzle-spec-constraint spec)
+                               (coin-spec-builtin-cap spec)))
+                    (println "examples-reproduced: ~a of ~a"
+                             (puzzle-spec-k spec) (puzzle-spec-k spec))
+                    (print-score score (puzzle-spec-par spec))
+                    (println "fallback-score: ~a"
+                             (score-word->string
+                               (cdr (assq 'word baseline))))
+                    (println "outranks-fallback: ~a"
+                             (if (coin-score-better?
+                                   (cdr (assq 'word score))
+                                   (cdr (assq 'word baseline)))
+                                 "yes" "no"))
+                    (println "share-eligible: ~a"
+                             (if under-par? "yes" "no"))
                     (println "submitted: no")
                     score)
                   (let* ((address (cli-arg args "--address" #f))
@@ -593,21 +816,85 @@
                          (spacing (coin-chain-min-block-spacing
                                     (node-config n)))
                          (time (require-spacing parent spacing))
-                         (commitments (context-commitments data-dir context)))
+                         (decoded-commits
+                           (decode-inputs
+                             (cli-arg-list args "--commit")
+                             "commit" decode-commit-input))
+                         (commit-selection
+                           (select-commitments
+                             (append (context-commitments data-dir context)
+                                     (car decoded-commits))
+                             (cdr decoded-commits)))
+                         (commitments (car commit-selection))
+                         (decoded-shares
+                           (decode-inputs
+                             (cli-arg-list args "--reveal")
+                             "reveal" decode-share-input))
+                         (parent-block
+                           (and (pair? (car decoded-shares))
+                                (validated-parent-block n parent)))
+                         (parent-context
+                           (and parent-block
+                                (coin-parent-context parent-block)))
+                         (share-validation
+                           (validate-shares
+                             parent-context solution
+                             (car decoded-shares) (cdr decoded-shares)))
+                         (shares (list-ref share-validation 0))
+                         (share-rejected (list-ref share-validation 1))
+                         (quality (list-ref share-validation 2))
+                         (score (if (= quality 0)
+                                    preliminary
+                                    (cli-score-report spec solution quality)))
+                         (baseline (cli-score-report spec fallback 0)))
                     (when (> (bytevector-length (string->utf8 graffiti))
                              coin-max-graffiti-bytes)
                       (error "--graffiti: text exceeds consensus byte cap"))
+                    (println "height: ~a" height)
+                    (println "complexity: ~a"
+                             (report-ref context 'complexity))
+                    (println "constraint: ~a"
+                             (cli-constraint-detail
+                               (puzzle-spec-constraint spec)
+                               (coin-spec-builtin-cap spec)))
+                    (println "examples-reproduced: ~a of ~a"
+                             (puzzle-spec-k spec) (puzzle-spec-k spec))
+                    (print-score score (puzzle-spec-par spec))
+                    (println "fallback-score: ~a"
+                             (score-word->string
+                               (cdr (assq 'word baseline))))
+                    (println "outranks-fallback: ~a"
+                             (if (coin-score-better?
+                                   (cdr (assq 'word score))
+                                   (cdr (assq 'word baseline)))
+                                 "yes" "no"))
+                    (print-contributions
+                      commitments (cdr commit-selection)
+                      shares share-rejected parent-context quality)
                     (let* ((build
                              (lambda (txs fees)
-                               (coin-build-block
-                                 parent height
-                                 (report-ref context 'complexity)
-                                 solution graffiti payout time
-                                 txs fees commitments)))
+                               (if (null? shares)
+                                   (coin-build-block
+                                     parent height
+                                     (report-ref context 'complexity)
+                                     solution graffiti payout time
+                                     txs fees commitments)
+                                   (coin-build-coop-block
+                                     parent-block height
+                                     (report-ref context 'complexity)
+                                     solution shares graffiti payout time
+                                     txs fees commitments))))
                            (selected (coin-select-block-transactions
                                       n height build))
                            (b (build (car selected) (cdr selected)))
+                           (size (coin-block-size b))
                            (header (block-header-field b)))
+                      (unless (and size (<= size coin-max-block-bytes))
+                        (error (string-append
+                                 "mine: block is "
+                                 (number->string (or size -1))
+                                 " bytes; consensus cap is "
+                                 (number->string coin-max-block-bytes))))
                       (node-ingest-headers n (list header))
                       (node-store-block n b)
                       (unless (= 1 (node-validate-blocks n))
@@ -616,8 +903,10 @@
                                  (node-status-snapshot-sync-last-error
                                    (node-status n)))))
                       (println "block: ~a" (block-header-id header))
+                      (println "block-bytes: ~a" size)
                       (println "transactions: ~a"
                                (length (car selected)))
+                      (print-payouts b shares)
                       (println "submitted: yes")
                       b))))))))
 

@@ -1,0 +1,26 @@
+;;; Test-solution fixture for the local regtest drill.
+
+(package
+  name: "sigil-coin-local-testnet"
+  version: "0.1.0"
+  sigil: "0.20"
+  entry: '(sigil coin local-testnet)
+  bundle-name: "sigil-coin-local-testnet"
+
+  configs: (list
+    (config name: 'dev output-dir: "build/dev" bundle?: #t))
+
+  dependencies: (list
+    (from-git url: "codeberg:sigil/sigil-crypto" version: "^0.16.1")
+    (from-path dir: "../.." package: "sigil-coin-cli")
+    (from-path dir: "../.." package: "sigil-coin-node")
+    (from-path dir: "../.." package: "sigil-coin-consensus")
+    (from-path dir: "../.." package: "sigil-coin-puzzle")
+    (from-path dir: "../../../sigil-bitcoin" package: "sigil-bitcoin-node")
+    (from-git url: "codeberg:sigil/sigil-sqlite" version: "^0.16.0"))
+
+  tasks: (list
+    (task
+      name: 'build
+      steps: (list
+        (compile-sigil-modules sources: "src/**/*.sgl")))))

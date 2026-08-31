@@ -1,0 +1,77 @@
+;;; (sigil coin local-testnet) — test-solution fixture for the local drill
+
+(define-library (sigil coin local-testnet)
+  (import (sigil io)
+          (sigil process)
+          (sigil string)
+          (sigil bitcoin node)
+          (sigil coin puzzle generator)
+          (sigil coin consensus)
+          (only (sigil coin consensus shares)
+                coin-check-share-solution/spec)
+          (sigil coin node)
+          (sigil coin cli mine)
+          (sigil coin cli wallet))
+  (export main)
+
+  (begin
+    (define (application-args raw)
+      (let loop ((xs raw))
+        (cond ((null? xs) raw)
+              ((string=? (car xs) "--") (cdr xs))
+              (else (loop (cdr xs))))))
+
+    (define (field alist key)
+      (cdr (assq key alist)))
+
+    ;; Parser sees parentheses as delimiters. Removing adjacent spaces keeps
+    ;; behavior while making generator source strictly under par.
+    (define (golf source)
+      (let loop ((text source) (i 1))
+        (let ((n (string-length text)))
+          (cond ((>= i (- n 1)) text)
+                ((and (char=? #\space (string-ref text i))
+                      (or (char=? #\( (string-ref text (+ i 1)))
+                          (char=? #\' (string-ref text (+ i 1)))
+                          (char=? #\" (string-ref text (+ i 1)))
+                          (char=? #\) (string-ref text (- i 1)))))
+                 (loop (string-append (substring text 0 i)
+                                      (substring text (+ i 1) n))
+                       1))
+                (else (loop text (+ i 1)))))))
+
+    ;; This fixture only supplies a test solution because the CLI has no
+    ;; solver. Commit aggregation, reveal aggregation, mining and submission
+    ;; remain canonical CLI operations.
+    (define (solve-share data-dir)
+      (let* ((key (wallet-key data-dir))
+             (pubkey (wallet-public-key key))
+             (n (node-open sigilcoin-regtest-chain data-dir))
+             (context (coin-puzzle-context
+                        n (list "--regtest" "--data-dir" data-dir)))
+             (coop (coin-coop-context
+                     parent-prev-hash: (field context 'parent-hash)
+                     puzzle-height: (field context 'height)
+                     complexity: (field context 'complexity)
+                     spec: (field context 'spec)
+                     commits: '()))
+             (spec (coin-share-puzzle coop pubkey))
+             (solution (golf (puzzle-spec-hidden-source spec)))
+             (checked (coin-check-share-solution/spec spec solution)))
+        (node-close n)
+        (when (or (coin-failed? checked)
+                  (>= (string-length solution) (puzzle-spec-par spec)))
+          (error (string-append
+                   "local-testnet: could not derive strictly under-par share work; hidden="
+                   (puzzle-spec-hidden-source spec)
+                   " candidate=" solution
+                   " par=" (number->string (puzzle-spec-par spec))
+                   " candidate-bytes=" (number->string (string-length solution)))))
+        (println "~a" solution)))
+
+    (define (main)
+      (let ((args (application-args (cdr (command-line)))))
+        (if (and (= 2 (length args))
+                 (string=? (car args) "solve-share"))
+            (solve-share (cadr args))
+            (error "usage: sigil-coin-local-testnet solve-share DATA_DIR"))))))

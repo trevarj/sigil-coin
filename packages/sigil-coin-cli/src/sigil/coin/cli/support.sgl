@@ -84,7 +84,7 @@
           (let ((decoded (coin-bits-decode parent-bits)))
             (if (coin-ok? decoded)
                 (coin-result-value decoded)
-                coin-complexity-genesis))))
+                (error "puzzle: parent header has invalid complexity bits")))))
 
     ;;; Derive the program-by-example puzzle for a height.
     ;;;

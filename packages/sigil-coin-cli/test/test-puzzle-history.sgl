@@ -1,0 +1,204 @@
+;;; Historical CLI puzzles follow validated parent ancestry across retargets.
+
+(import (sigil test)
+        (sigil fs)
+        (sigil io)
+        (sigil string)
+        (sigil error)
+        (sigil sqlite)
+        (sigil bitcoin primitives)
+        (sigil bitcoin encoding)
+        (sigil bitcoin consensus)
+        (sigil bitcoin node)
+        (sigil coin puzzle)
+        (sigil coin puzzle generator)
+        (sigil coin consensus)
+        (sigil coin node)
+        (sigil coin cli history)
+        (sigil coin cli))
+
+(define %payout #u8(#x6a #x02 #x68 #x69))
+
+(define (last-of xs)
+  (if (null? (cdr xs)) (car xs) (last-of (cdr xs))))
+
+(define (prefix xs count)
+  (if (or (= count 0) (null? xs))
+      '()
+      (cons (car xs) (prefix (cdr xs) (- count 1)))))
+
+(define (context-ref context key)
+  (cdr (assq key context)))
+
+(define (message-of err)
+  (let ((message (exception-message err)))
+    (if (string? message) message "")))
+
+(define (raised-message thunk)
+  (guard (err (#t (message-of err)))
+    (thunk)
+    #f))
+
+(define (cli-output args)
+  (with-output-to-string (lambda () (cli-run args))))
+
+(define (cli-failure args)
+  (let ((message #f))
+    (with-output-to-string
+      (lambda ()
+        (set! message (raised-message (lambda () (cli-run args))))))
+    message))
+
+(define (complexity-of header)
+  (let ((decoded (coin-header-complexity header)))
+    (unless (coin-ok? decoded)
+      (error "test-puzzle-history: generated header has invalid bits"))
+    (coin-result-value decoded)))
+
+(define (build-block n history height hidden? label)
+  (let* ((parent (last-of history))
+         (complexity (coin-required-complexity history height))
+         (solution
+           (and hidden?
+                (puzzle-spec-hidden-source
+                  (coin-puzzle-for
+                    (block-header-hash parent) height complexity)))))
+    (coin-build-block
+      parent height complexity solution label %payout
+      (+ (block-header-time parent)
+         (coin-chain-min-block-spacing (node-config n))))))
+
+(define (extend-validated n history target hidden? label)
+  (let loop ((headers history))
+    (let ((height (length headers)))
+      (if (> height target)
+          headers
+          (let* ((b (build-block n headers height hidden? label))
+                 (header (block-header-field b)))
+            (unless (= 1 (node-ingest-headers n (list header)))
+              (error "test-puzzle-history: header was not ingested"))
+            (node-store-block n b)
+            (unless (= 1 (node-validate-blocks n))
+              (error (string-append
+                       "test-puzzle-history: block did not validate: "
+                       (node-status-snapshot-sync-last-error
+                         (node-status n)))))
+            (loop (append headers (list header))))))))
+
+(define (extend-downloaded n history target label)
+  (let loop ((headers history))
+    (let ((height (length headers)))
+      (if (> height target)
+          headers
+          (let* ((b (build-block n headers height #f label))
+                 (header (block-header-field b)))
+            (unless (= 1 (node-ingest-headers n (list header)))
+              (error "test-puzzle-history: branch header was not ingested"))
+            (node-store-block n b)
+            (loop (append headers (list header))))))))
+
+(define (assert-cli-complexity args height expected)
+  (let ((text
+          (cli-output
+            (append
+              (list "puzzle" "--height" (number->string height)) args))))
+    (assert-true
+      (string-contains?
+        text
+        (string-append "complexity: " (number->string expected) " (tier")))))
+
+(test-group "sigilcoin puzzle history"
+  (test "historical and next puzzles use exact active ancestry"
+    (let* ((dir (make-temp-directory))
+           (args (list "--regtest" "--data-dir" dir))
+           (n (node-open sigilcoin-regtest-chain dir))
+           (genesis (chain-config-genesis-header (node-config n)))
+           ;; Hidden canonical programs and table-program fork blocks produce
+           ;; different second-window score margins.
+           (canonical (extend-validated n (list genesis) 32 #t "canonical"))
+           (old-h32 (list-ref canonical 32)))
+      (assert-equal 32
+                    (node-status-snapshot-best-block-height (node-status n)))
+      (for-each
+        (lambda (height)
+          (let* ((context
+                   (coin-puzzle-context
+                     n (list "--height" (number->string height))))
+                 (expected (complexity-of (list-ref canonical height))))
+            (assert-equal expected (context-ref context 'complexity))
+            (assert-cli-complexity args height expected)))
+        '(1 15 16 17 31 32))
+
+      ;; Download a taller fork from H15. Validation rolls canonical state
+      ;; onto this branch; stale rows at every shared height remain stored.
+      (let* ((fork-base (prefix canonical 16))
+             (fork (extend-downloaded n fork-base 33 "fork")))
+        (assert-equal 18 (node-validate-blocks n))
+        (assert-equal 33
+                      (node-status-snapshot-best-block-height (node-status n)))
+        (let* ((active-h32 (coin-header-at-height n 32))
+               (context-h32 (coin-puzzle-context n '("--height" "32")))
+               (next-context (coin-puzzle-context n '()))
+               (next-complexity
+                 (coin-required-complexity
+                   (coin-canonical-history n (last-of fork) 34) 34)))
+          (assert-false (equal? (block-header-hash old-h32)
+                                (block-header-hash active-h32)))
+          (assert-equal (block-header-hash (list-ref fork 31))
+                        (context-ref context-h32 'parent-hash))
+          (assert-equal (complexity-of active-h32)
+                        (context-ref context-h32 'complexity))
+          (assert-equal next-complexity
+                        (context-ref next-context 'complexity))
+          (assert-cli-complexity args 32 (complexity-of active-h32))
+          (assert-cli-complexity args 34 next-complexity)
+
+          ;; A taller header without its body may lead header sync, but cannot
+          ;; change validated puzzle ancestry.
+          (let ((ghost (block-header-field
+                         (build-block n fork 34 #t "bodyless"))))
+            (assert-equal 1 (node-ingest-headers n (list ghost)))
+            (assert-equal 34
+                          (node-status-snapshot-best-height (node-status n)))
+            (assert-equal 33
+                          (node-status-snapshot-best-block-height
+                            (node-status n)))
+            (assert-equal next-complexity
+                          (context-ref (coin-puzzle-context n '())
+                                       'complexity))
+            (assert-true
+              (string-contains?
+                (cli-failure
+                  (append (list "puzzle" "--height" "35") args))
+                "next block is height 34")))
+
+          ;; Canonical body/header gaps fail explicitly. No genesis or tip-C
+          ;; fallback is allowed.
+          (let ((h20-hash (hex-encode
+                            (block-header-hash (list-ref fork 20)))))
+            (sqlite-run (node-db n)
+                        "UPDATE blocks SET block_hex = NULL WHERE hash = ?"
+                        h20-hash)
+            (assert-true
+              (string-contains?
+                (raised-message
+                  (lambda ()
+                    (coin-puzzle-context n '("--height" "32"))))
+                "validated block body is missing"))
+            (sqlite-run (node-db n) "DELETE FROM headers WHERE hash = ?"
+                        h20-hash)
+            (assert-true
+              (string-contains?
+                (raised-message
+                  (lambda ()
+                    (coin-puzzle-context n '("--height" "32"))))
+                "header is missing")))))
+      (node-close n)))
+
+  (test "invalid parent bits never fall back to genesis complexity"
+    (assert-true
+      (string-contains?
+        (raised-message (lambda () (cli-complexity 0 #f)))
+        "invalid complexity bits"))))
+
+(run-tests)

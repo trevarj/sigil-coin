@@ -144,6 +144,19 @@
 (define (tip-height args)
   (quietly (lambda () (cli-with-node args coin-validated-tip-height))))
 
+;; Feed a mined block to another real CLI node, as peer sync would.
+(define (accept-block args b)
+  (quietly
+    (lambda ()
+      (cli-with-node args
+        (lambda (n)
+          (node-ingest-headers n (list (block-header-field b)))
+          (node-store-block n b)
+          (unless (= 1 (node-validate-blocks n))
+            (error (string-append
+                     "accept-block: block did not validate: "
+                     (node-status-snapshot-sync-last-error (node-status n))))))))))
+
 ;; Mine one block to a literal address, so no key is needed.
 (define (mine-to args address . extra)
   (run (append (list "mine" "--address" address) extra args)))
@@ -933,7 +946,33 @@
             (assert-true (string-contains? message name))
             (assert-true (string-contains? message
                                            "knowable before you start"))))
-        '(1 2 3 4 5 6 7)))))
+        '(1 2 3 4 5 6 7))))
+
+  (test "external commitments are canonically ordered and capped at K16"
+    (let* ((args (work-args))
+           (flags
+             (let loop ((i 17) (out '()))
+               (if (= i 0)
+                   out
+                   (loop (- i 1)
+                         (append out
+                           (list "--commit"
+                                 (hex-encode
+                                   (make-bytevector
+                                     coin-commitment-bytes i))))))))
+           (result
+             (run (append (list "mine" "--address" %payout-address)
+                          flags args)))
+           (b (car result))
+           (text (cdr result))
+           (payload (coin-result-value (coin-block-coinbase-payload b)))
+           (decoded
+             (coin-commits-decode
+               (coin-coinbase-payload-commits payload))))
+      (assert-true (coin-ok? decoded))
+      (assert-equal coin-max-commitments
+                    (length (coin-result-value decoded)))
+      (assert-true (string-contains? text "commitment cap is 16")))))
 
 ;; Confirm `fanout`, then fill the following block from its independent
 ;; outputs. Shared by keyless workspace runs and the native wallet lifecycle,
@@ -1122,6 +1161,54 @@
                        (bytevector-append #u8(1) share-bytes))))
         (and (coin-ok? decoded) (car (coin-result-value decoded)))))
 
+    (define (reveal-flags shares)
+      (let loop ((xs shares) (flags '()))
+        (if (null? xs)
+            flags
+            (loop (cdr xs)
+                  (append flags
+                          (list "--reveal"
+                                (hex-encode (coin-share-encode (car xs)))))))))
+
+    ;; Build H=1 with each source committed, then reveal every exact candidate.
+    (define (external-share-fixture sources)
+      (let* ((contributor (fixed-share-args))
+             (producer (work-args))
+             (records (map (lambda (source)
+                             (commit-solution contributor source))
+                           sources))
+             (commit-flags
+               (let loop ((xs records) (flags '()))
+                 (if (null? xs)
+                     flags
+                     (loop (cdr xs)
+                           (append flags
+                             (list "--commit"
+                                   (hex-encode
+                                     (cli-commit-record-commitment
+                                       (car xs)))))))))
+             (parent (run-value
+                       (append (list "mine" "--address" %payout-address)
+                               commit-flags producer))))
+        (accept-block contributor parent)
+        (list contributor producer parent records
+              (map
+                (lambda (record)
+                  (decoded-share
+                    (run-value
+                      (append
+                        (list "reveal" "--height" "1" "--commitment"
+                              (hex-encode
+                                (cli-commit-record-commitment record)))
+                        contributor))))
+                records))))
+
+    (define (block-shares b)
+      (coin-result-value
+        (coin-shares-decode
+          (coin-coinbase-payload-shares
+            (coin-result-value (coin-block-coinbase-payload b))))))
+
     (test-group "sigilcoin commit and reveal"
       (test "puzzle and mine use the wallet-personalized consensus task"
         (let* ((args (fixed-share-args))
@@ -1250,6 +1337,245 @@
                           (length
                             (transaction-outputs
                               (car (block-transactions child))))))))
+
+      (test "external contributor commit and reveal flow mines and pays through CLI"
+        (let* ((contributor (fixed-share-args))
+               (producer (work-args))
+               (committed (run (append (list "commit" "--solution"
+                                             %share-best)
+                                       contributor)))
+               (record (car committed))
+               (commitment-bytes
+                 (cli-commit-record-commitment record))
+               (commitment (hex-encode commitment-bytes))
+               (commits-push
+                 (hex-encode (coin-commits-encode
+                               (list commitment-bytes))))
+               (parent-run
+                 (run (append
+                        (list "mine" "--address" %payout-address
+                              "--commit" "zz"
+                              "--commit" commits-push
+                              "--commit" commitment)
+                        producer)))
+               (parent (car parent-run))
+               (parent-text (cdr parent-run)))
+          (assert-true (string-contains? (cdr committed) "commits-push:"))
+          (assert-true (string-contains? parent-text
+                                         "accepted-commitment:"))
+          (assert-true (string-contains? parent-text
+                                         "reason=malformed hexadecimal"))
+          (assert-true (string-contains? parent-text "reason=duplicate"))
+          (accept-block contributor parent)
+          (let* ((revealed
+                   (run (append (list "reveal" "--height" "1")
+                                contributor)))
+                 (share-bytes (car revealed))
+                 (share-hex (hex-encode share-bytes))
+                 (shares-push
+                   (hex-encode
+                     (coin-shares-encode (list (decoded-share share-bytes)))))
+                 (child-run
+                   (run (append
+                          (list "mine" "--address" %other-address
+                                "--reveal" "zz"
+                                "--reveal" shares-push
+                                "--reveal" share-hex)
+                          producer)))
+                 (child (car child-run))
+                 (child-text (cdr child-run))
+                 (payload
+                   (coin-result-value (coin-block-coinbase-payload child)))
+                 (included
+                   (coin-result-value
+                     (coin-shares-decode
+                       (coin-coinbase-payload-shares payload))))
+                 (unit (coin-split-unit (coin-block-reward 2) 1))
+                 (recipient-script (coin-share-script %share-pubkey))
+                 (carrier-script
+                   (coin-address->script-pubkey
+                     "--address" %payout-address)))
+            (assert-true (string-contains? (cdr revealed) "shares-push:"))
+            (assert-equal 2 (tip-height producer))
+            (assert-equal 1 (length included))
+            (assert-equal share-bytes (coin-share-encode (car included)))
+            (assert-true (string-contains? child-text "accepted-share:"))
+            (assert-true (string-contains? child-text
+                                           "reason=malformed hexadecimal"))
+            (assert-true (string-contains? child-text
+                                           "reason=duplicate pubkey"))
+            (assert-true (string-contains? child-text "aggregate-q:"))
+            (assert-true (string-contains? child-text
+                                           "payout: role=producer"))
+            (assert-true (string-contains? child-text
+                                           "payout: role=share"))
+            (assert-true (string-contains? child-text
+                                           "payout: role=carrier"))
+            (assert-true (<= (coin-block-size child) coin-max-block-bytes))
+            (assert-equal unit
+                          (utxo-total (utxos-of producer recipient-script)))
+            (assert-equal (+ (coin-block-reward 1) unit)
+                          (utxo-total (utxos-of producer carrier-script)))
+            ;; Same H=1 reveal is expired against H=2's commitments.
+            (let ((expired-text
+                    (cdr (mine-to producer %payout-address
+                                  "--reveal" share-hex))))
+              (assert-true (string-contains? expired-text
+                                             "share-uncommitted")))))
+        ;; Another branch never carried contributor's commitment.
+        (let* ((other (work-args))
+               (ignored (mine-to other %payout-address))
+               (foreign-contributor (fixed-share-args))
+               (foreign-producer (work-args))
+               (foreign-record
+                 (commit-solution foreign-contributor %share-best))
+               (foreign-parent
+                 (run-value
+                   (append
+                     (list "mine" "--address" %payout-address
+                           "--commit"
+                           (hex-encode
+                             (cli-commit-record-commitment foreign-record)))
+                     foreign-producer))))
+          (accept-block foreign-contributor foreign-parent)
+          (let* ((foreign-share
+                   (run-value
+                     (append (list "reveal" "--height" "1")
+                             foreign-contributor)))
+                 (text (cdr (mine-to other %other-address
+                                     "--reveal"
+                                     (hex-encode foreign-share)))))
+            (assert-true (string-contains? text "share-uncommitted")))))
+
+      (test "forged same-pubkey reveal cannot suppress honest contribution"
+        (let* ((fixture (external-share-fixture (list %share-best)))
+               (producer (list-ref fixture 1))
+               (records (list-ref fixture 3))
+               (honest (car (list-ref fixture 4)))
+               (forged
+                 (coin-share honest
+                   signature: (make-bytevector coin-share-signature-bytes 0)))
+               (context
+                 (height-one-share-context
+                   (map cli-commit-record-commitment records)))
+               (checked (coin-check-shares context #u8() (list honest)))
+               (quality (coin-share-quality context honest))
+               (result
+                 (run
+                   (append (list "mine" "--address" %other-address)
+                           (reveal-flags (list forged honest)) producer)))
+               (included (block-shares (car result)))
+               (text (cdr result)))
+          ;; This is the old exploit ordering: forged canonical bytes first.
+          (assert-true (cli-bytes<? (coin-share-encode forged)
+                                    (coin-share-encode honest)))
+          (assert-true (coin-ok? checked))
+          (assert-equal 1 (length included))
+          (assert-equal (coin-share-encode honest)
+                        (coin-share-encode (car included)))
+          (assert-true (string-contains? text "share-bad-signature"))
+          (assert-true
+            (string-contains?
+              text (string-append "aggregate-q: "
+                                  (number->string quality))))))
+
+      (test "eight invalid reveals cannot starve a valid ninth reveal"
+        (let* ((fixture (external-share-fixture (list %share-best)))
+               (producer (list-ref fixture 1))
+               (honest (car (list-ref fixture 4)))
+               (honest-pubkey (coin-share-pubkey honest))
+               (invalid-pubkeys
+                 (let gather ((n 1) (out '()))
+                   (cond
+                     ((= (length out) coin-max-shares) (reverse out))
+                     ((> n 255)
+                      (error "test: could not find eight lower pubkeys"))
+                     (else
+                       (let ((pubkey
+                               (wallet-public-key (make-bytevector 32 n))))
+                         (gather
+                           (+ n 1)
+                           (if (and (not (equal? pubkey honest-pubkey))
+                                    (cli-bytes<? pubkey honest-pubkey))
+                               (cons pubkey out)
+                               out)))))))
+               (invalids
+                 (map
+                   (lambda (pubkey)
+                     (coin-share
+                       pubkey: pubkey
+                       signature: (make-bytevector
+                                    coin-share-signature-bytes 0)
+                       blind: (make-bytevector coin-share-blind-bytes 0)
+                       solution: #u8(120)))
+                   invalid-pubkeys))
+               (result
+                 (run
+                   (append (list "mine" "--address" %other-address)
+                           (reveal-flags (append invalids (list honest)))
+                           producer)))
+               (included (block-shares (car result)))
+               (text (cdr result)))
+          (assert-equal coin-max-shares (length invalids))
+          (assert-equal 1 (length included))
+          (assert-equal (coin-share-encode honest)
+                        (coin-share-encode (car included)))
+          (assert-true (string-contains? text "share-uncommitted"))
+          (assert-true (not (string-contains? text "share cap is 8")))
+          (assert-true (not (string-contains? text "aggregate-q: 0")))))
+
+      (test "two valid same-key reveals choose identically in either order"
+        (let* ((fixture
+                 (external-share-fixture
+                   (list %share-worse %share-best)))
+               (producer-a (list-ref fixture 1))
+               (parent (list-ref fixture 2))
+               (records (list-ref fixture 3))
+               (a (car (list-ref fixture 4)))
+               (b (list-ref (list-ref fixture 4) 1))
+               (context
+                 (height-one-share-context
+                   (map cli-commit-record-commitment records)))
+               (checked-a (coin-check-shares context #u8() (list a)))
+               (qa (coin-share-quality context a))
+               (checked-b (coin-check-shares context #u8() (list b)))
+               (qb (coin-share-quality context b))
+               (ac (coin-share-commitment context a))
+               (bc (coin-share-commitment context b))
+               (expected
+                 (cond ((> qa qb) a)
+                       ((> qb qa) b)
+                       ((cli-bytes<? ac bc) a)
+                       ((cli-bytes<? bc ac) b)
+                       ((cli-bytes<? (coin-share-encode a)
+                                     (coin-share-encode b)) a)
+                       (else b)))
+               (producer-b (work-args))
+               (ignored (accept-block producer-b parent))
+               (result-a
+                 (run
+                   (append (list "mine" "--address" %other-address)
+                           (reveal-flags (list a b)) producer-a)))
+               (result-b
+                 (run
+                   (append (list "mine" "--address" %other-address)
+                           (reveal-flags (list b a)) producer-b)))
+               (included-a (block-shares (car result-a)))
+               (included-b (block-shares (car result-b))))
+          (assert-true (coin-ok? checked-a))
+          (assert-true (coin-ok? checked-b))
+          (assert-equal 1 (length included-a))
+          (assert-equal 1 (length included-b))
+          (assert-equal (coin-share-encode expected)
+                        (coin-share-encode (car included-a)))
+          (assert-equal (coin-share-encode (car included-a))
+                        (coin-share-encode (car included-b)))
+          (assert-true
+            (string-contains? (cdr result-a)
+                              "duplicate pubkey (nonchosen valid candidate)"))
+          (assert-true
+            (string-contains? (cdr result-b)
+                              "duplicate pubkey (nonchosen valid candidate)"))))
 
       (test "recommit keeps the first candidate and exact save is idempotent"
         (let* ((args (fixed-share-args))

@@ -1,0 +1,78 @@
+;;; (sigil coin cli history) — canonical puzzle history from the node store
+
+(define-library (sigil coin cli history)
+  (import (sigil string)
+          (sigil sqlite)
+          (sigil bitcoin primitives)
+          (sigil bitcoin encoding)
+          (sigil bitcoin consensus)
+          (sigil bitcoin node))
+  (export
+    coin-canonical-history)
+
+  (begin
+
+    (define (row-ref row key)
+      (let ((pair (assoc key row)))
+        (if pair
+            (cdr pair)
+            (let ((sym (assoc (string->symbol key) row)))
+              (and sym (cdr sym))))))
+
+    (define (history-row n hash)
+      (let ((rows
+              (sqlite-query
+                (node-db n)
+                "SELECT h.height, h.header_hex, b.validated AS block_validated, b.block_hex FROM headers h LEFT JOIN blocks b ON b.hash = h.hash WHERE h.hash = ? AND h.valid = 1 LIMIT 1"
+                (hex-encode hash))))
+        (and (not (null? rows)) (car rows))))
+
+    (define (incomplete height detail)
+      (error (string-append
+               "puzzle: incomplete canonical history at height "
+               (number->string height)
+               ": "
+               detail)))
+
+    ;;; Persisted canonical headers before `height`, oldest first.
+    ;;;
+    ;;; Ancestry starts at `parent`; height-only rows from stale forks cannot
+    ;;; enter the result. Non-genesis headers must have validated bodies, since
+    ;;; only those score commitments belong to the canonical block chain.
+    ;;;
+    ;;; ```scheme
+    ;;; (length (coin-canonical-history n parent 16)) ; => 16
+    ;;; ```
+    (define (coin-canonical-history n parent height)
+      (: node? block-header? integer? -> list?)
+      (unless (> height 0)
+        (error "puzzle: history height must be positive"))
+      (let loop ((hash (block-header-hash parent))
+                 (h (- height 1))
+                 (out '()))
+        (if (< h 0)
+            out
+            (let ((row (history-row n hash)))
+              (unless row
+                (incomplete h "header is missing"))
+              (unless (= h (row-ref row "height"))
+                (incomplete h "stored header height does not match ancestry"))
+              (let ((header
+                      (guard (err
+                              (else
+                               (incomplete h "stored header cannot be parsed")))
+                        (block-header-parse
+                          (hex-decode (row-ref row "header_hex"))))))
+                (unless (equal? hash (block-header-hash header))
+                  (incomplete h "stored header hash does not match its row"))
+                (if (= h 0)
+                    (unless (equal?
+                              hash
+                              (chain-config-genesis-hash (node-config n)))
+                      (incomplete h "ancestry does not reach configured genesis"))
+                    (unless (and (= 1 (or (row-ref row "block_validated") 0))
+                                 (row-ref row "block_hex"))
+                      (incomplete h "validated block body is missing")))
+                (loop (block-header-previous-block header)
+                      (- h 1)
+                      (cons header out)))))))))

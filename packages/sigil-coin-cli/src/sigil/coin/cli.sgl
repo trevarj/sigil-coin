@@ -126,7 +126,7 @@
       (println "")
       (println "mining:")
       (println "  sigilcoin puzzle [--height N] [--share] [--complexity C] [CHAIN] [--data-dir DIR]")
-      (println "  sigilcoin mine [--solution EXPR] [--graffiti TEXT] [--address ADDR] [--share] [--complexity C] [CHAIN] [--data-dir DIR]")
+      (println "  sigilcoin mine [--solution EXPR] [--commit HEX]... [--reveal HEX]... [--graffiti TEXT] [--address ADDR] [--share] [--complexity C] [CHAIN] [--data-dir DIR]")
       (println "  sigilcoin commit --solution EXPR [--height N] [--complexity C] [CHAIN] [--data-dir DIR]")
       (println "  sigilcoin reveal [--height N] [--commitment HEX] [CHAIN] [--data-dir DIR]")
       (println "")
@@ -170,6 +170,7 @@
       (println "CHAIN is --regtest, or --chain sigilcoin-main|sigilcoin-regtest.")
       (println "--complexity C previews a puzzle at a difficulty the chain has not reached.")
       (println "--share derives and checks the wallet pubkey's personalized co-op puzzle.")
+      (println "mine --commit accepts a commitment or canonical COMMITS push; --reveal accepts a share or canonical SHARES push. Both repeat.")
       (println "Default chain: sigilcoin-main. Default data dir: ~a."
                cli-default-data-dir)
       (println "Amounts are SGL: 1 SGL = 100000000 daviwils.")

@@ -1,0 +1,30 @@
+;;; Offline redirects for local-testnet helper dependencies.
+
+(define (sigil name)
+  (for-package name: name
+    use: (from-path dir: (string-append "../../../sigil/packages/" name))))
+
+(define (bitcoin name)
+  (for-package name: name
+    use: (from-path dir: (string-append "../../../sigil-bitcoin/packages/" name))))
+
+(redirects
+  packages: (list
+    (sigil "sigil-lib")
+    (sigil "sigil-stdlib")
+    (sigil "sigil-test")
+    (sigil "sigil-test-runner")
+    (bitcoin "sigil-bitcoin-utils")
+    (bitcoin "sigil-bitcoin-primitives")
+    (bitcoin "sigil-bitcoin-encoding")
+    (bitcoin "sigil-secp256k1")
+    (bitcoin "sigil-bitcoin-keys")
+    (bitcoin "sigil-bitcoin-script")
+    (bitcoin "sigil-bitcoin-tx")
+    (bitcoin "sigil-bitcoin-consensus")
+    (bitcoin "sigil-bitcoin-p2p")
+    (bitcoin "sigil-bitcoin-node")
+    (for-package name: "sigil-crypto"
+      use: (from-path dir: "../../.sigil/deps/sigil-crypto"))
+    (for-package name: "sigil-sqlite"
+      use: (from-path dir: "../../.sigil/deps/sigil-sqlite"))))
