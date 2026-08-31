@@ -76,9 +76,12 @@ nix build .#sigilcoin --print-build-logs
 
 ```
 sigilcoin> ✓ Build complete!
-sigilcoin> buildPhase completed in 6 minutes 41 seconds
 sigilcoin> Running phase: installCheckPhase
 ```
+
+Build duration and the resulting store hash depend on cache state and the exact
+source revision; neither is a release invariant and neither should be compared
+to a pasted historical value.
 
 That build compiled the canonical module paths, including
 `sigil/coin/consensus/{retarget,score,shares}.sgl`,
@@ -87,7 +90,7 @@ That build compiled the canonical module paths, including
 `(sigil coin consensus)` and `(sigil coin node)` surfaces.
 
 ```sh
-readlink -f result   # => /nix/store/68jcgjvqd1y3w5ns1af6n3skgzk2f2bp-sigilcoin-0.1.0
+readlink -f result   # => /nix/store/<hash>-sigilcoin-0.1.0
 ls result/bin        # => sigilcoin  sigilcoin-explorer
 timeout 5 ./result/bin/sigilcoin help >/dev/null
 timeout 5 ./result/bin/sigilcoin version

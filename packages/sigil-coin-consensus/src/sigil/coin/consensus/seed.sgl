@@ -171,7 +171,8 @@
     ;;; per chain and every sibling at a height then pays derivation once.
     ;;;
     ;;; ponytail: linear assoc list. `capacity` is a few dozen and every
-    ;;; lookup is a 32-byte compare against a 1.28 M step miss, so a hash
+    ;;; lookup is a 32-byte compare against a 1.30 M step miss (64 rejected
+    ;;; attempts plus one bounded fallback), so a hash
     ;;; table would be all cost and no measurable gain; switch if the cache
     ;;; ever holds hundreds of heights.
     (define-struct coin-puzzle-cache
