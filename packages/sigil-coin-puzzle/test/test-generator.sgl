@@ -464,6 +464,58 @@
     (assert-error (puzzle-fallback 5 4096))))
 
 ;; ============================================================
+;; Shared attempt budget
+;; ============================================================
+
+(test-group "pbe attempt budget"
+  (test "one evaluator call cannot cross the 20000-step attempt cap"
+    ;; Before shared machines, hidden verification ran this recursion on a
+    ;; fresh 200000-step machine, then charged its >20000 steps afterward.
+    (let* ((budget (puzzle-budget-open))
+           (pairs '((1 1 1) (2 2 2) (3 3 3)))
+           (source
+             (string-append
+               "(lambda(x)(letrec((f(lambda(n)(if(zero? n)(list x x)"
+               "(f(- n 1))))))(f 3000)))"))
+           (result (puzzle-compose 1 128 0 pairs source 0 budget))
+           (public-report (puzzle-run-examples source pairs)))
+      (assert-equal 'budget-exhausted result)
+      (assert-equal puzzle-generator-max-fuel
+                    (puzzle-budget-used budget))
+      ;; Public solution verification still owns its independent 200000 cap.
+      (assert-true (puzzle-report-ok? public-report))
+      (assert-true (> (puzzle-report-steps public-report)
+                      puzzle-generator-max-fuel))
+      (assert-true (< (puzzle-report-steps public-report) puzzle-max-fuel))))
+
+  (test "repeated attempts share the same bound under every constraint"
+    (let constraints ((ci 0))
+      (if (> ci 7)
+          (assert-true #t)
+          (begin
+            (let retries ((retry 0))
+              (if (< retry 4)
+                  (let* ((a (puzzle-budget-open))
+                         (b (puzzle-budget-open))
+                         (ra (puzzle-attempt/constraint/budget
+                               (seed-of (+ ci retry)) 77 4095 ci retry a))
+                         (rb (puzzle-attempt/constraint/budget
+                               (seed-of (+ ci retry)) 77 4095 ci retry b)))
+                    (assert-true (<= (puzzle-budget-used a)
+                                     puzzle-generator-max-fuel))
+                    (assert-equal (puzzle-budget-used a)
+                                  (puzzle-budget-used b))
+                    (assert-equal
+                      (if (puzzle-spec? ra)
+                          (puzzle-spec-hidden-source ra)
+                          ra)
+                      (if (puzzle-spec? rb)
+                          (puzzle-spec-hidden-source rb)
+                          rb))
+                    (retries (+ retry 1)))))
+            (constraints (+ ci 1)))))))
+
+;; ============================================================
 ;; Non-degeneracy
 ;; ============================================================
 

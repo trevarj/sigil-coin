@@ -672,6 +672,23 @@
       (assert-equal 'fuel-exhausted (puzzle-result-error-kind result))
       (assert-equal puzzle-max-fuel (puzzle-result-steps result))))
 
+  (test "shared machines stop at the exact fuel boundary"
+    ;; `(iota n)` costs n + 4 steps. Exact budget succeeds; one fewer fails
+    ;; without reporting or executing a 20000th step.
+    (let* ((exact (puzzle-machine-open 20000))
+           (ok (puzzle-eval/machine exact '(iota 19996)))
+           (after (puzzle-eval/machine exact 1))
+           (short (puzzle-machine-open 19999))
+           (over (puzzle-eval/machine short '(iota 19996))))
+      (assert-true (puzzle-ok? ok))
+      (assert-equal 20000 (puzzle-result-steps ok))
+      (assert-equal 20000 (puzzle-machine-steps exact))
+      (assert-equal 'fuel-exhausted (puzzle-result-error-kind after))
+      (assert-equal 20000 (puzzle-result-steps after))
+      (assert-equal 'fuel-exhausted (puzzle-result-error-kind over))
+      (assert-equal 19999 (puzzle-result-steps over))
+      (assert-equal 19999 (puzzle-machine-steps short))))
+
   (test "runaway non-tail recursion hits the depth cap, not the host stack"
     (let ((result (puzzle-run
                     (string-append "(letrec ((f (lambda (n) (if (zero? n) 0"

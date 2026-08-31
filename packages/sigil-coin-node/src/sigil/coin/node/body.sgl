@@ -1,9 +1,10 @@
 ;;; (sigil coin node body) — canonical block-body validation
 ;;;
-;;; Size and header fields are gated before any program runs. Producer and
-;;; personalized share programs are then checked, reward outputs are checked
-;;; against the exact 2/1/1 split, and only then does Bitcoin's connector
-;;; mutate the UTXO set.
+;;; Deterministic body order: size/merkle/header, payload and codecs, cheap
+;;; share shape/order/commit/dedup, exact 2/1/1 outputs, breadth-first share
+;;; source preparation, breadth-first signatures, producer PBE, share PBE,
+;;; Q/score equality, then Bitcoin connection. Personalized specs derive once;
+;;; only verified share reports may feed aggregate quality.
 
 (define-library (sigil coin node body)
   (import (sigil math)
@@ -12,10 +13,19 @@
           (sigil bitcoin consensus)
           (sigil coin puzzle)
           (sigil coin consensus)
+          (only (sigil coin consensus shares)
+                coin-check-shares-cheap
+                coin-prepare-shares
+                coin-check-share-signatures
+                coin-verify-prepared-shares
+                coin-coop-context-derivation-count
+                coin-coop-context-signature-count
+                coin-coop-context-example-count)
           (sigil coin node rules))
   (export
     coin-score-for-solution
     coin-parent-context
+    coin-body-validation-stats
     coin-block-score
     coin-connect-block
     coin-block-rules
@@ -72,7 +82,33 @@
                   (puzzle-report-steps report)
                   quality))))))
 
-    (define (context-for parent-block header height)
+    ;; Latest bounded validation counters for tests and diagnostics only.
+    (define %last-validation-stats '(0 0 0))
+
+    ;;; Latest `(share-derivations signatures share-PBE-evaluations)` tuple.
+    ;;;
+    ;;; Producer derivation is intentionally absent: it goes through the
+    ;;; chain-wide puzzle cache and can legitimately cost either one cold
+    ;;; derivation or zero on a hit. Cache tests pin that behavior directly;
+    ;;; putting a hardcoded `1` here made this diagnostic claim work it did not
+    ;;; observe.
+    (define (coin-body-validation-stats)
+      (: -> list?)
+      %last-validation-stats)
+
+    (define (record-validation-stats! context)
+      (set! %last-validation-stats
+            (list (if context
+                      (coin-coop-context-derivation-count context)
+                      0)
+                  (if context
+                      (coin-coop-context-signature-count context)
+                      0)
+                  (if context
+                      (coin-coop-context-example-count context)
+                      0))))
+
+    (define (metadata-context-for parent-block header height)
       (cond
         ((= height 0) #f)
         ((not parent-block)
@@ -80,41 +116,147 @@
         ((not (equal? (block-header-hash (block-header-field parent-block))
                       (block-header-previous-block header)))
          (error "coin-block-score: parent block does not match the header"))
-        (else (coin-parent-context parent-block))))
+        (else
+          (let* ((parent-header (block-header-field parent-block))
+                 (payload (require-coin-ok
+                            "coin-parent-context: coinbase"
+                            (coin-block-coinbase-payload parent-block)))
+                 (parent-complexity
+                   (require-coin-ok
+                     "coin-parent-context: bits"
+                     (coin-header-complexity parent-header)))
+                 (commits
+                   (require-coin-ok
+                     "coin-parent-context: commits"
+                     (coin-commits-decode
+                       (coin-coinbase-payload-commits payload)))))
+            (coin-coop-context
+              parent-prev-hash: (block-header-previous-block parent-header)
+              puzzle-height: (coin-coinbase-payload-height payload)
+              complexity: parent-complexity
+              spec: #f
+              commits: commits)))))
 
-    ;; Validate mining claims and return `(score shares context payload)`.
-    (define (check-block-claims parent-block height complexity b)
-      (guard (e (#t (coin-error 'internal-error "the block score check raised")))
+    ;; Parse and run every cheap share check. Return
+    ;; `(shares metadata-context payload)` without deriving a puzzle.
+    (define (prepare-block-claims parent-block height b)
+      (guard (e (#t (coin-error 'internal-error
+                                "the cheap block claim check raised")))
         (let ((decoded (coin-block-coinbase-payload b)))
           (if (coin-failed? decoded)
               decoded
               (let* ((header (block-header-field b))
                      (payload (coin-result-value decoded))
-                     (context (context-for parent-block header height)))
-                (if (not (= height (coin-coinbase-payload-height payload)))
-                    (coin-error 'height-mismatch
-                                "the coinbase height is not the block height")
-                    (let ((coop (coin-check-coop payload context)))
-                      (if (coin-failed? coop)
-                          coop
-                          (let* ((shares (coin-result-value coop))
-                                 (quality (if (null? shares)
-                                              0
-                                              (coin-shares-quality
-                                                context shares)))
-                                 (scored (coin-score-for-solution
-                                           (block-header-previous-block header)
-                                           height
-                                           complexity
-                                           (coin-coinbase-payload-solution
-                                             payload)
-                                           quality)))
-                            (if (coin-failed? scored)
-                                scored
-                                (coin-ok (list (coin-result-value scored)
-                                               shares
-                                               context
-                                               payload))))))))))))
+                     (commits (coin-commits-decode
+                                (coin-coinbase-payload-commits payload)))
+                     (shares-result (coin-shares-decode
+                                      (coin-coinbase-payload-shares payload))))
+                (cond
+                  ((not (= height (coin-coinbase-payload-height payload)))
+                   (coin-error 'height-mismatch
+                               "the coinbase height is not the block height"))
+                  ((coin-failed? commits) commits)
+                  ((coin-failed? shares-result) shares-result)
+                  (else
+                    (let* ((shares (coin-result-value shares-result))
+                           (context
+                             (metadata-context-for parent-block header height)))
+                      (cond
+                        ((and (pair? shares) (not context))
+                         (coin-error 'shares-at-genesis
+                                     "genesis carries no shares"))
+                        ((and context
+                              (not (= (coin-coop-context-puzzle-height context)
+                                      (- height 1))))
+                         (coin-error 'internal-error
+                                     "co-op context is for the wrong height"))
+                        ((null? shares)
+                         (coin-ok (list shares context payload)))
+                        (else
+                          (let ((cheap
+                                  (coin-check-shares-cheap
+                                    context
+                                    (coin-coinbase-payload-solution payload)
+                                    shares)))
+                            (if (coin-failed? cheap)
+                                cheap
+                                (coin-ok (list shares context payload))))))))))))))
+
+    ;; Prepare sources, verify signatures, validate producer, then run share
+    ;; examples and reuse verified reports for Q. Return
+    ;; `(score shares context payload)`.
+    (define (finish-block-claims parent-block height complexity header prepared)
+      (guard (e (#t (coin-error 'internal-error
+                                "the expensive block claim check raised")))
+        (let* ((shares (car prepared))
+               (payload (list-ref prepared 2))
+               (context (if (null? shares)
+                            #f
+                            (coin-parent-context parent-block)))
+               (producer
+                 (lambda ()
+                   (coin-score-for-solution
+                     (block-header-previous-block header)
+                     height
+                     complexity
+                     (coin-coinbase-payload-solution payload)
+                     0))))
+          (if (null? shares)
+              (let ((scored (producer)))
+                (if (coin-failed? scored)
+                    scored
+                    (coin-ok (list (coin-result-value scored)
+                                   shares context payload))))
+              (let ((source-check (coin-prepare-shares context shares)))
+                (record-validation-stats! context)
+                (if (coin-failed? source-check)
+                    source-check
+                    (let ((signature-check
+                            (coin-check-share-signatures context shares)))
+                      (record-validation-stats! context)
+                      (if (coin-failed? signature-check)
+                          signature-check
+                          ;; Producer PBE is deliberately before share PBE.
+                          ;; Snapshot immediately after it returns, including
+                          ;; on failure. This makes the ordering assertion
+                          ;; load-bearing: if a mutant evaluates shares first,
+                          ;; their example counter cannot hide behind the
+                          ;; producer's early return.
+                          (let ((producer-score (producer)))
+                            (record-validation-stats! context)
+                            (if (coin-failed? producer-score)
+                                producer-score
+                                (let ((share-check
+                                        (coin-verify-prepared-shares
+                                          context shares)))
+                                  (record-validation-stats! context)
+                                  (if (coin-failed? share-check)
+                                      share-check
+                                      (let* ((quality
+                                               (coin-shares-quality
+                                                 context shares))
+                                             (base
+                                               (coin-score-decode
+                                                 (coin-result-value
+                                                   producer-score)))
+                                             (score
+                                               (coin-score-pack
+                                                 (coin-score-length base)
+                                                 (coin-score-memory base)
+                                                 (coin-score-steps base)
+                                                 quality)))
+                                        (coin-ok
+                                          (list score shares context
+                                                payload)))))))))))))))
+
+    (define (check-block-claims parent-block height complexity b)
+      (set! %last-validation-stats '(0 0 0))
+      (let ((prepared (prepare-block-claims parent-block height b)))
+        (if (coin-failed? prepared)
+            prepared
+            (finish-block-claims
+              parent-block height complexity (block-header-field b)
+              (coin-result-value prepared)))))
 
     ;;; Recompute exact header score from producer and personalized shares.
     (define (coin-block-score parent-block height complexity b)
@@ -193,32 +335,44 @@
     (define (coin-connect-block rules params height utxos b verify-scripts?
                                    parent-block)
       (: block-rules? consensus-params? integer? list? block? any? any? -> list?)
+      (set! %last-validation-stats '(0 0 0))
       (require-coin-ok "coin-connect-block: block size"
                        (coin-validate-block-size b))
+      (unless (block-merkle-root-valid? b)
+        (error "coin-connect-block: invalid-merkle-root"))
       (let* ((header (block-header-field b))
              (claimed (coin-header-score header)))
         (unless (= coin-header-version (block-header-version header))
           (error "coin-connect-block: wrong-version"))
-        ;; Header acceptance binds this decoded value to chain-derived
-        ;; retarget history before any body can reach this connector.
+        ;; Header acceptance binds complexity to chain history. Score shape,
+        ;; payload codecs and payout shape all precede ECDSA and PBE.
         (let* ((complexity (require-coin-ok
                              "coin-connect-block: bits"
-                             (coin-header-complexity header)))
-               (checked (check-block-claims parent-block height complexity b))
-               (value (require-coin-ok "coin-connect-block: score" checked))
-               (score (car value))
-               (shares (cadr value))
-               (coinbase (car (block-transactions b)))
-               (carrier (and (pair? shares)
-                             (coin-carrier-script parent-block)))
-               (total (+ ((block-rules-subsidy rules) height)
-                         (block-fees b utxos))))
+                             (coin-header-complexity header))))
           (require-coin-ok "coin-connect-block: score"
                            (coin-score-check claimed))
-          (unless (= claimed score)
-            (error "coin-connect-block: score-mismatch"))
-          (require-coin-ok "coin-connect-block: split"
-                           (coin-check-split coinbase total shares carrier))))
+          (let* ((prepared-result
+                   (prepare-block-claims parent-block height b))
+                 (prepared
+                   (require-coin-ok "coin-connect-block: claims"
+                                    prepared-result))
+                 (shares (car prepared))
+                 (coinbase (car (block-transactions b)))
+                 (carrier (and (pair? shares)
+                               (coin-carrier-script parent-block)))
+                 (total (+ ((block-rules-subsidy rules) height)
+                           (block-fees b utxos))))
+            (require-coin-ok
+              "coin-connect-block: split"
+              (coin-check-split coinbase total shares carrier))
+            (let* ((checked
+                     (finish-block-claims
+                       parent-block height complexity header prepared))
+                   (value
+                     (require-coin-ok "coin-connect-block: score" checked))
+                   (score (car value)))
+              (unless (= claimed score)
+                (error "coin-connect-block: score-mismatch"))))))
       ((block-rules-connect bitcoin-block-rules)
        rules params height utxos b verify-scripts? parent-block))
 

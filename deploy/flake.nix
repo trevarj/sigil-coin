@@ -22,8 +22,8 @@
   # copy of this flake rather than the working tree. They default to the
   # operator's local clones, pinned by revision, because sigil-coin's
   # dependency set is currently ahead of what is pushed: at the time of
-  # writing, local sigil-bitcoin HEAD is 5362a80 while
-  # `github:trevarj/sigil-bitcoin` master is 4721ae5. Pinning by rev also
+  # writing, local sigil-bitcoin HEAD is 424a4a8 and includes the durable
+  # seven-argument parent-block validation seam. Pinning by rev also
   # means an uncommitted change in a sibling checkout can never leak into a
   # deployment build, and that the flake still locks while a sibling working
   # tree is dirty.
@@ -47,7 +47,7 @@
       flake = false;
     };
     sigil-bitcoin = {
-      url = "git+file:///home/trev/Workspace/sigil/sigil-bitcoin?rev=5362a808d295f7435f3c37d0897a8707016dcc0b";
+      url = "git+file:///home/trev/Workspace/sigil/sigil-bitcoin?rev=424a4a83beb9e81ab7e292f4d51c05ce16306450";
       flake = false;
     };
 
@@ -210,6 +210,21 @@
           touch $out
         '';
 
+        # Mine H1, close, mine H2 after reopening, close again, then prove a
+        # third process sees both validated bodies. This fails if deployment
+        # loses sigil-bitcoin's durable-parent seven-argument connector seam.
+        sigilcoin-durable-parent = pkgs.runCommand "sigilcoin-durable-parent" { } ''
+          data=$TMPDIR/node
+          ${built.sigilcoin}/bin/sigilcoin mine --regtest --data-dir "$data" >/dev/null
+          sleep 2
+          ${built.sigilcoin}/bin/sigilcoin mine --regtest --data-dir "$data" >/dev/null
+          status="$(${built.sigilcoin}/bin/sigilcoin status --regtest --data-dir "$data")"
+          grep -q '^best-height: 2$' <<<"$status"
+          grep -q '^best-block-height: 2$' <<<"$status"
+          grep -q '^validated-blocks: 2$' <<<"$status"
+          touch $out
+        '';
+
         # Proves the module's options and the systemd units it generates are
         # well-formed without building anything. This is the check that
         # catches a typo in a unit before it reaches the seed host.
@@ -247,14 +262,23 @@
             };
             units = host.config.systemd.units;
           in
+          assert host.config.services.sigilcoin.chain == "sigilcoin-main";
+          assert host.config.services.sigilcoin.dataDir == "/var/lib/sigilcoin";
+          assert builtins.elem 19444 host.config.networking.firewall.allowedTCPPorts;
+          assert builtins.elem "d /var/lib/sigilcoin 0750 sigilcoin sigilcoin - -"
+            host.config.systemd.tmpfiles.rules;
+          assert builtins.elem "d /var/lib/sigilcoin/wallet 0700 sigilcoin sigilcoin - -"
+            host.config.systemd.tmpfiles.rules;
           pkgs.runCommand "sigilcoin-module-eval" { } ''
-            test -n "${units."sigilcoin-listen.service".unit}"
-            test -n "${units."sigilcoin-sync.service".unit}"
-            test -n "${units."sigilcoin-explorer.service".unit}"
+            listen=${units."sigilcoin-listen.service".unit}/sigilcoin-listen.service
+            sync=${units."sigilcoin-sync.service".unit}/sigilcoin-sync.service
+            explorer=${units."sigilcoin-explorer.service".unit}/sigilcoin-explorer.service
+            test -s "$listen"
+            test -s "$sync"
+            test -s "$explorer"
 
             # The socket proxy is gone for good: the node binds its own
-            # public port. Any unit named after the proxy is a regression,
-            # and so is a listen unit that went back to loopback.
+            # public port. Any unit named after the proxy is a regression.
             test -z "${
               toString (
                 builtins.attrNames (
@@ -262,8 +286,24 @@
                 )
               )
             }"
-            grep -q "0.0.0.0" ${units."sigilcoin-listen.service".unit}/sigilcoin-listen.service
-            grep -q "19444" ${units."sigilcoin-listen.service".unit}/sigilcoin-listen.service
+
+            # Check executable, canonical CLI flags, ports and state paths.
+            grep -Fq "/bin/sigilcoin listen" "$listen"
+            grep -Fq -- "--bind 0.0.0.0" "$listen"
+            grep -Fq -- "--port 19444" "$listen"
+            grep -Fq -- "--max-connections 0" "$listen"
+            grep -Fq -- "--chain sigilcoin-main" "$listen"
+            grep -Fq -- "--data-dir /var/lib/sigilcoin" "$listen"
+
+            grep -Fq "/bin/sigilcoin run" "$sync"
+            grep -Fq -- "--iterations 0" "$sync"
+            grep -Fq -- "--chain sigilcoin-main" "$sync"
+            grep -Fq -- "--data-dir /var/lib/sigilcoin" "$sync"
+
+            grep -Fq "/bin/sigilcoin-explorer" "$explorer"
+            grep -Fq -- "--data-dir /var/lib/sigilcoin" "$explorer"
+            grep -Fq -- "--host 127.0.0.1" "$explorer"
+            grep -Fq -- "--port 8080" "$explorer"
 
             touch $out
           '';

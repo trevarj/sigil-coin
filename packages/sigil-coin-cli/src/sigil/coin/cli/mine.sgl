@@ -20,6 +20,8 @@
           (sigil coin puzzle generator)
           (sigil coin puzzle constraints)
           (sigil coin consensus)
+          (only (sigil coin consensus shares)
+                coin-check-share-solution/spec)
           (sigil coin node)
           (sigil coin cli args)
           (sigil coin cli wallet)
@@ -535,9 +537,9 @@
           (lambda (n)
             (let* ((context (coin-puzzle-context n args))
                    (height (report-ref context 'height))
+                   (coop (and share? (share-context context '())))
                    (spec (if share?
-                             (coin-share-puzzle
-                               (share-context context '()) pubkey)
+                             (coin-share-puzzle coop pubkey)
                              (report-ref context 'spec)))
                    (fallback (puzzle-spec-table-solution spec))
                    (solution (cli-arg args "--solution" fallback))
@@ -549,9 +551,9 @@
                    (quality (if (and share? under-par?)
                                 (list-ref
                                   (require-share-solution
-                                    "mine" context pubkey
+                                    "mine" coop pubkey
                                     (make-bytevector coin-share-blind-bytes 0)
-                                    solution)
+                                    solution spec)
                                   3)
                                 0))
                    (score (if (= quality 0)
@@ -650,12 +652,11 @@
                      blind: blind
                      solution: (string->utf8 solution)))
 
-    ;; Consensus validates personalized work. Global producer solutions are
-    ;; intentionally not accepted as co-op shares.
-    (define (require-share-solution who context pubkey blind solution)
-      (let* ((coop (share-context context '()))
-             (share (draft-share pubkey blind solution))
-             (checked (coin-check-share-solution coop share)))
+    ;; Preview personalized work without claiming commitment or signature
+    ;; validation. Global producer solutions are not accepted as co-op shares.
+    (define (require-share-solution who coop pubkey blind solution spec)
+      (let* ((share (draft-share pubkey blind solution))
+             (checked (coin-check-share-solution/spec spec solution)))
         (when (coin-failed? checked)
           (error
             (string-append
@@ -670,8 +671,7 @@
               ". Run `sigilcoin puzzle --share` for your co-op task;"
               " co-op work must solve that pubkey-personalized puzzle and be strictly"
               " under its par.")))
-        (let* ((spec (coin-share-puzzle coop pubkey))
-               (quality (coin-share-quality coop share))
+        (let* ((quality (list-ref (coin-result-value checked) 1))
                (score (cli-score-report spec solution quality)))
           (list coop share spec quality score))))
 
@@ -680,10 +680,12 @@
              (solution (cli-required
                          args "--solution" "commit"
                          "the personalized program source you are committing to"))
+             (coop (share-context context '()))
+             (spec (coin-share-puzzle coop pubkey))
              (checked (require-share-solution
-                        "commit" context pubkey
+                        "commit" coop pubkey
                         (make-bytevector coin-share-blind-bytes 0)
-                        solution)))
+                        solution spec)))
         (list context solution checked)))
 
     ;;; Publish and retain one personalized solution commitment.
@@ -784,8 +786,10 @@
                         blind)))
                (and (equal? expected
                             (cli-commit-record-commitment record))
-                    (let* ((checked (require-share-solution
-                                      "reveal" context pubkey blind solution))
+                    (let* ((coop (share-context context '()))
+                           (spec (coin-share-puzzle coop pubkey))
+                           (checked (require-share-solution
+                                      "reveal" coop pubkey blind solution spec))
                            (share (list-ref checked 1))
                            (quality (list-ref checked 3))
                            (score (list-ref checked 4)))
@@ -886,24 +890,17 @@
                   ;; public solution is printed.
                   (unless (coin-ok? decoded)
                     (error "reveal: consensus rejected the emitted share encoding"))
-                  (let ((back (car (coin-result-value decoded))))
-                    (unless (equal? (cli-commit-record-commitment record)
-                                    (coin-share-commitment
-                                      (share-context context
-                                        (list
-                                          (cli-commit-record-commitment
-                                            record)))
-                                      back))
-                      (error "reveal: emitted share does not open its commitment"))
-                    (unless (coin-share-signature-ok?
-                              (share-context context '()) back)
-                      (error "reveal: emitted share signature does not verify"))
-                    (unless (coin-ok? (coin-check-share-solution
-                                        (share-context context '()) back))
-                      (error "reveal: emitted share fails its personalized under-par puzzle"))
+                  (let* ((back (car (coin-result-value decoded)))
+                         (verified-context
+                           (share-context
+                             context
+                             (list (cli-commit-record-commitment record))))
+                         (verified
+                           (coin-check-shares verified-context #u8() (list back))))
+                    (unless (coin-ok? verified)
+                      (error "reveal: consensus rejected the emitted share"))
                     (unless (= (list-ref candidate 3)
-                               (coin-share-quality
-                                 (share-context context '()) back))
+                               (coin-share-quality verified-context back))
                       (error "reveal: emitted share quality changed")))
                   (println "height: ~a" height)
                   (println "reveal-in: ~a" (+ height 1))

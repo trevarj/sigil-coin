@@ -1,15 +1,21 @@
 ;;; Print the genesis constants for a quote and timestamp.
 ;;;
 ;;; Launch-day tool. `packages/sigil-coin-node/src/sigil/coin/node/chain.sgl`
-;;; carries four checked-in values per chain — the quote, the timestamp, the
-;;; serialized header hex and the display id — and all four have to move
-;;; together, because the quote IS the genesis coinbase and changing it
-;;; changes the hash. This prints what the new values must be.
+;;; and `packages/sigil-coin-node/src/sigil/coin/node/genesis.sgl` carry four
+;;; checked-in values per chain — quote, timestamp, serialized header hex and
+;;; display id — and all four have to move together, because the quote IS the
+;;; genesis coinbase and changing it changes the hash. This prints what the
+;;; new values must be.
 ;;;
 ;;; Run from the repository root:
 ;;;
-;;;   nix develop /home/trev/Workspace/sigil -c \
-;;;     sigil deploy/genesis-constants.sgl --redirects ./dev-redirects.sgl
+;;;   cache=$(mktemp -d); trap 'rm -rf "$cache"' EXIT
+;;;   nix develop /home/trev/Workspace/sigil -c env XDG_CACHE_HOME="$cache" \
+;;;     /home/trev/Workspace/sigil/sigil/build/dev/bin/sigil \
+;;;     deploy/genesis-constants.sgl --redirects ./dev-redirects.sgl
+;;;
+;;; The empty cache is deliberate: launch-critical constants must compile from
+;;; current source rather than falling back to bytecode left by an older build.
 ;;;
 ;;; Edit QUOTE and TIME below, run it, then paste the two hex strings into
 ;;; `coin-genesis-header-constant` and `coin-genesis-id-constant` in the

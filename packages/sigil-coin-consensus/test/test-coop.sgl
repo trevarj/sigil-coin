@@ -24,7 +24,15 @@
         (sigil secp256k1)
         (sigil coin puzzle)
         (sigil coin puzzle generator)
-        (sigil coin consensus))
+        (sigil coin consensus)
+        (only (sigil coin consensus shares)
+              coin-coop-context-derivation-count
+              coin-coop-context-signature-count
+              coin-coop-context-example-count
+              coin-check-shares-cheap
+              coin-prepare-shares
+              coin-check-share-signatures
+              coin-verify-prepared-shares))
 
 ;; ============================================================
 ;; Helpers
@@ -238,6 +246,17 @@
     lock-time: 0))
 
 (define %burn (bytes-of #x6a))
+
+(define %test-header
+  (block-header version: 5
+                previous-block: %zero32
+                merkle-root: %zero32
+                time: 1
+                bits: #x207f0080
+                nonce: 0))
+
+(define (block-with txs)
+  (block header-field: %test-header transactions: txs))
 
 (define (outs pairs)
   (map (lambda (p) (txout value: (car p) script-pubkey: (cdr p))) pairs))
@@ -453,6 +472,54 @@
   (test "a non-block has no coinbase"
     (assert-equal 'missing-coinbase (coin-result-reason
                                       (coin-block-coinbase-payload 42))))
+
+  (test "a zero-input transaction has no coinbase"
+    (let ((b (block-with
+               (list (transaction version: 1 inputs: '() outputs: '()
+                                  lock-time: 0)))))
+      (assert-false (coin-block-coinbase b))
+      (assert-equal 'missing-coinbase
+                    (coin-result-reason
+                      (coin-block-coinbase-payload b)))))
+
+  (test "coinbase extraction rejects malformed parsed shapes without raising"
+    (let* ((script (coin-coinbase-payload-encode
+                     (simple-payload 3 (string->bytes %sol-a) #u8())))
+           (coinbase-input
+             (txin previous-output: (outpoint txid: %zero32 index: #xffffffff)
+                   script-sig: script sequence: #xffffffff witness: '()))
+           (wrong-script
+             (txin previous-output: (outpoint txid: %zero32 index: #xffffffff)
+                   script-sig: 42 sequence: #xffffffff witness: '()))
+           (regular-input
+             (txin previous-output: (outpoint txid: %zero32 index: 0)
+                   script-sig: script sequence: #xffffffff witness: '()))
+           (tx (lambda (inputs)
+                 (transaction version: 1 inputs: inputs outputs: '()
+                              lock-time: 0)))
+           (missing
+             (list (block-with '())
+                   (block-with 42)
+                   (block-with (cons (tx (list coinbase-input)) 42))
+                   (block-with (list 42))
+                   (block-with (list (tx 42)))
+                   (block-with (list (tx (list 42))))
+                   (block-with (list (tx (list regular-input))))
+                   (block-with
+                     (list (tx (list coinbase-input coinbase-input)))))))
+      (assert-true
+        (let loop ((xs missing))
+          (or (null? xs)
+              (and (eq? 'missing-coinbase
+                        (coin-result-reason
+                          (coin-block-coinbase-payload (car xs))))
+                   (loop (cdr xs))))))
+      ;; Shape checks happen before payload decoding, but a coinbase-shaped
+      ;; input still gets the decoder's canonical field tag.
+      (assert-equal 'not-bytevector
+                    (coin-result-reason
+                      (coin-block-coinbase-payload
+                        (block-with (list (tx (list wrong-script)))))))))
 
   (test "a block's coinbase payload decodes"
     (let* ((script (coin-coinbase-payload-encode
@@ -1307,9 +1374,9 @@
           (string->bytes %sol-a)
           (list (fake-share 1 %sol-a))))))
 
-  (test "a context without a spec is an internal error"
+  (test "cheap pubkey failure wins before a missing expensive spec"
     (assert-equal
-      'internal-error
+      'share-bad-pubkey
       (coin-result-reason
         (coin-check-shares
           (coin-coop-context parent-prev-hash: %prev
@@ -1539,14 +1606,102 @@
                                                            junk))))))
 
       (test-group "share validation: the happy path"
-        (test "one committed, signed, personalized solution is accepted"
-          (let ((shares (list (valid-share-of 2))))
+        (test "public preview leaves the verified cache empty"
+          (let* ((share (valid-share-of 2))
+                 (context (context-for (list share)))
+                 (preview (coin-check-share-solution context share)))
+            (assert-true (coin-ok? preview))
+            (assert-equal 3 (length (coin-result-value preview)))
+            (assert-error (coin-share-quality context share))
+            (assert-equal 1 (coin-coop-context-derivation-count context))
+            (assert-equal 0 (coin-coop-context-example-count context))))
+
+        (test "prepared and signed provenance cannot expose quality"
+          (let* ((share (valid-share-of 2))
+                 (shares (list share))
+                 (context (context-for shares)))
             (assert-true
-              (coin-ok? (coin-check-share-solution
-                          %bare-context (car shares))))
-            (assert-true (coin-ok? (check shares)))
-            (assert-equal 1 (length (coin-result-value (check shares))))
-            (assert-true (> (coin-shares-quality %bare-context shares) 0))))
+              (coin-ok?
+                (coin-check-shares-cheap
+                  context (string->bytes %sol-d) shares)))
+            (assert-true (coin-ok? (coin-prepare-shares context shares)))
+            (assert-error (coin-share-quality context share))
+            (assert-equal 1 (coin-coop-context-derivation-count context))
+            (assert-equal 0 (coin-coop-context-example-count context))
+            (assert-true
+              (coin-ok? (coin-check-share-signatures context shares)))
+            (assert-error (coin-share-quality context share))
+            (assert-true
+              (coin-ok? (coin-verify-prepared-shares context shares)))
+            (assert-true (> (coin-share-quality context share) 0))
+            (assert-equal 1 (coin-coop-context-example-count context))))
+
+        (test "one committed, signed, personalized solution is accepted"
+          (let* ((shares (list (valid-share-of 2)))
+                 (context (context-for shares))
+                 (checked (coin-check-shares
+                            context (string->bytes %sol-d) shares)))
+            (assert-true (coin-ok? checked))
+            (assert-equal 1 (length (coin-result-value checked)))
+            (assert-true (> (coin-shares-quality context shares) 0))))
+
+        (test "accepted shares derive once and Q reuses validation reports"
+          (let* ((shares (in-share-order (map valid-share-of '(2 9 12))))
+                 (context (context-for shares))
+                 (checked (coin-check-shares
+                            context (string->bytes %sol-d) shares)))
+            (assert-true (coin-ok? checked))
+            (assert-equal 3 (coin-coop-context-derivation-count context))
+            (assert-equal 3 (coin-coop-context-signature-count context))
+            (assert-equal 3 (coin-coop-context-example-count context))
+            (let ((quality (coin-shares-quality context shares)))
+              (assert-equal 3 (coin-coop-context-derivation-count context))
+              (assert-equal
+                quality
+                (coin-quality
+                  (map (lambda (share)
+                         (let* ((spec
+                                  (coin-share-puzzle
+                                    %bare-context
+                                    (coin-share-pubkey share)))
+                                (size
+                                  (bytevector-length
+                                    (coin-share-solution share))))
+                           (coin-share-contribution
+                             (coin-share-margin-milli
+                               (puzzle-spec-par spec) size))))
+                       shares)))
+              ;; Any accidental fallback now shows up at derivation entry.
+              (coin-share-puzzle context (coin-share-pubkey (car shares)))
+              (assert-equal 4
+                            (coin-coop-context-derivation-count context)))))
+
+        (test "verified quality requires the exact committed share"
+          (let* ((share (valid-share-of 2))
+                 (context (context-for (list share)))
+                 (changed (coin-share
+                            share
+                            signature: (filled coin-share-signature-bytes 0))))
+            (assert-true
+              (coin-ok?
+                (coin-check-shares
+                  context (string->bytes %sol-d) (list share))))
+            (assert-true (> (coin-share-quality context share) 0))
+            (assert-error (coin-share-quality context changed))))
+
+        (test "duplicate source wins before bad signature and puzzle work"
+          (let* ((honest (share-of 1 %sol-a))
+                 (forged (coin-share
+                           honest
+                           signature: (filled 64 0)))
+                 (context (context-for (list forged)))
+                 (checked (coin-check-shares
+                            context (string->bytes %sol-a) (list forged))))
+            (assert-equal 'share-duplicate-solution
+                          (coin-result-reason checked))
+            (assert-equal 0 (coin-coop-context-signature-count context))
+            (assert-equal 0 (coin-coop-context-derivation-count context))
+            (assert-equal 0 (coin-coop-context-example-count context))))
 
         (test "three personalized shares are accepted and returned in order"
           (let ((shares (in-share-order (map valid-share-of '(2 9 12)))))
@@ -1605,8 +1760,7 @@
                                                   (list share))))))
 
         (test "a bad signature is refused once the commitment matches"
-          ;; The commitment is built from the tampered share, so check 4
-          ;; passes and check 5 is what rejects it.
+          ;; Commitment and all source-preparation gates pass before ECDSA.
           (let* ((honest (share-of 1 %sol-a))
                  (forged (coin-share
                            pubkey: (coin-share-pubkey honest)

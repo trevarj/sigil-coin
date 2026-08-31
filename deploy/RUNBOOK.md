@@ -42,15 +42,24 @@ error that says so rather than building the wrong thing.
 
 ```nix
 inputs.sigilcoin.url = "git+file:///home/trev/Workspace/sigil/sigil-coin?dir=deploy";
-# or, once the repo is published:
-#   inputs.sigilcoin.url = "github:trevarj/sigil-coin?dir=deploy";
 ```
+
+**This is intentionally a local-testnet flake until the repositories are
+pushed.** The current `sigil-bitcoin` pin includes unpublished commits, so a
+`github:trevarj/sigil-coin?dir=deploy` input cannot reproduce this build yet.
+After the manual testnet and explicit push approval, replace all three local
+`git+file:` source inputs with public forge URLs at the pushed revisions and
+re-run every flake check before calling the deployment portable.
 
 The two sibling checkouts are flake inputs pinned by revision
 (`git+file:///…/sigil` and `git+file:///…/sigil-bitcoin`), as are the
-fourteen `from-git` Sigil libraries the two dependency graphs need. That is
-what lets the build sandbox stay offline, and it is why there is no
-`depsHash` to fill in any more. Bump a sibling with `--override-input` or
+fourteen `from-git` Sigil libraries the two dependency graphs need. The
+`sigil-bitcoin` pin is `424a4a83beb9e81ab7e292f4d51c05ce16306450`, which
+provides the durable-parent seven-argument block connector and is currently
+available only in the local checkout. An older pin can
+build yet lose H2 parent-body validation after reopen, so
+`sigilcoin-durable-parent` is a blocking flake check. These pins let the build
+sandbox stay offline, and are why there is no `depsHash` to fill in. Bump a sibling with `--override-input` or
 `nix flake update`; see the comment block at the top of `flake.nix`.
 
 There is no separate explorer package: `sigil-coin-explorer` declares
@@ -66,18 +75,29 @@ nix build .#sigilcoin --print-build-logs
 ```
 
 ```
-sigilcoin> buildPhase completed in 6 minutes 17 seconds
+sigilcoin> ✓ Build complete!
+sigilcoin> buildPhase completed in 6 minutes 41 seconds
 sigilcoin> Running phase: installCheckPhase
 ```
 
+That build compiled the canonical module paths, including
+`sigil/coin/consensus/{retarget,score,shares}.sgl`,
+`sigil/coin/node/{rules,body,miner,genesis,chain}.sgl`, and
+`sigil/coin/explorer/derive.sgl`, then consumed the sole public
+`(sigil coin consensus)` and `(sigil coin node)` surfaces.
+
 ```sh
-readlink -f result   # => /nix/store/r20gic6jsq8dz9ayc22xn2svxim87aka-sigilcoin-0.1.0
+readlink -f result   # => /nix/store/68jcgjvqd1y3w5ns1af6n3skgzk2f2bp-sigilcoin-0.1.0
 ls result/bin        # => sigilcoin  sigilcoin-explorer
-./result/bin/sigilcoin version
+timeout 5 ./result/bin/sigilcoin help >/dev/null
+timeout 5 ./result/bin/sigilcoin version
+timeout 5 ./result/bin/sigilcoin-explorer --help >/dev/null
+timeout 5 ./result/bin/sigilcoin-explorer --version
 ```
 
 ```
 sigilcoin 0.1.0
+sigilcoin-explorer 0.1.0
 ```
 
 and `nix flake check`, run from inside `deploy/`:
@@ -88,20 +108,25 @@ all checks passed!
 ```
 
 The count is what is LEFT TO BUILD, not how many checks exist. There are
-exactly two: `sigilcoin-runs`, which builds both binaries and runs
-`sigilcoin version`, and `module-eval`, which evaluates a host, asserts the
-units it generates, and fails if a `sigilcoin-listen-proxy` unit ever comes
-back. A run whose dependencies are already built legitimately prints
+exactly three: `sigilcoin-runs` builds both binaries and runs
+`sigilcoin version`; `sigilcoin-durable-parent` mines H1, closes, reopens to
+mine H2, then checks both validated bodies from a third process; and
+`module-eval` evaluates a host and checks node, sync and explorer units,
+canonical flags and state paths, firewall port 19444, wallet/data-directory
+modes, and absence of `sigilcoin-listen-proxy`. A run whose dependencies are already built legitimately prints
 `running 0 flake checks`.
 Zero means "nothing left to do", not "nothing was verified" — but it also
 proves nothing, so when you want the checks to actually execute, force them:
 
 ```sh
 nix build --rebuild --no-link \
-  .#checks.x86_64-linux.module-eval .#checks.x86_64-linux.sigilcoin-runs
+  .#checks.x86_64-linux.module-eval \
+  .#checks.x86_64-linux.sigilcoin-runs \
+  .#checks.x86_64-linux.sigilcoin-durable-parent
 ```
 
 ```
+checking outputs of '/nix/store/…-sigilcoin-durable-parent.drv'...
 checking outputs of '/nix/store/…-sigilcoin-module-eval.drv'...
 checking outputs of '/nix/store/…-sigilcoin-runs.drv'...
 ```
@@ -230,7 +255,7 @@ peer-failures: 0
 pending-blocks: 0
 sync-stage: idle
 sync-last-error:
-tip-solution-bytes: 44
+tip-solution-bytes: 90
 next-height: 1
 next-reward: 1.00000000 SGL
 issued-supply: 0.00000000 SGL
@@ -581,7 +606,6 @@ options:
 
 The explorer never writes: it opens the node's database read-only,
 answers one request per connection, and closes.
-  --version         print the package version and exit
 ```
 
 MINIMUM VERSION: `--help`, `-h` and `--version` answer and exit before
@@ -595,18 +619,40 @@ running it. Every explorer command in this runbook is wrapped in `timeout`
 for that reason.
 
 Serving was verified the same way — bounded, because the server itself does
-not exit:
+not exit. Canonical HTML routes are `/`, `/blocks`, `/difficulty`,
+`/block/<height|id>`, and `/address/<sgl1...>`; JSON mirrors them under
+`/api/summary`, `/api/blocks`, `/api/difficulty`, `/api/block/<height|id>`, and
+`/api/address/<sgl1...>`.
 
 ```sh
-timeout 5 sigilcoin-explorer --regtest --data-dir /tmp/n --host 127.0.0.1 --port 18099 &
-sleep 2 && curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:18099/
+dir=$(mktemp -d)
+sigilcoin status --regtest --data-dir "$dir" >/dev/null
+timeout 10 sigilcoin-explorer --regtest --data-dir "$dir" \
+  --host 127.0.0.1 --port 18099 &
+server=$!
+sleep 2
+for route in / /blocks /difficulty /block/0 \
+  /api/summary /api/blocks /api/difficulty /api/block/0; do
+  curl -s -o /dev/null -w "$route %{http_code}\n" "http://127.0.0.1:18099$route"
+done
+kill "$server"
+rm -rf "$dir"
 ```
 
 ```
-200
-explorer: sigilcoin-regtest at /tmp/n/sigilcoin-regtest.sqlite
-explorer: http://127.0.0.1:18099/
+/ 200
+/blocks 200
+/difficulty 200
+/block/0 200
+/api/summary 200
+/api/blocks 200
+/api/difficulty 200
+/api/block/0 200
 ```
+
+On an initialized regtest database every listed route must return 200. Address
+routes need a real `sgl1...` address from that database; unknown names and
+unknown routes return 404, and missing database routes return 503.
 
 **A read-only SQLite reader cannot recover a hot journal.** If the node is
 killed mid-write — `SIGKILL`, a power cut, the soak plan's own hard-kill test

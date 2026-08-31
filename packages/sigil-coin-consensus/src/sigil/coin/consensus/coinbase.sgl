@@ -318,12 +318,35 @@
                                 "scriptSig is not the canonical encoding")
                               (coin-ok payload))))))))))))
 
-    ;; Return first transaction; strict payload decoding rejects malformed input.
+    ;; Return the sole coinbase-shaped input after checking every list and
+    ;; record shape needed before extraction.
+    (define (coinbase-input tx)
+      (and (transaction? tx)
+           (let ((inputs (transaction-inputs tx)))
+             (and (list? inputs)
+                  (pair? inputs)
+                  (null? (cdr inputs))
+                  (let* ((input (car inputs))
+                         (op (and (txin? input)
+                                  (txin-previous-output input))))
+                    (and (outpoint? op)
+                         (number? (outpoint-index op))
+                         (exact? (outpoint-index op))
+                         (integer? (outpoint-index op))
+                         (= #xffffffff (outpoint-index op))
+                         (equal? (make-bytevector 32 0)
+                                 (outpoint-txid op))
+                         input))))))
+
+    ;; Return first transaction only when it has canonical coinbase shape.
     (define (coin-block-coinbase b)
       (guard (e (#t #f))
         (and (block? b)
-             (pair? (block-transactions b))
-             (car (block-transactions b)))))
+             (let ((transactions (block-transactions b)))
+               (and (list? transactions)
+                    (pair? transactions)
+                    (let ((tx (car transactions)))
+                      (and (coinbase-input tx) tx)))))))
 
     ;;; Decode a block's coinbase payload.
     ;;;
@@ -335,12 +358,12 @@
     ;;; ```
     (define (coin-block-coinbase-payload b)
       (: any? -> coin-result?)
-      (let ((tx (coin-block-coinbase b)))
-        (if (not tx)
+      (let* ((tx (coin-block-coinbase b))
+             (input (and tx (coinbase-input tx))))
+        (if (not input)
             (coin-error 'missing-coinbase
                         "block has no coinbase transaction")
-            (coin-coinbase-payload-decode
-              (txin-script-sig (car (transaction-inputs tx)))))))
+            (coin-coinbase-payload-decode (txin-script-sig input)))))
 
     ;;; The carrier's payout script: `scriptPubKey` of output 0 of the
     ;;; PARENT block's coinbase (§6.5).

@@ -59,6 +59,13 @@
     puzzle-eval
     puzzle-run
 
+    ;; Shared bounded machine (generator support)
+    puzzle-machine?
+    puzzle-machine-open
+    puzzle-machine-steps
+    puzzle-eval/machine
+    puzzle-run-examples/machine
+
     ;; Program-by-example front end (canonical)
     puzzle-report
     puzzle-report?
@@ -734,6 +741,31 @@
 
     (define (cells-used m)
       (puzzle--machine-cells m))
+
+    ;;; Open one evaluator machine with an explicit fuel budget.
+    ;;;
+    ;;; Calls through `puzzle-eval/machine` and
+    ;;; `puzzle-run-examples/machine` consume this same machine. The budget
+    ;;; may not exceed the public solution cap.
+    ;;;
+    ;;; ```scheme
+    ;;; (puzzle-machine-steps (puzzle-machine-open 20000)) ; => 0
+    ;;; ```
+    (define (puzzle-machine-open fuel)
+      (: integer? -> puzzle-machine?)
+      (if (or (< fuel 0) (> fuel puzzle-max-fuel))
+          (error "puzzle machine: fuel must be in [0, 200000]"))
+      (puzzle--machine fuel: fuel budget: fuel))
+
+    ;;; True when `value` is a shared evaluator machine.
+    (define (puzzle-machine? value)
+      (: any? -> boolean?)
+      (puzzle--machine? value))
+
+    ;;; Steps consumed by a shared evaluator machine.
+    (define (puzzle-machine-steps machine)
+      (: puzzle-machine? -> integer?)
+      (steps-used machine))
 
     ;; ============================================================
     ;; Environments
@@ -1412,14 +1444,22 @@
     ;;; ```
     (define (puzzle-eval ast)
       (: any? -> puzzle-result?)
-      (let ((m (puzzle--machine fuel: puzzle-max-fuel
-                                budget: puzzle-max-fuel)))
-        (guard (e (#t (abort->result e (steps-used m) (cells-used m))))
-          (let ((value (ev m ast '() 1)))
-            (puzzle-result status: 'ok
-                           value: value
-                           steps: (steps-used m)
-                           allocations: (cells-used m))))))
+      (puzzle-eval/machine (puzzle-machine-open puzzle-max-fuel) ast))
+
+    ;;; Evaluate a parsed AST on an existing bounded machine.
+    ;;;
+    ;;; Step and allocation totals are cumulative across every call sharing
+    ;;; `machine`. Exhaustion stops inside the evaluator at the machine's
+    ;;; exact fuel boundary.
+    (define (puzzle-eval/machine machine ast)
+      (: puzzle-machine? any? -> puzzle-result?)
+      (guard (e (#t (abort->result e (steps-used machine)
+                                   (cells-used machine))))
+        (let ((value (ev machine ast '() 1)))
+          (puzzle-result status: 'ok
+                         value: value
+                         steps: (steps-used machine)
+                         allocations: (cells-used machine)))))
 
     ;;; Parse and evaluate solution source in one step.
     ;;;
@@ -1519,31 +1559,41 @@
     ;;; ```
     (define (puzzle-run-examples source pairs)
       (: any? list? -> puzzle-report?)
-      (let ((m (puzzle--machine fuel: puzzle-max-fuel
-                                budget: puzzle-max-fuel)))
-        (guard (e (#t (puzzle--abort->report e m)))
-          (let* ((ast (puzzle--parse-datum source puzzle-max-source-bytes))
-                 (proc (ev m ast '() 1)))
-            (if (not (puzzle--one-arity? proc))
-                (puzzle--report-error m 'solution-not-a-procedure #f
-                                      "solution is not a 1-arity procedure")
-                (let loop ((ps pairs) (i 0))
-                  (cond
-                    ((null? ps)
-                     (puzzle-report status: 'ok
-                                    value: proc
-                                    steps: (steps-used m)
-                                    cells: (cells-used m)))
-                    ((not (pair? ps))
-                     (puzzle--report-error m 'bad-syntax #f
-                                           "examples must be a proper list"))
-                    (else
-                      (let* ((example (car ps))
-                             (got (puzzle--apply m proc
-                                                 (list (car example)) 1)))
-                        (if (or (puzzle-procedure? got)
-                                (not (puzzle-value? got))
-                                (not (puzzle-value=? (cdr example) got)))
-                            (puzzle--report-error m 'solution-mismatch i
-                                                  "example not reproduced")
-                            (loop (cdr ps) (+ i 1)))))))))))) ))
+      (puzzle-run-examples/machine
+        (puzzle-machine-open puzzle-max-fuel) source pairs))
+
+    ;;; Run examples on an existing bounded machine.
+    ;;;
+    ;;; This is the generator entry point. Parsing remains source-bounded;
+    ;;; source evaluation and every application consume `machine` directly,
+    ;;; so no nested evaluation can outlive its remaining fuel.
+    (define (puzzle-run-examples/machine machine source pairs)
+      (: puzzle-machine? any? list? -> puzzle-report?)
+      (guard (e (#t (puzzle--abort->report e machine)))
+        (let* ((ast (puzzle--parse-datum source puzzle-max-source-bytes))
+               (proc (ev machine ast '() 1)))
+          (if (not (puzzle--one-arity? proc))
+              (puzzle--report-error machine 'solution-not-a-procedure #f
+                                    "solution is not a 1-arity procedure")
+              (let loop ((ps pairs) (i 0))
+                (cond
+                  ((null? ps)
+                   (puzzle-report status: 'ok
+                                  value: proc
+                                  steps: (steps-used machine)
+                                  cells: (cells-used machine)))
+                  ((not (pair? ps))
+                   (puzzle--report-error machine 'bad-syntax #f
+                                         "examples must be a proper list"))
+                  (else
+                    (let* ((example (car ps))
+                           (got (puzzle--apply machine
+                                               proc
+                                               (list (car example))
+                                               1)))
+                      (if (or (puzzle-procedure? got)
+                              (not (puzzle-value? got))
+                              (not (puzzle-value=? (cdr example) got)))
+                          (puzzle--report-error machine 'solution-mismatch i
+                                                "example not reproduced")
+                          (loop (cdr ps) (+ i 1))))))))))) ))

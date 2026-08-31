@@ -109,6 +109,19 @@
                 script-pubkey: (or (cdr entry) producer-script)))
        (coin-split-plan value shares carrier-script)))
 
+;; Aggregate only successful pure previews. These deliberately malformed
+;; synthetic shares make the header claim zero Q.
+(define (preview-quality context shares)
+  (let loop ((xs shares) (contributions '()))
+    (if (null? xs)
+        (coin-quality (reverse contributions))
+        (let ((preview (coin-check-share-solution context (car xs))))
+          (if (coin-failed? preview)
+              0
+              (loop (cdr xs)
+                    (cons (list-ref (coin-result-value preview) 2)
+                          contributions)))))))
+
 ;; Build one  block. `solution` is the producer's own program for THIS
 ;; height's puzzle; the shares solve the PARENT's.
 (define (build-block parent-header height complexity solution shares
@@ -155,23 +168,23 @@
                    (puzzle-report-steps report)
                    (if (null? shares)
                        0
-                       (coin-shares-quality
-                         (let* ((puzzle-height (- height 1))
-                                (parent-prev
-                                  (block-header-previous-block parent-header))
-                                (parent-complexity
-                                  (coin-result-value
-                                    (coin-bits-decode
-                                      (block-header-bits parent-header)))))
-                           (coin-coop-context
-                             parent-prev-hash: parent-prev
-                             puzzle-height: puzzle-height
-                             complexity: parent-complexity
-                             spec: (coin-puzzle-for
-                                     parent-prev puzzle-height
-                                     parent-complexity)
-                             commits: '()))
-                         shares))))
+                       (let* ((puzzle-height (- height 1))
+                              (parent-prev
+                                (block-header-previous-block parent-header))
+                              (parent-complexity
+                                (coin-result-value
+                                  (coin-bits-decode
+                                    (block-header-bits parent-header))))
+                              (context
+                                (coin-coop-context
+                                  parent-prev-hash: parent-prev
+                                  puzzle-height: puzzle-height
+                                  complexity: parent-complexity
+                                  spec: (coin-puzzle-for
+                                          parent-prev puzzle-height
+                                          parent-complexity)
+                                  commits: '())))
+                         (preview-quality context shares)))))
       transactions: transactions)))
 
 ;; Write a block into the node's own tables, the way a synced node would.
@@ -237,9 +250,8 @@
       commits: '())))
 
 (define (personalized-shares parent-header puzzle-height complexity)
-  ;; Structurally real consensus reveals. Signatures and solutions need not
-  ;; be revalidated for explorer rendering; tiny distinct programs keep each
-  ;; personalized margin and contribution observable.
+  ;; Structurally real but invalid reveals. Explorer must preserve their named
+  ;; preview failures without validating signatures or trusting claimed Q.
   (list (make-share 1 "x")
         (make-share 2 "y")
         (make-share 3 "<script>x</script>")))
@@ -663,7 +675,7 @@
 ;; ============================================================
 
 (test-group "co-op shares"
-  (test "every share has personalized par, margin and contribution"
+  (test "malformed share previews stay named and unverified"
     (with-store
       (lambda (store)
         (let* ((b (explorer-block-by-height store %coop-height))
@@ -679,20 +691,23 @@
             (let loop ((xs shares) (raw %coop-shares))
               (unless (null? xs)
                 (let* ((s (car xs))
-                       (spec (coin-share-puzzle
-                               context (coin-share-pubkey (car raw)))))
+                       (raw-share (car raw))
+                       (preview
+                         (coin-check-share-solution context raw-share)))
                   (assert-true (string? (explorer-share-address s)))
                   (assert-true (number? (explorer-share-solution-length s)))
-                  (assert-equal (puzzle-spec-par spec) (explorer-share-par s))
-                  (assert-true (> (explorer-share-margin s) 0))
-                  (assert-true (<= 1 (explorer-share-contribution s) 4))
-                  (assert-equal 'not-a-solution (explorer-share-problem s))
+                  (assert-true (coin-failed? preview))
+                  (assert-equal (coin-result-reason preview)
+                                (explorer-share-problem s))
+                  (assert-equal #f (explorer-share-par s))
+                  (assert-equal #f (explorer-share-margin s))
+                  (assert-equal #f (explorer-share-contribution s))
                   (assert-equal #f (explorer-share-steps s))
                   (assert-equal #f (explorer-share-cells s))
+                  ;; Pure preview must not grant verified-cache provenance.
+                  (assert-error (coin-share-quality context raw-share))
                   (loop (cdr xs) (cdr raw))))))
-          (assert-equal
-            (min 15 (apply + (map explorer-share-contribution shares)))
-            (explorer-block-score-quality b))
+          (assert-equal 0 (explorer-block-score-quality b))
           ;; The three programs are byte-wise distinct, as §6.4 requires.
           (assert-true (not (equal? (explorer-share-solution
                                       (list-ref shares 0))
@@ -1084,11 +1099,11 @@
                             (dict-get (car rows) "signature"))
               (assert-equal (explorer-share-blind-hex (car xs))
                             (dict-get (car rows) "blind"))
-              (assert-equal (explorer-share-par (car xs))
+              (assert-equal (or (explorer-share-par (car xs)) 'null)
                             (dict-get (car rows) "personal_par"))
-              (assert-equal (explorer-share-margin (car xs))
+              (assert-equal (or (explorer-share-margin (car xs)) 'null)
                             (dict-get (car rows) "margin"))
-              (assert-equal (explorer-share-contribution (car xs))
+              (assert-equal (or (explorer-share-contribution (car xs)) 'null)
                             (dict-get (car rows) "contribution"))
               (assert-equal (or (explorer-share-steps (car xs)) 'null)
                             (dict-get (car rows) "steps"))

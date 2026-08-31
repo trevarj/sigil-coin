@@ -541,25 +541,25 @@
                       commits: '()))))))
 
     ;; One consensus share flattened for display. Signature and blind are
-    ;; decoded as hex, never verified or interpreted by the explorer.
+    ;; decoded as hex, never verified or interpreted by the explorer. Derived
+    ;; work fields come only from consensus's pure preview, which cannot
+    ;; populate the fully-verified share cache.
     (define (make-share index share payout context detail?)
       (let* ((pubkey (coin-share-pubkey share))
              (solution (coin-share-solution share))
-             (personalized (and detail? context
-                                (guard (e (#t #f))
-                                  (coin-share-puzzle context pubkey))))
-             (personalized-view
-               (and personalized (explorer-puzzle-view personalized)))
-             (par (and personalized-view (car personalized-view)))
+             (preview (and detail? context
+                           (coin-check-share-solution context share)))
+             (preview-value (and preview (coin-ok? preview)
+                                 (coin-result-value preview)))
+             (personalized (and preview-value (list-ref preview-value 0)))
+             (report (and preview-value (list-ref preview-value 1)))
+             (contribution (and preview-value (list-ref preview-value 2)))
+             (par (and personalized (puzzle-spec-par personalized)))
              (length-used (bytevector-length solution))
-             (margin (and par (< length-used par)
-                          (guard (e (#t #f))
-                            (coin-share-margin-milli par length-used))))
-             (contribution (and margin
-                                (guard (e (#t #f))
-                                  (coin-share-contribution margin))))
-             (cost (and personalized
-                        (explorer-check-solution personalized solution)))
+             (margin (and par
+                          (coin-share-margin-milli par length-used)))
+             (steps (and report (puzzle-report-steps report)))
+             (cells (and report (puzzle-report-cells report)))
              (script (guard (e (#t #f)) (coin-share-script pubkey))))
         (explorer-share
           index: index
@@ -573,16 +573,15 @@
           par: par
           margin: margin
           contribution: contribution
-          steps: (and cost (car cost))
-          cells: (and cost (cdr cost))
-          memory-bucket: (and cost (explorer-bucket (cdr cost)))
-          step-bucket: (and cost (explorer-bucket (car cost)))
+          steps: steps
+          cells: cells
+          memory-bucket: (and cells (explorer-bucket cells))
+          step-bucket: (and steps (explorer-bucket steps))
           payout: payout
           problem: (cond ((not detail?) 'not-evaluated)
-                         ((not personalized) 'puzzle-unknown)
-                         ((not margin) 'share-not-under-par)
-                         (cost #f)
-                         (else 'not-a-solution)))))
+                         ((not context) 'puzzle-unknown)
+                         ((coin-failed? preview) (coin-result-reason preview))
+                         (else #f)))))
 
     (define (output-role index share-count)
       (cond ((not (number? share-count)) 'unexpected)

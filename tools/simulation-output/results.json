@@ -1,0 +1,210 @@
+{
+  "schema": 2,
+  "canonical_apis": [
+    "coin-puzzle-for",
+    "puzzle-for/constraint",
+    "coin-share-puzzle",
+    "coin-check-solution",
+    "coin-check-share-solution",
+    "coin-share-margin-milli",
+    "coin-share-contribution",
+    "coin-quality",
+    "coin-score-encode",
+    "coin-score-better?",
+    "coin-split-unit",
+    "coin-split-plan",
+    "coin-block-reward",
+    "coin-cumulative-supply",
+    "secp256k1-seckey-verify?",
+    "secp256k1-pubkey-create",
+    "secp256k1-pubkey-parse"
+  ],
+  "determinism": {
+    "seed_formula": "byte[j]=(11+31*seed_index+7*j) mod 256",
+    "seed_count": 12,
+    "heights": [
+      0,
+      1,
+      16,
+      255,
+      4096
+    ],
+    "complexities": [
+      16,
+      255,
+      256,
+      512,
+      1024,
+      2560,
+      4095
+    ],
+    "forced_constraints": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "pubkey_scalars": "1..64 multiples of secp256k1 G",
+    "clock_or_host_randomness": false
+  },
+  "puzzles": {
+    "global_count": 420,
+    "forced_count": 8,
+    "constraint_mix": {
+      "none": 144,
+      "no-digits": 50,
+      "no-quote": 72,
+      "letrec-required": 48,
+      "builtin-cap": 33,
+      "single-lambda": 21,
+      "small-literals": 29,
+      "fold-required": 23
+    },
+    "k": {
+      "min": 3,
+      "median": 4,
+      "max": 8,
+      "mean_floor": 4
+    },
+    "width": {
+      "min": 6,
+      "median": 8,
+      "max": 24,
+      "mean_floor": 11
+    },
+    "table_bytes": {
+      "min": 63,
+      "median": 119,
+      "max": 319,
+      "mean_floor": 146
+    },
+    "par": {
+      "min": 24,
+      "median": 30,
+      "max": 78,
+      "mean_floor": 33
+    },
+    "retries": {
+      "min": 0,
+      "median": 0,
+      "max": 3,
+      "mean_floor": 0
+    },
+    "retrying_puzzles": 49,
+    "fallbacks": 0,
+    "hidden_validation_steps": {
+      "min": 30,
+      "median": 61,
+      "max": 297,
+      "mean_floor": 71
+    },
+    "hidden_validation_allocations": {
+      "min": 22,
+      "median": 56,
+      "max": 393,
+      "mean_floor": 65
+    }
+  },
+  "personalized_shares": {
+    "count": 64,
+    "global_constraint": 6,
+    "margin_milli": {
+      "min": 8,
+      "median": 24,
+      "max": 42,
+      "mean_floor": 21
+    },
+    "contribution_counts": {
+      "one": 64,
+      "two": 0,
+      "three": 0,
+      "four": 0
+    },
+    "first_eight": {
+      "indexes": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8
+      ],
+      "mean_margin_milli": 23,
+      "contribution_sum": 8,
+      "quality_q": 8
+    },
+    "easiest_eight": {
+      "indexes": [
+        20,
+        33,
+        61,
+        6,
+        7,
+        9,
+        5,
+        39
+      ],
+      "mean_margin_milli": 36,
+      "contribution_sum": 8,
+      "quality_q": 8
+    }
+  },
+  "payouts": {
+    "rows": 162,
+    "heights": [
+      0,
+      1,
+      30,
+      31,
+      730,
+      731,
+      1460,
+      24820,
+      24821
+    ],
+    "fees": [
+      0,
+      12345
+    ],
+    "share_counts": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8
+    ],
+    "max_supply": 14302999991970,
+    "final_reward_height": 24820
+  },
+  "censorship_timeline": {
+    "commitment_height": 31,
+    "reveal_height": 32,
+    "carrier_actor": "carrier-A",
+    "carrier_key": "key-63",
+    "reveal_producer_actor": "producer-B",
+    "reveal_producer_key": "key-64",
+    "rows": 32,
+    "scope": "H/H+1 payout accounting; no profitability or equilibrium claim"
+  },
+  "aggregate_ordering": {
+    "producer_length": 32,
+    "producer_cells": 80,
+    "producer_steps": 300,
+    "strong_q": 12,
+    "weak_q": 8,
+    "strong_score_word": 131281456,
+    "weak_score_word": 131281520,
+    "strong_outranks_weak": true
+  },
+  "caveat": "Consensus proves distinct pubkey-personalized tasks and verified work, not distinct owners or identity independence."
+}

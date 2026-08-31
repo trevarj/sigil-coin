@@ -25,7 +25,7 @@ surface it.
 - [ ] No open work on `src/sigil/coin/puzzle.sgl` or
       `src/sigil/coin/puzzle/generator.sgl`. Merge or abandon it now.
 - [ ] Full suite green:
-      `nix develop /home/trev/Workspace/sigil -c sigil test --redirects ./dev-redirects.sgl --no-color`
+      `nix develop /home/trev/Workspace/sigil -c /home/trev/Workspace/sigil/sigil/build/dev/bin/sigil test --redirects ./dev-redirects.sgl --no-color`
 - [ ] Tag the freeze so the launch commit is nameable, and say in the tag
       message that the puzzle layer is frozen.
 
@@ -50,8 +50,13 @@ the genesis hash: change one byte and every constant below changes.
 - [ ] On launch day, edit `QUOTE` and `TIME` in `deploy/genesis-constants.sgl` and run it
       from the repository root:
 
-      nix develop /home/trev/Workspace/sigil -c \
-        sigil deploy/genesis-constants.sgl --redirects ./dev-redirects.sgl
+      cache=$(mktemp -d); trap 'rm -rf "$cache"' EXIT
+      nix develop /home/trev/Workspace/sigil -c env XDG_CACHE_HOME="$cache" \
+        /home/trev/Workspace/sigil/sigil/build/dev/bin/sigil \
+        deploy/genesis-constants.sgl --redirects ./dev-redirects.sgl
+
+      The empty cache is part of the check: a launch-critical genesis must
+      compile from the current source, never reuse bytecode from an older build.
 
       Current coherent provisional output:
 
@@ -111,11 +116,12 @@ should be in the same place the code is.
       block spacing floor 72000 seconds, future drift allowance 7200 seconds,
       coinbase maturity 100 blocks.
 - [ ] Fork choice, stated plainly: greater height wins; at equal height the
-      better score wins, where score is the shorter program, then the one
-      that allocated less, then the one that ran in fewer steps, then the one
-      carrying more co-op shares. There is no block-hash tie-break: two blocks
-      that score identically are incomparable and the one seen first is kept,
-      which is what stops a copied solution from being ground into a win.
+      better score wins, where score is the shorter producer program, then
+      lower producer allocations, then fewer producer steps, then higher
+      aggregate quality `Q` from strictly under-par pubkey-personalized shares.
+      Raw reveal count affects reward splitting, not ranking. There is no
+      block-hash tie-break: two blocks that score identically are incomparable
+      and the one seen first is kept.
 
 Anyone can check the first two against their own build with
 `sigilcoin status`, which prints `best-hash` on a fresh data directory.
@@ -125,18 +131,27 @@ Anyone can check the first two against their own build with
 Follow [`deploy/RUNBOOK.md`](deploy/RUNBOOK.md); the checklist here is only
 the launch-day gate.
 
+- [ ] `deploy/flake.lock` pins `sigil-bitcoin` at
+      `424a4a83beb9e81ab7e292f4d51c05ce16306450` or a reviewed descendant with
+      the durable-parent seven-argument connector seam.
 - [ ] `cd …/sigil-coin/deploy && nix flake check` passes on the build host.
-      The number it prints is what was left to build (two checks exist;
-      zero once cached), so do not read it as a pass count.
-      Force the two real checks to execute:
-      `nix build --rebuild --no-link .#checks.x86_64-linux.module-eval .#checks.x86_64-linux.sigilcoin-runs`.
-      One builds both binaries and runs `sigilcoin version`; `module-eval`
-      asserts that no `sigilcoin-listen-proxy` unit exists and that the
-      listen unit binds the public port itself.
+      The number it prints is what was left to build (three checks exist;
+      zero once cached), so do not read it as a pass count. Force all three:
+      `nix build --rebuild --no-link .#checks.x86_64-linux.module-eval .#checks.x86_64-linux.sigilcoin-runs .#checks.x86_64-linux.sigilcoin-durable-parent`.
+      Checks build both binaries, mine H1 then close/reopen for H2 through the
+      durable-parent seam, and validate node, sync and explorer units, their
+      canonical flags and state paths, firewall port 19444,
+      wallet/data-directory modes, and absence of any
+      `sigilcoin-listen-proxy` unit.
 - [ ] `nix build …/sigil-coin?dir=deploy#sigilcoin` produces
-      `result/bin/sigilcoin` and `result/bin/sigilcoin-explorer`, and
-      `./result/bin/sigilcoin version` prints `sigilcoin 0.1.0`.
-      The `?dir=deploy` is required; see `deploy/flake.nix`.
+      `result/bin/sigilcoin` and `result/bin/sigilcoin-explorer`. Verify both
+      bounded command surfaces:
+      `timeout 5 ./result/bin/sigilcoin help`,
+      `timeout 5 ./result/bin/sigilcoin version`,
+      `timeout 5 ./result/bin/sigilcoin-explorer --help`, and
+      `timeout 5 ./result/bin/sigilcoin-explorer --version`.
+      Both version commands print `0.1.0`; all four return zero. The
+      `?dir=deploy` is required; see `deploy/flake.nix`.
 - [ ] Host deployed with `services.sigilcoin.enable = true`,
       `chain = "sigilcoin-main"`, `listen.bind = "0.0.0.0"`,
       `openFirewall = true`.
@@ -154,12 +169,13 @@ the launch-day gate.
       `sigilcoin-explorer 0.1.0` and returns. If it blocks instead, the
       build predates `--help`/`--version` handling and every explorer
       command has to be run under `timeout`.
-- [ ] Explorer up at `explorer.sigilcoin.lol` behind a TLS reverse proxy, and
-      it renders genesis. The explorer itself stays bound to `127.0.0.1:8080`;
-      the proxy is the only public path to it. If the explorer is not
-      ready, launch without it and say so in the announcement rather than
-      delaying — a chain with no explorer is fine; a chain with no seed is
-      not.
+- [ ] Explorer up at `explorer.sigilcoin.lol` behind a TLS reverse proxy. The
+      explorer itself stays bound to `127.0.0.1:8080`; the proxy is the only
+      public path. Smoke-test canonical routes `/`, `/blocks`, `/difficulty`,
+      `/block/0`, `/api/summary`, `/api/blocks`, `/api/difficulty`, and
+      `/api/block/0`. If explorer is not ready, launch without it and say so
+      rather than delaying — a chain with no explorer is fine; a chain with no
+      seed is not.
 - [ ] A second node, on different hardware and a different network, syncs
       from the seed and reaches the same tip. One node is not a network.
 
@@ -239,11 +255,13 @@ after.
 
 Run mainnet rules — `--chain sigilcoin-main`, not regtest, so the real 20
 hour spacing floor and the real genesis are in play — on two machines, on
-different networks, for **at least 14 days**. Fourteen because it is the
-shortest window that contains a plausible number of blocks on a chain that
-mints one a day, and because the emission warmup is 30 blocks: a shorter soak
-never leaves the 1 SGL warmup band and never exercises the first halving
-boundary at all.
+different networks, for **at least 14 days**. Fourteen days is long enough to
+observe daily pacing, disconnect/reconnect behavior, hard-kill recovery,
+commit/reveal across several heights and independent agreement through normal
+operator churn. At roughly one block a day it remains inside the 30-block
+warmup and cannot approach the 730-block halving; those boundaries are covered
+by deterministic consensus tests and accelerated regtest/simulation, not by
+pretending a two-week soak reaches them.
 
 What to run:
 
@@ -252,8 +270,8 @@ What to run:
   seed by DNS name, never by IP.
 - Mine deliberately awkward blocks: a solution at exactly 512 bytes, graffiti
   at exactly 400 bytes, a block filled to the 16384-byte cap, a block at the
-  earliest legal timestamp, and a competing block at the same height to force
-  a tie-break.
+  earliest legal timestamp, and equal-score siblings to exercise first-seen
+  retention and next-block convergence.
 - Restart both hosts at least once. Kill the seed with `SIGKILL` mid-write at
   least once, and confirm both node units come back. The explorer will NOT
   recover on its own: a hard kill can leave a SQLite hot journal, rolling it
@@ -289,9 +307,9 @@ absolute values:
 - `issued-supply` diverges from the published schedule by one daviwil.
 - The database is corrupt after a hard kill, or a restore does not reproduce
   the balance.
-- A single block takes more than a few seconds to validate. Solution
-  verification is bounded but not cheap, and a chain where a hostile block is
-  a denial of service is not ready to be public.
+- A single uncached worst-case block exceeds the documented roughly 74.3-second
+  consensus ceiling, or ordinary blocks routinely approach it. Validation is
+  bounded but not cheap; measure hostile blocks separately from normal ones.
 - Port 19444 is ever observed refusing a connection from off-host while
   `sigilcoin-listen` is active. The node holds the port for as long as it
   runs, so a refusal while it is up means the accept loop is wedged. (A
@@ -307,8 +325,8 @@ flag — is a post-launch fix, not an abort.
 
 ## Decisions still owed by the operator
 
-What is left is DNS, a certificate, and one go/no-go call. Nothing in this
-table can be deferred past step 5.
+The table is the authoritative list. Several choices remain in addition to
+DNS and TLS, and nothing unresolved here can be deferred past step 5.
 
 | # | Decision | Where it lives now |
 | --- | --- | --- |
@@ -321,6 +339,8 @@ table can be deferred past step 5.
 | 7 | ~~Confirm the explorer's flags~~ — RESOLVED. `--regtest`, `--data-dir`, `--host`, `--port` confirmed against `explorer-main` and against `sigilcoin-explorer --help` run from the built binary. | `services.sigilcoin-explorer.command` in `deploy/module.nix` |
 | 8 | The TLS certificate for `explorer.sigilcoin.lol` | Still owed. The domain is `sigilcoin.lol` and the explorer's public name is `explorer.sigilcoin.lol` (`deploy/RUNBOOK.md`), but nothing in the tree issues or terminates a certificate: that is the reverse proxy's job on the host. |
 | 9 | Whether to launch without an explorer if it is not ready | Recommendation: yes |
-| 11 | Whether to run the 14-day pre-launch soak, or launch without it | Still owed. See [Pre-launch soak](#pre-launch-soak); nothing has ever run outside loopback. |
-| 10 | ~~Whether `sigilcoin listen` gets a persistent accept loop before launch~~ — RESOLVED IN THE CLI, not worked around. `run-listen` now loops indefinitely under `--max-connections 0` (`operate.sgl`: `((= max-connections 0) (loop last))`) and serves each connection inside its own guard, so a hangup, garbage bytes or a silent drop kill that connection only. Re-measured against this build: idle at `--accept-timeout 2000` it was alive at 30 s and 55 s and ended only by an external `timeout`; six hostile connections were absorbed and a seventh still accepted. The seed therefore binds 19444 itself. | `packages/sigil-coin-cli/src/sigil/coin/cli/operate.sgl`, `deploy/module.nix` |
-| 10b | ~~Whether to delete the socket proxy once the CLI can adopt an inherited fd~~ — DELETED NOW, and no fd adoption was needed. The proxy existed only because the old listener died on an accept timeout and on hostile input; with that fixed it was pure cost: an extra unit pair and hop, no inbound peer address ever reaching the node (which forecloses abuse-banning), and a `Restart=always` without `StartLimitIntervalSec=0` that could park `systemd-socket-proxyd` in `failed` and take port 19444 out of service — the outage it was supposed to prevent. `nix flake check`'s `module-eval` now fails if any `sigilcoin-listen-proxy` unit comes back. | `deploy/module.nix`, `deploy/flake.nix` |
+| 10 | Whether to run the 14-day pre-launch soak, or launch without it | Still owed. See [Pre-launch soak](#pre-launch-soak); nothing has ever run outside loopback. |
+| 11 | Whether to accept untested 2/1/1 producer/share/carrier incentives | Still owed. Regtest proves exact payout enforcement, not public participant behaviour. |
+| 12 | ~~Whether `sigilcoin listen` gets a persistent accept loop before launch~~ — RESOLVED IN THE CLI, not worked around. `run-listen` now loops indefinitely under `--max-connections 0` (`operate.sgl`: `((= max-connections 0) (loop last))`) and serves each connection inside its own guard, so a hangup, garbage bytes or a silent drop kill that connection only. Re-measured against this build: idle at `--accept-timeout 2000` it was alive at 30 s and 55 s and ended only by an external `timeout`; six hostile connections were absorbed and a seventh still accepted. The seed therefore binds 19444 itself. | `packages/sigil-coin-cli/src/sigil/coin/cli/operate.sgl`, `deploy/module.nix` |
+| 13 | Replace local deployment source pins with public forge URLs after the approved push | The current flake deliberately uses local `git+file:` inputs because required SigilCoin and sigil-bitcoin commits are not public yet. Manual local testnet approval and explicit push permission come first; then pin the pushed revisions and repeat every Nix check. |
+| 14 | ~~Whether to delete the socket proxy once the CLI can adopt an inherited fd~~ — DELETED NOW, and no fd adoption was needed. The proxy existed only because the old listener died on an accept timeout and on hostile input; with that fixed it was pure cost: an extra unit pair and hop, no inbound peer address ever reaching the node (which forecloses abuse-banning), and a `Restart=always` without `StartLimitIntervalSec=0` that could park `systemd-socket-proxyd` in `failed` and take port 19444 out of service — the outage it was supposed to prevent. `nix flake check`'s `module-eval` now fails if any `sigilcoin-listen-proxy` unit comes back. | `deploy/module.nix`, `deploy/flake.nix` |

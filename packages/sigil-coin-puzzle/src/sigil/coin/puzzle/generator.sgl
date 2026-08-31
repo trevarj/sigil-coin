@@ -50,6 +50,7 @@
     puzzle-for/constraint/anchor
     puzzle-attempt
     puzzle-attempt/constraint
+    puzzle-attempt/constraint/budget
     puzzle-constraint-for
     puzzle-fallback
     puzzle-fallback/constraint
@@ -59,7 +60,6 @@
     puzzle-quote-free-expression
 
     ;; Attempt budget
-    puzzle-budget
     puzzle-budget?
     puzzle-budget-open
     puzzle-budget-used)
@@ -74,8 +74,9 @@
     ;;; evaluation in that attempt.
     ;;;
     ;;; Puzzle derivation is work every validator repeats, so it is bounded
-    ;;; independently of the solution caps: 64 retries x 20000 steps is the
-    ;;; worst case for a height, and it is cached per `(prev-hash, height)`.
+    ;;; independently of the solution caps: 64 rejected attempts plus one
+    ;;; verified fallback, each with at most 20000 steps, is the 1.3 M-step
+    ;;; worst case for a height. The result is cached per `(prev-hash, height)`.
     (define puzzle-generator-max-fuel 20000)
 
     ;;; Minimum accepted par, in source bytes.
@@ -201,29 +202,32 @@
     ;; The attempt budget
     ;; ============================================================
 
-    ;;; Steps consumed so far by one generation attempt.
+    ;;; One shared evaluator machine for a generation attempt.
     ;;;
-    ;;; Every evaluation the generator makes — applying the hidden function,
-    ;;; probing the builtins, running the table — is charged here, and the
-    ;;; attempt is rejected the moment the total passes
-    ;;; `puzzle-generator-max-fuel`. That is what makes derivation cost a
-    ;;; constant of the canonical rather than a function of the seed.
+    ;;; Hidden applications, builtin probes, table verification and hidden
+    ;;; verification all execute directly on this machine. No nested call gets
+    ;;; an independent 200000-step allowance.
     (define-struct puzzle-budget
-      (used default: 0 mutable: #t))
+      (machine))
 
-    ;;; Open a fresh attempt budget.
+    ;;; Open a fresh 20000-step attempt budget.
     ;;;
     ;;; ```scheme
     ;;; (puzzle-budget-used (puzzle-budget-open)) ; => 0
     ;;; ```
     (define (puzzle-budget-open)
       (: -> puzzle-budget?)
-      (puzzle-budget used: 0))
+      (puzzle-budget
+        machine: (puzzle-machine-open puzzle-generator-max-fuel)))
 
-    ;; Charge `steps` and report whether the attempt is still inside budget.
-    (define (charge! budget steps)
-      (set-puzzle-budget-used! budget (+ (puzzle-budget-used budget) steps))
-      (<= (puzzle-budget-used budget) puzzle-generator-max-fuel))
+    ;;; Steps consumed by an attempt budget, pinned at 20000 on exhaustion.
+    (define (puzzle-budget-used budget)
+      (: puzzle-budget? -> integer?)
+      (puzzle-machine-steps (puzzle-budget-machine budget)))
+
+    (define (budget-fuel-exhausted? result)
+      (and (eq? 'error (puzzle-report-status result))
+           (eq? 'fuel-exhausted (puzzle-report-error-kind result))))
 
     ;; ============================================================
     ;; Deterministic draws
@@ -612,12 +616,15 @@
       (let loop ((names (puzzle-builtin-names)))
         (if (null? names)
             #f
-            (let ((report (puzzle-run-examples (symbol->string (car names))
-                                               pairs)))
-              (charge! budget (puzzle-report-steps report))
-              (if (puzzle-report-ok? report)
-                  #t
-                  (loop (cdr names)))))))
+            (let ((report
+                    (puzzle-run-examples/machine
+                      (puzzle-budget-machine budget)
+                      (symbol->string (car names))
+                      pairs)))
+              (cond
+                ((budget-fuel-exhausted? report) 'budget-exhausted)
+                ((puzzle-report-ok? report) #t)
+                (else (loop (cdr names))))))))
 
     ;; Does `source` parse, satisfy the constraint, and reproduce every pair
     ;; under the consensus caps? Returns #f or a rejection reason symbol.
@@ -633,10 +640,13 @@
                                            (puzzle-result-value parsed) d))
                constraint-tag)
               (else
-                (let ((report (puzzle-run-examples source pairs)))
-                  (if (not (charge! budget (puzzle-report-steps report)))
-                      'budget-exhausted
-                      (if (puzzle-report-ok? report) #f mismatch-tag)))))))))
+                (let ((report
+                        (puzzle-run-examples/machine
+                          (puzzle-budget-machine budget) source pairs)))
+                  (cond
+                    ((budget-fuel-exhausted? report) 'budget-exhausted)
+                    ((puzzle-report-ok? report) #f)
+                    (else mismatch-tag)))))))))
 
     ;;; Verify a candidate puzzle and build its spec, or return the symbol
     ;;; naming the first check it failed.
@@ -706,42 +716,46 @@
                                              puzzle-max-output-literal-bytes)))))))
            'output-oversize)
           ((all-equal-outputs? pairs) 'constant-outputs)
-          ((builtin-solves? pairs budget) 'builtin-trivial)
-          ((> (puzzle-budget-used budget) puzzle-generator-max-fuel)
-           'budget-exhausted)
           (else
-            (let ((table (puzzle-table-solution ci pairs)))
-              (if (not table)
-                  'table-unprintable
-                  (let ((table-bad
-                          (verify-solution table pairs ci d budget
-                                           'table-oversize 'table-parse
-                                           'table-constraint
-                                           'table-mismatch)))
-                    (if table-bad
-                        table-bad
-                        (let ((hidden-bad
-                                (verify-solution hidden-source pairs ci d
-                                                 budget 'source-oversize
-                                                 'source-parse
-                                                 'constraint-violated
-                                                 'hidden-mismatch)))
-                          (if hidden-bad
-                              hidden-bad
-                              (let ((par (min (string-length hidden-source)
+            (let ((builtin-result (builtin-solves? pairs budget)))
+              (cond
+                ((eq? builtin-result 'budget-exhausted) 'budget-exhausted)
+                (builtin-result 'builtin-trivial)
+                (else
+                  (let ((table (puzzle-table-solution ci pairs)))
+                    (if (not table)
+                        'table-unprintable
+                        (let ((table-bad
+                                (verify-solution
+                                  table pairs ci d budget
+                                  'table-oversize 'table-parse
+                                  'table-constraint 'table-mismatch)))
+                          (if table-bad
+                              table-bad
+                              (let ((hidden-bad
+                                      (verify-solution
+                                        hidden-source pairs ci d budget
+                                        'source-oversize 'source-parse
+                                        'constraint-violated
+                                        'hidden-mismatch)))
+                                (if hidden-bad
+                                    hidden-bad
+                                    (let ((par
+                                            (min
+                                              (string-length hidden-source)
                                               (string-length table))))
-                                (if (< par puzzle-min-par-bytes)
-                                    'par-floor
-                                    (puzzle-spec
-                                      height: height
-                                      complexity: complexity
-                                      constraint: ci
-                                      k: k
-                                      examples: pairs
-                                      hidden-source: hidden-source
-                                      table-solution: table
-                                      par: par
-                                      retries: retries)))))))))))))
+                                      (if (< par puzzle-min-par-bytes)
+                                          'par-floor
+                                          (puzzle-spec
+                                            height: height
+                                            complexity: complexity
+                                            constraint: ci
+                                            k: k
+                                            examples: pairs
+                                            hidden-source: hidden-source
+                                            table-solution: table
+                                            par: par
+                                            retries: retries))))))))))))))))
 
     (define (every-pair? pairs ok?)
       (let loop ((ps pairs))
@@ -791,10 +805,16 @@
     ;; The published source is what runs, wrapper included, so nothing is
     ;; assumed about the repair transform preserving semantics.
     (define (apply-hidden hidden-ast input budget)
-      (let ((result (puzzle-eval (list hidden-ast (list 'quote input)))))
-        (if (not (charge! budget (puzzle-result-steps result)))
-            'budget-exhausted
-            (if (puzzle-ok? result) result 'apply-failed))))
+      (let ((result
+              (puzzle-eval/machine
+                (puzzle-budget-machine budget)
+                (list hidden-ast (list 'quote input)))))
+        (cond
+          ((and (puzzle-failed? result)
+                (eq? 'fuel-exhausted (puzzle-result-error-kind result)))
+           'budget-exhausted)
+          ((puzzle-ok? result) result)
+          (else 'apply-failed))))
 
     (define (hidden-outputs hidden-ast inputs budget)
       (let loop ((xs inputs) (acc '()))
@@ -825,7 +845,7 @@
     ;;; (puzzle-spec? (puzzle-attempt/constraint seed 1 128 0 0)) ; => #t
     ;;; ```
     (define (puzzle-attempt/constraint* seed height complexity ci retry
-                                     anchor-output)
+                                       anchor-output budget)
       (check-generator-inputs seed height retry)
       (check-complexity complexity)
       (if (and anchor-output (not (puzzle-anchor-output? anchor-output)))
@@ -835,7 +855,6 @@
              (k (puzzle-complexity-k complexity))
              (ordinary-k (if anchor-output (- k 1) k))
              (width (puzzle-complexity-width complexity))
-             (budget (puzzle-budget-open))
              (g (puzzle-prng-open seed height retry))
              (entries (enabled-productions ci width)))
         (if (null? entries)
@@ -883,12 +902,20 @@
 
     (define (puzzle-attempt/constraint seed height complexity ci retry)
       (: bytevector? integer? integer? integer? integer? -> any?)
-      (puzzle-attempt/constraint* seed height complexity ci retry #f))
+      (puzzle-attempt/constraint* seed height complexity ci retry #f
+                                  (puzzle-budget-open)))
+
+    ;;; Run one explicit-constraint attempt with an observable shared budget.
+    (define (puzzle-attempt/constraint/budget seed height complexity ci retry
+                                             budget)
+      (: bytevector? integer? integer? integer? integer? puzzle-budget? -> any?)
+      (puzzle-attempt/constraint* seed height complexity ci retry #f budget))
 
     (define (puzzle-attempt/constraint/anchor seed height complexity ci retry
-                                           anchor-output)
+                                             anchor-output)
       (: bytevector? integer? integer? integer? integer? string? -> any?)
-      (puzzle-attempt/constraint* seed height complexity ci retry anchor-output))
+      (puzzle-attempt/constraint* seed height complexity ci retry anchor-output
+                                  (puzzle-budget-open)))
 
     ;;; Run one generation attempt for a height.
     ;;;
@@ -898,8 +925,8 @@
     (define (puzzle-attempt seed height complexity retry)
       (: bytevector? integer? integer? integer? -> any?)
       (puzzle-attempt/constraint seed height complexity
-                              (puzzle-constraint-for seed height complexity)
-                              retry))
+                                 (puzzle-constraint-for seed height complexity)
+                                 retry))
 
     ;; The fallback body and inputs are frozen. `(* x x)` is not reproduced
     ;; by any 1-arity builtin, the outputs are pairwise distinct, and every

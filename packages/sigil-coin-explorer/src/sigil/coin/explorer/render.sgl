@@ -620,9 +620,10 @@
                                 "<p class=\"q\">Each share solves its own"
                                 " pubkey-personalized version of the parent"
                                 " height's puzzle. Par, margin and Q+ come"
-                                " from that task. Signatures are decoded but"
-                                " not re-verified on page load; node validation"
-                                " already settled them.</p>"
+                                " from consensus's pure source preview."
+                                " Signatures are decoded but not re-verified"
+                                " on page load; node validation already settled"
+                                " them.</p>"
                                 "<table><tr>" (headings %share-headings)
                                 "</tr>"
                                 (join (map share-row shares))

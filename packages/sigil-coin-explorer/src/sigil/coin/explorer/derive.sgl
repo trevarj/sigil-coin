@@ -22,7 +22,6 @@
     explorer-margin
     explorer-next-complexity
     explorer-retarget-height?
-    explorer-check-solution
     explorer-bucket
     explorer-author-tag)
 
@@ -132,16 +131,6 @@
       (: any? -> boolean?)
       (guard (e (#t #f))
         (coin-retarget-height? height)))
-
-    ;;; Run source against `spec`, returning `(steps . cells)` on success.
-    (define (explorer-check-solution spec solution)
-      (: any? any? -> any?)
-      (guard (e (#t #f))
-        (let ((checked (coin-check-solution spec solution)))
-          (and (coin-ok? checked)
-               (let ((report (coin-result-value checked)))
-                 (cons (puzzle-report-steps report)
-                       (puzzle-report-cells report)))))))
 
     ;;; Bucket a non-negative resource count, or `#f` when malformed.
     (define (explorer-bucket count)

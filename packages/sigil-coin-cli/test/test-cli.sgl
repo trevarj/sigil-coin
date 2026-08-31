@@ -1150,8 +1150,10 @@
                  (share (decoded-share share-bytes))
                  (context (height-one-share-context
                             (list (cli-commit-record-commitment record))))
+                 (validated (coin-check-shares context #u8() (list share)))
                  (quality (coin-share-quality context share)))
             (assert-true (coin-share? share))
+            (assert-true (coin-ok? validated))
             (assert-equal coin-share-blind-bytes
                           (bytevector-length (coin-share-blind share)))
             (assert-equal (+ coin-share-fixed-bytes
@@ -1160,8 +1162,6 @@
             (assert-equal (cli-commit-record-commitment record)
                           (coin-share-commitment context share))
             (assert-true (coin-share-signature-ok? context share))
-            (assert-true (coin-ok?
-                           (coin-check-share-solution context share)))
             (assert-true (<= 1 quality 4))
             (assert-true (string-contains?
                            text (string-append "quality: "

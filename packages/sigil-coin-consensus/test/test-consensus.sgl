@@ -533,6 +533,16 @@
   (test "a solution that does not evaluate is an eval failure"
     (assert-equal 'solution-eval-failed (reason %spec "zzz")))
 
+  (test "an interpreter invariant failure stays an internal error"
+    ;; A malformed example makes the interpreter's protected application
+    ;; path raise. Repairing that one field proves this branch is load-bearing.
+    (assert-equal 'internal-error
+                  (reason (spec-with 0 '(1)) "(lambda(x)x)"))
+    (assert-true
+      (coin-ok?
+        (coin-check-solution
+          (spec-with 0 '((1 . 1))) "(lambda(x)x)"))))
+
   (test "exhausting the fuel cap is an eval failure, not a hang"
     ;; The one machine per solution is what bounds this: 200000 steps
     ;; across the evaluation and all `k` applications.
@@ -680,14 +690,19 @@
                                    commits: (list (filled 32 99))))
            (a (coin-share-puzzle %share-context pk))
            (b (coin-share-puzzle other-context pk))
-           (source (filled (- (puzzle-spec-par a) 1) #x78))
-           (share (coin-share pubkey: pk
-                                 signature: (filled 64 0)
-                                 blind: (filled 32 0)
-                                 solution: source)))
+           (source (filled (- (puzzle-spec-par a) 1) #x78)))
       (assert-equal (puzzle-spec-examples a) (puzzle-spec-examples b))
-      (assert-equal (coin-share-quality %share-context share)
-                    (coin-share-quality other-context share)))))
+      ;; Quality of an unvalidated share is intentionally unavailable. The
+      ;; deterministic score inputs remain independent of unrelated block
+      ;; data: same personalized par and same source length imply the same
+      ;; contribution once validation caches the report.
+      (assert-equal
+        (coin-share-contribution
+          (coin-share-margin-milli (puzzle-spec-par a)
+                                   (bytevector-length source)))
+        (coin-share-contribution
+          (coin-share-margin-milli (puzzle-spec-par b)
+                                   (bytevector-length source)))))))
 
 (test-group "sigil-coin canonical score word"
   (test "the bit layout is frozen"

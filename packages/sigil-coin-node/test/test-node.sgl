@@ -159,6 +159,43 @@
                    blind: (make-bytevector 32 (+ n 100))
                    solution: bytes)))
 
+;; Remove safe spaces adjacent to parentheses, producing a strict under-par
+;; equivalent of each generated personalized source.
+(define (golf-source source)
+  (let loop ((text source) (i 1))
+    (if (>= i (- (string-length text) 1))
+        text
+        (if (and (char=? #\space (string-ref text i))
+                 (or (char=? #\( (string-ref text (+ i 1)))
+                     (char=? #\) (string-ref text (- i 1)))))
+            (loop (string-append (substring text 0 i)
+                                 (substring text (+ i 1)
+                                            (string-length text)))
+                  i)
+            (loop text (+ i 1))))))
+
+(define (generated-share n context)
+  (let* ((pubkey (secp256k1-pubkey-create (make-bytevector 32 n)))
+         (spec (coin-share-puzzle context pubkey))
+         (source (golf-source (puzzle-spec-hidden-source spec))))
+    (and (< (string-length source) (puzzle-spec-par spec))
+         (coin-ok? (coin-check-solution spec source))
+         (signed-share n source context))))
+
+(define (generated-shares count context)
+  (let loop ((n 1) (out '()))
+    (if (= count (length out))
+        (sort-bytes out coin-share-pubkey)
+        (let ((candidate (generated-share n context)))
+          (if (> n 255)
+              (error "test-node: fewer than eight personalized golfs")
+              (loop (+ n 1)
+                    (if (and candidate
+                             (not (member (coin-share-solution candidate)
+                                          (map coin-share-solution out))))
+                        (cons candidate out)
+                        out)))))))
+
 (define (message-of err)
   (let ((message (exception-message err)))
     (if (string? message) message "")))
@@ -982,7 +1019,54 @@
                     (txout-script-pubkey (list-ref outputs 3)))
       (assert-true (not (eq? #f
                              (connect/parent 2 %coop-block %coop-parent
-                                             parent-utxos))))))
+                                             parent-utxos))))
+      ;; One personalized derivation/signature/PBE per accepted pubkey. Q
+      ;; consumes verified reports rather than deriving or evaluating again.
+      (assert-equal '(2 2 2) (coin-body-validation-stats))))
+
+  (test "bad producer rejects eight valid shares before share examples"
+    (let* ((shares (generated-shares 8 %share-context0))
+           (commitments
+             (sort-bytes
+               (map (lambda (share)
+                      (coin-share-commitment %share-context0 share))
+                    shares)
+               (lambda (x) x)))
+           (parent
+             (coin-build-block
+               %genesis 1 coin-genesis-complexity #f "eight commits" %payout
+               (+ %genesis-time %spacing) '() 0 commitments))
+           (child
+             (coin-build-coop-block
+               parent 2 coin-genesis-complexity #f shares "eight reveals"
+               %payout
+               (+ (block-header-time (block-header-field parent)) %spacing)))
+           (payload
+             (coin-result-value (coin-block-coinbase-payload child)))
+           (bad-payload
+             (coin-coinbase-payload
+               payload solution: (string->utf8 "(lambda(x)")))
+           (coinbase (car (block-transactions child)))
+           (input (car (transaction-inputs coinbase)))
+           (bad-coinbase
+             (transaction
+               coinbase
+               inputs: (list
+                         (txin
+                           input
+                           script-sig:
+                             (coin-coinbase-payload-encode bad-payload)))))
+           (bad (block-with-coinbase child bad-coinbase))
+           (parent-utxos
+             (connect/parent 1 parent %genesis-block '())))
+      (assert-equal 8 (length shares))
+      (assert-true
+        (raises-containing?
+          (lambda () (connect/parent 2 bad parent parent-utxos))
+          "solution-parse-failed"))
+      ;; Load-bearing: moving producer validation after share PBE makes final
+      ;; counter 8 instead of 0. Derivation, parse/arity and ECDSA may run.
+      (assert-equal '(8 8 0) (coin-body-validation-stats))))
 
   (test "aggregate Q equals header claim and low field is 15-Q"
     (let* ((quality (coin-shares-quality %coop-context %coop-shares))
@@ -1054,6 +1138,8 @@
                      (lambda () (connect/parent 2 wrong-carrier %coop-parent
                                                 parent-utxos))
                      "coinbase-output-shape"))
+      ;; Exact carrier/split shape rejects before signature or puzzle work.
+      (assert-equal '(0 0 0) (coin-body-validation-stats))
       (assert-true (raises-containing?
                      (lambda () (connect/parent 2 wrong-values %coop-parent
                                                 parent-utxos))

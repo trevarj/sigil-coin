@@ -94,6 +94,15 @@
                 blind: blind
                 solution: solution)))
 
+(define (preview-quality context shares)
+  (coin-quality
+    (map (lambda (share)
+           (let ((preview (coin-check-share-solution context share)))
+             (unless (coin-ok? preview)
+               (error "preview-quality: valid fixture failed preview"))
+             (list-ref (coin-result-value preview) 2)))
+         shares)))
+
 ;; Known short solutions for the personalized H1 tasks of keys 1 and 6. First
 ;; remains valid with hostile source in a dead branch.
 (define %share-source-1
@@ -216,38 +225,58 @@
                     (car (cdr (cdr %node-built))))))
 
   (test "explorer derives valid personalized shares, Q, carrier, and split"
-    (with-store
-      (lambda (store)
-        (let* ((b (explorer-block-by-height store 2))
-               (shares (explorer-block-shares b))
-               (outputs (explorer-block-outputs b)))
-          (assert-equal #f (explorer-block-problem b))
-          (assert-equal 2 (explorer-block-share-count b))
-          (assert-equal 2 (length shares))
-          (for-each
-            (lambda (share)
-              (assert-equal #f (explorer-share-problem share))
-              (assert-true (> (explorer-share-margin share) 0))
-              (assert-true (> (explorer-share-contribution share) 0))
-              (assert-true (number? (explorer-share-steps share)))
-              (assert-true (number? (explorer-share-cells share))))
-            shares)
-          (assert-equal (coin-shares-quality %share-context %shares)
-                        (explorer-block-score-quality b))
-          (assert-equal '(producer share share carrier)
-                        (map explorer-output-role outputs))
-          (assert-equal (coin-block-reward 2)
-                        (explorer-block-total-output b))
-          (for-each (lambda (output)
-                      (assert-equal (explorer-output-expected output)
-                                    (explorer-output-value output)))
-                    outputs)
-          (assert-equal %miner-a
-                        (explorer-output-address (list-ref outputs 3)))
-          (assert-equal (map explorer-share-payout shares)
-                        (map explorer-output-value
-                             (list (list-ref outputs 1)
-                                   (list-ref outputs 2))))))))
+    (let ((quality (preview-quality %share-context %shares)))
+      ;; Explorer uses same pure preview: no share gains verified provenance.
+      (for-each (lambda (share)
+                  (assert-error (coin-share-quality %share-context share)))
+                %shares)
+      (with-store
+        (lambda (store)
+          (let* ((b (explorer-block-by-height store 2))
+                 (shares (explorer-block-shares b))
+                 (outputs (explorer-block-outputs b)))
+            (assert-equal #f (explorer-block-problem b))
+            (assert-equal 2 (explorer-block-share-count b))
+            (assert-equal 2 (length shares))
+            (let loop ((shown shares) (raw %shares))
+              (unless (null? shown)
+                (let* ((share (car shown))
+                       (source (car raw))
+                       (preview (coin-check-share-solution
+                                  %share-context source))
+                       (value (coin-result-value preview))
+                       (spec (list-ref value 0))
+                       (report (list-ref value 1)))
+                  (assert-equal #f (explorer-share-problem share))
+                  (assert-equal (puzzle-spec-par spec)
+                                (explorer-share-par share))
+                  (assert-equal
+                    (coin-share-margin-milli
+                      (puzzle-spec-par spec)
+                      (bytevector-length (coin-share-solution source)))
+                    (explorer-share-margin share))
+                  (assert-equal (list-ref value 2)
+                                (explorer-share-contribution share))
+                  (assert-equal (puzzle-report-steps report)
+                                (explorer-share-steps share))
+                  (assert-equal (puzzle-report-cells report)
+                                (explorer-share-cells share))
+                  (loop (cdr shown) (cdr raw)))))
+            (assert-equal quality (explorer-block-score-quality b))
+            (assert-equal '(producer share share carrier)
+                          (map explorer-output-role outputs))
+            (assert-equal (coin-block-reward 2)
+                          (explorer-block-total-output b))
+            (for-each (lambda (output)
+                        (assert-equal (explorer-output-expected output)
+                                      (explorer-output-value output)))
+                      outputs)
+            (assert-equal %miner-a
+                          (explorer-output-address (list-ref outputs 3)))
+            (assert-equal (map explorer-share-payout shares)
+                          (map explorer-output-value
+                               (list (list-ref outputs 1)
+                                     (list-ref outputs 2)))))))))
 
   (test "rendered co-op block exposes canonical fields"
     (let ((page (body-of "/block/2")))

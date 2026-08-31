@@ -76,6 +76,8 @@
                              (number->string (puzzle-report-index report))
                              "?")
                          " was not reproduced")))
+          ((eq? kind 'internal-error)
+           (coin-error 'internal-error (kind-detail kind)))
           (else (coin-error 'solution-eval-failed (kind-detail kind))))))
 
     ;;; Check a candidate solution against an already-derived puzzle.

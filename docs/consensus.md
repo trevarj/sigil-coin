@@ -31,13 +31,19 @@
 | Constant | Value |
 |---|---:|
 | `puzzle-max-source-bytes` | 512 |
+| `puzzle-max-parse-depth` | 64 |
 | `puzzle-max-fuel` | 200000 |
 | `puzzle-max-allocations` | 400000 |
 | `puzzle-max-string-bytes` | 65536 |
 | `puzzle-max-eval-depth` | 128 |
+| integer magnitude | `< 2^256` |
+| `puzzle-generator-max-fuel` | 20000 per attempt |
 | `puzzle-min-par-bytes` | 24 |
 | `puzzle-max-generator-retries` | 64 |
+| ordinary input/output literal bytes | 8 / 24 |
+| personalized anchor input/output | `"@"` / 66 characters |
 | `puzzle-max-k` | 8 |
+| grammar productions | 24 |
 | `puzzle-complexity-min` | 16 |
 | `puzzle-complexity-max` | 4095 |
 | `puzzle-complexity-genesis` | 128 |
@@ -56,6 +62,9 @@
 | `coin-median-time-span` | 11 |
 | `coin-retarget-window` | 16 |
 | `coin-target-margin` | 100 milli-units |
+| header `version` | 5 |
+| score quality `Q` | 0..15 |
+| coinbase scriptSig bytes | 8..6588 |
 
 Emission remains defined by `(sigil coin consensus emission)` and is independent
 of reward splitting.
@@ -126,7 +135,10 @@ g_c   = puzzle-prng-open(seed, H, 0xFFFFFFFF)
 ci    = tier-catalogue[tier(C)][ puzzle-prng-below!(g_c, |tier-catalogue[tier(C)]|) ]
 ```
 
-One attempt, keyed `(seed, H, retry)`, under a shared 20000-step budget:
+One attempt, keyed `(seed, H, retry)`, runs every evaluation on one machine
+opened with exactly 20000 steps. Fuel, allocation and string counters are shared
+across hidden-output generation, builtin probes, table verification and hidden
+verification; no nested evaluator opens the 200000-step solution machine:
 
 1. `g = puzzle-prng-open(seed, H, retry)`.
 2. Synthesise a function body from the constraint-restricted sub-grammar at
@@ -152,8 +164,10 @@ One attempt, keyed `(seed, H, retry)`, under a shared 20000-step budget:
 
 After 64 rejections, `puzzle-fallback(H, C)` returns a frozen puzzle whose
 `constraint` is forced to 0 and whose examples are frozen constants. It
-re-checks every acceptance condition and raises if any fails, because a failure
-there is a bug in this module rather than a bad block.
+re-checks every acceptance condition on one fresh 20000-step machine and raises
+if any fails, because a failure there is a bug in this module rather than a bad
+block. Thus one attempt is bounded at 20000 steps and complete derivation,
+including fallback, is bounded at `65 * 20000 = 1.30 M` steps.
 
 **Determinism.** SplitMix64 over exact integers with explicit 64-bit masking,
 FNV-1a absorption of `(seed, H, retry)` with LEB128 self-delimiting integers,
@@ -506,22 +520,23 @@ rejected: `share-bad-signature`.
 
 ### 6.4 Share validation order
 
-For a block at height `H` with `R` shares, per share `i`, first failure wins:
+Validation is **breadth-first by cost**, not one share from start to finish.
+For a block at height `H` with `R` shares, first failure in each stage wins:
 
-| # | Check | Tag |
+| Stage | Checks | Representative tags |
 |---|---|---|
-| 1 | `H >= 1` when `R > 0` (genesis carries no shares) | `shares-at-genesis` |
-| 2 | `pubkey` is a valid compressed point | `share-bad-pubkey` |
-| 3 | `pubkey[i] > pubkey[i-1]` lexicographically | `shares-unordered` |
-| 4 | `SHA256d(commitment_preimage)` for this share is in block `H-1`'s COMMITS | `share-uncommitted` |
-| 5 | signature verifies against `share_preimage` | `share-bad-signature` |
-| 6 | `solution` differs byte-wise from the producer's SOLUTION and from every earlier share's solution | `share-duplicate-solution` |
-| 7 | derive the pubkey-personalized puzzle using the global puzzle's constraint | `internal-error` only on implementation failure |
-| 8 | `L < personalized_par`; equality or excess is invalid | `share-not-under-par` |
-| 9 | `coin-check-solution(personalized_spec, solution)` passes | inherits §4.3 tags, prefixed `share-` |
+| 1 — cheap metadata | `H >= 1`; count and field sizes; valid compressed pubkeys; strict pubkey order; commitment membership in block `H-1`; raw solution dedup against producer and earlier shares | `shares-at-genesis`, `shares-oversize`, `share-bad-pubkey`, `shares-unordered`, `share-uncommitted`, `share-duplicate-solution` |
+| 2 — prepare every source | derive each pubkey-personalized spec once; enforce `L < personalized_par`; raw source/parse/AST constraint/one-argument procedure checks without evaluating the examples | `share-not-under-par`, inherited parse/constraint/arity tags, `internal-error` only on implementation failure |
+| 3 — signatures | verify every signature against its share preimage | `share-bad-signature` |
+| 4 — producer | evaluate and score the producer solution | §4.3 producer tags |
+| 5 — shares | evaluate each already-prepared share against its personalized examples; cache its verified report and contribution; aggregate `Q` | inherited §4.3 tags prefixed `share-` |
+| 6 — commitment | recompute `W` from producer fields and `Q`, requiring exact equality with the header | `score-mismatch` |
 
-Checks are ordered cheapest-first: a 32-byte set membership before a signature
-verification before a puzzle evaluation.
+This order is load-bearing against validation DoS. A malformed payout shape
+performs no derivation, signature or PBE work. A malformed producer may force
+bounded personalized derivation and signatures, but **zero share example
+evaluations**. Each personalized spec is derived once and reused for the
+under-par check, share evaluation and quality contribution.
 
 **Dedup.** Duplicates are rejected at the block level, not silently dropped,
 because "reject" is total and "drop" needs a re-ordering rule. The producer
@@ -1020,8 +1035,8 @@ Per block, worst case, with the frozen caps:
 | header checks | O(1) | version, bits, `W` field ranges, MTP, drift, spacing |
 | block size | one serialization | first body rule, bounds everything after |
 | coinbase decode | O(6588) bytes | five pushes + one re-encode |
-| global puzzle derivation | 64 x 20000 = 1.28 M steps | cached per `(prev_hash, H)` so siblings pay once |
-| personalized puzzle derivation | 8 x 64 x 20000 = 10.24 M steps | one bounded explicit-constraint derivation per distinct share pubkey; cacheable by `(global_seed, pubkey)` |
+| global puzzle derivation | 65 x 20000 = 1.30 M steps | 64 rejected attempts plus one verified fallback; cached per `(prev_hash, H)` so siblings pay once |
+| personalized puzzle derivation | 8 x 65 x 20000 = 10.40 M steps | one bounded explicit-constraint derivation per distinct share pubkey, including fallback; cacheable by `(global_seed, pubkey)` |
 | producer solution | 200000 steps | one machine across all `k` applications |
 | share solutions | 8 x 200000 = 1.6 M steps | same, per share |
 | signature verification | 8 ECDSA | ~0.5 ms total |
@@ -1030,35 +1045,39 @@ Per block, worst case, with the frozen caps:
 | transactions | Bitcoin's existing cost | unchanged |
 
 ```
-solutions      : 1.8 M steps   ~=  9.9 s
-producer puzzle: 1.28 M steps  ~=  7.0 s   (once per height)
-share puzzles  : 10.24 M steps ~= 56.3 s   (eight worst-case derivations)
-                ------------------------
-worst case     : ~73 s before caching; personalized specs are cacheable by
-                 `(global_seed, pubkey)` across sibling blocks
+solutions      :  1.8 M steps ~=  9.9 s
+producer puzzle:  1.3 M steps ~=  7.2 s   (once per height, fallback included)
+share puzzles  : 10.4 M steps ~= 57.2 s   (eight worst-case derivations)
+                 ----------------------
+worst case     : 13.5 M steps ~= 74.3 s before caching; personalized specs are
+                 cacheable by `(global_seed, pubkey)` across sibling blocks
 ```
 
-Against 72000 s mainnet spacing that is 0.024% duty. Typical cost is
-microseconds: the survey's observed peak was 300 steps.
+The machine boundary is executable: a 20000-step evaluation succeeds, the same
+program on 19999 fuel stops at 19999, and an attempt containing a formerly
+unbounded single evaluator call returns `budget-exhausted` at exactly 20000.
+A deterministic audit of 1280 full derivations (20 seeds, two heights, four
+complexities and all eight constraints) measured 2117 steps for both the
+heaviest attempt and heaviest complete non-fallback derivation. The hard bounds,
+not the sample, govern consensus.
+
+Against 72000 s mainnet spacing the theoretical 74.3 s is about 0.1% duty.
 
 **Pre-validation gate (required).** A node MUST order body validation
 cheapest-first and MUST NOT evaluate a solution before the block has passed
-size, payload decode, and header-commitment checks. Recommended order:
+size, payload decode, header fields and payout shape. The canonical order is:
 
 1. header accept (`O(1)`)
 2. block size
 3. coinbase payload decode and canonicality
 4. `W` field ranges and reserved-nibble check
-5. output shape and split arithmetic (integer only)
-6. constraint check on all `R+1` solution sources (byte scan)
-7. parse all `R+1` solutions
-8. commitment membership for all shares
-9. signature verification for all shares
-10. derive personalized specs and reject every `L >= personalized_par`
-11. producer solution evaluation
-12. personalized share solution evaluations and aggregate `Q`
-13. recompute `W`, require equality with the header
-14. Bitcoin's connector
+5. share field/source/count/order/dedup/commit-membership checks and exact output split/carrier shape
+6. derive each personalized spec once; enforce source length, strict under-par, parse, AST constraint and arity for every share
+7. signature verification for every share
+8. producer solution evaluation and score
+9. personalized share example evaluations using the prepared specs; cache verified reports/contributions and aggregate `Q`
+10. recompute `W`, require equality with the header
+11. Bitcoin's connector
 
 A node SHOULD additionally bound the number of siblings at one height it will
 validate bodies for concurrently. That is policy, not consensus.
@@ -1109,8 +1128,8 @@ The 5%, 10%, and 15% contribution steps prevent raw-key multiplication from
 ranking like deep work, but no live co-op margin distribution exists yet.
 *Recommendation:* ship the four frozen bands and measure. Distinct shares mean
 distinct personalized tasks, not distinct owners; ownership identity is neither
-observable nor required by consensus. Revisit bands only through an explicit hard fork if observed margins cluster
-pathologically around a boundary.
+observable nor required by consensus. Revisit bands only through an explicit
+hard fork if observed margins cluster pathologically around a boundary.
 
 **3. `k` and grammar width both scale with `C`, and they interact.**
 Raising `k` makes overfitting more expensive (good) but also makes the table
@@ -1126,3 +1145,37 @@ re-check as the backstop — if the two knobs ever conflict, the generator
 re-rolls rather than publishing an unsolvable puzzle. If re-roll rates climb
 above a few percent at high `C`, decouple `k` from `C` and drive it from a
 separate, slower signal.
+
+**4. The exact 2/1/1 reward weights have no public incentive data.**
+Producer weight 2, each accepted share 1 and carrier 1 are consensus. Regtest
+unit and integration coverage proves output shape, conservation and payout
+binding; it does not prove participants will commit, reveal or carry others'
+work. Changing the weights after launch is a hard fork.
+
+**5. Permissionless keys are not identities and can be ground.**
+One actor may control all eight share keys. The full-key anchor proves each
+accepted source solves its chosen pubkey's distinct puzzle, but pubkeys are free
+to generate, so a miner can sample keys and work only on unusually easy
+personalized puzzles. Aggregate `Q` is capped at 15; no rule proves distinct
+owners or makes key selection scarce.
+
+**6. Public-network behaviour is untested.**
+Only local loopback nodes have run. Reorg frequency, peer churn, sustained
+SQLite contention, hostile validation load and long-running resource use remain
+unknown until the required two-host soak completes.
+
+---
+
+## 14. Network and implementation status (non-consensus)
+
+The sole public rule surface is `(sigil coin consensus)`; node code consumes it
+through `(sigil coin node)`. Mainnet uses header version 5, magic
+`8f d1 c0 a5`, port 19444, protocol version 70015 and user agent
+`/sigilcoin-node:0.1.0/`. Regtest uses magic `a5 c0 d1 8f`, port 19445 and a
+one-second spacing floor for local tests.
+
+Mainnet's quote is `Sigil - Practical Symbolic Power`, but its timestamp,
+serialized header and display id remain coherent placeholders, not final launch
+constants. They become final only after the operator chooses the launch
+timestamp and regenerates all derived constants together. Regtest genesis is
+fixed and remains the local testing chain.

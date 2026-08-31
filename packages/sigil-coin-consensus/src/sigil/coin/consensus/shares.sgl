@@ -40,11 +40,11 @@
 ;;; data a local miner built.
 ;;;
 ;;; COST (§11). Validation is ordered cheapest-first ACROSS all shares, not
-;;; share by share: every pubkey is parsed before any commitment is looked
-;;; up, every commitment before any signature, every signature before any
-;;; program runs. A block whose eighth share is junk is rejected without
-;;; evaluating the first seven. The ceiling is 8 x 200000 evaluator steps
-;;; plus 8 ECDSA verifications.
+;;; share by share: block/codec/source membership checks, personalized source
+;;; preparation, signatures, the producer solution, and only then share PBE.
+;;; A malformed producer therefore rejects an eight-share sibling after eight
+;;; derivations and signatures but before any share example evaluation. The
+;;; ceiling is 9 x 200000 evaluator steps plus 8 ECDSA verifications.
 
 (define-library (sigil coin consensus shares)
   (import (sigil struct)
@@ -54,6 +54,8 @@
           (sigil bitcoin script)
           (sigil bitcoin tx)
           (sigil secp256k1)
+          (sigil coin puzzle)
+          (sigil coin puzzle constraints)
           (sigil coin puzzle generator)
           (sigil coin consensus result)
           (sigil coin consensus rules)
@@ -108,13 +110,22 @@
     coin-coop-context-complexity
     coin-coop-context-spec
     coin-coop-context-commits
+    coin-coop-context-derivation-count
+    coin-coop-context-signature-count
+    coin-coop-context-example-count
     coin-share-signature-ok?
     coin-share-margin-milli
     coin-share-contribution
     coin-quality
     coin-share-quality
     coin-shares-quality
+    coin-check-share-solution/spec
     coin-check-share-solution
+    coin-check-shares-cheap
+    coin-prepare-shares
+    coin-check-share-signatures
+    coin-verify-prepared-shares
+    coin-check-shares-expensive
     coin-check-shares
 
     ;; The reward split
@@ -651,7 +662,15 @@
       (puzzle-height integer?)
       (complexity integer?)
       (spec)
-      (commits default: '()))
+      (commits default: '())
+      ;; Separate provenance: preparation proves source gates only; verified
+      ;; entries prove commitment, signature and examples before exposing Q.
+      (prepared-cache default: '() mutable: #t)
+      (signature-cache default: '() mutable: #t)
+      (verified-cache default: '() mutable: #t)
+      (derivation-count default: 0 mutable: #t)
+      (signature-count default: 0 mutable: #t)
+      (example-count default: 0 mutable: #t))
 
     ;;; Derive one share's personalized puzzle from validated parent context.
     ;;;
@@ -674,6 +693,8 @@
                       (= (puzzle-spec-complexity global)
                          (coin-coop-context-complexity context))))
             (error "coin-share-puzzle: global puzzle does not match context"))
+        (set-coin-coop-context-derivation-count!
+          context (+ 1 (coin-coop-context-derivation-count context)))
         (puzzle-for/constraint/anchor
           (coin-share-puzzle-seed
             (coin-puzzle-seed
@@ -790,15 +811,112 @@
                   (error "coin-quality: contribution out of range"))
               (loop (cdr xs) (+ total x))))))
 
+    (define (same-share? a b)
+      (and (equal? (coin-share-pubkey a) (coin-share-pubkey b))
+           (equal? (coin-share-signature a) (coin-share-signature b))
+           (equal? (coin-share-blind a) (coin-share-blind b))
+           (equal? (coin-share-solution a) (coin-share-solution b))))
+
+    (define (cache-ref entries share)
+      (let loop ((xs entries))
+        (cond
+          ((null? xs) #f)
+          ((same-share? share (list-ref (car xs) 0)) (car xs))
+          (else (loop (cdr xs))))))
+
+    ;; Prepared entries are `(share spec arity-report contribution)`.
+    (define (share-prepared-ref context share)
+      (cache-ref (coin-coop-context-prepared-cache context) share))
+
+    ;; Verified entries are `(share report contribution)`.
+    (define (share-verified-ref context share)
+      (cache-ref (coin-coop-context-verified-cache context) share))
+
+    (define (share-signed? context share)
+      (and (cache-ref (coin-coop-context-signature-cache context) share) #t))
+
+    (define (reset-share-validation! context)
+      (set-coin-coop-context-prepared-cache! context '())
+      (set-coin-coop-context-signature-cache! context '())
+      (set-coin-coop-context-verified-cache! context '())
+      (set-coin-coop-context-derivation-count! context 0)
+      (set-coin-coop-context-signature-count! context 0)
+      (set-coin-coop-context-example-count! context 0))
+
+    ;;; Check source against an already-derived personalized share puzzle.
+    ;;;
+    ;;; This pure preview does not read or populate a co-op validation cache.
+    ;;; On success its value is `(report contribution)`, enough for local
+    ;;; scoring without claiming commitment or signature validation.
+    (define (coin-check-share-solution/spec spec solution)
+      (: puzzle-spec? any? -> coin-result?)
+      (guard (e (#t (coin-error 'internal-error
+                                "the personalized share check raised")))
+        (let ((source-size (bytevector-length (solution-bytes solution))))
+          (if (>= source-size (puzzle-spec-par spec))
+              (coin-error
+                'share-not-under-par
+                "share is not strictly below personalized par")
+              (let ((checked (coin-check-solution spec solution)))
+                (if (coin-failed? checked)
+                    (coin-error (share-reason (coin-result-reason checked))
+                                (coin-result-detail checked))
+                    (coin-ok
+                      (list
+                        (coin-result-value checked)
+                        (coin-share-contribution
+                          (coin-share-margin-milli
+                            (puzzle-spec-par spec) source-size))))))))))
+
+    ;; Evaluate examples only after source preparation, signature and
+    ;; commitment provenance exists. Cache report/contribution only then.
+    (define (check-share-solution/verified context share)
+      (let ((verified (share-verified-ref context share))
+            (prepared (share-prepared-ref context share)))
+        (cond
+          (verified
+           (coin-ok (list (list-ref verified 1) (list-ref verified 2))))
+          ((not prepared)
+           (coin-error 'internal-error "share source was not prepared"))
+          ((not (share-signed? context share))
+           (coin-error 'internal-error "share signature was not verified"))
+          ((not (member-bytes?
+                  (coin-share-commitment context share)
+                  (coin-coop-context-commits context)))
+           (coin-error 'share-uncommitted
+                       "share was not committed in the parent block"))
+          (else
+            (set-coin-coop-context-example-count!
+              context (+ 1 (coin-coop-context-example-count context)))
+            (let* ((spec (list-ref prepared 1))
+                   (checked
+                     (coin-check-share-solution/spec
+                       spec (coin-share-solution share))))
+              (if (coin-failed? checked)
+                  checked
+                  (let* ((preview (coin-result-value checked))
+                         (entry (list share
+                                      (list-ref preview 0)
+                                      (list-ref preview 1))))
+                    (set-coin-coop-context-verified-cache!
+                      context
+                      (cons entry (coin-coop-context-verified-cache context)))
+                    (coin-ok (cdr entry)))))))))
+
     ;;; Quality contribution of one already-validated share.
+    ;;;
+    ;;; There is deliberately no derivation fallback here. Verified cache
+    ;;; provenance records the exact report and contribution only after
+    ;;; signature, commitment and examples. Re-deriving on a cache miss
+    ;;; both doubled validator work and made the derivation counter lie; asking
+    ;;; for quality before validation is an internal caller bug, not network
+    ;;; data to recover from.
     (define (coin-share-quality context share)
       (: coin-coop-context? coin-share? -> integer?)
-      (let* ((spec (coin-share-puzzle context
-                                         (coin-share-pubkey share)))
-             (source-size
-               (bytevector-length (coin-share-solution share))))
-        (coin-share-contribution
-          (coin-share-margin-milli (puzzle-spec-par spec) source-size))))
+      (let ((cached (share-verified-ref context share)))
+        (if cached
+            (list-ref cached 2)
+            (error "coin-share-quality: share was not validated in this context"))))
 
     ;;; Aggregate quality of an already-validated share list.
     (define (coin-shares-quality context shares)
@@ -806,30 +924,23 @@
       (coin-quality
         (map (lambda (share) (coin-share-quality context share)) shares)))
 
-    ;;; Validate one share's source against its personalized puzzle.
+    ;;; Preview one share's source against its personalized puzzle.
     ;;;
-    ;;; This excludes signature and commitment checks, which remain block-level
-    ;;; breadth-first passes. It is public so miners can verify candidate work
-    ;;; before signing it.
+    ;;; This excludes commitment and signature checks and never populates the
+    ;;; verified-share cache. On success its value is
+    ;;; `(personalized-spec report contribution)`.
     (define (coin-check-share-solution context share)
       (: coin-coop-context? coin-share? -> coin-result?)
       (guard (e (#t (coin-error 'internal-error
                                 "the personalized share check raised")))
         (let* ((personalized
-                 (coin-share-puzzle context
-                                       (coin-share-pubkey share)))
-               (source-size
-                 (bytevector-length (coin-share-solution share))))
-          (if (>= source-size (puzzle-spec-par personalized))
-              (coin-error 'share-not-under-par
-                          "share is not strictly below personalized par")
-              (let ((checked (coin-check-solution
-                               personalized
-                               (coin-share-solution share))))
-                (if (coin-failed? checked)
-                    (coin-error (share-reason (coin-result-reason checked))
-                                (coin-result-detail checked))
-                    checked))))))
+                 (coin-share-puzzle context (coin-share-pubkey share)))
+               (checked
+                 (coin-check-share-solution/spec
+                   personalized (coin-share-solution share))))
+          (if (coin-failed? checked)
+              checked
+              (coin-ok (cons personalized (coin-result-value checked)))))))
 
     ;; Run `check` over each share in turn, ascending, first failure wins.
     ;; The passes are separate so the whole block clears a cheap check
@@ -841,123 +952,306 @@
             (let ((failure (check (car xs) previous)))
               (or failure (loop (cdr xs) (car xs)))))))
 
-    ;;; Validate a block's revealed shares (§6.4).
+    (define (failure-detail kind)
+      (if (symbol? kind) (symbol->string kind) "unknown"))
+
+    (define (share-arity-result report)
+      (let ((kind (puzzle-report-error-kind report)))
+        (cond
+          ((eq? kind 'solution-not-a-procedure)
+           (coin-error 'share-solution-not-a-procedure
+                       "solution is not a 1-arity procedure"))
+          ((eq? kind 'internal-error)
+           (coin-error 'internal-error (failure-detail kind)))
+          (else
+            (coin-error 'share-solution-eval-failed
+                        (failure-detail kind))))))
+
+    ;;; Prepare every personalized source breadth-first without examples.
     ;;;
-    ;;; `producer-solution` is the block's own SOLUTION push, which the
-    ;;; shares must all differ from; `shares` is the decoded SHARES list.
-    ;;; On success the value is that same list. Its length is `R` for the
-    ;;; reward split; `coin-shares-quality` derives ranking value `Q`.
-    ;;;
-    ;;; The checks run in §6.4's order, but BREADTH-FIRST — every share
-    ;;; clears check `n` before any share attempts check `n+1`:
-    ;;;
-    ;;;   1  R <= 8, and P >= 0            shares-oversize / shares-at-genesis
-    ;;;   2  pubkey is a valid point       share-bad-pubkey
-    ;;;   3  strictly ascending pubkeys    shares-unordered
-    ;;;   4  commitment is in the parent   share-uncommitted
-    ;;;   5  signature verifies            share-bad-signature
-    ;;;   6  solution is not a duplicate   share-duplicate-solution
-    ;;;   7  solution solves puzzle P      share-<solution tag>
-    ;;;
-    ;;; That order is cost, not taste: a 32-byte set membership before an
-    ;;; ECDSA verification before a 200000-step evaluation, and a block
-    ;;; whose last share is junk never runs the first seven programs.
-    ;;;
-    ;;; Total: never raises, whatever the shares carry.
-    ;;;
-    ;;; ```scheme
-    ;;; (coin-result-value (coin-check-shares context #u8(49) '())) ; => ()
-    ;;; ```
-    (define (coin-check-shares context producer-solution shares)
-      (: coin-coop-context? any? list? -> coin-result?)
-      (guard (e (#t (coin-error 'internal-error "the share check raised")))
+    ;;; All specs are derived once, then every source clears strict under-par,
+    ;;; lexical constraint, parse, AST constraint and one-arity gates before
+    ;;; any signature or example evaluation. Prepared cache entries prove only
+    ;;; these source gates; they do not authorize `coin-share-quality`.
+    (define (coin-prepare-shares context shares)
+      (: coin-coop-context? list? -> coin-result?)
+      (guard (e (#t (coin-error 'internal-error
+                                "the share preparation raised")))
+        (when (coin-coop-context? context)
+          (set-coin-coop-context-prepared-cache! context '())
+          (set-coin-coop-context-signature-cache! context '())
+          (set-coin-coop-context-verified-cache! context '()))
         (cond
           ((not (coin-coop-context? context))
            (coin-error 'internal-error "expected a co-op context"))
           ((not (list? shares))
            (coin-error 'internal-error "expected a list of shares"))
-          ((null? shares) (coin-ok '()))
-          ((> (length shares) coin-max-shares)
-           (coin-error 'shares-oversize "more than eight shares"))
-          ;; A share reveals puzzle `P = H-1`. At `H = 0` there is no such
-          ;; puzzle and no parent to have carried the commitment.
-          ((< (coin-coop-context-puzzle-height context) 0)
-           (coin-error 'shares-at-genesis "genesis carries no shares"))
+          ((null? shares)
+           (set-coin-coop-context-prepared-cache! context '())
+           (coin-ok '()))
           ((not (puzzle-spec? (coin-coop-context-spec context)))
            (coin-error 'internal-error "co-op context has no puzzle spec"))
           (else
-            (let* ((producer (solution-bytes producer-solution))
-                   (spec (coin-coop-context-spec context))
-                   (commits (coin-coop-context-commits context))
-                   (failure
-                     (or
-                       ;; 2. every key is a point on the curve. The
-                       ;; signature check would RAISE on a key libsecp256k1
-                       ;; cannot parse, so this pass is also what keeps the
-                       ;; next one total.
-                       (each-share
-                         shares
-                         (lambda (share previous)
-                           (and (not (guard (e (#t #f))
-                                       (and (secp256k1-pubkey-parse
-                                              (coin-share-pubkey share))
-                                            #t)))
-                                (coin-error 'share-bad-pubkey
-                                            "share pubkey is not a valid compressed point"))))
-                       ;; 3. strictly ascending, which is canonical, forces
-                       ;; distinct payout keys, and makes every later
-                       ;; duplicate scan linear.
-                       (each-share
-                         shares
-                         (lambda (share previous)
-                           (and previous
-                                (>= 0 (bytes-compare
-                                        (coin-share-pubkey share)
-                                        (coin-share-pubkey previous)))
-                                (coin-error 'shares-unordered
-                                            "shares are not in strictly ascending pubkey order"))))
-                       ;; 4. the parent carried this exact commitment. This
-                       ;; is what a producer is paid the carrier output for,
-                       ;; and what he cannot fabricate.
-                       (each-share
-                         shares
-                         (lambda (share previous)
-                           (and (not (member-bytes?
-                                       (coin-share-commitment
-                                         context share)
-                                       commits))
-                                (coin-error 'share-uncommitted
-                                            "share was not committed in the parent block"))))
-                       ;; 5. the sharer authorised this program and this
-                       ;; payout, at this height, on this branch.
-                       (each-share
-                         shares
-                         (lambda (share previous)
-                           (and (not (coin-share-signature-ok?
-                                       context share))
-                                (coin-error 'share-bad-signature
-                                            "share signature does not verify"))))
-                       ;; 6. dedup on raw solution bytes, against the
-                       ;; producer's own solution and every earlier share.
-                       (let loop ((xs shares) (seen (list producer)))
-                         (cond
-                           ((null? xs) #f)
-                           ((member-bytes?
-                              (coin-share-solution (car xs)) seen)
-                            (coin-error 'share-duplicate-solution
-                                        "share repeats a solution already in this block"))
-                           (else
-                             (loop (cdr xs)
+            (let* ((derived
+                     (map
+                       (lambda (share)
+                         (list share
+                               (coin-share-puzzle
+                                 context (coin-share-pubkey share))))
+                       shares))
+                   (length-failure
+                     (each-share
+                       derived
+                       (lambda (entry previous)
+                         (let* ((share (list-ref entry 0))
+                                (spec (list-ref entry 1))
+                                (size (bytevector-length
+                                        (coin-share-solution share))))
+                           (and (>= size (puzzle-spec-par spec))
+                                (coin-error
+                                  'share-not-under-par
+                                  "share is not strictly below personalized par"))))))
+                   (source-failure
+                     (and (not length-failure)
+                          (each-share
+                            derived
+                            (lambda (entry previous)
+                              (let* ((share (list-ref entry 0))
+                                     (spec (list-ref entry 1)))
+                                (and
+                                  (not (puzzle-constraint-source-ok?
+                                         (puzzle-spec-constraint spec)
+                                         (coin-share-solution share)))
+                                  (coin-error
+                                    'share-constraint-violated
+                                    "share violates personalized constraint"))))))))
+              (cond
+                (length-failure length-failure)
+                (source-failure source-failure)
+                (else
+                  (let* ((parsed
+                           (map
+                             (lambda (entry)
+                               (list entry
+                                     (puzzle-parse/limit
+                                       (coin-share-solution (list-ref entry 0))
+                                       coin-max-solution-bytes)))
+                             derived))
+                         (parse-failure
+                           (each-share
+                             parsed
+                             (lambda (item previous)
+                               (let ((result (list-ref item 1)))
+                                 (and (puzzle-failed? result)
+                                      (coin-error
+                                        'share-solution-parse-failed
+                                        (failure-detail
+                                          (puzzle-result-error-kind result)))))))))
+                    (if parse-failure
+                        parse-failure
+                        (let ((constraint-failure
+                                (each-share
+                                  parsed
+                                  (lambda (item previous)
+                                    (let* ((entry (list-ref item 0))
+                                           (spec (list-ref entry 1))
+                                           (ast (puzzle-result-value
+                                                  (list-ref item 1))))
+                                      (and
+                                        (not (puzzle-constraint-ast-ok?
+                                               (puzzle-spec-constraint spec)
+                                               ast
+                                               (coin-spec-builtin-cap spec)))
+                                        (coin-error
+                                          'share-constraint-violated
+                                          "share violates personalized constraint")))))))
+                          (if constraint-failure
+                              constraint-failure
+                              (let arity-loop ((xs parsed) (prepared '()))
+                                (if (null? xs)
+                                    (begin
+                                      (set-coin-coop-context-prepared-cache!
+                                        context (reverse prepared))
+                                      (coin-ok shares))
+                                    (let* ((entry (list-ref (car xs) 0))
+                                           (share (list-ref entry 0))
+                                           (spec (list-ref entry 1))
+                                           (report
+                                             (puzzle-run-examples
+                                               (coin-share-solution share)
+                                               '())))
+                                      (if (not (puzzle-report-ok? report))
+                                          (share-arity-result report)
+                                          (let* ((size
+                                                   (bytevector-length
+                                                     (coin-share-solution share)))
+                                                 (contribution
+                                                   (coin-share-contribution
+                                                     (coin-share-margin-milli
+                                                       (puzzle-spec-par spec)
+                                                       size))))
+                                            (arity-loop
+                                              (cdr xs)
+                                              (cons (list share spec report
+                                                          contribution)
+                                                    prepared))))))))))))))))))
+
+    ;;; Run structural, canonical and commitment checks for all shares.
+    ;;;
+    ;;; This stage deliberately accepts a context whose puzzle spec is `#f`:
+    ;;; node validation can reject payout shape before deriving any puzzle.
+    ;;; It also resets the bounded per-block validation cache and counters.
+    (define (coin-check-shares-cheap context producer-solution shares)
+      (: coin-coop-context? any? list? -> coin-result?)
+      (guard (e (#t (coin-error 'internal-error "the cheap share check raised")))
+        (cond
+          ((not (coin-coop-context? context))
+           (coin-error 'internal-error "expected a co-op context"))
+          ((not (list? shares))
+           (coin-error 'internal-error "expected a list of shares"))
+          (else
+            (reset-share-validation! context)
+            (cond
+              ((null? shares) (coin-ok '()))
+              ((> (length shares) coin-max-shares)
+               (coin-error 'shares-oversize "more than eight shares"))
+              ((< (coin-coop-context-puzzle-height context) 0)
+               (coin-error 'shares-at-genesis "genesis carries no shares"))
+              (else
+                (let* ((producer (solution-bytes producer-solution))
+                       (commits (coin-coop-context-commits context))
+                       (failure
+                         (or
+                           ;; Source and fixed field widths precede curve work.
+                           (each-share
+                             shares
+                             (lambda (share previous)
+                               (and (not (share-fields-ok? share))
+                                    (coin-error 'shares-malformed
+                                                "share fields are malformed"))))
+                           ;; Point parsing keeps every later secp call total.
+                           (each-share
+                             shares
+                             (lambda (share previous)
+                               (and (not (guard (e (#t #f))
+                                           (and (secp256k1-pubkey-parse
+                                                  (coin-share-pubkey share))
+                                                #t)))
+                                    (coin-error
+                                      'share-bad-pubkey
+                                      "share pubkey is not a valid compressed point"))))
+                           (each-share
+                             shares
+                             (lambda (share previous)
+                               (and previous
+                                    (>= 0 (bytes-compare
+                                            (coin-share-pubkey share)
+                                            (coin-share-pubkey previous)))
+                                    (coin-error
+                                      'shares-unordered
+                                      "shares are not in strictly ascending pubkey order"))))
+                           (each-share
+                             shares
+                             (lambda (share previous)
+                               (and (not (member-bytes?
+                                           (coin-share-commitment context share)
+                                           commits))
+                                    (coin-error
+                                      'share-uncommitted
+                                      "share was not committed in the parent block"))))
+                           ;; Raw-byte dedup is cheaper than ECDSA and PBE.
+                           (let loop ((xs shares) (seen (list producer)))
+                             (cond
+                               ((null? xs) #f)
+                               ((member-bytes?
+                                  (coin-share-solution (car xs)) seen)
+                                (coin-error
+                                  'share-duplicate-solution
+                                  "share repeats a solution already in this block"))
+                               (else
+                                 (loop
+                                   (cdr xs)
                                    (cons (coin-share-solution (car xs))
-                                         seen)))))
-                       ;; 7. and only now, each pubkey-personalized task.
-                       (each-share
-                         shares
-                         (lambda (share previous)
-                           (let ((checked (coin-check-share-solution
-                                            context share)))
-                             (and (coin-failed? checked) checked)))))))
+                                         seen))))))))
+                  (or failure (coin-ok shares)))))))))
+
+    ;;; Verify every signature breadth-first after every source is prepared.
+    (define (coin-check-share-signatures context shares)
+      (: coin-coop-context? list? -> coin-result?)
+      (guard (e (#t (coin-error 'internal-error
+                                "the share signature check raised")))
+        (cond
+          ((not (coin-coop-context? context))
+           (coin-error 'internal-error "expected a co-op context"))
+          ((not (list? shares))
+           (coin-error 'internal-error "expected a list of shares"))
+          (else
+            (set-coin-coop-context-signature-cache! context '())
+            (let ((failure
+                    (each-share
+                      shares
+                      (lambda (share previous)
+                        (set-coin-coop-context-signature-count!
+                          context
+                          (+ 1 (coin-coop-context-signature-count context)))
+                        (and (not (coin-share-signature-ok? context share))
+                             (coin-error
+                               'share-bad-signature
+                               "share signature does not verify"))))))
+              (if failure
+                  failure
+                  (begin
+                    (set-coin-coop-context-signature-cache!
+                      context (map (lambda (share) (list share)) shares))
+                    (coin-ok shares))))))))
+
+    ;;; Evaluate examples for prepared, signed shares and populate verified Q.
+    (define (coin-verify-prepared-shares context shares)
+      (: coin-coop-context? list? -> coin-result?)
+      (guard (e (#t (coin-error 'internal-error
+                                "the prepared share check raised")))
+        (cond
+          ((not (coin-coop-context? context))
+           (coin-error 'internal-error "expected a co-op context"))
+          ((not (list? shares))
+           (coin-error 'internal-error "expected a list of shares"))
+          (else
+            (let ((failure
+                    (each-share
+                      shares
+                      (lambda (share previous)
+                        (let ((checked
+                                (check-share-solution/verified context share)))
+                          (and (coin-failed? checked) checked))))))
               (or failure (coin-ok shares)))))))
+
+    ;;; Run source preparation, ECDSA, then PBE for standalone callers.
+    ;;; Node body validation inserts producer validation before final PBE.
+    (define (coin-check-shares-expensive context shares)
+      (: coin-coop-context? list? -> coin-result?)
+      (let ((prepared (coin-prepare-shares context shares)))
+        (if (coin-failed? prepared)
+            prepared
+            (let ((signed (coin-check-share-signatures context shares)))
+              (if (coin-failed? signed)
+                  signed
+                  (coin-verify-prepared-shares context shares))))))
+
+    ;;; Validate a block's revealed shares in deterministic cost order.
+    ;;;
+    ;;; Failure order is field/source shape, count/genesis, pubkey, order,
+    ;;; commitment, duplicate source, under-par, lexical constraint, parse,
+    ;;; AST constraint, arity/source evaluation, signature, then examples.
+    ;;; Node body validation inserts output shape before source preparation and
+    ;;; producer validation between signature and examples. Total: hostile
+    ;;; network values return `coin-result`.
+    (define (coin-check-shares context producer-solution shares)
+      (: coin-coop-context? any? list? -> coin-result?)
+      (let ((cheap (coin-check-shares-cheap
+                     context producer-solution shares)))
+        (if (coin-failed? cheap)
+            cheap
+            (coin-check-shares-expensive context shares))))
 
     ;; ============================================================
     ;; The reward split
@@ -1096,4 +1390,4 @@
                                            (cdr (car ps)))))
                          (coin-error 'coinbase-output-shape
                                      "coinbase output pays the wrong script"))
-                        (else (loop (cdr os) (cdr ps)))))))))))))) 
+                        (else (loop (cdr os) (cdr ps))))))))))))))

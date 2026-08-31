@@ -68,7 +68,7 @@ Replaced entirely:
 
 - proof of work. No header is ever hashed against a target. Nothing in the
   chain calls a difficulty-retarget function derived from hashing.
-- the meaning of three header fields. `version` is pinned, `bits` carries the
+- the meaning of three header fields. `version` is pinned to 5, `bits` carries the
   difficulty parameter, and `nonce` carries a composite score word.
 - fork choice. Chain quality is program quality, not accumulated hashes.
 
@@ -603,7 +603,35 @@ very block that carried the reveal, so the "live beats settled" rule refuses
 to displace it. **The reveal is safe precisely because publishing it requires
 a block that settles its height.**
 
-### 9.2 What a share binds
+### 9.2 Personalized share work
+
+The producer solves the global puzzle for height `P`. A share solves a distinct
+public puzzle personalized by its compressed payout pubkey:
+
+```
+global_seed = seed(P)
+share_seed  = SHA256d( "SigilCoin/share-puzzle/1"
+                     || global_seed
+                     || pubkey )
+```
+
+It uses the global puzzle's height, complexity, example count and constraint.
+Its first `k-1` examples come from `share_seed`; the last is the mandatory
+anchor pair:
+
+```
+input  = "@"
+output = encode_ap(pubkey)
+```
+
+`encode_ap` maps each nibble of the full 33-byte compressed pubkey to `a` through
+`p`, yielding an injective 66-character string. Ordinary generation reserves
+`"@"`. Since a deterministic function has one output for that input, one source
+cannot solve personalized puzzles for two keys. A share is valid only when its
+source is **strictly shorter** than that personalized puzzle's par; equality is
+`share-not-under-par`, not useful work.
+
+The signed share binds that work to its branch and payout:
 
 ```
 share_preimage = SHA256d( "SigilCoin/share/1"
@@ -658,9 +686,17 @@ carried commitments that were revealed. He cannot fake it: fabricated
 commitments earn nothing, because nobody can reveal them.
 
 Including shares costs the producer real reward. What pays for it is aggregate
-verified quality `Q`: under-par personalized shares improve the score after
-producer length, memory, and steps tie. Raw share count affects only the reward
-split.
+verified quality `Q`, not reveal count:
+
+```
+margin       = floor(1000 * (personalized_par - L) / personalized_par)
+contribution = 1 + min(3, floor(margin / 50))
+Q            = min(15, sum(contribution))
+```
+
+A valid share contributes 1 through 4 according to how far it beats its own
+par. `Q` improves the score only after producer length, memory and steps tie.
+Raw reveal count controls only the reward split.
 
 ### 9.4 Unrevealed commitments
 
@@ -711,17 +747,18 @@ Worst case per block, at the frozen caps:
 | header checks | O(1) |
 | block size | one serialization |
 | coinbase decode | O(6588) bytes, five pushes and one re-encode |
-| global puzzle derivation | 64 attempts x 20000 steps = 1.28 M steps, cached per height |
-| personalized puzzle derivation | 8 x 64 x 20000 steps = 10.24 M steps |
+| global puzzle derivation | at most 65 attempts x 20000 steps = 1.30 M steps, cached per height |
+| personalized puzzle derivation | 8 x 65 x 20000 steps = 10.40 M steps |
 | producer solution | 200000 steps on one machine |
 | share solutions | 8 x 200000 steps |
 | signature verification | 8 ECDSA |
 | transactions | Bitcoin's existing cost |
 
 At about 5.5 microseconds per puzzle-language step, the uncached ceiling is
-roughly 73 seconds, about 0.1% of the 72000-second spacing floor. Global and
-personalized puzzle specs are cached across siblings. Typical cost is
-microseconds: measured puzzles used around 300 steps and 80 cells.
+roughly 74.3 seconds, about 0.1% of the 72000-second spacing floor. The global
+puzzle is cached across sibling blocks at one height; personalized share specs
+are derived once and reused within each block validation. Typical evaluator
+cost is around 1.65 ms: measured puzzles used roughly 300 steps and 80 cells.
 
 Two rules keep that bound real.
 
@@ -787,16 +824,13 @@ proxy. Operational detail is in `deploy/RUNBOOK.md`; the launch gate is in
 Three design decisions came from measuring rather than reasoning, and it is
 worth saying which.
 
-**The puzzle asks for a function because pre-freeze measurement required
-it.** Before protocol rules were frozen, a survey model tested target-value
-puzzles by asking for a program that produced one value. This model was never
-an implemented SigilCoin ruleset. Across 480 generated cases, **78.3%** of best
-known answers were quoted target literals: mining reduced to transcription.
-The survey also found the minimal answer unique 96.7% of the time, unbounded
-same-length variants that made hash tie-breaking grindable, and execution
-metrics at 0.03% of the fuel cap and 0.08% of the allocation cap. PBE replaced
-that measurement model before freeze: a function cannot be quoted, and its
-examples expose structure worth synthesizing.
+**The puzzle asks for a function because measurement required it.** A survey
+of 480 one-output synthesis cases found **78.3%** of best known answers were
+quoted literals: mining reduced to transcription. Requiring a one-argument
+function over several examples removes that trivial answer and exposes
+structure worth synthesizing. The same survey found execution metrics at
+0.03% of the fuel cap and 0.08% of the allocation cap, supporting fixed,
+bounded verification.
 
 **The example count is 8 because executable bounds beat estimates.** Ten
 examples need 515 bytes under one repair wrapper and leave only two bytes under
@@ -835,10 +869,17 @@ whatever is strongest, not toward whatever is most interesting.
 **Without identity, effort decides.** Permissionless participation,
 identity-free mining, and rough parity between a human and an automated miner
 cannot all hold at once. This chain chose the first two, which means the third
-is gone. A person writing programs by hand will lose to someone who leaves a
-search running, exactly as a CPU miner loses to an ASIC. The difference is
-only that here the winning machine is a program someone wrote, and the losing
-human can read it.
+is gone. One actor may control all eight payout keys; consensus proves eight
+personalized solutions, not eight people. A person writing programs by hand
+will lose to someone who leaves a search running, exactly as a CPU miner loses
+to an ASIC.
+
+**Payout keys can be ground.** Personalized puzzles prevent one source from
+being replayed under several keys, but keys are free to generate. A miner can
+sample pubkeys, derive their public puzzles and work only on unusually easy
+ones. The mandatory full-key anchor makes every chosen solution bind to that
+key; it does not make key selection scarce. `Q <= 15` bounds the block-level
+benefit, but there is no identity or anti-grinding rule.
 
 **The difficulty ceiling is finite.** `C` raises example count and grammar
 width, but every published puzzle must carry a fallback table that fits the
@@ -856,11 +897,11 @@ any competitor who submits their best. The manipulation is real, it is
 self-financed, and there is no in-protocol detection of it.
 
 **A block producer can silently omit others' commitments.** He chooses what
-his block carries. The carrier output pays him to include them and the
-share-count tie-break rewards him for carrying reveals, but a miner who
-expects to win most heights is better off excluding everyone, and there is no
-in-protocol defence. The mitigations are that he controls only one height and
-forfeits both the carrier payout and the tie-break. If censorship shows up in
+his block carries. The carrier output pays him to include them and aggregate verified share
+quality can break a producer-score tie, but a miner who expects to win most
+heights is better off excluding everyone, and there is no in-protocol defence.
+The mitigations are that he controls only one height and forfeits both the
+carrier payout and the quality tie-break. If censorship shows up in
 practice, the cheapest fix is to make commitment count a soft input to
 retargeting — a chain carrying no commitments is treated as easier — which
 costs the censor difficulty rather than requiring a new mechanism. That is not
@@ -873,10 +914,11 @@ most cases. A thief who copies the program and matches `Q` produces an
 incomparable sibling: nodes keep the first one seen, and the next block settles
 the height. That is the honest limit of same-block reveal protection.
 
-**The producer/share weight split is a guess.** Producer 2, each share 1,
-carrier 1. There is no data behind it, because nothing with shares has ever
-run. If it is wrong in one direction producers carry fewer shares than the
-tie-break rewards; in the other, sharing is not worth a sharer's effort.
+**The producer/share/carrier split is a guess.** Its exact weights are 2/1/1.
+Unit and integration tests on regtest prove output shape, conservation and
+payment binding, but no public co-op network has tested the incentives. If the
+split is wrong in one direction producers carry fewer shares than `Q` rewards;
+in the other, sharing is not worth a sharer's effort.
 
 **The retarget window of 16 is short.** The margin distribution is
 heavy-tailed — most blocks do not beat par at all — so a 16-sample median can
@@ -928,7 +970,10 @@ and used by integration tests.
 | builtins / special forms | 41 / 7 |
 | example count `k` | 3..8 |
 | grammar width `w` | 6..24 of 24 productions |
-| input / output literal cap | 8 / 24 bytes |
+| ordinary input / output literal cap | 8 / 24 bytes |
+| personalized anchor | `"@"` -> 66-character full-pubkey encoding |
+| personalized share threshold | strictly below personalized par |
+| share quality | 1..4 per share, aggregate `Q <= 15` |
 | minimum par | 24 bytes |
 | generator retries | 64, then a frozen fallback |
 | generator budget | 20000 steps per attempt |

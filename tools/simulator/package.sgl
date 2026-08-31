@@ -1,0 +1,41 @@
+;;; Native simulator runner. Bundling binds canonical libsecp256k1 APIs.
+
+(package
+  name: "sigil-coin-simulator"
+  version: "0.1.0"
+  sigil: "0.20"
+  description: "Deterministic SigilCoin consensus simulator"
+  entry: '(sigil coin simulation)
+  bundle-name: "sigil-coin-simulator"
+
+  configs: (list
+    (config
+      name: 'dev
+      output-dir: "build/dev"
+      bundle?: #t))
+
+  dependencies: (list
+    (from-git url: "codeberg:sigil/sigil-json" version: "^0.16")
+    (from-git url: "codeberg:sigil/sigil-crypto" version: "^0.16.1")
+    (from-path dir: "../.." package: "sigil-coin-puzzle")
+    (from-path dir: "../.." package: "sigil-coin-consensus")
+    ;; Bundle collector needs native consensus dependencies listed directly.
+    (from-path dir: "../../../sigil-bitcoin" package: "sigil-secp256k1")
+    (from-path dir: "../../../sigil-bitcoin" package: "sigil-bitcoin-utils")
+    (from-path dir: "../../../sigil-bitcoin" package: "sigil-bitcoin-primitives")
+    (from-path dir: "../../../sigil-bitcoin" package: "sigil-bitcoin-encoding")
+    (from-path dir: "../../../sigil-bitcoin" package: "sigil-bitcoin-keys")
+    (from-path dir: "../../../sigil-bitcoin" package: "sigil-bitcoin-script")
+    (from-path dir: "../../../sigil-bitcoin" package: "sigil-bitcoin-tx")
+    (from-path dir: "../../../sigil-bitcoin"
+               package: "sigil-bitcoin-consensus"))
+
+  tasks: (list
+    (task
+      name: 'build
+      description: "Build deterministic SigilCoin simulator"
+      steps: (list
+        (compile-sigil-modules
+          sources: ".sigil/deps/sigil-json/src/**/*.sgl")
+        (compile-sigil-modules
+          sources: "src/**/*.sgl")))))
