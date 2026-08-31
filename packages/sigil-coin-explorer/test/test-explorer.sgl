@@ -947,7 +947,7 @@
       (assert-true (has? page "&lt;script&gt;alert(1)&lt;/script&gt;"))
       (assert-true (not (has? page "<script>")))
       (assert-true (not (has? page "</script>")))
-      (assert-true (not (has? page "<img")))
+      (assert-true (not (has? page "<img src=x")))
       (assert-true (has? page "&lt;img src=x onerror=&quot;y&quot;&gt;"))
       (assert-true (has? page "&#39;sq&#39;"))))
 
@@ -1320,5 +1320,31 @@
           (assert-equal 200 (explorer-response-status
                               (explorer-respond sigilcoin-regtest-chain dir
                                                 "/block/1"))))))))
+
+(test-group "branded shared shell"
+  (test "HTML shell carries the apex wordmark and resilient asset fallbacks"
+    (let ((page (explorer-page "Test" "<p>body</p>")))
+      (assert-true (has? page "class=\"wordmark\""))
+      (assert-true (has? page "href=\"https://sigilcoin.lol\""))
+      (assert-true
+        (has? page
+              "https://sigilcoin.lol/assets/sigilcoin-symbol-v1.png"))
+      (assert-true
+        (has? page
+              "<span class=\"wordmark-symbol\" aria-hidden=\"true\">S</span>"))
+      (assert-true (has? page "SigilCoin <small>Explorer</small>"))
+      (assert-true (has? page "<main class=\"shell\"><p>body</p></main>"))
+      (assert-true (has? page "overflow-x:auto"))
+      (assert-true (has? page ":focus-visible"))))
+
+  (test "CSP permits only narrow apex image and font origins"
+    (let ((response (explorer-http-response
+                      (list 200 "text/html; charset=utf-8"
+                            (explorer-page "Test" "ok")))))
+      (assert-true
+        (has? response
+              "Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; img-src https://sigilcoin.lol; font-src https://sigilcoin.lol; base-uri 'none'; frame-ancestors 'none'"))
+      (assert-true (not (has? response "script-src")))
+      (assert-true (not (has? response "https://cdn"))))))
 
 (run-tests)

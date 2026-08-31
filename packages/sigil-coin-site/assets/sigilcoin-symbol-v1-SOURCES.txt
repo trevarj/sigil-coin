@@ -1,0 +1,12 @@
+SigilCoin symbol v1
+
+Selected study: S1A2 Tight Apex
+Original: S1A2-tight-apex-2048.png (2048x2048 RGBA, byte-preserved)
+Source SHA-256: 98928778f74a0dce29c43b9b5c3096057a469abacb35a978e8d48414318db028
+Canonical export: sigilcoin-symbol-v1.png (512x512 RGBA)
+Favicon export: sigilcoin-favicon-v1.png (64x64 RGBA)
+
+The exports were resized with ImageMagick 7.1.2-29 using the Lanczos filter,
+then losslessly optimized with oxipng 10.1.1. Export metadata was stripped.
+
+License declaration: BSD-3-Clause (packages/sigil-coin-site/package.sgl).

@@ -33,6 +33,7 @@
         "sigil-nrepl": "sigil-nrepl",
         "sigil-socket": "sigil-socket",
         "sigil-sqlite": "sigil-sqlite",
+        "sigil-sxml": "sigil-sxml",
         "sigil-tls": "sigil-tls",
         "sigil-version": "sigil-version"
       }
@@ -285,6 +286,23 @@
         "rev": "3d441fb32a216aaf99d0e2732bef5877e91d5d48",
         "type": "git",
         "url": "https://codeberg.org/sigil/sigil-sqlite"
+      }
+    },
+    "sigil-sxml": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1783418216,
+        "narHash": "sha256-RVyIWt8BaCvfksA2sd1zpGIA1qRJw4pI3xc4hDgnW10=",
+        "ref": "refs/heads/master",
+        "rev": "5a4f043247600f58bdabae19de55664d759a30c9",
+        "revCount": 36,
+        "type": "git",
+        "url": "https://codeberg.org/sigil/sigil-sxml"
+      },
+      "original": {
+        "rev": "5a4f043247600f58bdabae19de55664d759a30c9",
+        "type": "git",
+        "url": "https://codeberg.org/sigil/sigil-sxml"
       }
     },
     "sigil-tls": {

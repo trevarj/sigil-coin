@@ -4,9 +4,8 @@
 #
 #   sigil-toolchain   the Sigil compiler: `make stdlib` for the bootstrap CLI,
 #                     then that CLI building the real one
-#   sigilcoin         `bin/sigilcoin` AND `bin/sigilcoin-explorer`, both of
-#                     which fall out of the same `sigil build` of the
-#                     sigil-coin workspace
+#   sigilcoin         node/explorer binaries plus the generated static site,
+#                     all from the same `sigil build` of the workspace
 #
 # There is no vendoring derivation and no `depsHash`. `sigil build` only
 # reaches the network when a declared dependency is missing from disk, and
@@ -210,6 +209,7 @@ let
       EOF
 
       sigil build --redirects $TMPDIR/nix-redirects.sgl
+      build/dev/bin/sigilcoin-site --output build/site
       runHook postBuild
     '';
 
@@ -225,16 +225,21 @@ let
     # becomes a shipped binary.
     installPhase = ''
       runHook preInstall
-      mkdir -p $out/bin $out/lib
+      mkdir -p $out/bin $out/lib $out/share/sigilcoin-site
       cp -r build/dev/lib/. $out/lib/
       install -Dm755 build/dev/bin/sigilcoin $out/bin/sigilcoin
       install -Dm755 build/dev/bin/sigilcoin-explorer $out/bin/sigilcoin-explorer
+      cp -r build/site/. $out/share/sigilcoin-site/
       runHook postInstall
     '';
 
     doInstallCheck = true;
     installCheckPhase = ''
       test "$($out/bin/sigilcoin version)" = "sigilcoin ${version}"
+      test -f $out/share/sigilcoin-site/index.html
+      test -f $out/share/sigilcoin-site/assets/site-v1.css
+      test -f $out/share/sigilcoin-site/assets/sigilcoin-symbol-v1.png
+      test -f $out/share/sigilcoin-site/assets/sigilcoin-favicon-v1.png
     '';
 
     meta = {

@@ -15,7 +15,8 @@
     "packages/sigil-coin-consensus"
     "packages/sigil-coin-node"
     "packages/sigil-coin-cli"
-    "packages/sigil-coin-explorer")
+    "packages/sigil-coin-explorer"
+    "packages/sigil-coin-site")
 
   configs: (list
     (config

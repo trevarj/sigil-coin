@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 600" role="img" aria-labelledby="title desc">
+  <title id="title">SigilCoin open ecosystem</title><desc id="desc">SigilCoin connects the Sigil language, source, protocol documents, explorer and System Crafters community.</desc>
+  <defs><radialGradient id="core"><stop stop-color="#a98cff" stop-opacity=".46"/><stop offset="1" stop-color="#111522"/></radialGradient><filter id="glow"><feGaussianBlur stdDeviation="8" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs>
+  <style>.line{fill:none;stroke:#515a78;stroke-width:2;stroke-dasharray:6 9;animation:orbit 6s linear infinite}.card{fill:#111522;stroke:#343b55}.title{fill:#f5f3ff;font:700 17px ui-sans-serif,system-ui}.meta{fill:#aaa9bd;font:500 13px ui-monospace,monospace}.core{animation:pulse 3.2s ease-in-out infinite;transform-origin:380px 300px}@keyframes orbit{to{stroke-dashoffset:-60}}@keyframes pulse{50%{transform:scale(1.025)}}@media(prefers-reduced-motion:reduce){.line,.core{animation:none}}</style>
+  <circle cx="380" cy="300" r="235" fill="none" stroke="#242a3e"/><circle cx="380" cy="300" r="155" fill="none" stroke="#242a3e"/>
+  <path class="line" d="M380 300L180 140M380 300L580 140M380 300L650 300M380 300L580 470M380 300L180 470M380 300L110 300"/>
+  <g class="core"><circle cx="380" cy="300" r="94" fill="url(#core)" stroke="#a98cff" filter="url(#glow)"/><text class="title" x="380" y="289" text-anchor="middle">SIGILCOIN</text><text class="meta" x="380" y="317" text-anchor="middle">PROGRAM PROOF</text></g>
+  <g><rect class="card" x="102" y="90" width="156" height="92" rx="18"/><text class="title" x="180" y="127" text-anchor="middle">Sigil</text><text class="meta" x="180" y="151" text-anchor="middle">usesigil.org</text></g>
+  <g><rect class="card" x="502" y="90" width="156" height="92" rx="18"/><text class="title" x="580" y="127" text-anchor="middle">Source</text><text class="meta" x="580" y="151" text-anchor="middle">open repository</text></g>
+  <g><rect class="card" x="574" y="254" width="150" height="92" rx="18"/><text class="title" x="649" y="291" text-anchor="middle">Explorer</text><text class="meta" x="649" y="315" text-anchor="middle">read-only chain</text></g>
+  <g><rect class="card" x="502" y="424" width="156" height="92" rx="18"/><text class="title" x="580" y="461" text-anchor="middle">Consensus</text><text class="meta" x="580" y="485" text-anchor="middle">normative spec</text></g>
+  <g><rect class="card" x="102" y="424" width="156" height="92" rx="18"/><text class="title" x="180" y="461" text-anchor="middle">Whitepaper</text><text class="meta" x="180" y="485" text-anchor="middle">design rationale</text></g>
+  <g><rect class="card" x="36" y="254" width="150" height="92" rx="18"/><text class="title" x="111" y="291" text-anchor="middle">Community</text><text class="meta" x="111" y="315" text-anchor="middle">#systemcrafters</text></g>
+</svg>

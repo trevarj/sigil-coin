@@ -352,9 +352,10 @@
           ;; live view; nothing here may be cached as if it were final.
           "Cache-Control: no-store\r\n"
           "X-Content-Type-Options: nosniff\r\n"
-          ;; No page loads a script, a style sheet or an image, so the
-          ;; strictest policy that still renders is the correct one.
-          "Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'\r\n"
+          ;; The shell has no scripts. Only the apex site's versioned symbol
+          ;; and optional webfonts are allowed; text and system fallbacks keep
+          ;; the explorer usable when either asset is unavailable.
+          "Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; img-src https://sigilcoin.lol; font-src https://sigilcoin.lol; base-uri 'none'; frame-ancestors 'none'\r\n"
           "Connection: close\r\n"
           "\r\n"
           (if body text ""))))

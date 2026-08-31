@@ -1,0 +1,157 @@
+;;; Focused contract tests for the deterministic static SigilCoin site.
+
+(import (sigil test)
+        (sigil fs)
+        (sigil path)
+        (sigil string)
+        (sigil coin site))
+
+(define (has? text part) (string-contains? text part))
+
+(define (fresh-dir)
+  (let ((dir (make-temp-directory)))
+    (unless dir (error "test-site: could not create temporary directory"))
+    dir))
+
+(define (generated dir name)
+  (read-file-string (path-join dir name)))
+
+(define (generated-bytes dir name)
+  (read-file-bytes (path-join dir name)))
+
+(define %a (fresh-dir))
+(define %b (fresh-dir))
+(site-generate %a)
+(site-generate %b)
+(define %html (generated %a "index.html"))
+(define %css (generated %a "assets/site-v1.css"))
+(define %js (generated %a "assets/site-v1.js"))
+
+(test-group "locked landing-page content"
+  (test "hero and primary links are exact"
+    (assert-true (has? %html "Mine programs, not hashes."))
+    (assert-true
+      (has? %html
+            "Puzzle. Program. Block. Each block publishes a puzzle. Shortest valid program wins."))
+    (assert-true (has? %html "https://explorer.sigilcoin.lol"))
+    (assert-true
+      (has? %html
+            "https://github.com/trevarj/sigil-coin/blob/HEAD/docs/whitepaper.md")))
+
+  (test "selected symbol and favicon are wired into the shell"
+    (assert-true (has? %html "rel=\"icon\""))
+    (assert-true
+      (has? %html "href=\"assets/sigilcoin-favicon-v1.png\""))
+    (assert-true
+      (has? %html "src=\"assets/sigilcoin-symbol-v1.png\""))
+    (assert-true (has? %html "class=\"brand-symbol\""))
+    (assert-true (has? %html "alt=\"\""))
+    (assert-true (not (has? %html "<span class=\"brand-symbol\"")))
+    (assert-true
+      (not (has? %html
+                 "data-raster-src=\"assets/sigilcoin-symbol-v1.png\""))))
+
+  (test "automation language and all six fundamentals are present"
+    (assert-true
+      (has? %html
+            "Puzzles are intended for LLMs and program-synthesis scripts"))
+    (for-each
+      (lambda (fact) (assert-true (has? %html fact)))
+      '("Program synthesis" "~1 block/day" "512 bytes" "Zero" "premine"
+        "143029.99991970 SGL" "maximum co-op shares")))
+
+  (test "consensus layers and ecosystem URLs are explicit"
+    (for-each
+      (lambda (text) (assert-true (has? %html text)))
+      '("Bitcoin foundation" "Frozen puzzle machine" "Composite score"
+        "Margin retarget" "Co-op commit–reveal"
+        "https://usesigil.org"
+        "https://github.com/trevarj/sigil-coin"
+        "https://github.com/trevarj/sigil-coin/blob/HEAD/docs/consensus.md"
+        "https://web.libera.chat/#systemcrafters")))
+
+  (test "start path has warning, commands and compact LLM prompt"
+    (assert-true
+      (has? %html
+            "Warning: back up .sigilcoin/wallet/wallet.key before receiving SGL."))
+    (assert-true
+      (has? %html "https://github.com/trevarj/sigil-coin/releases"))
+    (for-each
+      (lambda (command) (assert-true (has? %html command)))
+      '("sigilcoin address"
+        "sigilcoin sync"
+        "sigilcoin puzzle"
+        "sigilcoin mine --solution"))
+    (assert-true
+      (has? %html
+            "Write the shortest valid SigilCoin puzzle-language one-argument function that reproduces every given input/output pair, obeys the stated syntactic constraint, and fits in 512 source bytes. Return source only."))
+    (assert-true (has? %html "id=\"fundamentals\""))
+    (assert-true (has? %html "<details>"))
+    (assert-true (not (has? %html "step-number\">5<")))
+    (assert-true (has? %html "aria-label=\"Copy"))
+    (assert-true (has? %js "navigator.clipboard")))
+
+  (test "forbidden phrase and finance features are absent"
+    (assert-true (not (has? %html "worth nothing")))
+    (assert-true (not (has? %js "fetch(")))
+    (assert-true (not (has? %js "XMLHttpRequest")))))
+
+(test-group "static artifact"
+  (test "all generated files exist"
+    (for-each
+      (lambda (name) (assert-true (file-exists? (path-join %a name))))
+      (append '("index.html" "robots.txt" "sitemap.xml")
+              (map (lambda (name) (path-join "assets" name))
+                   site-asset-files))))
+
+  (test "selected source and PNG exports are published"
+    (for-each
+      (lambda (name)
+        (assert-true
+          (file-exists? (path-join %a "assets" name))))
+      '("S1A2-tight-apex-2048.png"
+        "sigilcoin-symbol-v1.png"
+        "sigilcoin-favicon-v1.png"
+        "sigilcoin-symbol-v1-SOURCES.txt"))
+    (let ((sources
+            (generated %a "assets/sigilcoin-symbol-v1-SOURCES.txt")))
+      (assert-true (has? sources "Selected study: S1A2 Tight Apex"))
+      (assert-true (has? sources "2048x2048 RGBA"))
+      (assert-true (has? sources "512x512 RGBA"))
+      (assert-true (has? sources "64x64 RGBA"))))
+
+  (test "two runs are byte-for-byte deterministic"
+    (for-each
+      (lambda (name)
+        (assert-equal (generated-bytes %a name) (generated-bytes %b name)))
+      (append '("index.html" "robots.txt" "sitemap.xml")
+              (map (lambda (name) (path-join "assets" name))
+                   site-asset-files))))
+
+  (test "runtime assets make no third-party requests"
+    (assert-true (not (has? %css "http://")))
+    (assert-true (not (has? %css "https://")))
+    (assert-true (not (has? %js "http://")))
+    (assert-true (not (has? %js "https://")))
+    (assert-true (has? %css "local(\"Plus Jakarta Sans\")"))
+    (assert-true (has? %css "local(\"JetBrains Mono\")")))
+
+  (test "no-JS and reduced-motion fallbacks remain readable"
+    (assert-true (has? %css ".reveal{opacity:1;transform:none}"))
+    (assert-true (has? %css "prefers-reduced-motion:reduce"))
+    (assert-true (has? %js "IntersectionObserver"))))
+
+(test-group "safe hand-authored SVGs"
+  (test "diagrams have labels, viewBoxes and reduced motion"
+    (for-each
+      (lambda (name)
+        (let ((svg (generated %a (path-join "assets" name))))
+          (assert-true (has? svg "viewBox="))
+          (assert-true (has? svg "<title"))
+          (assert-true (has? svg "prefers-reduced-motion:reduce"))
+          (assert-true (not (has? svg "<script")))
+          (assert-true (not (has? svg "http://www.w3.org/1999/xlink")))
+          (assert-true (not (has? svg " href=")))))
+      '("mining-v1.svg" "score-fork-v1.svg" "ecosystem-v1.svg"))))
+
+(run-tests)

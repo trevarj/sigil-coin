@@ -1,0 +1,31 @@
+;;; sigil-coin-site — deterministic static site for sigilcoin.lol
+
+(package
+  name: "sigil-coin-site"
+  version: "0.1.0"
+  sigil: "0.20"
+  description: "Static SigilCoin landing site generator"
+  url: "https://github.com/trevarj/sigil-coin"
+  license: "BSD-3-Clause"
+  entry: '(sigil coin site)
+  bundle-name: "sigilcoin-site"
+
+  dependencies: (list
+    ;; Exact release pin: static output must not drift with serializer changes.
+    (from-git url: "codeberg:sigil/sigil-sxml" version: "0.15.0"))
+
+  dev-dependencies: (list
+    (from-git url: "codeberg:sigil/sigil"
+              package: "sigil-stdlib" version: "^0.20")
+    (from-git url: "codeberg:sigil/sigil"
+              package: "sigil-test" version: "^0.20")
+    (from-git url: "codeberg:sigil/sigil"
+              package: "sigil-test-runner" version: "^0.20"))
+
+  tasks: (list
+    (task
+      name: 'build
+      description: "Build sigil-coin-site"
+      steps: (list
+        (compile-sigil-modules
+          sources: "src/**/*.sgl")))))

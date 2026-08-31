@@ -111,6 +111,11 @@
       url = "git+https://codeberg.org/sigil/sigil-sqlite?ref=master&rev=3d441fb32a216aaf99d0e2732bef5877e91d5d48";
       flake = false;
     };
+    # Exact sigil-sxml v0.15.0 pin for deterministic site serialization.
+    sigil-sxml = {
+      url = "git+https://codeberg.org/sigil/sigil-sxml?rev=5a4f043247600f58bdabae19de55664d759a30c9";
+      flake = false;
+    };
     sigil-tls = {
       url = "git+https://codeberg.org/sigil/sigil-tls?ref=master&rev=fe4b756f2f46eacf5e3a4eb5d17f2681d88c5ee8";
       flake = false;
@@ -207,6 +212,17 @@
         sigilcoin-runs = pkgs.runCommand "sigilcoin-runs" { } ''
           test "$(${built.sigilcoin}/bin/sigilcoin version)" = "sigilcoin 0.1.0"
           test -x ${built.sigilcoin}/bin/sigilcoin-explorer
+          test -f ${built.sigilcoin}/share/sigilcoin-site/index.html
+          test -f ${built.sigilcoin}/share/sigilcoin-site/assets/site-v1.css
+          test -f ${built.sigilcoin}/share/sigilcoin-site/assets/plus-jakarta-v1.woff2
+          test -f ${built.sigilcoin}/share/sigilcoin-site/assets/jetbrains-mono-v1.woff2
+          test -f ${built.sigilcoin}/share/sigilcoin-site/assets/mining-v1.svg
+          test -f ${built.sigilcoin}/share/sigilcoin-site/assets/sigilcoin-symbol-v1.png
+          test -f ${built.sigilcoin}/share/sigilcoin-site/assets/sigilcoin-favicon-v1.png
+          grep -q "Mine programs, not hashes." \
+            ${built.sigilcoin}/share/sigilcoin-site/index.html
+          grep -q "143029.99991970 SGL" \
+            ${built.sigilcoin}/share/sigilcoin-site/index.html
           touch $out
         '';
 
