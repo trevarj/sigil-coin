@@ -49,20 +49,28 @@
     coin-genesis-hash
     coin-genesis-header-hex
     coin-genesis-header-constant
+    coin-testnet-genesis-header-constant
     coin-regtest-genesis-header-constant
     coin-genesis-id-constant
+    coin-testnet-genesis-id-constant
     coin-regtest-genesis-id-constant
     coin-target-block-spacing
+    coin-testnet-min-block-spacing
     coin-regtest-min-block-spacing
     coin-chain-min-block-spacing
+    coin-chain-address-hrp
     coin-irc-channel
     coin-genesis-quote
     coin-genesis-time
+    coin-testnet-genesis-quote
+    coin-testnet-genesis-time
     coin-regtest-genesis-quote
     coin-regtest-genesis-time
     sigilcoin-consensus-params
     sigilcoin-main-chain
+    sigilcoin-testnet-chain
     sigilcoin-regtest-chain
+    sigilcoin-chain-by-name
   )
 
   (begin

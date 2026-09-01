@@ -65,11 +65,29 @@
 ;; somewhere other than the miner's own wallet.
 (define %other-address "sgl1qw508d6qejxtdg4y5r3zarvary0c5xw7kr43pwr")
 
+;; The same witness programs under private testnet's chain-owned HRP.
+(define %testnet-payout-address
+  (segwit-encode
+    (coin-chain-address-hrp sigilcoin-testnet-chain)
+    0
+    (caddr (segwit-decode %payout-address))))
+(define %testnet-other-address
+  (segwit-encode
+    (coin-chain-address-hrp sigilcoin-testnet-chain)
+    0
+    (caddr (segwit-decode %other-address))))
+
 (define (fresh-args)
   (let ((dir (make-temp-directory)))
     (unless dir
       (error "fresh-args: failed to create a temp directory"))
     (list "--regtest" "--data-dir" dir)))
+
+(define (fresh-testnet-args)
+  (let ((dir (make-temp-directory)))
+    (unless dir
+      (error "fresh-testnet-args: failed to create a temp directory"))
+    (list "--testnet" "--data-dir" dir)))
 
 ;; Run a command through the binary's own dispatcher, swallowing the
 ;; `key: value` lines it prints and returning them alongside its value.
@@ -285,15 +303,29 @@
       (assert-true (string-contains? message "--to"))
       (assert-true (string-contains? message "sgl1"))))
 
-  (test "the default chain is mainnet and --regtest selects the local one"
+  (test "chain shortcuts and --chain dispatch to their SigilCoin configs"
     (assert-equal "sigilcoin-main" (cli-chain-name '()))
+    (assert-equal "sigilcoin-testnet" (cli-chain-name '("--testnet")))
     (assert-equal "sigilcoin-regtest" (cli-chain-name '("--regtest")))
     (assert-true (eq? sigilcoin-main-chain (cli-chain '())))
+    (assert-true (eq? sigilcoin-testnet-chain (cli-chain '("--testnet"))))
+    (assert-true (eq? sigilcoin-testnet-chain
+                      (cli-chain '("--chain" "sigilcoin-testnet"))))
     (assert-true (eq? sigilcoin-regtest-chain (cli-chain '("--regtest"))))
     (assert-true (eq? sigilcoin-regtest-chain
                       (cli-chain '("--chain" "sigilcoin-regtest"))))
     (assert-true (eq? sigilcoin-main-chain
-                      (cli-chain '("--chain" "sigilcoin-main")))))
+                      (cli-chain '("--chain" "sigilcoin-main"))))
+    (assert-true
+      (string-contains?
+        (raises-message
+          (lambda () (cli-chain-name '("--testnet" "--regtest"))))
+        "mutually exclusive"))
+    ;; An explicit chain keeps its existing precedence over shortcut flags.
+    (assert-equal "sigilcoin-main"
+                  (cli-chain-name
+                    '("--testnet" "--regtest"
+                      "--chain" "sigilcoin-main"))))
 
   (test "a Bitcoin chain cannot be opened by this binary"
     ;; `chain-config-by-name` would happily hand back a Bitcoin config; the
@@ -304,9 +336,16 @@
       (assert-true (string-contains? message "bitcoin-mainnet"))
       (assert-true (string-contains? message "sigilcoin-main"))))
 
-  (test "the data directory defaults to a dot directory"
+  (test "testnet defaults to an independent operator-overridable data dir"
     (assert-equal ".sigilcoin" (cli-data-dir '()))
-    (assert-equal "/tmp/n" (cli-data-dir '("--data-dir" "/tmp/n")))))
+    (assert-equal ".sigilcoin" (cli-data-dir '("--regtest")))
+    (assert-equal ".sigilcoin-testnet" (cli-data-dir '("--testnet")))
+    (assert-equal ".sigilcoin-testnet"
+                  (cli-data-dir '("--chain" "sigilcoin-testnet")))
+    ;; Sharing is possible only when the operator explicitly chooses it.
+    (assert-equal "/tmp/n"
+                  (cli-data-dir
+                    '("--testnet" "--data-dir" "/tmp/n")))))
 
 ;; ============================================================
 ;; Amounts
@@ -363,7 +402,10 @@
       (assert-true (string-contains? text "sigilcoin run"))
       (assert-true (string-contains? text "sigilcoin listen"))
       (assert-true (string-contains? text "sigilcoin address"))
-      (assert-true (string-contains? text "sigilcoin balance"))))
+      (assert-true (string-contains? text "sigilcoin balance"))
+      (assert-true (string-contains? text "--testnet"))
+      (assert-true (string-contains? text "sigilcoin-testnet"))
+      (assert-true (string-contains? text ".sigilcoin-testnet"))))
 
   (test "help and version answer without touching a node"
     (assert-true (string-contains? (run-text '("help")) "sigilcoin puzzle"))
@@ -432,16 +474,52 @@
                         (script-p2wpkh (caddr (segwit-decode address))))))
       (list %payout-address %other-address)))
 
-  (test "an address round-trips through bech32 under the sgl prefix"
+  (test "addresses round-trip under the selected chain HRP"
     (let* ((program (make-bytevector 20 42))
-           (address (segwit-encode coin-address-hrp 0 program)))
-      (assert-true (string-starts-with? address "sgl1"))
+           (main-address (segwit-encode coin-address-hrp 0 program))
+           (testnet-address
+             (segwit-encode
+               (coin-chain-address-hrp sigilcoin-testnet-chain)
+               0
+               program)))
+      (assert-true (string-starts-with? main-address "sgl1"))
+      (assert-true (string-starts-with? testnet-address "tsgl1"))
       (assert-equal (script-p2wpkh program)
-                    (coin-address->script-pubkey "--to" address))
-      ;; The same program under Bitcoin's HRP is a different string: the
-      ;; HRP is data, not something baked into the encoder.
-      (assert-true (not (string=? address
+                    (coin-address->script-pubkey "--to" main-address))
+      (assert-equal
+        (script-p2wpkh program)
+        (coin-address->script-pubkey
+          "--to" testnet-address sigilcoin-testnet-chain))
+      ;; The same program under another HRP is a different string: the HRP
+      ;; is selected chain data, not something baked into the encoder.
+      (assert-true (not (string=? main-address testnet-address)))
+      (assert-true (not (string=? main-address
                                   (segwit-encode "bc" 0 program))))))
+
+  (test "main and testnet reject each other's address HRP"
+    (let ((main-message
+            (raises-message
+              (lambda ()
+                (coin-address->script-pubkey
+                  "--to" %testnet-other-address sigilcoin-main-chain))))
+          (testnet-message
+            (raises-message
+              (lambda ()
+                (coin-address->script-pubkey
+                  "--to" %other-address sigilcoin-testnet-chain))))
+          (bitcoin-message
+            (raises-message
+              (lambda ()
+                (coin-address->script-pubkey
+                  "--to"
+                  "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
+                  sigilcoin-testnet-chain)))))
+      (assert-true (string-contains? main-message "sgl1"))
+      (assert-true (string-contains? main-message "tsgl"))
+      (assert-true (string-contains? testnet-message "tsgl1"))
+      (assert-true (string-contains? testnet-message "sgl"))
+      (assert-true (string-contains? bitcoin-message "tsgl1"))
+      (assert-true (string-contains? bitcoin-message "bc"))))
 
   (test "a Bitcoin address is refused, saying which chain it belongs to"
     (let ((message (raises-message
@@ -551,6 +629,45 @@
                        (string-append "issued-supply: "
                                       (cli-daviwils->sgl
                                         (coin-cumulative-supply 1)))))))))
+
+(test-group "sigilcoin private testnet"
+  (test "status and puzzle run through both testnet selectors"
+    (let ((shortcut (fresh-testnet-args))
+          (explicit (list "--chain" "sigilcoin-testnet"
+                          "--data-dir" (make-temp-directory))))
+      (assert-true (string-contains?
+                     (run-text (cons "status" shortcut))
+                     "chain: sigilcoin-testnet"))
+      (assert-true (string-contains?
+                     (run-text (cons "status" explicit))
+                     "chain: sigilcoin-testnet"))
+      (assert-true (string-contains?
+                     (run-text (cons "puzzle" shortcut))
+                     "height: 1"))))
+
+  (test "testnet mine accepts tsgl and keeps launch pacing intact"
+    (let ((args (fresh-testnet-args)))
+      (assert-true (string-starts-with? %testnet-payout-address "tsgl1"))
+      (assert-true (string-contains?
+                     (failure-message
+                       (append (list "mine" "--address" %payout-address)
+                               args))
+                     "tsgl1"))
+      ;; Before the scheduled testnet launch, a valid payout reaches the
+      ;; timestamp guard and is correctly held there. Once launch spacing is
+      ;; satisfiable, the same test mines and validates the block end to end.
+      (let* ((command (append (list "mine"
+                                    "--address" %testnet-payout-address)
+                              args))
+             (message (failure-message command)))
+        (if message
+            (begin
+              (assert-true (string-contains? message "too early"))
+              (assert-equal 0 (tip-height args)))
+            ;; `failure-message` already executed the command successfully.
+            ;; Do not run it a second time: once H1 is legal that would try to
+            ;; mine H2 immediately and fail the one-hour spacing rule.
+            (assert-equal 1 (tip-height args)))))))
 
 (test-group "sigilcoin peers"
   (test "peers are added, listed and removed on the SigilCoin chain"
@@ -1826,7 +1943,33 @@
                              (wallet-public-key
                                (wallet-key (cli-data-dir args)))))))
           ;; Stable across invocations: the key is persisted, not redrawn.
-          (assert-equal text (run-text (cons "address" args))))))
+          (assert-equal text (run-text (cons "address" args)))))
+
+      (test "testnet address and send use tsgl without sharing a wallet"
+        (let* ((main-args (fresh-args))
+               (testnet-args (fresh-testnet-args))
+               (main-dir (cli-data-dir main-args))
+               (testnet-dir (cli-data-dir testnet-args))
+               (main-text (run-text (cons "address" main-args)))
+               (testnet-text (run-text (cons "address" testnet-args))))
+          (assert-true (not (string=? main-dir testnet-dir)))
+          (assert-true (string-contains? main-text "address: sgl1"))
+          (assert-true (string-contains? testnet-text "address: tsgl1"))
+          (assert-true (string-contains? testnet-text
+                                         "chain: sigilcoin-testnet"))
+          (assert-true
+            (not (equal? (wallet-key main-dir) (wallet-key testnet-dir))))
+          ;; No funds is the expected final refusal: reaching it proves the
+          ;; selected testnet address decoded and the testnet node opened.
+          (let ((message
+                  (failure-message
+                    (append (list "send"
+                                  "--to" %testnet-other-address
+                                  "--amount" "0.25")
+                            testnet-args))))
+            (assert-true (string-contains? message "balance is too low"))
+            (assert-true (not (string-contains? message
+                                                "valid bech32")))))))
 
     (test-group "sigilcoin key storage"
       (test "the key file is created private and reused"

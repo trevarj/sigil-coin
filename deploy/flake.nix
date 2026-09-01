@@ -22,9 +22,9 @@
   # copy of this flake rather than the working tree. They default to the
   # operator's local clones, pinned by revision, because sigil-coin's
   # dependency set is currently ahead of what is pushed: at the time of
-  # writing, local sigil-bitcoin HEAD is 424a4a8 and includes the durable
-  # seven-argument parent-block validation seam. Pinning by rev also
-  # means an uncommitted change in a sibling checkout can never leak into a
+  # writing, local sigil-bitcoin HEAD is 7547072 and includes both the durable
+  # parent-block validation seam and strict per-chain P2P magic enforcement.
+  # Pinning by rev also means an uncommitted change in a sibling checkout can never leak into a
   # deployment build, and that the flake still locks while a sibling working
   # tree is dirty.
   #
@@ -47,7 +47,7 @@
       flake = false;
     };
     sigil-bitcoin = {
-      url = "git+file:///home/trev/Workspace/sigil/sigil-bitcoin?rev=424a4a83beb9e81ab7e292f4d51c05ce16306450";
+      url = "git+file:///home/trev/Workspace/sigil/sigil-bitcoin?rev=7547072e87636423ab57f0dbeb538c2c8c6b440d";
       flake = false;
     };
 

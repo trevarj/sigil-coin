@@ -71,6 +71,7 @@
     explorer-serve-connection
     explorer-serve
     explorer-usage
+    explorer-chain-for-args
     explorer-main)
 
   (begin
@@ -147,7 +148,9 @@
             (explorer-block-by-id store token))))
 
     (define (address-view store token)
-      (let ((script (explorer-address->script token)))
+      (let ((script (explorer-address->script-for-chain
+                      (explorer-store-config store)
+                      token)))
         (and script
              (cons (explorer-address-balance store script)
                    (explorer-address-blocks store
@@ -711,18 +714,27 @@
         "sigilcoin-explorer — read-only web explorer for SigilCoin\n"
         "\n"
         "usage:\n"
-        "  sigilcoin-explorer [--regtest] [--data-dir DIR] [--host HOST] [--port N]\n"
+        "  sigilcoin-explorer [--testnet|--regtest] [--data-dir DIR] [--host HOST] [--port N] [--requests N]\n"
         "\n"
         "options:\n"
-        "  --regtest         serve sigilcoin-regtest instead of sigilcoin-main\n"
+        "  --testnet        serve the private sigilcoin-testnet chain\n"
+        "  --regtest        serve sigilcoin-regtest instead of sigilcoin-main\n"
         "  --data-dir DIR    node data directory to read (default: .)\n"
         "  --host HOST       address to bind (default: 127.0.0.1)\n"
         "  --port N          port to bind (default: 8080)\n"
+        "  --requests N      serve exactly N requests, then exit (default: unlimited)\n"
         "  -h, --help        print this and exit\n"
         "  --version         print the package version and exit\n"
         "\n"
         "The explorer never writes: it opens the node's database read-only,\n"
         "answers one request per connection, and closes.\n"))
+
+    ;;; Select the explorer chain without opening a database or binding a port.
+    (define (explorer-chain-for-args args)
+      (: list? -> chain-config?)
+      (cond ((flag? args "--testnet") sigilcoin-testnet-chain)
+            ((flag? args "--regtest") sigilcoin-regtest-chain)
+            (else sigilcoin-main-chain)))
 
     ;;; `sigil-coin-explorer`'s entry point.
     ;;;
@@ -747,16 +759,20 @@
            (flush-output-port (current-output-port))
            (exit 0))
           (else
-           (let* ((chain (if (flag? args "--regtest")
-                             sigilcoin-regtest-chain
-                             sigilcoin-main-chain))
+           (let* ((chain (explorer-chain-for-args args))
                   (data-dir (option args "--data-dir" "."))
                   (host (option args "--host" "127.0.0.1"))
                   (port (or (string->number (option args "--port" "8080"))
-                            8080)))
+                            8080))
+                  (request-text (option args "--requests" #f))
+                  (requests (and request-text (string->number request-text))))
+             (when (and request-text
+                        (not (and requests (integer? requests) (> requests 0))))
+               (error "explorer: --requests must be a positive integer"))
              (display (string-append "explorer: " (chain-config-name chain)
                                      " at " (explorer-db-path chain data-dir)
                                      "\nexplorer: http://" host ":"
                                      (number->string port) "/\n"))
              (flush-output-port (current-output-port))
-             (explorer-serve chain data-dir port: port host: host))))))))
+             (explorer-serve chain data-dir
+                             port: port host: host requests: requests))))))))

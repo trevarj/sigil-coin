@@ -40,8 +40,12 @@
 
     ;; Store: addresses
     explorer-address-hrp
+    explorer-testnet-address-hrp
+    explorer-chain-address-hrp
     explorer-script->address
+    explorer-script->address-for-chain
     explorer-address->script
+    explorer-address->script-for-chain
 
     ;; Store: opening
     explorer-db-path
@@ -205,6 +209,7 @@
     explorer-http-response
     explorer-serve-connection
     explorer-serve
+    explorer-chain-for-args
     explorer-main
     main)
 

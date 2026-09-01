@@ -1,8 +1,8 @@
 ;;; (sigil coin node chain) — live SigilCoin chain configs
 ;;;
-;;; Mainnet and regtest run canonical program-by-example consensus. Mainnet's
-;;; timestamp remains placeholder data until operator chooses launch day;
-;;; changing it requires regenerating genesis constants.
+;;; Mainnet, private testnet, and regtest run canonical program-by-example
+;;; consensus. Mainnet's timestamp remains placeholder data until operator
+;;; chooses launch day; changing it requires regenerating genesis constants.
 
 (define-library (sigil coin node chain)
   (import (sigil bitcoin consensus)
@@ -13,21 +13,30 @@
           (sigil coin node genesis))
   (export
     coin-target-block-spacing
+    coin-testnet-min-block-spacing
     coin-regtest-min-block-spacing
     coin-chain-min-block-spacing
+    coin-chain-address-hrp
     coin-irc-channel
     coin-genesis-quote
     coin-genesis-time
+    coin-testnet-genesis-quote
+    coin-testnet-genesis-time
     coin-regtest-genesis-quote
     coin-regtest-genesis-time
     sigilcoin-consensus-params
     sigilcoin-main-chain
-    sigilcoin-regtest-chain)
+    sigilcoin-testnet-chain
+    sigilcoin-regtest-chain
+    sigilcoin-chain-by-name)
 
   (begin
 
     ;;; Intended seconds between blocks: one day.
     (define coin-target-block-spacing 86400)
+
+    ;;; Private testnet spacing floor: one hour.
+    (define coin-testnet-min-block-spacing 3600)
 
     ;;; Regtest spacing floor.
     (define coin-regtest-min-block-spacing 1)
@@ -42,6 +51,13 @@
     ;;; Placeholder mainnet timestamp. Non-final until launch operator chooses
     ;;; launch day and regenerates canonical genesis constants.
     (define coin-genesis-time 1785542400)
+
+    ;;; Private testnet genesis quote.
+    (define coin-testnet-genesis-quote
+      "SigilCoin private testnet - 2026-09-01")
+
+    ;;; Fixed private testnet genesis timestamp: 2026-09-01T00:00:00Z.
+    (define coin-testnet-genesis-time 1788220800)
 
     ;;; Regtest genesis quote.
     (define coin-regtest-genesis-quote
@@ -72,8 +88,22 @@
             (error "coin-chain-min-block-spacing: chain publishes no spacing floor"))
         (cdr entry)))
 
-    (define (extensions min-spacing genesis)
+    ;;; Read the SegWit address human-readable prefix from a chain config.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-chain-address-hrp sigilcoin-testnet-chain) ; => "tsgl"
+    ;;; ```
+    (define (coin-chain-address-hrp chain)
+      (: chain-config? -> string?)
+      (let ((entry (assq 'hrp
+                         (chain-config-extension chain 'address '()))))
+        (if (not (and (pair? entry) (string? (cdr entry))))
+            (error "coin-chain-address-hrp: chain publishes no address HRP"))
+        (cdr entry)))
+
+    (define (extensions min-spacing genesis hrp)
       (list
+        (cons 'address (list (cons 'hrp hrp)))
         (cons 'consensus
               (list (cons 'rules (coin-header-rules min-spacing))
                     ;; Shared node passes durable validated parents after H1;
@@ -95,10 +125,10 @@
                     (cons 'max-coinbase-script-bytes
                           coin-max-coinbase-script-bytes)))))
 
-    (define (config name magic port seeds min-spacing genesis)
+    (define (config name network-id magic port seeds min-spacing genesis hrp)
       (let ((header (block-header-field genesis)))
         (chain-config name: name
-                      network-id: name
+                      network-id: network-id
                       magic: magic
                       default-port: port
                       seed-peers: seeds
@@ -108,10 +138,14 @@
                       genesis-header: header
                       genesis-hash: (block-header-hash header)
                       consensus-params: sigilcoin-consensus-params
-                      extensions: (extensions min-spacing genesis))))
+                      extensions: (extensions min-spacing genesis hrp))))
 
     (define %main-genesis
       (coin-genesis-block coin-genesis-quote coin-genesis-time))
+
+    (define %testnet-genesis
+      (coin-genesis-block coin-testnet-genesis-quote
+                          coin-testnet-genesis-time))
 
     (define %regtest-genesis
       (coin-genesis-block coin-regtest-genesis-quote
@@ -120,17 +154,55 @@
     ;;; Main SigilCoin network. Genesis timestamp remains non-final.
     (define sigilcoin-main-chain
       (config "sigilcoin-main"
+              "sigilcoin-main"
               #u8(#x8f #xd1 #xc0 #xa5)
               19444
               '(("seed.sigilcoin.lol" . 19444))
               coin-min-block-spacing
-              %main-genesis))
+              %main-genesis
+              "sgl"))
+
+    ;;; Private operator test network with canonical validation.
+    (define sigilcoin-testnet-chain
+      (config "sigilcoin-testnet"
+              "sigilcoin-test"
+              #u8(#xd3 #x7a #x91 #xc4)
+              19446
+              '()
+              coin-testnet-min-block-spacing
+              %testnet-genesis
+              "tsgl"))
 
     ;;; Local development chain.
     (define sigilcoin-regtest-chain
       (config "sigilcoin-regtest"
+              "sigilcoin-regtest"
               #u8(#xa5 #xc0 #xd1 #x8f)
               19445
               '()
               coin-regtest-min-block-spacing
-              %regtest-genesis))))
+              %regtest-genesis
+              "sgl"))
+
+    ;;; Return a SigilCoin chain config by canonical or short name.
+    ;;;
+    ;;; ```scheme
+    ;;; (sigilcoin-chain-by-name "testnet") ; => sigilcoin-testnet-chain
+    ;;; ```
+    (define (sigilcoin-chain-by-name name)
+      (: string? -> chain-config?)
+      (cond ((or (string=? name "sigilcoin-main")
+                 (string=? name "sigilcoin")
+                 (string=? name "main")
+                 (string=? name "mainnet"))
+             sigilcoin-main-chain)
+            ((or (string=? name "sigilcoin-testnet")
+                 (string=? name "sigilcoin-test")
+                 (string=? name "testnet"))
+             sigilcoin-testnet-chain)
+            ((or (string=? name "sigilcoin-regtest")
+                 (string=? name "regtest"))
+             sigilcoin-regtest-chain)
+            (else
+             (error (string-append
+                      "sigilcoin-chain-by-name: unknown chain " name)))))))

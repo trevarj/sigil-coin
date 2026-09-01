@@ -426,30 +426,6 @@
           (assert-true (has? answer "408 Request Timeout"))
           (assert-true (< elapsed 3)))))))
 
-(define %explorer-script
-  (let loop ((candidates
-               (list "packages/sigil-coin-explorer/test/explorer-peer.sgl"
-                     "test/explorer-peer.sgl"
-                     "../test/explorer-peer.sgl")))
-    (cond ((null? candidates)
-           (error "test-explorer-e2e: cannot find explorer-peer.sgl"))
-          ((file-exists? (car candidates)) (car candidates))
-          (else (loop (cdr candidates))))))
-
-(define %explorer-command
-  (let loop ((paths (library-paths)) (out '()))
-    (if (null? paths)
-        (append (reverse out) (list %explorer-script "--"))
-        (loop (cdr paths) (cons (car paths) (cons "-L" out))))))
-
-(define (spawn-peer args)
-  (let ((p (apply process-spawn
-                  "sigil"
-                  die-with-parent: #t
-                  (append %explorer-command args))))
-    (unless p (error "test-explorer-e2e: could not spawn explorer peer"))
-    p))
-
 (define %explorer-binary
   (let loop ((candidates
                (list "build/dev/bin/sigilcoin-explorer"
@@ -499,24 +475,32 @@
              answer)))))
 
 (test-group "explorer executable and accept loop"
-  (test "--help and --version exit without serving"
-    (let* ((help (spawn-explorer (list "--help")))
+  (test "--help and --version exit without serving, even with --testnet"
+    (let* ((help (spawn-explorer (list "--testnet" "--help")))
            (help-lines (explorer-lines help))
            (help-code (process-wait help))
-           (version (spawn-explorer (list "--version")))
+           (version (spawn-explorer (list "--testnet" "--version")))
            (version-lines (explorer-lines version))
            (version-code (process-wait version)))
       (assert-equal 0 help-code)
       (assert-true (printed? help-lines "usage:"))
+      (assert-true (printed? help-lines "--testnet"))
       (assert-true (printed? help-lines "--data-dir"))
       (assert-true (not (printed? help-lines "http://")))
       (assert-equal 0 version-code)
-      (assert-true (printed? version-lines "sigilcoin-explorer 0.1.0"))))
+      (assert-true (printed? version-lines "sigilcoin-explorer 0.1.0"))
+      (assert-true (not (printed? version-lines "http://")))))
 
   (test "bounded serving exits after one real request"
+    ;; Use the native-linked production binary, not the source helper. The
+    ;; package harness can resolve every workspace and native dependency for
+    ;; this executable, while a second `sigil -L ...` process cannot safely
+    ;; reconstruct that graph from a package test.
     (let* ((port (explorer-port 1))
-           (child (spawn-peer
-                    (list "--bounded" %dir (number->string port))))
+           (child (spawn-explorer
+                    (list "--regtest" "--data-dir" %dir
+                          "--port" (number->string port)
+                          "--requests" "1")))
            (answer (http-get port "/api/summary"))
            (code (process-wait child)))
       (assert-true (string? answer))

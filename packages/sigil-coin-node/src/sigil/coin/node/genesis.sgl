@@ -61,8 +61,10 @@
     coin-genesis-hash
     coin-genesis-header-hex
     coin-genesis-header-constant
+    coin-testnet-genesis-header-constant
     coin-regtest-genesis-header-constant
     coin-genesis-id-constant
+    coin-testnet-genesis-id-constant
     coin-regtest-genesis-id-constant)
 
   (begin
@@ -190,6 +192,13 @@
     (define coin-genesis-header-constant
       "050000000000000000000000000000000000000000000000000000000000000000000000b4a701bee9f07241ca026ac90bd801e769d5ca4024be0fe3fd18b7ebd26f7d6500376d6a80007f20f0a55516")
 
+    ;;; Serialized canonical private testnet genesis header, as hex.
+    ;;;
+    ;;; Built from `coin-testnet-genesis-quote` and
+    ;;; `coin-testnet-genesis-time` in `(sigil coin node chain)`.
+    (define coin-testnet-genesis-header-constant
+      "050000000000000000000000000000000000000000000000000000000000000000000000c2dae5665d3349784ed7b82fb085c470971e33a3999e26e96d6dbd0dc31ba1198015966a80007f20f0a55516")
+
     ;;; Serialized canonical regtest genesis header, as hex. Same provenance, from
     ;;; `coin-regtest-genesis-quote` and `coin-regtest-genesis-time`.
     (define coin-regtest-genesis-header-constant
@@ -199,6 +208,10 @@
     ;;; humans. No leading zeros: there is no proof-of-work to produce them.
     (define coin-genesis-id-constant
       "fba5dc25f4802378c2f2821f8d2699718c34edf09c4e854bf14aff714734dba4")
+
+    ;;; Display id of the canonical private testnet genesis block.
+    (define coin-testnet-genesis-id-constant
+      "953c60759643c0701ea19e52d9e97bf57ed4fe1295830545ca7244757a3921a1")
 
     ;;; Display id of the canonical regtest genesis block.
     (define coin-regtest-genesis-id-constant

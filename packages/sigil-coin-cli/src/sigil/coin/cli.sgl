@@ -15,6 +15,7 @@
     cli-run
     main
     cli-default-data-dir
+    cli-testnet-default-data-dir
     cli-arg
     cli-arg-list
     cli-flag?
@@ -167,12 +168,15 @@
       (println "  sigilcoin run [--iterations N|0] [--retry-delay N] [--validation-blocks N] [--max-blocks N] [CHAIN] [--data-dir DIR]")
       (println "  sigilcoin listen [--bind HOST] [--port N] [--backlog N] [--max-connections N|0] [--accept-timeout N] [--read-timeout N] [--max-steps N] [--max-tx N] [CHAIN] [--data-dir DIR]")
       (println "")
-      (println "CHAIN is --regtest, or --chain sigilcoin-main|sigilcoin-regtest.")
+      (println "CHAIN is --testnet, --regtest, or --chain sigilcoin-main|sigilcoin-testnet|sigilcoin-regtest.")
+      (println "Use only one shortcut flag; an explicit --chain selects the network when wrappers supply shortcuts.")
       (println "--complexity C previews a puzzle at a difficulty the chain has not reached.")
       (println "--share derives and checks the wallet pubkey's personalized co-op puzzle.")
       (println "mine --commit accepts a commitment or canonical COMMITS push; --reveal accepts a share or canonical SHARES push. Both repeat.")
-      (println "Default chain: sigilcoin-main. Default data dir: ~a."
-               cli-default-data-dir)
+      (println "Default chain: sigilcoin-main. Main/regtest data dir: ~a. Testnet data dir: ~a."
+               cli-default-data-dir
+               cli-testnet-default-data-dir)
+      (println "--data-dir DIR explicitly overrides the selected chain's default; use it to choose any separate operator layout.")
       (println "Amounts are SGL: 1 SGL = 100000000 daviwils.")
       (println "Timeouts: --resolve-timeout, --connect-timeout, --read-timeout, in ms."))
 

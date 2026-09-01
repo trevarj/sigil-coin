@@ -7,9 +7,10 @@
 ;;;
 ;;; ## Addresses
 ;;;
-;;; A SigilCoin address is a native SegWit v0 address under the human
-;;; readable part `sgl`, so it reads as `sgl1...` and cannot be pasted into
-;;; a Bitcoin wallet by accident.
+;;; A SigilCoin address is a native SegWit v0 address under the selected
+;;; chain's human readable part: `sgl1...` on main/regtest and `tsgl1...` on
+;;; testnet. Neither can be pasted into a Bitcoin wallet by accident, and a
+;;; wallet command rejects the other SigilCoin network's prefix.
 ;;;
 ;;; `sigil-bitcoin` does NOT hard-code `bc`: `segwit-encode` and
 ;;; `bitcoin-network` both take the HRP as data, and `segwit-decode` hands
@@ -73,6 +74,7 @@
           (sigil bitcoin script)
           (sigil bitcoin tx)
           (sigil bitcoin node)
+          (sigil coin node)
           (sigil coin cli args))
   (export
     coin-address-hrp
@@ -106,12 +108,16 @@
 
   (begin
 
-    ;;; Human readable part of every SigilCoin address.
+    ;;; Human readable part of a mainnet SigilCoin address.
+    ;;;
+    ;;; Retained as the public mainnet constant; selected-chain commands use
+    ;;; `coin-chain-address-hrp` from the node package instead.
     ;;;
     ;;; ```scheme
     ;;; coin-address-hrp ; => "sgl"
     ;;; ```
-    (define coin-address-hrp "sgl")
+    (define coin-address-hrp
+      (coin-chain-address-hrp sigilcoin-main-chain))
 
     ;; Bitcoin Core's relay floor for a P2WPKH output. Change below this is
     ;; not worth an input to spend later, so it is dropped into the fee.
@@ -142,67 +148,88 @@
     ;; Addresses
     ;; ============================================================
 
-    ;;; Derive the `sgl1...` address of a serialized public key.
+    ;; Existing library callers that omit a chain keep mainnet behavior.
+    ;; Commands always pass their selected chain explicitly.
+    (define (address-chain chains)
+      (cond ((null? chains) sigilcoin-main-chain)
+            ((null? (cdr chains)) (car chains))
+            (else (error "address: expected at most one chain config"))))
+
+    ;;; Derive the selected chain's address for a serialized public key.
+    ;;;
+    ;;; With no optional chain this retains the original mainnet `sgl1...`
+    ;;; API. Pass a chain config to derive that network's HRP.
     ;;;
     ;;; ```scheme
-    ;;; (coin-address (private-key->public-key (make-bytevector 32 1)))
-    ;;; ; => "sgl1..."
+    ;;; (coin-address pubkey sigilcoin-testnet-chain) ; => "tsgl1..."
     ;;; ```
-    (define (coin-address public-key)
-      (: bytevector? -> string?)
+    (define (coin-address public-key . chains)
+      (: bytevector? any? ... -> string?)
       (unless (public-key? public-key)
         (error "coin-address: expected a serialized secp256k1 public key"))
-      (segwit-encode coin-address-hrp 0 (hash160 public-key)))
+      (segwit-encode
+        (coin-chain-address-hrp (address-chain chains))
+        0
+        (hash160 public-key)))
 
-    ;;; Decode a SigilCoin address into the scriptPubKey that pays it.
+    ;;; Decode an address into the scriptPubKey that pays it.
     ;;;
-    ;;; Every rejection says which part is wrong, because the usual mistake
-    ;;; is a pasted Bitcoin address and "invalid address" does not tell
-    ;;; anyone that.
+    ;;; The optional chain defaults to mainnet for API compatibility. Wallet
+    ;;; commands pass the selected chain, so cross-network SigilCoin and
+    ;;; Bitcoin addresses are rejected before a transaction is built.
     ;;;
     ;;; ```scheme
-    ;;; (coin-address->script-pubkey "--to" (coin-address pubkey))
+    ;;; (coin-address->script-pubkey
+    ;;;   "--to" (coin-address pubkey chain) chain)
     ;;; ; => the P2WPKH script
     ;;; ```
-    (define (coin-address->script-pubkey who address)
-      (: string? any? -> bytevector?)
-      (unless (string? address)
-        (error (string-append who ": expected an sgl1... address")))
-      (let ((decoded (segwit-decode address)))
-        (unless decoded
-          (error (string-append
-                   who
-                   ": \""
-                   address
-                   "\" is not a valid bech32 address.")))
-        (let ((hrp (car decoded))
-              (version (cadr decoded))
-              (program (caddr decoded)))
-          (unless (string=? hrp coin-address-hrp)
+    (define (coin-address->script-pubkey who address . chains)
+      (: string? any? any? ... -> bytevector?)
+      (let* ((chain (address-chain chains))
+             (expected-hrp (coin-chain-address-hrp chain)))
+        (unless (string? address)
+          (error (string-append who
+                                ": expected a "
+                                expected-hrp
+                                "1... address")))
+        (let ((decoded (segwit-decode address)))
+          (unless decoded
             (error (string-append
                      who
                      ": \""
                      address
-                     "\" is a \""
-                     hrp
-                     "\" address, not a SigilCoin one. SigilCoin addresses"
-                     " start with \""
-                     coin-address-hrp
-                     "1\".")))
-          (unless (= version 0)
-            (error (string-append
-                     who
-                     ": witness version "
-                     (number->string version)
-                     " is not spendable by this wallet; use a v0 "
-                     coin-address-hrp
-                     "1 address.")))
-          (unless (= 20 (bytevector-length program))
-            (error (string-append
-                     who
-                     ": only 20-byte (single key) v0 addresses are"
-                     " supported.")))
-          (script-p2wpkh program))))
+                     "\" is not a valid bech32 address.")))
+          (let ((hrp (car decoded))
+                (version (cadr decoded))
+                (program (caddr decoded)))
+            (unless (string=? hrp expected-hrp)
+              (error (string-append
+                       who
+                       ": \""
+                       address
+                       "\" is a \""
+                       hrp
+                       "\" address, not a \""
+                       expected-hrp
+                       "\" address for "
+                       (chain-config-name chain)
+                       ". Use an address starting with \""
+                       expected-hrp
+                       "1\".")))
+            (unless (= version 0)
+              (error (string-append
+                       who
+                       ": witness version "
+                       (number->string version)
+                       " is not spendable by this wallet; use a v0 "
+                       expected-hrp
+                       "1 address.")))
+            (unless (= 20 (bytevector-length program))
+              (error (string-append
+                       who
+                       ": only 20-byte (single key) v0 addresses are"
+                       " supported.")))
+            (script-p2wpkh program)))))
 
     ;; ============================================================
     ;; Key storage
@@ -732,11 +759,12 @@
     ;;; ```
     (define (run-address args)
       (: list? -> any?)
-      (cli-chain args)
-      (let* ((data-dir (cli-data-dir args))
+      (let* ((chain (cli-chain args))
+             (data-dir (cli-data-dir args))
              (key (wallet-key data-dir)))
-        (println "address: ~a" (coin-address (wallet-public-key key)))
-        (println "chain: ~a" (cli-chain-name args))
+        (println "address: ~a"
+                 (coin-address (wallet-public-key key) chain))
+        (println "chain: ~a" (chain-config-name chain))
         (println "key-file: ~a" (wallet-key-file data-dir))))
 
     ;;; Print what the node's UTXO set says the wallet owns.
@@ -747,15 +775,16 @@
     (define (run-balance args)
       (: list? -> any?)
       ;; Chain and flags first: a mistyped command should not create a key.
-      (cli-chain args)
-      (let* ((key (wallet-key (cli-data-dir args)))
+      (let* ((chain (cli-chain args))
+             (key (wallet-key (cli-data-dir args)))
              (script (wallet-script-pubkey key)))
         (cli-with-node args
           (lambda (n)
             (let ((balance (wallet-balance n script))
                   (rows (wallet-utxos n script)))
-              (println "address: ~a" (coin-address (wallet-public-key key)))
-              (println "chain: ~a" (cli-chain-name args))
+              (println "address: ~a"
+                       (coin-address (wallet-public-key key) chain))
+              (println "chain: ~a" (chain-config-name chain))
               (println "outputs: ~a" (length rows))
               (println "balance: ~a SGL" (cli-daviwils->sgl (car balance)))
               (println "spendable: ~a SGL" (cli-daviwils->sgl (cdr balance)))
@@ -779,9 +808,12 @@
     ;;; ```
     (define (run-send args)
       (: list? -> any?)
-      (cli-chain args)
-      (let* ((to (cli-required args "--to" "send" "a sgl1... address"))
-             (to-script (coin-address->script-pubkey "--to" to))
+      (let* ((chain (cli-chain args))
+             (hrp (coin-chain-address-hrp chain))
+             (to (cli-required
+                   args "--to" "send"
+                   (string-append "a " hrp "1... address")))
+             (to-script (coin-address->script-pubkey "--to" to chain))
              (amount (cli-sgl->daviwils
                        "--amount"
                        (cli-required args "--amount" "send" "an amount in SGL")))

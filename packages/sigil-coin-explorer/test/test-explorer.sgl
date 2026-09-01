@@ -55,6 +55,8 @@
 (define %miner-b "sgl1qw508d6qejxtdg4y5r3zarvary0c5xw7kr43pwr")
 (define %script-a (explorer-address->script %miner-a))
 (define %script-b (explorer-address->script %miner-b))
+(define %testnet-miner-a
+  (explorer-script->address-for-chain sigilcoin-testnet-chain %script-a))
 
 (define %zero32 (make-bytevector 32 0))
 (define %coinbase-index #xffffffff)
@@ -448,6 +450,99 @@
         (has? (utf8->string
                 (coin-share-solution (list-ref shares 2)))
               "<script>")))))
+
+;; ============================================================
+;; Private testnet selection and addresses
+;; ============================================================
+
+(test-group "private testnet explorer"
+  (test "--testnet selects only the private testnet chain"
+    (assert-equal "sigilcoin-main"
+                  (chain-config-name (explorer-chain-for-args '())))
+    (assert-equal "sigilcoin-regtest"
+                  (chain-config-name
+                    (explorer-chain-for-args '("--regtest"))))
+    (assert-equal "sigilcoin-testnet"
+                  (chain-config-name
+                    (explorer-chain-for-args '("--testnet")))))
+
+  (test "testnet uses tsgl while main and regtest use sgl"
+    (assert-equal "sgl" (explorer-chain-address-hrp sigilcoin-main-chain))
+    (assert-equal "sgl" (explorer-chain-address-hrp sigilcoin-regtest-chain))
+    (assert-equal "tsgl"
+                  (explorer-chain-address-hrp sigilcoin-testnet-chain))
+    (assert-true (string-starts-with? %testnet-miner-a "tsgl1"))
+    (assert-equal %script-a
+                  (explorer-address->script-for-chain
+                    sigilcoin-testnet-chain %testnet-miner-a))
+    (assert-equal #f
+                  (explorer-address->script-for-chain
+                    sigilcoin-testnet-chain %miner-a))
+    (assert-equal #f
+                  (explorer-address->script-for-chain
+                    sigilcoin-main-chain %testnet-miner-a)))
+
+  (test "testnet summary, address, block, PBE, Q, co-op, and difficulty routes answer read-only"
+    (let* ((dir (fresh-dir))
+           (n (node-open sigilcoin-testnet-chain dir))
+           (genesis (node-best-header n)))
+      (node-close n)
+      (let* ((path (explorer-db-path sigilcoin-testnet-chain dir))
+             (db (sqlite-open path))
+             (complexity 128)
+             (b1 (build-block
+                   genesis 1 complexity
+                   (hidden-solution (block-header-hash genesis) 1 complexity)
+                   '() '() "testnet producer" %script-a %script-a))
+             (shares (personalized-shares genesis 1 complexity))
+             (b2 (build-block
+                   (block-header-field b1) 2 complexity
+                   (hidden-solution (block-header-hash (block-header-field b1))
+                                    2 complexity)
+                   shares '() %hostile-graffiti %script-a %script-a)))
+        (store-block! db b1 1)
+        (set-tip! db (store-block! db b2 2) 2)
+        (sqlite-close db)
+        (let* ((before (read-file-bytes path))
+               (routes
+                 (list "/" "/blocks" "/difficulty" "/block/2"
+                       (string-append "/address/" %testnet-miner-a)
+                       "/api/summary" "/api/blocks" "/api/difficulty"
+                       "/api/block/2"
+                       (string-append "/api/address/" %testnet-miner-a))))
+          (for-each
+            (lambda (route)
+              (let ((response
+                      (explorer-respond sigilcoin-testnet-chain dir route)))
+                (assert-equal 200 (explorer-response-status response))))
+            routes)
+          (let* ((summary
+                   (json-decode
+                     (explorer-response-body
+                       (explorer-respond sigilcoin-testnet-chain dir
+                                         "/api/summary"))))
+                 (block
+                   (json-decode
+                     (explorer-response-body
+                       (explorer-respond sigilcoin-testnet-chain dir
+                                         "/api/block/2"))))
+                 (page (explorer-response-body
+                         (explorer-respond sigilcoin-testnet-chain dir
+                                           "/block/2"))))
+            (assert-equal "sigilcoin-testnet" (dict-get summary "chain"))
+            (assert-equal 3 (dict-get block "share_count"))
+            (assert-true (number? (dict-get block "complexity")))
+            (assert-true (number? (dict-get (dict-get block "score")
+                                            "quality")))
+            (assert-true (has? page "<h2>Puzzle</h2>"))
+            (assert-true (has? page "<h2>Co-op shares</h2>"))
+            (assert-true (has? page %testnet-miner-a))
+            (assert-true (not (has? page "<script>"))))
+          (assert-equal 404
+                        (explorer-response-status
+                          (explorer-respond sigilcoin-testnet-chain dir
+                            (string-append "/address/" %miner-a))))
+          (assert-equal before (read-file-bytes path)))))))
 
 ;; ============================================================
 ;; Read-only

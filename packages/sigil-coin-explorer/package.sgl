@@ -32,6 +32,11 @@
               package: "sigil-bitcoin-node" version: "^0.1"))
 
   dev-dependencies: (list
+    ;; `test-explorer-e2e.sgl` signs real co-op shares. Declare the native
+    ;; module directly so the package test harness links it rather than
+    ;; relying on a transitive node dependency that the harness cannot see.
+    (from-git url: "github:trevarj/sigil-bitcoin"
+              package: "sigil-secp256k1" version: "^0.1")
     (from-git url: "codeberg:sigil/sigil"
               package: "sigil-stdlib" version: "^0.20")
     (from-git url: "codeberg:sigil/sigil"

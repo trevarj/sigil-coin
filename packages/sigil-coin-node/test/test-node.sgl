@@ -1240,4 +1240,201 @@
                         (node-status reopened)))
         (node-close reopened))))))
 
+;; ============================================================
+;; Private testnet chain
+;; ============================================================
+
+(define (chain-extension-ref chain extension key)
+  (let ((entry (assq key (chain-config-extension chain extension '()))))
+    (and (pair? entry) (cdr entry))))
+
+(test-group "sigilcoin private testnet"
+  (test "the deterministic genesis rebuilds and has no premine"
+    (let* ((built (coin-genesis-block coin-testnet-genesis-quote
+                                      coin-testnet-genesis-time))
+           (header (block-header-field built))
+           (coinbase (car (block-transactions built)))
+           (outputs (transaction-outputs coinbase)))
+      (assert-equal "SigilCoin private testnet - 2026-09-01"
+                    coin-testnet-genesis-quote)
+      (assert-equal 1788220800 coin-testnet-genesis-time)
+      (assert-equal coin-testnet-genesis-header-constant
+                    (coin-genesis-header-hex coin-testnet-genesis-quote
+                                             coin-testnet-genesis-time))
+      (assert-equal 160 (string-length coin-testnet-genesis-header-constant))
+      (assert-equal coin-testnet-genesis-id-constant
+                    (block-header-id header))
+      (assert-equal 0 (coin-block-reward 0))
+      (assert-equal 1 (length outputs))
+      (assert-equal 0 (txout-value (car outputs)))
+      (assert-equal #u8(#x6a) (txout-script-pubkey (car outputs)))
+      (assert-true (block-merkle-root-valid? built))))
+
+  (test "the network config is exact and canonical policy stays intact"
+    (assert-equal "sigilcoin-testnet"
+                  (chain-config-name sigilcoin-testnet-chain))
+    (assert-equal "sigilcoin-test"
+                  (chain-config-network-id sigilcoin-testnet-chain))
+    (assert-equal #u8(#xd3 #x7a #x91 #xc4)
+                  (chain-config-magic sigilcoin-testnet-chain))
+    (assert-equal 19446
+                  (chain-config-default-port sigilcoin-testnet-chain))
+    (assert-equal '() (chain-config-seed-peers sigilcoin-testnet-chain))
+    (assert-equal (chain-config-protocol-version sigilcoin-main-chain)
+                  (chain-config-protocol-version sigilcoin-testnet-chain))
+    (assert-equal 70015
+                  (chain-config-protocol-version sigilcoin-testnet-chain))
+    (assert-equal (chain-config-services sigilcoin-main-chain)
+                  (chain-config-services sigilcoin-testnet-chain))
+    (assert-equal 1 (chain-config-services sigilcoin-testnet-chain))
+    (assert-true
+      (eq? sigilcoin-consensus-params
+           (chain-config-consensus-params sigilcoin-testnet-chain)))
+    (assert-equal 3600 coin-testnet-min-block-spacing)
+    (assert-equal 3600
+                  (coin-chain-min-block-spacing sigilcoin-testnet-chain))
+    (assert-equal coin-target-block-spacing
+                  (chain-extension-ref sigilcoin-testnet-chain
+                                       'policy 'target-block-spacing))
+    (assert-equal coin-max-future-drift
+                  (chain-extension-ref sigilcoin-testnet-chain
+                                       'policy 'max-future-drift))
+    (assert-equal coin-median-time-span
+                  (chain-extension-ref sigilcoin-testnet-chain
+                                       'policy 'median-time-span))
+    (assert-equal coin-max-block-bytes
+                  (chain-extension-ref sigilcoin-testnet-chain
+                                       'policy 'max-block-bytes))
+    (assert-equal coin-max-solution-bytes
+                  (chain-extension-ref sigilcoin-testnet-chain
+                                       'policy 'max-solution-bytes))
+    (assert-equal coin-max-graffiti-bytes
+                  (chain-extension-ref sigilcoin-testnet-chain
+                                       'policy 'max-graffiti-bytes))
+    (assert-equal coin-max-supply
+                  (chain-extension-ref sigilcoin-testnet-chain
+                                       'policy 'max-supply))
+    (assert-equal coin-max-coinbase-script-bytes
+                  (chain-extension-ref sigilcoin-testnet-chain
+                                       'policy 'max-coinbase-script-bytes)))
+
+  (test "addresses and lookup isolate the three SigilCoin chains"
+    (assert-equal "sgl" (coin-chain-address-hrp sigilcoin-main-chain))
+    (assert-equal "tsgl" (coin-chain-address-hrp sigilcoin-testnet-chain))
+    (assert-equal "sgl" (coin-chain-address-hrp sigilcoin-regtest-chain))
+    (assert-true (eq? sigilcoin-main-chain
+                      (sigilcoin-chain-by-name "sigilcoin-main")))
+    (assert-true (eq? sigilcoin-testnet-chain
+                      (sigilcoin-chain-by-name "sigilcoin-test")))
+    (assert-true (eq? sigilcoin-testnet-chain
+                      (sigilcoin-chain-by-name "testnet")))
+    (assert-true (eq? sigilcoin-regtest-chain
+                      (sigilcoin-chain-by-name "regtest")))
+    (assert-error (sigilcoin-chain-by-name "bitcoin-testnet"))
+    (assert-true
+      (not (equal? (chain-config-genesis-hash sigilcoin-main-chain)
+                   (chain-config-genesis-hash sigilcoin-testnet-chain))))
+    (assert-true
+      (not (equal? (chain-config-genesis-hash sigilcoin-regtest-chain)
+                   (chain-config-genesis-hash sigilcoin-testnet-chain))))
+    (let ((magic (chain-config-magic sigilcoin-testnet-chain)))
+      (for-each
+        (lambda (other)
+          (assert-true (not (equal? magic (chain-config-magic other)))))
+        (list bitcoin-mainnet-chain
+              bitcoin-testnet-chain
+              bitcoin-testnet4-chain
+              bitcoin-signet-chain
+              bitcoin-regtest-chain
+              sigilcoin-main-chain
+              sigilcoin-regtest-chain))))
+
+  (test "the one-hour spacing floor is enforced at the exact boundary"
+    (let* ((genesis (coin-genesis-header coin-testnet-genesis-quote
+                                         coin-testnet-genesis-time))
+           (good-block
+             (coin-build-block genesis
+                               1
+                               coin-genesis-complexity
+                               #f
+                               "testnet spacing"
+                               %payout
+                               (+ coin-testnet-genesis-time
+                                  coin-testnet-min-block-spacing)))
+           (good (block-header-field good-block))
+           (early (block-header
+                    good
+                    time: (- (block-header-time good) 1))))
+      (assert-true
+        (coin-ok? (coin-validate-header-context
+                    (list genesis)
+                    good
+                    (block-header-time good)
+                    (coin-chain-min-block-spacing sigilcoin-testnet-chain))))
+      (assert-equal 'insufficient-spacing
+                    (coin-result-reason
+                      (coin-validate-header-context
+                        (list genesis)
+                        early
+                        (block-header-time good)
+                        (coin-chain-min-block-spacing
+                          sigilcoin-testnet-chain))))))
+
+  (test "producer and co-op blocks use the full canonical body rules"
+    (let* ((genesis-block
+             (coin-genesis-block coin-testnet-genesis-quote
+                                 coin-testnet-genesis-time))
+           (genesis (block-header-field genesis-block))
+           (h1 (coin-build-block genesis
+                                 1
+                                 coin-genesis-complexity
+                                 #f
+                                 "testnet producer"
+                                 %payout
+                                 (+ coin-testnet-genesis-time
+                                    coin-testnet-min-block-spacing)))
+           (h2 (coin-build-coop-block
+                 h1
+                 2
+                 coin-genesis-complexity
+                 #f
+                 '()
+                 "testnet co-op"
+                 %payout
+                 (+ coin-testnet-genesis-time
+                    (* 2 coin-testnet-min-block-spacing))))
+           (rules (chain-config-block-rules sigilcoin-testnet-chain))
+           (connect-testnet (block-rules-connect rules))
+           (utxos (connect-testnet rules
+                                   sigilcoin-consensus-params
+                                   1
+                                   '()
+                                   h1
+                                   #t
+                                   #f)))
+      (assert-true (block-rules? rules))
+      (assert-true (eq? coin-block-reward (block-rules-subsidy rules)))
+      (assert-equal coin-coinbase-script-bounds
+                    (block-rules-coinbase-script-bounds rules))
+      (assert-true (not (eq? #f utxos)))
+      (assert-true
+        (not (eq? #f
+                  (connect-testnet rules
+                                   sigilcoin-consensus-params
+                                   2
+                                   utxos
+                                   h2
+                                   #t
+                                   h1))))
+      ;; A legal header word that lies about the producer body remains a
+      ;; body-level rejection on testnet, exactly as on the other chains.
+      (assert-error
+        (connect-testnet rules
+                         sigilcoin-consensus-params
+                         1
+                         '()
+                         (with-nonce h1 0)
+                         #t
+                         #f)))))
+
 (run-tests)

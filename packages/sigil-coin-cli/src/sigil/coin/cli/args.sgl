@@ -29,6 +29,7 @@
           (sigil coin node))
   (export
     cli-default-data-dir
+    cli-testnet-default-data-dir
     cli-arg
     cli-arg-list
     cli-flag?
@@ -50,6 +51,16 @@
     ;;; cli-default-data-dir ; => ".sigilcoin"
     ;;; ```
     (define cli-default-data-dir ".sigilcoin")
+
+    ;;; Testnet data directory used when `--data-dir` is not given.
+    ;;;
+    ;;; A separate default keeps disposable test coins and wallet keys away
+    ;;; from mainnet. An operator can still choose any directory explicitly.
+    ;;;
+    ;;; ```scheme
+    ;;; cli-testnet-default-data-dir ; => ".sigilcoin-testnet"
+    ;;; ```
+    (define cli-testnet-default-data-dir ".sigilcoin-testnet")
 
     ;;; Value of the `--name value` flag in `args`, or `default`.
     ;;;
@@ -131,19 +142,29 @@
                                 ".")))
         value))
 
-    ;;; Chain name selected by `--chain` or `--regtest`.
+    ;;; Chain name selected by `--chain`, `--testnet`, or `--regtest`.
+    ;;;
+    ;;; An explicit `--chain` retains the parser's existing precedence over
+    ;;; shortcut flags. Without one, the two shortcut flags are mutually
+    ;;; exclusive rather than silently opening an unintended network.
     ;;;
     ;;; ```scheme
     ;;; (cli-chain-name '())            ; => "sigilcoin-main"
+    ;;; (cli-chain-name '("--testnet")) ; => "sigilcoin-testnet"
     ;;; (cli-chain-name '("--regtest")) ; => "sigilcoin-regtest"
     ;;; ```
     (define (cli-chain-name args)
       (: list? -> string?)
-      (cli-arg args
-               "--chain"
-               (if (cli-flag? args "--regtest")
-                   "sigilcoin-regtest"
-                   "sigilcoin-main")))
+      (let ((explicit (cli-arg args "--chain" #f)))
+        (if explicit
+            explicit
+            (let ((regtest? (cli-flag? args "--regtest"))
+                  (testnet? (cli-flag? args "--testnet")))
+              (when (and regtest? testnet?)
+                (error "chain: --testnet and --regtest are mutually exclusive. Use only one, or pass --chain NAME explicitly."))
+              (cond (regtest? "sigilcoin-regtest")
+                    (testnet? "sigilcoin-testnet")
+                    (else "sigilcoin-main"))))))
 
     ;;; Resolve the chain config a command runs against.
     ;;;
@@ -161,6 +182,9 @@
                    (string=? name "sigilcoin")
                    (string=? name "main"))
                sigilcoin-main-chain)
+              ((or (string=? name "sigilcoin-testnet")
+                   (string=? name "testnet"))
+               sigilcoin-testnet-chain)
               ((or (string=? name "sigilcoin-regtest")
                    (string=? name "regtest"))
                sigilcoin-regtest-chain)
@@ -168,16 +192,28 @@
                (error (string-append
                         "--chain: unknown chain \""
                         name
-                        "\". Use sigilcoin-main or sigilcoin-regtest."))))))
+                        "\". Use sigilcoin-main, sigilcoin-testnet, or"
+                        " sigilcoin-regtest."))))))
 
     ;;; Data directory a command opens its node in.
     ;;;
+    ;;; Testnet has its own default so it never silently shares mainnet's
+    ;;; wallet. `--data-dir` remains an explicit operator override, including
+    ;;; when an operator intentionally wants another layout.
+    ;;;
     ;;; ```scheme
+    ;;; (cli-data-dir '("--testnet")) ; => ".sigilcoin-testnet"
     ;;; (cli-data-dir '("--data-dir" "/tmp/x")) ; => "/tmp/x"
     ;;; ```
     (define (cli-data-dir args)
       (: list? -> string?)
-      (cli-arg args "--data-dir" cli-default-data-dir))
+      (let ((name (cli-chain-name args)))
+        (cli-arg args
+                 "--data-dir"
+                 (if (or (string=? name "sigilcoin-testnet")
+                         (string=? name "testnet"))
+                     cli-testnet-default-data-dir
+                     cli-default-data-dir))))
 
     ;;; Message carried by an exception, or `fallback`.
     ;;;

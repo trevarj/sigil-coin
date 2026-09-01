@@ -809,7 +809,7 @@
                          (graffiti (cli-arg args "--graffiti" ""))
                          (payout (if address
                                      (coin-address->script-pubkey
-                                       "--address" address)
+                                       "--address" address (node-config n))
                                      (wallet-script-pubkey
                                        (wallet-key data-dir))))
                          (parent (report-ref context 'parent))

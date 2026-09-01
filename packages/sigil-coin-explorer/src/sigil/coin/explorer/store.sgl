@@ -61,8 +61,12 @@
   (export
     ;; Addresses
     explorer-address-hrp
+    explorer-testnet-address-hrp
+    explorer-chain-address-hrp
     explorer-script->address
+    explorer-script->address-for-chain
     explorer-address->script
+    explorer-address->script-for-chain
 
     ;; Opening
     explorer-db-path
@@ -193,6 +197,14 @@
     ;;; ```
     (define explorer-address-hrp "sgl")
 
+    ;;; Human readable part of private-testnet SigilCoin addresses.
+    (define explorer-testnet-address-hrp "tsgl")
+
+    ;;; Address human readable part selected by a SigilCoin chain config.
+    (define (explorer-chain-address-hrp chain)
+      (: chain-config? -> string?)
+      (coin-chain-address-hrp chain))
+
     ;;; How many blocks a list page shows by default.
     (define explorer-default-page-size 25)
 
@@ -235,6 +247,17 @@
                                    (car witness)
                                    (cadr witness)))))))
 
+    ;;; Render a scriptPubKey with the address prefix selected by `chain`.
+    (define (explorer-script->address-for-chain chain script)
+      (: chain-config? any? -> any?)
+      (guard (e (#t #f))
+        (and (bytevector? script)
+             (let ((witness (script-witness-program-decode script)))
+               (and witness
+                    (segwit-encode (explorer-chain-address-hrp chain)
+                                   (car witness)
+                                   (cadr witness)))))))
+
     ;;; Decode an `sgl1` address into the scriptPubKey that pays it, or `#f`.
     ;;;
     ;;; Total, and deliberately strict: the address arrives in a URL, so a
@@ -253,6 +276,18 @@
              (let ((decoded (segwit-decode address)))
                (and decoded
                     (string=? (car decoded) explorer-address-hrp)
+                    (script-witness-program (cadr decoded)
+                                            (caddr decoded)))))))
+
+    ;;; Decode only the address prefix selected by `chain`.
+    (define (explorer-address->script-for-chain chain address)
+      (: chain-config? any? -> any?)
+      (guard (e (#t #f))
+        (and (string? address)
+             (let ((decoded (segwit-decode address)))
+               (and decoded
+                    (string=? (car decoded)
+                              (explorer-chain-address-hrp chain))
                     (script-witness-program (cadr decoded)
                                             (caddr decoded)))))))
 
@@ -544,7 +579,7 @@
     ;; decoded as hex, never verified or interpreted by the explorer. Derived
     ;; work fields come only from consensus's pure preview, which cannot
     ;; populate the fully-verified share cache.
-    (define (make-share index share payout context detail?)
+    (define (make-share chain index share payout context detail?)
       (let* ((pubkey (coin-share-pubkey share))
              (solution (coin-share-solution share))
              (preview (and detail? context
@@ -566,7 +601,7 @@
           pubkey-hex: (hex-encode pubkey)
           signature-hex: (hex-encode (coin-share-signature share))
           blind-hex: (hex-encode (coin-share-blind share))
-          address: (explorer-script->address script)
+          address: (explorer-script->address-for-chain chain script)
           solution: solution
           solution-source: (solution-source solution)
           solution-length: length-used
@@ -591,7 +626,7 @@
             (else 'unexpected)))
 
     ;; Label actual outputs against consensus's exact split plan.
-    (define (make-outputs outputs shares carrier-script)
+    (define (make-outputs chain outputs shares carrier-script)
       (let* ((total (let loop ((xs outputs) (sum 0))
                       (if (null? xs)
                           sum
@@ -612,7 +647,8 @@
                               role: (output-role i share-count)
                               value: (txout-value (car xs))
                               script: script
-                              address: (explorer-script->address script)
+                              address: (explorer-script->address-for-chain
+                                         chain script)
                               expected: (and (pair? expected)
                                              (car (car expected))))
                             out)))))))
@@ -648,8 +684,10 @@
                                 (stored-block store parent-hash)))
              (carrier-script (and parent-block
                                   (coin-carrier-script parent-block)))
+             (chain (explorer-store-config store))
              (outputs (if parsed
-                          (make-outputs (coinbase-outputs parsed)
+                          (make-outputs chain
+                                        (coinbase-outputs parsed)
                                         shares carrier-script)
                           '()))
              (graffiti (and payload
@@ -717,7 +755,8 @@
                         (loop (cdr xs)
                               (+ i 1)
                               (if (pair? payouts) (cdr payouts) '())
-                              (cons (make-share i
+                              (cons (make-share chain
+                                                i
                                                 (car xs)
                                                 (and (pair? payouts)
                                                      (car payouts))
