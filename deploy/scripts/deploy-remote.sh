@@ -125,8 +125,11 @@ PREPARE_REMOTE
 rsync_args=(
   --archive --compress --delete --protect-args
   --exclude=.git/
-  --exclude=build/
-  --exclude='**/build/'
+  --exclude=/build/
+  --exclude='/packages/*/build/'
+  --exclude='/tools/*/build/'
+  --exclude=/examples/build/
+  --exclude=/test/build/
   --exclude=.sigil/
   --exclude='**/.sigil/'
   --exclude=.sigilcoin/
@@ -156,8 +159,8 @@ if [[ -n $ENV_FILE ]]; then
 fi
 
 ssh "$REMOTE_HOST" bash -s -- \
-  "$REMOTE_DIR" "$MODE" "${SIGIL_UID:-}" "${SIGIL_GID:-}" \
-  "${EXPLORER_UID:-}" "$allow_mainnet" "$has_env" <<'REMOTE_SCRIPT'
+  "$REMOTE_DIR" "$MODE" "${SIGIL_UID:--}" "${SIGIL_GID:--}" \
+  "${EXPLORER_UID:--}" "$allow_mainnet" "$has_env" <<'REMOTE_SCRIPT'
 set -euo pipefail
 remote_dir=$1
 mode=$2
@@ -172,9 +175,9 @@ has_env=$7
 [[ $mode != mainnet || $allow_mainnet == yes ]] || { echo 'mainnet is not acknowledged' >&2; exit 64; }
 
 cd "$remote_dir/sigil-coin/deploy/docker"
-if [[ -z $sigil_uid ]]; then sigil_uid=$(id -u); fi
-if [[ -z $sigil_gid ]]; then sigil_gid=$(id -g); fi
-if [[ -z $explorer_uid ]]; then explorer_uid=$((sigil_uid + 1)); fi
+if [[ $sigil_uid == - ]]; then sigil_uid=$(id -u); fi
+if [[ $sigil_gid == - ]]; then sigil_gid=$(id -g); fi
+if [[ $explorer_uid == - ]]; then explorer_uid=$((sigil_uid + 1)); fi
 for identity in "$sigil_uid" "$sigil_gid" "$explorer_uid"; do
   [[ $identity =~ ^[0-9]+$ ]] || { echo 'container UID/GID values must be numeric' >&2; exit 64; }
 done

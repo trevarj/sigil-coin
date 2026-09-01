@@ -46,9 +46,15 @@ for pattern in '.sigilcoin' '.sigilcoin/**' '**/.sigilcoin' '**/.sigilcoin/**' \
   assert_fixed "$pattern" deploy/docker/Dockerfile.dockerignore
 done
 for pattern in '--exclude=.sigilcoin/' "--exclude='**/.sigilcoin/'" \
-  '--exclude=.sigilcoin-testnet/' "--exclude='**/.sigilcoin-testnet/'"; do
+  '--exclude=.sigilcoin-testnet/' "--exclude='**/.sigilcoin-testnet/'" \
+  '--exclude=/build/' "--exclude='/packages/*/build/'" \
+  "--exclude='/tools/*/build/'" '--exclude=/examples/build/' '--exclude=/test/build/'; do
   assert_fixed "$pattern" deploy/scripts/deploy-remote.sh
 done
+if grep -Fq -- '--exclude=build/' deploy/scripts/deploy-remote.sh || \
+   grep -Fq -- "--exclude='**/build/'" deploy/scripts/deploy-remote.sh; then
+  fail 'remote deployment excludes source directories named build'
+fi
 
 for compose in deploy/docker/compose.testnet.yml deploy/docker/compose.mainnet.yml; do
   assert_fixed 'user: "${SIGIL_UID:-1000}:${SIGIL_GID:-1000}"' "$compose"
@@ -68,6 +74,8 @@ assert_fixed 'TESTNET_EXPOSURE_ACK' deploy/docker/entrypoint.sh
 assert_fixed 'peer-ip-allowlisted|public-testnet-approved' deploy/docker/entrypoint.sh
 assert_fixed 'peer-ip-allowlisted|public-testnet-approved' deploy/scripts/run-local.sh
 assert_fixed 'peer-ip-allowlisted|public-testnet-approved' deploy/scripts/deploy-remote.sh
+assert_fixed '"${SIGIL_UID:--}" "${SIGIL_GID:--}"' deploy/scripts/deploy-remote.sh
+assert_fixed '"${EXPLORER_UID:--}"' deploy/scripts/deploy-remote.sh
 assert_fixed 'umask 0027' deploy/docker/entrypoint.sh
 assert_fixed 'chmod 0640' deploy/docker/entrypoint.sh
 assert_fixed 'chmod 0700' deploy/docker/entrypoint.sh

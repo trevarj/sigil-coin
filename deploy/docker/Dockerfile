@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-ARG NIX_IMAGE=nixos/nix:2.24.11
+ARG NIX_IMAGE=nixos/nix:2.35.2
 
 FROM ${NIX_IMAGE} AS builder
 WORKDIR /src/sigil-coin
@@ -28,8 +28,11 @@ RUN nix-store --import < /tmp/sigilcoin.nar \
     && test -x "$out/bin/sigilcoin" \
     && test -x "$out/bin/sigilcoin-explorer" \
     && test -f "$out/share/sigilcoin-site/index.html" \
+    && mkdir -p /opt /usr/local/bin \
     && ln -s "$out" /opt/sigilcoin \
-    && ln -s "$(readlink -f "$(command -v sleep)")" /usr/local/bin/sleep \
+    && for command in chmod mkdir sleep; do \
+         ln -s "$(readlink -f "$(command -v "$command")")" "/usr/local/bin/$command"; \
+       done \
     && rm -f /tmp/sigilcoin.nar /tmp/sigilcoin-out
 
 COPY --chmod=0555 deploy/docker/entrypoint.sh /usr/local/bin/sigilcoin-entrypoint
