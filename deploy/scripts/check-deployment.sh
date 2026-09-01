@@ -21,6 +21,15 @@ expect_exit() {
   set -e
   [[ $actual == "$wanted" ]] || fail "expected exit $wanted, got $actual: $*"
 }
+expect_not_exit() {
+  local forbidden=$1
+  shift
+  set +e
+  "$@" >/dev/null 2>&1
+  local actual=$?
+  set -e
+  [[ $actual != "$forbidden" ]] || fail "unexpected exit $forbidden: $*"
+}
 
 bash -n deploy/scripts/deploy-remote.sh deploy/scripts/run-local.sh \
   deploy/scripts/stop-local.sh deploy/scripts/check-deployment.sh
@@ -56,6 +65,9 @@ assert_fixed '"${P2P_BIND:-127.0.0.1}:${P2P_PORT:-19446}:19446/tcp"' deploy/dock
 assert_fixed '"127.0.0.1:${EXPLORER_PORT:-8080}:8080/tcp"' deploy/docker/compose.testnet.yml
 if grep -Fq 'EXPLORER_BIND' deploy/docker/compose.testnet.yml; then fail 'testnet explorer has a bind override'; fi
 assert_fixed 'TESTNET_EXPOSURE_ACK' deploy/docker/entrypoint.sh
+assert_fixed 'peer-ip-allowlisted|public-testnet-approved' deploy/docker/entrypoint.sh
+assert_fixed 'peer-ip-allowlisted|public-testnet-approved' deploy/scripts/run-local.sh
+assert_fixed 'peer-ip-allowlisted|public-testnet-approved' deploy/scripts/deploy-remote.sh
 assert_fixed 'umask 0027' deploy/docker/entrypoint.sh
 assert_fixed 'chmod 0640' deploy/docker/entrypoint.sh
 assert_fixed 'chmod 0700' deploy/docker/entrypoint.sh
@@ -75,11 +87,35 @@ expect_exit 64 env ALLOW_MAINNET=maybe BIN_DIR=/nonexistent bash deploy/scripts/
 expect_exit 64 env CHAIN=mainnet sh deploy/docker/entrypoint.sh listener
 expect_exit 64 env CHAIN=testnet HOST_P2P_BIND=0.0.0.0 sh deploy/docker/entrypoint.sh listener
 expect_exit 64 env CHAIN=testnet HOST_P2P_BIND=0.0.0.0 \
+  TESTNET_EXPOSURE_ACK=not-approved sh deploy/docker/entrypoint.sh listener
+expect_exit 64 env CHAIN=testnet HOST_P2P_BIND=0.0.0.0 \
   TESTNET_EXPOSURE_ACK=peer-ip-allowlisted REMOTE_PEER_IP=not-an-ip \
   sh deploy/docker/entrypoint.sh listener
 expect_exit 64 env P2P_BIND=0.0.0.0 BIN_DIR=/nonexistent bash deploy/scripts/run-local.sh
+expect_exit 64 env P2P_BIND=0.0.0.0 TESTNET_EXPOSURE_ACK=not-approved \
+  BIN_DIR=/nonexistent bash deploy/scripts/run-local.sh
 expect_exit 64 env P2P_BIND=0.0.0.0 TESTNET_EXPOSURE_ACK=peer-ip-allowlisted \
   REMOTE_PEER_IP=not-an-ip BIN_DIR=/nonexistent bash deploy/scripts/run-local.sh
+expect_exit 64 env TESTNET_EXPOSURE_ACK=public-testnet-approved-typo \
+  BIN_DIR=/nonexistent bash deploy/scripts/run-local.sh
+
+# Valid exposure modes must pass their guards. Later failure is expected here:
+# the entrypoint lacks /opt/sigilcoin and run-local receives a missing BIN_DIR.
+preflight_state=$(mktemp -d)
+expect_not_exit 64 env CHAIN=testnet DATA_DIR="$preflight_state/private" \
+  HOST_P2P_BIND=0.0.0.0 TESTNET_EXPOSURE_ACK=peer-ip-allowlisted \
+  REMOTE_PEER_IP=198.51.100.10 PEER=198.51.100.10:19446 \
+  sh deploy/docker/entrypoint.sh listener
+expect_not_exit 64 env CHAIN=testnet DATA_DIR="$preflight_state/public" \
+  HOST_P2P_BIND=0.0.0.0 TESTNET_EXPOSURE_ACK=public-testnet-approved \
+  sh deploy/docker/entrypoint.sh listener
+expect_not_exit 64 env P2P_BIND=0.0.0.0 \
+  TESTNET_EXPOSURE_ACK=peer-ip-allowlisted REMOTE_PEER_IP=198.51.100.10 \
+  PEER=198.51.100.10:19446 BIN_DIR=/nonexistent bash deploy/scripts/run-local.sh
+expect_not_exit 64 env P2P_BIND=0.0.0.0 \
+  TESTNET_EXPOSURE_ACK=public-testnet-approved BIN_DIR=/nonexistent \
+  bash deploy/scripts/run-local.sh
+rm -rf -- "$preflight_state"
 
 if python3 -c 'import yaml' >/dev/null 2>&1; then
   python3 - <<'PY'

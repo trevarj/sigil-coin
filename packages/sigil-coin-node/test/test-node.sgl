@@ -1241,14 +1241,14 @@
         (node-close reopened))))))
 
 ;; ============================================================
-;; Private testnet chain
+;; Public testnet chain
 ;; ============================================================
 
 (define (chain-extension-ref chain extension key)
   (let ((entry (assq key (chain-config-extension chain extension '()))))
     (and (pair? entry) (cdr entry))))
 
-(test-group "sigilcoin private testnet"
+(test-group "sigilcoin public testnet"
   (test "the deterministic genesis rebuilds and has no premine"
     (let* ((built (coin-genesis-block coin-testnet-genesis-quote
                                       coin-testnet-genesis-time))
@@ -1279,7 +1279,6 @@
                   (chain-config-magic sigilcoin-testnet-chain))
     (assert-equal 19446
                   (chain-config-default-port sigilcoin-testnet-chain))
-    (assert-equal '() (chain-config-seed-peers sigilcoin-testnet-chain))
     (assert-equal (chain-config-protocol-version sigilcoin-main-chain)
                   (chain-config-protocol-version sigilcoin-testnet-chain))
     (assert-equal 70015
@@ -1317,6 +1316,14 @@
     (assert-equal coin-max-coinbase-script-bytes
                   (chain-extension-ref sigilcoin-testnet-chain
                                        'policy 'max-coinbase-script-bytes)))
+
+  (test "the public seed is exact and isolated to testnet"
+    (assert-equal '(("seed.testnet.sigilcoin.lol" . 19446))
+                  (chain-config-seed-peers sigilcoin-testnet-chain))
+    (assert-equal '(("seed.sigilcoin.lol" . 19444))
+                  (chain-config-seed-peers sigilcoin-main-chain))
+    (assert-equal '()
+                  (chain-config-seed-peers sigilcoin-regtest-chain)))
 
   (test "addresses and lookup isolate the three SigilCoin chains"
     (assert-equal "sgl" (coin-chain-address-hrp sigilcoin-main-chain))

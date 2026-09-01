@@ -65,23 +65,36 @@ is_remote_ipv4() {
 check_testnet_exposure() {
   [ "$chain" = testnet ] || return 0
   host_bind=${HOST_P2P_BIND:-127.0.0.1}
+  exposure_ack=${TESTNET_EXPOSURE_ACK:-}
+  case "$exposure_ack" in
+    ''|peer-ip-allowlisted|public-testnet-approved) ;;
+    *)
+      echo "invalid TESTNET_EXPOSURE_ACK (expected empty, peer-ip-allowlisted, or public-testnet-approved)" >&2
+      exit 64
+      ;;
+  esac
   case "$host_bind" in
     127.*) is_ipv4 "$host_bind" || { echo "invalid loopback P2P bind" >&2; exit 64; }; return 0 ;;
     ::1) return 0 ;;
   esac
   is_ipv4 "$host_bind" || { echo "non-loopback P2P bind must be an IPv4 literal" >&2; exit 64; }
-  if [ "${TESTNET_EXPOSURE_ACK:-}" != peer-ip-allowlisted ]; then
-    echo "refusing non-loopback testnet P2P bind: set TESTNET_EXPOSURE_ACK=peer-ip-allowlisted" >&2
-    exit 64
-  fi
-  if ! is_remote_ipv4 "${REMOTE_PEER_IP:-}"; then
-    echo "refusing non-loopback testnet P2P bind: REMOTE_PEER_IP must be a unicast IPv4 literal" >&2
-    exit 64
-  fi
-  if [ -n "${PEER:-}" ] && [ "${PEER%%:*}" != "$REMOTE_PEER_IP" ]; then
-    echo "refusing testnet exposure: PEER host must match REMOTE_PEER_IP" >&2
-    exit 64
-  fi
+  case "$exposure_ack" in
+    peer-ip-allowlisted)
+      if ! is_remote_ipv4 "${REMOTE_PEER_IP:-}"; then
+        echo "refusing allowlisted testnet P2P bind: REMOTE_PEER_IP must be a unicast IPv4 literal" >&2
+        exit 64
+      fi
+      if [ -n "${PEER:-}" ] && [ "${PEER%%:*}" != "$REMOTE_PEER_IP" ]; then
+        echo "refusing allowlisted testnet exposure: PEER host must match REMOTE_PEER_IP" >&2
+        exit 64
+      fi
+      ;;
+    public-testnet-approved) ;;
+    *)
+      echo "refusing non-loopback testnet P2P bind: select an explicit TESTNET_EXPOSURE_ACK mode" >&2
+      exit 64
+      ;;
+  esac
 }
 
 secure_node_state() {

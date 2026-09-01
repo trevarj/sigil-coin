@@ -13,10 +13,10 @@ Environment:
   MODE=testnet|mainnet       default: testnet
   BIN_DIR=/path/to/bin       skip the Nix build
   DATA_DIR, LOG_DIR, RUN_DIR override persistent paths
-  PEER=IP:PORT               optional manually approved peer
-  P2P_BIND=127.0.0.1         non-loopback requires the acknowledgement below
-  REMOTE_PEER_IP=IPv4        peer IP approved in the host firewall
-  TESTNET_EXPOSURE_ACK=peer-ip-allowlisted
+  PEER=HOST:PORT             optional outbound bootstrap peer
+  P2P_BIND=127.0.0.1         loopback unless an exposure mode is acknowledged
+  REMOTE_PEER_IP=IPv4        required only for peer-ip-allowlisted mode
+  TESTNET_EXPOSURE_ACK=       empty, peer-ip-allowlisted, or public-testnet-approved
   P2P_PORT=19446|19444       selected by mode
   EXPLORER_PORT=8080         explorer remains on 127.0.0.1
   SYNC_INTERVAL=60           seconds between bounded sync passes
@@ -73,23 +73,36 @@ is_remote_ipv4() {
 
 P2P_BIND=${P2P_BIND:-127.0.0.1}
 if [[ $MODE == testnet ]]; then
+  exposure_ack=${TESTNET_EXPOSURE_ACK:-}
+  case $exposure_ack in
+    ''|peer-ip-allowlisted|public-testnet-approved) ;;
+    *)
+      printf 'invalid TESTNET_EXPOSURE_ACK (expected empty, peer-ip-allowlisted, or public-testnet-approved)\n' >&2
+      exit 64
+      ;;
+  esac
   case $P2P_BIND in
     127.*) is_ipv4 "$P2P_BIND" || { printf 'invalid loopback P2P bind\n' >&2; exit 64; } ;;
     ::1) ;;
     *)
       is_ipv4 "$P2P_BIND" || { printf 'non-loopback P2P bind must be an IPv4 literal\n' >&2; exit 64; }
-      [[ ${TESTNET_EXPOSURE_ACK:-} == peer-ip-allowlisted ]] || {
-        printf 'refusing non-loopback testnet bind: set TESTNET_EXPOSURE_ACK=peer-ip-allowlisted\n' >&2
-        exit 64
-      }
-      is_remote_ipv4 "${REMOTE_PEER_IP:-}" || {
-        printf 'refusing non-loopback testnet bind: REMOTE_PEER_IP must be a unicast IPv4 literal\n' >&2
-        exit 64
-      }
-      if [[ -n ${PEER:-} && ${PEER%%:*} != "$REMOTE_PEER_IP" ]]; then
-        printf 'refusing testnet exposure: PEER host must match REMOTE_PEER_IP\n' >&2
-        exit 64
-      fi
+      case $exposure_ack in
+        peer-ip-allowlisted)
+          is_remote_ipv4 "${REMOTE_PEER_IP:-}" || {
+            printf 'refusing allowlisted testnet bind: REMOTE_PEER_IP must be a unicast IPv4 literal\n' >&2
+            exit 64
+          }
+          if [[ -n ${PEER:-} && ${PEER%%:*} != "$REMOTE_PEER_IP" ]]; then
+            printf 'refusing allowlisted testnet exposure: PEER host must match REMOTE_PEER_IP\n' >&2
+            exit 64
+          fi
+          ;;
+        public-testnet-approved) ;;
+        *)
+          printf 'refusing non-loopback testnet bind: select an explicit TESTNET_EXPOSURE_ACK mode\n' >&2
+          exit 64
+          ;;
+      esac
       ;;
   esac
 fi

@@ -1,6 +1,6 @@
 ;;; (sigil coin node chain) — live SigilCoin chain configs
 ;;;
-;;; Mainnet, private testnet, and regtest run canonical program-by-example
+;;; Mainnet, public testnet, and regtest run canonical program-by-example
 ;;; consensus. Mainnet's timestamp remains placeholder data until operator
 ;;; chooses launch day; changing it requires regenerating genesis constants.
 
@@ -35,7 +35,7 @@
     ;;; Intended seconds between blocks: one day.
     (define coin-target-block-spacing 86400)
 
-    ;;; Private testnet spacing floor: one hour.
+    ;;; Public testnet spacing floor: one hour.
     (define coin-testnet-min-block-spacing 3600)
 
     ;;; Regtest spacing floor.
@@ -52,11 +52,11 @@
     ;;; launch day and regenerates canonical genesis constants.
     (define coin-genesis-time 1785542400)
 
-    ;;; Private testnet genesis quote.
+    ;;; Canonical testnet genesis quote.
     (define coin-testnet-genesis-quote
       "SigilCoin private testnet - 2026-09-01")
 
-    ;;; Fixed private testnet genesis timestamp: 2026-09-01T00:00:00Z.
+    ;;; Fixed testnet genesis timestamp: 2026-09-01T00:00:00Z.
     (define coin-testnet-genesis-time 1788220800)
 
     ;;; Regtest genesis quote.
@@ -162,13 +162,13 @@
               %main-genesis
               "sgl"))
 
-    ;;; Private operator test network with canonical validation.
+    ;;; Public test network with canonical validation.
     (define sigilcoin-testnet-chain
       (config "sigilcoin-testnet"
               "sigilcoin-test"
               #u8(#xd3 #x7a #x91 #xc4)
               19446
-              '()
+              '(("seed.testnet.sigilcoin.lol" . 19446))
               coin-testnet-min-block-spacing
               %testnet-genesis
               "tsgl"))

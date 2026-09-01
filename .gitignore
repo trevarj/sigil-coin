@@ -15,6 +15,7 @@ result-*
 /sigil.lock
 
 # Deployment runtime state and local environment
+/deploy/local-testnet.env
 /deploy/docker/.env
 /deploy/docker/state/
 /deploy/state/

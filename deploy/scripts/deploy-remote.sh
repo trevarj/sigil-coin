@@ -17,7 +17,8 @@ Options:
   -h, --help        Show this help
 
 Mainnet additionally requires ALLOW_MAINNET=yes. Non-loopback testnet P2P
-requires TESTNET_EXPOSURE_ACK=peer-ip-allowlisted and REMOTE_PEER_IP=IPv4.
+requires either peer-ip-allowlisted with REMOTE_PEER_IP, or the exact explicit
+public-testnet-approved acknowledgement.
 EOF
 }
 
@@ -230,20 +231,32 @@ if [[ $mode == testnet ]]; then
   exposure_ack=$(env_or_file TESTNET_EXPOSURE_ACK)
   remote_peer_ip=$(env_or_file REMOTE_PEER_IP)
   peer=$(env_or_file PEER)
+  case $exposure_ack in
+    ''|peer-ip-allowlisted|public-testnet-approved) ;;
+    *)
+      echo 'invalid TESTNET_EXPOSURE_ACK (expected empty, peer-ip-allowlisted, or public-testnet-approved)' >&2
+      exit 64
+      ;;
+  esac
   case $p2p_bind in
     127.*) is_ipv4 "$p2p_bind" || { echo 'invalid loopback P2P bind' >&2; exit 64; } ;;
     ::1) ;;
     *)
       is_ipv4 "$p2p_bind" || { echo 'non-loopback P2P bind must be an IPv4 literal' >&2; exit 64; }
-      [[ $exposure_ack == peer-ip-allowlisted ]] || {
-        echo 'non-loopback testnet P2P requires TESTNET_EXPOSURE_ACK=peer-ip-allowlisted' >&2
-        exit 64
-      }
-      is_remote_ipv4 "$remote_peer_ip" || { echo 'REMOTE_PEER_IP must be a unicast IPv4 literal' >&2; exit 64; }
-      if [[ -n $peer && ${peer%%:*} != "$remote_peer_ip" ]]; then
-        echo 'PEER host must match REMOTE_PEER_IP for public testnet exposure' >&2
-        exit 64
-      fi
+      case $exposure_ack in
+        peer-ip-allowlisted)
+          is_remote_ipv4 "$remote_peer_ip" || { echo 'REMOTE_PEER_IP must be a unicast IPv4 literal' >&2; exit 64; }
+          if [[ -n $peer && ${peer%%:*} != "$remote_peer_ip" ]]; then
+            echo 'PEER host must match REMOTE_PEER_IP for allowlisted testnet exposure' >&2
+            exit 64
+          fi
+          ;;
+        public-testnet-approved) ;;
+        *)
+          echo 'non-loopback testnet P2P requires an explicit TESTNET_EXPOSURE_ACK mode' >&2
+          exit 64
+          ;;
+      esac
       ;;
   esac
 else

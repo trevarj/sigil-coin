@@ -1,9 +1,11 @@
 # SigilCoin launch checklist
 
-Do these in order. Steps 1 through 4 are irreversible once step 5 puts a
-public node up: after that, changing any of them splits the network or
-invalidates the chain. Operational detail lives in
-[`deploy/RUNBOOK.md`](deploy/RUNBOOK.md).
+Do these in order. The public testnet gate below must pass before the mainnet
+soak begins. Steps 1 through 4 are irreversible once step 5 puts a public
+mainnet node up: after that, changing any of them splits the network or
+invalidates the chain. Mainnet operational detail lives in
+[`deploy/RUNBOOK.md`](deploy/RUNBOOK.md); public testnet operations live in
+[`docs/testnet.md`](docs/testnet.md).
 
 Current state: **nothing here has ever run on a public network.** Genesis quote
 is chosen, but mainnet timestamp and derived constants are provisional until
@@ -13,6 +15,26 @@ hostname are in tree. See
 left.
 
 ---
+
+## 0. Complete the public testnet
+
+Mainnet preparation may continue in source, but the mainnet soak must not start
+until the public testnet has completed its full 30-day run.
+
+- [ ] `seed.testnet.sigilcoin.lol:19446` bootstraps a fresh community node by
+      DNS, without a hand-entered IP.
+- [ ] `explorer.testnet.sigilcoin.lol` serves through TLS while the explorer
+      container remains host-loopback-only.
+- [ ] The day-7 gate in [`docs/testnet.md`](docs/testnet.md) passes with
+      independent-node, consensus, recovery, explorer, abuse, log, and resource
+      evidence.
+- [ ] The day-30 gate passes with no unresolved consensus divergence, database
+      corruption, secret disclosure, or resource-growth trend.
+- [ ] Testnet coins and keys remain worthless and disposable; no production key
+      or mainnet state was used, and no testnet state is promoted to mainnet.
+
+Passing this gate authorizes only the separate mainnet soak. It does not
+authorize a mainnet push, deployment, DNS change, or launch.
 
 ## 1. Freeze the puzzle language and the generator
 
@@ -247,11 +269,12 @@ is the consensus-divergence signal and the one thing worth waking up for.
 
 ---
 
-## Pre-launch soak
+## Pre-launch mainnet soak
 
-**This has never run on a public network.** Two nodes on one machine, over
-loopback, is the extent of what has been exercised. Soak before step 5, not
-after.
+Do not begin this soak until every checkbox in
+[Complete the public testnet](#0-complete-the-public-testnet) is checked with
+preserved evidence. Public testnet completion does not replace this mainnet-rules
+soak. Run it before step 5, not after.
 
 Run mainnet rules — `--chain sigilcoin-main`, not regtest, so the real 20
 hour spacing floor and the real genesis are in play — on two machines, on
@@ -339,7 +362,7 @@ DNS and TLS, and nothing unresolved here can be deferred past step 5.
 | 7 | ~~Confirm the explorer's flags~~ — RESOLVED. `--regtest`, `--data-dir`, `--host`, `--port` confirmed against `explorer-main` and against `sigilcoin-explorer --help` run from the built binary. | `services.sigilcoin-explorer.command` in `deploy/module.nix` |
 | 8 | The TLS certificate for `explorer.sigilcoin.lol` | Still owed. The domain is `sigilcoin.lol` and the explorer's public name is `explorer.sigilcoin.lol` (`deploy/RUNBOOK.md`), but nothing in the tree issues or terminates a certificate: that is the reverse proxy's job on the host. |
 | 9 | Whether to launch without an explorer if it is not ready | Recommendation: yes |
-| 10 | Whether to run the 14-day pre-launch soak, or launch without it | Still owed. See [Pre-launch soak](#pre-launch-soak); nothing has ever run outside loopback. |
+| 10 | Complete the public testnet, then run the 14-day mainnet soak | Required. Neither gate may be waived; see [Complete the public testnet](#0-complete-the-public-testnet) and [Pre-launch mainnet soak](#pre-launch-mainnet-soak). |
 | 11 | Whether to accept untested 2/1/1 producer/share/carrier incentives | Still owed. Regtest proves exact payout enforcement, not public participant behaviour. |
 | 12 | ~~Whether `sigilcoin listen` gets a persistent accept loop before launch~~ — RESOLVED IN THE CLI, not worked around. `run-listen` now loops indefinitely under `--max-connections 0` (`operate.sgl`: `((= max-connections 0) (loop last))`) and serves each connection inside its own guard, so a hangup, garbage bytes or a silent drop kill that connection only. Re-measured against this build: idle at `--accept-timeout 2000` it was alive at 30 s and 55 s and ended only by an external `timeout`; six hostile connections were absorbed and a seventh still accepted. The seed therefore binds 19444 itself. | `packages/sigil-coin-cli/src/sigil/coin/cli/operate.sgl`, `deploy/module.nix` |
 | 13 | Replace local deployment source pins with public forge URLs after the approved push | The current flake deliberately uses local `git+file:` inputs because required SigilCoin and sigil-bitcoin commits are not public yet. Manual local testnet approval and explicit push permission come first; then pin the pushed revisions and repeat every Nix check. |
