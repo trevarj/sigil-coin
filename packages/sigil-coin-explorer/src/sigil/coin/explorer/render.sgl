@@ -358,22 +358,28 @@
 
     (define %style
       (string-append
-        "@font-face{font-family:Plus Jakarta Sans;src:url(https://sigilcoin.lol/assets/plus-jakarta-v1.woff2) format('woff2');font-display:swap}"
-        "@font-face{font-family:JetBrains Mono;src:url(https://sigilcoin.lol/assets/jetbrains-mono-v1.woff2) format('woff2');font-display:swap}"
-        ":root{color-scheme:dark;--bg:#080910;--panel:#11131e;--line:#2a2e43;--text:#f5f3ff;--muted:#aaa9bd;--violet:#a98cff;--cyan:#5ee7f1}"
-        "*{box-sizing:border-box}html{background:var(--bg)}"
-        "body{margin:0;color:var(--text);background:radial-gradient(circle at 80% 0,rgba(169,140,255,.12),transparent 28rem),var(--bg);font-family:Plus Jakarta Sans,Inter,system-ui,sans-serif;line-height:1.55}"
-        ".shell{width:min(72rem,calc(100% - 2rem));margin:auto;padding:2rem 0 5rem}"
-        ".topbar{display:flex;align-items:center;justify-content:space-between;gap:1.5rem;padding:1rem max(1rem,calc((100vw - 72rem)/2));border-bottom:1px solid var(--line);background:rgba(8,9,16,.88)}"
-        ".wordmark{display:flex;align-items:center;gap:.65rem;color:var(--text);font-weight:800;text-decoration:none}.wordmark-symbol{display:grid;width:2rem;height:2rem;place-items:center;border:1px solid rgba(240,192,64,.65);border-radius:35% 65% 62% 38%;background-image:url(https://sigilcoin.lol/assets/sigilcoin-symbol-v1.png),linear-gradient(135deg,rgba(240,192,64,.3),rgba(169,140,255,.14));background-position:center;background-size:cover;color:#f0c040;font-family:JetBrains Mono,monospace;font-size:.75rem}.wordmark small{color:var(--muted);font-weight:500}"
-        "nav{display:flex;flex-wrap:wrap;gap:1rem}nav a{color:var(--muted);text-decoration:none}nav a:hover{color:var(--text)}"
-        "a{color:var(--cyan);text-underline-offset:.2em}h1,h2{letter-spacing:-.035em}h1{font-size:clamp(2rem,5vw,3.6rem);line-height:1.05}h2{margin-top:2.4rem}"
-        "table{display:block;width:100%;overflow-x:auto;border-collapse:collapse;border:1px solid var(--line);border-radius:.6rem;background:rgba(17,19,30,.8)}"
-        "th,td{min-width:7rem;border-bottom:1px solid var(--line);padding:.58rem .7rem;text-align:left;vertical-align:top}"
-        "th{color:#d7d3e6;background:#171a28;font-size:.82rem}"
-        "pre,code{font-family:JetBrains Mono,ui-monospace,SFMono-Regular,Consolas,monospace}pre{white-space:pre-wrap;word-break:break-all;background:#0c0e17;border:1px solid var(--line);border-radius:.4rem;padding:.75rem;margin:0}"
-        ".q{color:var(--muted)}:focus-visible{outline:3px solid var(--cyan);outline-offset:3px}"
-        "@media(max-width:680px){.topbar{align-items:flex-start;flex-direction:column}.shell{width:min(100% - 1rem,72rem)}nav{gap:.75rem}th,td{padding:.45rem;min-width:6rem}}"))
+        "@font-face{font-family:Plus Jakarta Sans;src:local('Plus Jakarta Sans'),url(https://sigilcoin.lol/assets/plus-jakarta.woff2) format('woff2');font-display:swap;font-weight:400 800}"
+        "@font-face{font-family:JetBrains Mono;src:local('JetBrains Mono'),url(https://sigilcoin.lol/assets/jetbrains-mono.woff2) format('woff2');font-display:swap;font-weight:400 700}"
+        ":root{color-scheme:dark;--bg:#090a0d;--surface:#101216;--panel:#15181d;--raised:#1b1f25;--line:#2a2e35;--line-hot:#4a3a24;--text:#f2f0eb;--muted:#9299a6;--amber:#f6a623;--orange:#f97316;--violet:#a78bfa;--cyan:#55dce8;--good:#57d38c;--bad:#ff6b6b}"
+        "*{box-sizing:border-box}html{background:var(--bg);scroll-padding-top:5rem}"
+        "body{margin:0;color:var(--text);background:radial-gradient(circle at 78% -10rem,rgba(167,139,250,.1),transparent 32rem),linear-gradient(rgba(255,255,255,.014) 1px,transparent 1px),var(--bg);background-size:auto,100% 3rem,auto;font-family:Plus Jakarta Sans,Inter,system-ui,sans-serif;font-size:15px;line-height:1.5}"
+        ".topbar{position:sticky;z-index:20;top:0;display:flex;align-items:center;gap:1.5rem;min-height:3.5rem;padding:.55rem max(1rem,calc((100vw - 92rem)/2));border-bottom:1px solid var(--line);background:rgba(9,10,13,.94);box-shadow:0 8px 24px rgba(0,0,0,.22);backdrop-filter:blur(14px)}"
+        ".wordmark{display:flex;align-items:center;gap:.65rem;color:var(--text);font-weight:800;text-decoration:none;white-space:nowrap}.wordmark-symbol{display:grid;width:2rem;height:2rem;place-items:center;border:1px solid rgba(246,166,35,.65);border-radius:35% 65% 62% 38%;background-image:url(https://sigilcoin.lol/assets/sigilcoin-symbol.png),linear-gradient(135deg,rgba(246,166,35,.35),rgba(167,139,250,.2));background-position:center;background-size:cover;color:var(--amber);font-family:JetBrains Mono,ui-monospace,monospace;font-size:.72rem}.wordmark small{color:var(--muted);font-weight:500}"
+        "nav{display:flex;align-items:center;flex-wrap:wrap;gap:.2rem;margin-left:auto}nav a{padding:.35rem .62rem;border-radius:.35rem;color:var(--muted);font-size:.84rem;font-weight:650;text-decoration:none}nav a:hover{color:var(--text);background:var(--raised)}"
+        ".shell{width:min(92rem,calc(100% - 2rem));margin:auto;padding:1.5rem 0 5rem}a{color:var(--cyan);text-underline-offset:.2em}a:hover{color:#a8f6fc}"
+        "h1,h2{letter-spacing:-.035em}h1{margin:.25rem 0;font-size:clamp(2rem,4vw,3.4rem);line-height:1.05}h2{margin:0 0 1rem;font-size:1.15rem}p{margin:.55rem 0 1rem}.q{color:var(--muted)}.mono,code,pre,td:first-child,.metric-value{font-family:JetBrains Mono,ui-monospace,SFMono-Regular,Consolas,monospace;font-variant-numeric:tabular-nums}"
+        ".badge{display:inline-flex;align-items:center;gap:.35rem;width:max-content;padding:.18rem .5rem;border:1px solid #4c515b;border-radius:999px;background:#20242a;color:#c6cbd3;font-family:JetBrains Mono,ui-monospace,monospace;font-size:.69rem;font-weight:700;letter-spacing:.04em;line-height:1.25;text-transform:uppercase}.badge:before{width:.38rem;height:.38rem;border-radius:50%;background:currentColor;content:''}.badge-live,.badge-good{border-color:rgba(87,211,140,.35);background:rgba(87,211,140,.09);color:var(--good)}.badge-warn{border-color:rgba(246,166,35,.38);background:rgba(246,166,35,.09);color:var(--amber)}.badge-bad{border-color:rgba(255,107,107,.4);background:rgba(255,107,107,.09);color:var(--bad)}.badge-violet{border-color:rgba(167,139,250,.4);background:rgba(167,139,250,.09);color:var(--violet)}.status-badge{margin-left:.1rem}"
+        ".dashboard-hero,.page-head{display:flex;align-items:end;justify-content:space-between;gap:1.5rem;margin-bottom:1.2rem;padding:.35rem 0}.eyebrow{margin:0 0 .45rem;color:var(--amber);font-family:JetBrains Mono,ui-monospace,monospace;font-size:.73rem;font-weight:700;letter-spacing:.09em;text-transform:uppercase}.hero-note{max-width:36rem;margin:0;color:var(--muted);text-align:right}"
+        ".metric-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:.65rem;margin-bottom:1rem}.metric-card{min-width:0;min-height:7.3rem;padding:1rem;border:1px solid var(--line);border-top:2px solid var(--line-hot);border-radius:.55rem;background:linear-gradient(145deg,rgba(246,166,35,.035),transparent 45%),var(--panel);box-shadow:0 10px 26px rgba(0,0,0,.14)}.metric-label{display:block;margin-bottom:.65rem;color:var(--muted);font-size:.71rem;font-weight:750;letter-spacing:.07em;text-transform:uppercase}.metric-value{display:block;overflow:hidden;color:var(--text);font-size:clamp(1.05rem,2vw,1.5rem);font-weight:700;line-height:1.25;text-overflow:ellipsis;white-space:nowrap}.metric-value.accent,.metric-value .accent{color:var(--amber)}.metric-detail{display:block;overflow:hidden;margin-top:.42rem;color:var(--muted);font-size:.74rem;text-overflow:ellipsis;white-space:nowrap}"
+        ".panel{margin:0 0 1rem;padding:1rem;border:1px solid var(--line);border-radius:.6rem;background:rgba(21,24,29,.94);box-shadow:0 14px 34px rgba(0,0,0,.14)}.panel-head{display:flex;align-items:center;justify-content:space-between;gap:1rem;margin-bottom:.75rem}.panel-head h2{margin:0}.panel h3{margin:1rem 0 .65rem;font-size:.82rem;letter-spacing:.04em;text-transform:uppercase;color:var(--muted)}.content-panel{margin-top:1rem}.content-panel>p.q{max-width:75rem}.detail-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(18rem,.6fr);gap:1rem}.stack{display:grid;gap:1rem}.stack>.panel{margin:0}"
+        ".block-strip{display:flex;gap:.55rem;overflow-x:auto;padding:.1rem .05rem .55rem;scroll-snap-type:x proximity;scrollbar-color:var(--line) transparent}.block-tile{flex:0 0 13.5rem;scroll-snap-align:start;display:grid;gap:.45rem;padding:.75rem;border:1px solid var(--line);border-left:3px solid var(--amber);border-radius:.45rem;background:var(--surface);color:var(--text);text-decoration:none;transition:border-color .15s ease,transform .15s ease}.block-tile:hover{border-color:var(--orange);color:var(--text);transform:translateY(-2px)}.block-tile-head{display:flex;align-items:center;justify-content:space-between;gap:.5rem}.block-height{color:var(--amber);font-family:JetBrains Mono,ui-monospace,monospace;font-size:1rem;font-weight:800}.block-hash{overflow:hidden;color:var(--muted);font-family:JetBrains Mono,ui-monospace,monospace;font-size:.71rem;text-overflow:ellipsis;white-space:nowrap}.block-meta{display:flex;gap:.55rem;color:#c2c7ce;font-size:.7rem}.block-meta span+span{padding-left:.55rem;border-left:1px solid var(--line)}"
+        ".table-scroll{overflow:auto;max-width:100%;border:1px solid var(--line);border-radius:.45rem}.table-scroll table{border:0}table{width:100%;border-collapse:separate;border-spacing:0;background:var(--surface);font-size:.79rem}th,td{min-width:6.5rem;padding:.52rem .65rem;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}thead th{position:sticky;z-index:2;top:0;background:#20242a;color:#d9dde3;font-size:.69rem;letter-spacing:.055em;text-transform:uppercase}tbody th{background:#171a1f;color:#c6cbd3;font-size:.75rem}tbody tr:last-child>td,tbody tr:last-child>th{border-bottom:0}tbody tr{transition:background .12s ease}tbody tr:hover{background:rgba(246,166,35,.055)}td a{font-family:JetBrains Mono,ui-monospace,monospace}.hash-cell{max-width:26rem;overflow-wrap:anywhere}"
+        "pre,code{font-family:JetBrains Mono,ui-monospace,SFMono-Regular,Consolas,monospace}pre{overflow:auto;max-height:32rem;margin:0;padding:.75rem;border:1px solid var(--line);border-radius:.4rem;background:#0c0e11;color:#dfe3e8;white-space:pre-wrap;word-break:break-all}"
+        ".notice{margin:1rem 0;padding:.85rem 1rem;border:1px solid var(--line);border-left:3px solid var(--cyan);border-radius:.4rem;background:rgba(85,220,232,.06)}.notice-warn{border-left-color:var(--amber);background:rgba(246,166,35,.07)}.notice-error{border-color:rgba(255,107,107,.35);border-left-color:var(--bad);background:rgba(255,107,107,.07)}.empty-state{display:grid;min-height:9rem;place-items:center;padding:2rem;border:1px dashed #3b4049;border-radius:.5rem;background:rgba(16,18,22,.7);color:var(--muted);text-align:center}"
+        ".sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}:focus-visible{outline:3px solid var(--cyan);outline-offset:3px}"
+        "@media(max-width:1000px){.metric-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.detail-grid{grid-template-columns:1fr}}"
+        "@media(max-width:680px){body{font-size:14px}.topbar{align-items:flex-start;flex-wrap:wrap;gap:.35rem .8rem;padding:.45rem .6rem}.wordmark{flex:1}.wordmark small,.status-badge{display:none}nav{order:2;width:100%;justify-content:space-between;border-top:1px solid var(--line);padding-top:.3rem}nav a{padding:.28rem}.shell{width:calc(100% - 1rem);padding-top:1rem}.dashboard-hero,.page-head{align-items:flex-start;flex-direction:column}.hero-note{text-align:left}.metric-grid{grid-template-columns:1fr 1fr;gap:.45rem}.metric-card{min-height:6.6rem;padding:.75rem}.metric-value{font-size:1rem}.panel{padding:.7rem}.block-tile{flex-basis:11.75rem}th,td{min-width:5.5rem;padding:.45rem .5rem}}"
+        "@media(max-width:430px){.metric-grid{grid-template-columns:1fr}.metric-card{min-height:0}}@media(prefers-reduced-motion:reduce){*,*:before,*:after{scroll-behavior:auto!important;transition:none!important;animation:none!important}.block-tile:hover{transform:none}}"))
 
     (define (join parts)
       (apply string-append parts))
@@ -382,10 +388,40 @@
       (join (map (lambda (cell) (string-append "<td>" cell "</td>")) cells)))
 
     (define (headings names)
-      (join (map (lambda (name) (string-append "<th>" name "</th>")) names)))
+      (join (map (lambda (name)
+                   (string-append "<th scope=\"col\">" name "</th>"))
+                 names)))
 
     (define (field label value)
-      (string-append "<tr><th>" label "</th><td>" value "</td></tr>"))
+      (string-append "<tr><th scope=\"row\">" label "</th><td>" value
+                     "</td></tr>"))
+
+    (define (table-wrap markup)
+      (string-append "<div class=\"table-scroll\">" markup "</div>"))
+
+    (define (badge class text)
+      (string-append "<span class=\"badge " class "\">" text "</span>"))
+
+    (define (margin-badge milli)
+      (badge (cond ((not (number? milli)) "")
+                   ((> milli 0) "badge-good")
+                   ((< milli 0) "badge-bad")
+                   (else "badge-warn"))
+             (explorer-escape (explorer-margin-text milli))))
+
+    (define (under-par-badge delta)
+      (badge (cond ((not (number? delta)) "")
+                   ((> delta 0) "badge-good")
+                   ((< delta 0) "badge-bad")
+                   (else "badge-warn"))
+             (explorer-escape (explorer-under-par-text delta))))
+
+    (define (short-id id)
+      (if (and (string? id) (> (string-length id) 18))
+          (string-append (substring id 0 10) "…"
+                         (substring id (- (string-length id) 6)
+                                    (string-length id)))
+          (if (string? id) id "unknown")))
 
     ;;; Wrap a page body in the shared shell.
     ;;;
@@ -407,10 +443,11 @@
               "<a class=\"wordmark\" href=\"https://sigilcoin.lol\">"
               "<span class=\"wordmark-symbol\" aria-hidden=\"true\">S</span>"
               "<span>SigilCoin <small>Explorer</small></span></a>"
-              "<nav aria-label=\"Explorer navigation\"><a href=\"/\">summary</a>"
-              "<a href=\"/blocks\">blocks</a>"
-              "<a href=\"/difficulty\">difficulty</a>"
-              "<a href=\"/api/summary\">api</a></nav></header>"
+              "<span class=\"badge badge-live status-badge\">read only</span>"
+              "<nav aria-label=\"Explorer navigation\"><a href=\"/\">Summary</a>"
+              "<a href=\"/blocks\">Blocks</a>"
+              "<a href=\"/difficulty\">Difficulty</a>"
+              "<a href=\"/api/summary\">API</a></nav></header>"
               "<main class=\"shell\">" body "</main>"
               "</body></html>\n")))
 
@@ -464,9 +501,8 @@
                              (optional-number
                                (explorer-block-solution-length b))
                              (optional-number (explorer-block-par b))
-                             (explorer-escape
-                               (explorer-under-par-text
-                                 (explorer-block-under-par b)))
+                             (under-par-badge
+                               (explorer-block-under-par b))
                              (explorer-escape
                                (explorer-sigil-amount
                                  (explorer-block-reward b)))
@@ -476,6 +512,40 @@
 
     (define %block-headings
       '("height" "time" "miner" "bytes" "par" "margin" "reward" "quote"))
+
+    (define (block-tile b)
+      (let ((id (explorer-block-id b))
+            (height (number->string (explorer-block-height b)))
+            (transactions (explorer-block-transaction-count b))
+            (size (explorer-block-size b))
+            (quality (explorer-block-score-quality b))
+            (problem (explorer-block-problem b)))
+        (join (list
+                "<a class=\"block-tile\" href=\"/block/" height
+                "\" role=\"listitem\" aria-label=\"Block " height
+                "\" title=\""
+                (explorer-escape id) "\">"
+                "<span class=\"block-tile-head\"><span class=\"block-height\">#"
+                height "</span>"
+                (if problem
+                    (badge "badge-bad"
+                           (explorer-escape (symbol->string problem)))
+                    (badge "badge-good" "validated"))
+                "</span><span class=\"block-hash\">"
+                (explorer-escape (short-id id)) "</span>"
+                "<span class=\"block-meta\"><span>TX "
+                (optional-number transactions) "</span><span>"
+                (if (number? size)
+                    (string-append (number->string size) " B")
+                    "size —")
+                "</span><span>Q " (optional-number quality) "</span></span></a>"))))
+
+    (define (block-strip blocks)
+      (if (null? blocks)
+          "<div class=\"empty-state\">No blocks yet.</div>"
+          (string-append
+            "<div class=\"block-strip\" role=\"list\" aria-label=\"Recent blocks\">"
+            (join (map block-tile blocks)) "</div>")))
 
     ;; ============================================================
     ;; Puzzle, score, shares and split sections
@@ -497,25 +567,29 @@
     ;; difference between "trusted" and "escaped anyway" is a page.
     (define (examples-table pairs)
       (if (null? pairs)
-          "<p class=\"q\">No examples for this height.</p>"
-          (string-append
-            "<table><tr>" (headings '("input" "output")) "</tr>"
-            (join (map (lambda (pair)
-                         (string-append
-                           "<tr><td><pre>" (explorer-text (car pair))
-                           "</pre></td><td><pre>" (explorer-text (cdr pair))
-                           "</pre></td></tr>"))
-                       pairs))
-            "</table>")))
+          "<div class=\"empty-state\">No examples for this height.</div>"
+          (table-wrap
+            (string-append
+              "<table><thead><tr>" (headings '("input" "output"))
+              "</tr></thead><tbody>"
+              (join (map (lambda (pair)
+                           (string-append
+                             "<tr><td><pre>" (explorer-text (car pair))
+                             "</pre></td><td><pre>" (explorer-text (cdr pair))
+                             "</pre></td></tr>"))
+                         pairs))
+              "</tbody></table>"))))
 
     (define (puzzle-section b)
       (join (list
-                  "<h2>Puzzle</h2>"
-                  "<p class=\"q\">A solution is a one-argument function that"
-                  " reproduces every pair below, under the day's constraint."
-                  " Nothing here is stored in the block: every node derives"
-                  " it from the parent hash, the height and C.</p>"
-                  "<table>"
+              "<section class=\"panel content-panel\"><h2>Puzzle</h2>"
+              "<p class=\"q\">A solution is a one-argument function that"
+              " reproduces every pair below, under the day's constraint."
+              " Nothing here is stored in the block: every node derives"
+              " it from the parent hash, the height and C.</p>"
+              (table-wrap
+                (string-append
+                  "<table><tbody>"
                   (field "complexity C"
                          (optional-number (explorer-block-complexity b)))
                   (field "constraint"
@@ -529,50 +603,53 @@
                                "&mdash;")))
                   (field "examples (k)" (optional-number (explorer-block-k b)))
                   (field "par" (optional-number (explorer-block-par b)))
-                  "</table>"
-                  (examples-table (explorer-block-examples b)))))
+                  "</tbody></table>"))
+              (examples-table (explorer-block-examples b))
+              "</section>")))
 
     (define (score-section b)
       (join (list
-                  "<h2>Producer score</h2>"
-                  "<p class=\"q\">Lower is better. Length dominates memory,"
-                  " memory dominates steps, and aggregate personalized-share"
-                  " quality Q breaks remaining ties. Memory and steps are"
-                  " 7-bit buckets: raw counts are not recoverable from a"
-                  " header.</p>"
-                  "<table><tr>"
-                  (headings '("field" "value" "against par"))
-                  "</tr>"
-                  "<tr>"
-                  (rows (list "length L"
-                              (string-append
-                                (optional-number
-                                  (explorer-block-score-length b))
-                                " bytes")
-                              (explorer-escape
-                                (explorer-margin-text
-                                  (explorer-block-margin b)))))
-                  "</tr><tr>"
-                  (rows (list "memory MB"
-                              (optional-number
-                                (explorer-block-score-memory b))
-                              "<span class=\"q\">bucket</span>"))
-                  "</tr><tr>"
-                  (rows (list "steps SB"
-                              (optional-number
-                                (explorer-block-score-steps b))
-                              "<span class=\"q\">bucket</span>"))
-                  "</tr><tr>"
-                  (rows (list "aggregate Q"
-                              (optional-number
-                                (explorer-block-score-quality b))
-                              "<span class=\"q\">breaks ties only</span>"))
-                  "</tr><tr>"
-                  (rows (list "score word W"
-                              (explorer-escape
-                                (hex-word (explorer-block-score-word b)))
-                              "<span class=\"q\">the header nonce</span>"))
-                  "</tr></table>")))
+              "<section class=\"panel content-panel\"><h2>Producer score</h2>"
+              "<p class=\"q\">Lower is better. Length dominates memory,"
+              " memory dominates steps, and aggregate personalized-share"
+              " quality Q breaks remaining ties. Memory and steps are"
+              " 7-bit buckets: raw counts are not recoverable from a"
+              " header.</p>"
+              (table-wrap
+                (join (list
+                        "<table><thead><tr>"
+                        (headings '("field" "value" "against par"))
+                        "</tr></thead><tbody><tr>"
+                        (rows (list "length L"
+                                    (string-append
+                                      (optional-number
+                                        (explorer-block-score-length b))
+                                      " bytes")
+                                    (margin-badge
+                                      (explorer-block-margin b))))
+                        "</tr><tr>"
+                        (rows (list "memory MB"
+                                    (optional-number
+                                      (explorer-block-score-memory b))
+                                    "<span class=\"q\">bucket</span>"))
+                        "</tr><tr>"
+                        (rows (list "steps SB"
+                                    (optional-number
+                                      (explorer-block-score-steps b))
+                                    "<span class=\"q\">bucket</span>"))
+                        "</tr><tr>"
+                        (rows (list "aggregate Q"
+                                    (badge "badge-violet"
+                                      (optional-number
+                                        (explorer-block-score-quality b)))
+                                    "<span class=\"q\">breaks ties only</span>"))
+                        "</tr><tr>"
+                        (rows (list "score word W"
+                                    (explorer-escape
+                                      (hex-word (explorer-block-score-word b)))
+                                    "<span class=\"q\">the header nonce</span>"))
+                        "</tr></tbody></table>")))
+              "</section>")))
 
     (define (share-source-text s)
       (let ((source (explorer-share-solution-source s))
@@ -595,16 +672,23 @@
                     (share-address-cell s)
                     (optional-number (explorer-share-solution-length s))
                     (optional-number (explorer-share-par s))
-                    (explorer-escape
-                      (explorer-margin-text (explorer-share-margin s)))
-                    (optional-number (explorer-share-contribution s))
+                    (margin-badge (explorer-share-margin s))
+                    (badge "badge-violet"
+                           (optional-number
+                             (explorer-share-contribution s)))
                     (optional-number (explorer-share-steps s))
                     (optional-number (explorer-share-cells s))
                     (optional-number (explorer-share-step-bucket s))
                     (optional-number (explorer-share-memory-bucket s))
-                    (amount-cell (explorer-share-payout s))))
+                    (amount-cell (explorer-share-payout s))
+                    (let ((problem (explorer-share-problem s)))
+                      (if problem
+                          (badge "badge-bad"
+                                 (explorer-escape
+                                   (symbol->string problem)))
+                          (badge "badge-good" "ok")))))
         "</tr>"
-        "<tr><td colspan=\"11\"><span class=\"q\">pubkey "
+        "<tr><td colspan=\"12\"><span class=\"q\">pubkey "
         (explorer-escape (explorer-share-pubkey-hex s))
         " &middot; signature "
         (explorer-escape (explorer-share-signature-hex s))
@@ -614,17 +698,17 @@
 
     (define %share-headings
       '("#" "miner" "bytes" "personal par" "margin" "Q+" "steps"
-        "cells" "SB" "MB" "payout"))
+        "cells" "SB" "MB" "payout" "problem"))
 
     (define (shares-section b)
       (let ((shares (explorer-block-shares b)))
             (join (list
-                    "<h2>Co-op shares</h2>"
+                    "<section class=\"panel content-panel\"><h2>Co-op shares</h2>"
                     (if (null? shares)
                         (string-append
-                          "<p class=\"q\">No shares. The producer took the"
+                          "<div class=\"empty-state\">No shares. The producer took the"
                           " whole reward."
-                          "</p>")
+                          "</div>")
                         (join (list
                                 "<p class=\"q\">Each share solves its own"
                                 " pubkey-personalized version of the parent"
@@ -633,13 +717,14 @@
                                 " Signatures are decoded but not re-verified"
                                 " on page load; node validation already settled"
                                 " them.</p>"
-                                "<table><tr>" (headings %share-headings)
-                                "</tr>"
+                                "<div class=\"table-scroll\"><table><thead><tr>"
+                                (headings %share-headings)
+                                "</tr></thead><tbody>"
                                 (join (map share-row shares))
-                                "</table>")))
+                                "</tbody></table></div>")))
                     "<p>commitments carried: "
                     (optional-number (explorer-block-commit-count b))
-                    "</p>"))))
+                    "</p></section>"))))
 
     (define (role-text role)
       (cond ((eq? role 'producer) "producer")
@@ -653,7 +738,9 @@
         (string-append
           "<tr>"
           (rows (list (number->string (explorer-output-index o))
-                      (explorer-escape (role-text (explorer-output-role o)))
+                      (badge "badge-violet"
+                             (explorer-escape
+                               (role-text (explorer-output-role o))))
                       (let ((address (explorer-output-address o)))
                         (if (string? address)
                             (string-append "<a href=\"/address/"
@@ -664,8 +751,8 @@
                       (amount-cell expected)
                       (if (and (number? value) (number? expected))
                           (if (= value expected)
-                              "ok"
-                              "<span class=\"q\">disagrees</span>")
+                              (badge "badge-good" "ok")
+                              (badge "badge-bad" "disagrees"))
                           "<span class=\"q\">&mdash;</span>")))
           "</tr>")))
 
@@ -677,12 +764,13 @@
             (if (null? outputs)
                 ""
                 (join (list
-                        "<h2>Reward split</h2>"
+                        "<section class=\"panel content-panel\"><h2>Reward split</h2>"
                         "<p class=\"q\">Weights are producer 2, each share 1,"
                         " carrier 1; the floor's remainder goes to the"
                         " producer, so the outputs sum to the reward"
                         " exactly and nothing is burned.</p>"
-                        "<table><tr>" (headings %output-headings) "</tr>"
+                        "<div class=\"table-scroll\"><table><thead><tr>"
+                        (headings %output-headings) "</tr></thead><tbody>"
                         (join (map output-row outputs))
                         "<tr>"
                         (rows (list "" "<b>total</b>" ""
@@ -690,7 +778,7 @@
                                       (explorer-block-total-output b))
                                     (amount-cell (explorer-block-reward b))
                                     "<span class=\"q\">subsidy</span>"))
-                        "</tr></table>")))))
+                        "</tr></tbody></table></div></section>")))))
 
     (define %difficulty-headings
       '("height" "C" "par" "bytes" "margin" ""))
@@ -717,9 +805,8 @@
                                     (optional-number (explorer-block-par b))
                                     (optional-number
                                       (explorer-block-solution-length b))
-                                    (explorer-escape
-                                      (explorer-margin-text
-                                        (explorer-block-margin b)))
+                                    (margin-badge
+                                      (explorer-block-margin b))
                                     (if moved
                                         (string-append
                                           "retarget "
@@ -734,11 +821,12 @@
       (if (null? tally)
           ""
           (join (list
-                  "<h2>Authors</h2>"
+                  "<section class=\"panel\"><h2>Authors</h2>"
                   "<p class=\"q\">Self-declared, from the <code>/name/</code>"
                   " graffiti convention. Anyone may claim any name; this is"
                   " a signature of nothing.</p>"
-                  "<table><tr>" (headings '("author" "blocks")) "</tr>"
+                  "<div class=\"table-scroll\"><table><thead><tr>"
+                  (headings '("author" "blocks")) "</tr></thead><tbody>"
                   (join (map (lambda (entry)
                                (string-append
                                  "<tr>"
@@ -746,13 +834,22 @@
                                              (number->string (cdr entry))))
                                  "</tr>"))
                              tally))
-                  "</table>"))))
+                  "</tbody></table></div></section>"))))
 
     (define (block-table blocks)
       (if (null? blocks)
-          "<p>No blocks yet.</p>"
-          (string-append "<table><tr>" (headings %block-headings) "</tr>"
-                         (block-rows blocks) "</table>")))
+          "<div class=\"empty-state\">No blocks yet.</div>"
+          (string-append
+            "<div class=\"table-scroll\"><table><thead><tr>"
+            (headings %block-headings) "</tr></thead><tbody>"
+            (block-rows blocks) "</tbody></table></div>")))
+
+    (define (metric-card label value detail)
+      (join (list
+              "<article class=\"metric-card\"><span class=\"metric-label\">"
+              label "</span><strong class=\"metric-value\">" value
+              "</strong><span class=\"metric-detail\">" detail
+              "</span></article>")))
 
     ;; ============================================================
     ;; Pages
@@ -766,108 +863,139 @@
     ;;; ```
     (define (explorer-summary-page summary blocks)
       (: explorer-summary? list? -> string?)
-      (explorer-page
-        (string-append (explorer-summary-chain-name summary) " explorer")
-        (join (list
-                "<h1>" (explorer-escape
-                         (explorer-summary-chain-name summary)) "</h1>"
-                (if (explorer-summary-empty summary)
-                    "<p>This node has no chain data yet.</p>"
-                    "")
-                "<table>"
-                (field "tip height"
-                       (number->string
-                         (explorer-summary-tip-height summary)))
-                (field "tip block"
-                       (explorer-escape (explorer-summary-tip-id summary)))
-                (field "tip time"
-                       (explorer-escape
-                         (explorer-format-time
-                           (explorer-summary-tip-time summary))))
-                (field "headers"
-                       (string-append
-                         (number->string
-                           (explorer-summary-header-count summary))
-                         " (to height "
-                         (number->string
-                           (explorer-summary-header-height summary))
-                         ")"))
-                (field "validated blocks"
-                       (number->string
-                         (explorer-summary-block-count summary)))
-                (field "supply issued"
-                       (string-append
-                         (explorer-sigil-amount
-                           (explorer-summary-supply summary))
-                         " of "
-                         (explorer-sigil-amount
-                           (explorer-summary-max-supply summary))
-                         " SGL"))
-                (field "current reward"
-                       (string-append
-                         (explorer-sigil-amount
-                           (explorer-summary-next-reward summary))
-                         " SGL"))
-                (field "next halving"
-                       (let ((height (explorer-summary-next-halving-height
-                                       summary)))
-                         (if (number? height)
-                             (string-append "height " (number->string height))
-                             "never (reward has decayed to zero)")))
-                (let ((complexity (explorer-summary-complexity summary)))
-                  (if (number? complexity)
-                      (join (list
-                              (field "complexity C"
-                                     (number->string complexity))
-                              (field "next complexity"
-                                     (optional-number
-                                       (explorer-summary-next-complexity
-                                         summary)))
-                              (field "next retarget"
-                                     (let ((height
-                                             (explorer-summary-next-retarget-height
-                                               summary)))
-                                       (if (number? height)
-                                           (string-append
-                                             "height "
-                                             (number->string height))
-                                           "&mdash;")))))
-                      ""))
-                "</table>"
-                "<h2>Puzzle for height "
-                (number->string (explorer-summary-next-height summary))
-                "</h2>"
-                "<table>"
-                (field "par"
-                       (optional-number
-                         (explorer-summary-puzzle-par summary)))
-                (let ((ci (explorer-summary-puzzle-constraint summary)))
-                  (if (number? ci)
-                      (join (list
-                              (field "constraint"
-                                     (string-append
-                                       (number->string ci) " &mdash; "
-                                       (explorer-escape
-                                         (let ((text
-                                                 (explorer-summary-puzzle-constraint-text
-                                                   summary)))
-                                           (if (string? text) text "")))))
-                              (field "examples (k)"
-                                     (optional-number
-                                       (explorer-summary-puzzle-k summary)))))
-                      ""))
-                (field "seed"
-                       (let ((seed (explorer-summary-puzzle-seed summary)))
-                         (if (string? seed) (explorer-escape seed) "&mdash;")))
-                "</table>"
-                (examples-table (explorer-summary-puzzle-examples summary))
-                (author-table
-                  (explorer-author-tally
-                    blocks
-                    (let ((tip (explorer-summary-tip-time summary)))
-                      (and (number? tip) (- tip explorer-author-window)))))
-                "<h2>Recent blocks</h2>"
-                (block-table blocks)))))
+      (let ((chain (explorer-summary-chain-name summary))
+            (tip-id (explorer-summary-tip-id summary))
+            (complexity (explorer-summary-complexity summary)))
+        (explorer-page
+          (string-append chain " explorer")
+          (join (list
+                  "<section class=\"dashboard-hero\"><div>"
+                  "<p class=\"eyebrow\">Chain dashboard</p><h1>"
+                  (explorer-escape chain) "</h1></div><div>"
+                  (badge "badge-live" (explorer-escape chain))
+                  "<p class=\"hero-note\">Validated chain state and the next"
+                  " program-golf puzzle, served directly from this node.</p>"
+                  "</div></section>"
+                  (if (explorer-summary-empty summary)
+                      "<div class=\"notice notice-warn\"><strong>Waiting for chain data.</strong> This node has no chain data yet.</div>"
+                      "")
+                  "<section class=\"metric-grid\" aria-label=\"Chain metrics\">"
+                  (metric-card
+                    "tip height"
+                    (string-append "<span class=\"accent\">#"
+                                   (number->string
+                                     (explorer-summary-tip-height summary))
+                                   "</span>")
+                    (string-append "next height "
+                                   (number->string
+                                     (explorer-summary-next-height summary))))
+                  (metric-card
+                    "tip block"
+                    (string-append "<span title=\"" (explorer-escape tip-id)
+                                   "\">" (explorer-escape (short-id tip-id))
+                                   "</span>")
+                    (string-append "<span class=\"mono\">"
+                                   (explorer-escape tip-id) "</span>"))
+                  (metric-card
+                    "tip time"
+                    (explorer-escape
+                      (explorer-format-time
+                        (explorer-summary-tip-time summary)))
+                    "node-reported UTC")
+                  (metric-card
+                    "validated blocks"
+                    (number->string (explorer-summary-block-count summary))
+                    (string-append
+                      (number->string (explorer-summary-header-count summary))
+                      " headers to height "
+                      (number->string
+                        (explorer-summary-header-height summary))))
+                  (metric-card
+                    "supply issued"
+                    (string-append
+                      (explorer-sigil-amount
+                        (explorer-summary-supply summary)) " SGL")
+                    (string-append "of "
+                      (explorer-sigil-amount
+                        (explorer-summary-max-supply summary)) " SGL"))
+                  (metric-card
+                    "current reward"
+                    (string-append
+                      (explorer-sigil-amount
+                        (explorer-summary-next-reward summary)) " SGL")
+                    (let ((height
+                            (explorer-summary-next-halving-height summary)))
+                      (if (number? height)
+                          (string-append "next halving at height "
+                                         (number->string height))
+                          "never (reward has decayed to zero)")))
+                  (metric-card
+                    "complexity / retarget"
+                    (if (number? complexity)
+                        (string-append "C " (number->string complexity))
+                        "unavailable")
+                    (if (number? complexity)
+                        (string-append
+                          "next C "
+                          (optional-number
+                            (explorer-summary-next-complexity summary))
+                          " at height "
+                          (optional-number
+                            (explorer-summary-next-retarget-height summary)))
+                        "retarget data unavailable"))
+                  "</section>"
+                  "<section class=\"panel content-panel\"><h2>Puzzle for height "
+                  (number->string (explorer-summary-next-height summary))
+                  "</h2><p class=\"q\">The deterministic target for the next"
+                  " producer. Lower valid source length wins.</p>"
+                  (table-wrap
+                    (join (list
+                            "<table><tbody>"
+                            (field "par"
+                                   (optional-number
+                                     (explorer-summary-puzzle-par summary)))
+                            (let ((ci
+                                    (explorer-summary-puzzle-constraint summary)))
+                              (if (number? ci)
+                                  (join (list
+                                          (field "constraint"
+                                                 (string-append
+                                                   (number->string ci)
+                                                   " &mdash; "
+                                                   (explorer-escape
+                                                     (let ((text
+                                                       (explorer-summary-puzzle-constraint-text
+                                                         summary)))
+                                                       (if (string? text)
+                                                           text "")))))
+                                          (field "examples (k)"
+                                                 (optional-number
+                                                   (explorer-summary-puzzle-k
+                                                     summary)))))
+                                  ""))
+                            (field "seed"
+                                   (let ((seed
+                                           (explorer-summary-puzzle-seed summary)))
+                                     (if (string? seed)
+                                         (explorer-escape seed)
+                                         "&mdash;")))
+                            "</tbody></table>")))
+                  (examples-table (explorer-summary-puzzle-examples summary))
+                  "</section>"
+                  (author-table
+                    (explorer-author-tally
+                      blocks
+                      (let ((tip (explorer-summary-tip-time summary)))
+                        (and (number? tip)
+                             (- tip explorer-author-window)))))
+                  "<section class=\"panel recent-blocks-panel\">"
+                  "<div class=\"panel-head\"><h2>Recent blocks</h2>"
+                  (badge "badge-warn"
+                         (string-append (number->string (length blocks))
+                                        " shown"))
+                  "</div>" (block-strip blocks)
+                  "<h3>Detailed block ledger</h3>" (block-table blocks)
+                  "</section>")))))
 
     ;;; The difficulty history page: complexity and achieved margin over
     ;;; time, which is the chain's own record of how fast the field is
@@ -881,18 +1009,26 @@
       (explorer-page
         (string-append (explorer-summary-chain-name summary) " difficulty")
         (join (list
-                "<h1>Difficulty</h1>"
+                "<section class=\"page-head\"><div><p class=\"eyebrow\">"
+                "Retarget history</p><h1>Difficulty</h1></div>"
+                (badge "badge-violet"
+                  (string-append "C "
+                    (optional-number
+                      (explorer-summary-complexity summary))))
+                "</section><section class=\"panel\">"
                 "<p class=\"q\">C is the complexity parameter: it widens the"
                 " grammar, the example count and the constraint tier, and it"
                 " never touches an evaluator cap. It retargets every 16"
                 " blocks on the median relative margin, aiming for the"
                 " median block to come in 10.0% under par.</p>"
                 (if (null? blocks)
-                    "<p>No blocks yet.</p>"
+                    "<div class=\"empty-state\">No blocks yet.</div>"
                     (string-append
-                      "<table><tr>" (headings %difficulty-headings) "</tr>"
+                      "<div class=\"table-scroll\"><table><thead><tr>"
+                      (headings %difficulty-headings) "</tr></thead><tbody>"
                       (difficulty-rows blocks)
-                      "</table>"))))))
+                      "</tbody></table></div>"))
+                "</section>"))))
 
     ;;; The block list page.
     ;;;
@@ -903,7 +1039,16 @@
       (: explorer-summary? list? -> string?)
       (explorer-page
         (string-append (explorer-summary-chain-name summary) " blocks")
-        (join (list "<h1>Blocks</h1>" (block-table blocks)))))
+        (join (list
+                "<section class=\"page-head\"><div><p class=\"eyebrow\">"
+                "Validated ledger</p><h1>Blocks</h1></div>"
+                (badge "badge-warn"
+                       (string-append (number->string (length blocks))
+                                      " shown"))
+                "</section><section class=\"panel\">"
+                (block-strip blocks)
+                "<h2>Block details</h2>" (block-table blocks)
+                "</section>"))))
 
     ;;; The block detail page.
     ;;;
@@ -915,10 +1060,22 @@
       (explorer-page
         (string-append "Block " (number->string (explorer-block-height b)))
         (join (list
-                "<h1>Block " (number->string (explorer-block-height b))
-                "</h1>"
-                "<table>"
-                (field "id" (explorer-escape (explorer-block-id b)))
+                "<section class=\"page-head\"><div><p class=\"eyebrow\">"
+                "Validated block</p><h1>Block "
+                (number->string (explorer-block-height b))
+                "</h1></div>"
+                (let ((problem (explorer-block-problem b)))
+                  (if problem
+                      (badge "badge-bad"
+                             (explorer-escape (symbol->string problem)))
+                      (badge "badge-good" "validated")))
+                "</section><section class=\"panel\">"
+                "<h2 class=\"sr-only\">Block data</h2>"
+                "<div class=\"table-scroll\"><table><tbody>"
+                (field "id"
+                       (string-append "<span class=\"hash-cell mono\">"
+                                      (explorer-escape (explorer-block-id b))
+                                      "</span>"))
                 (field "time"
                        (explorer-escape
                          (explorer-format-time (explorer-block-time b))))
@@ -949,9 +1106,8 @@
                        (optional-number (explorer-block-solution-length b)))
                 (field "par" (optional-number (explorer-block-par b)))
                 (field "margin"
-                       (explorer-escape
-                         (explorer-under-par-text
-                           (explorer-block-under-par b))))
+                       (under-par-badge
+                         (explorer-block-under-par b)))
                 (field "transactions"
                        (optional-number
                          (explorer-block-transaction-count b)))
@@ -966,21 +1122,23 @@
                 (let ((problem (explorer-block-problem b)))
                   (if problem
                       (field "problem"
-                             (explorer-escape (symbol->string problem)))
+                             (badge "badge-bad"
+                               (explorer-escape (symbol->string problem))))
                       ""))
-                "</table>"
+                "</tbody></table></div></section>"
                 (puzzle-section b)
-                "<h2>Solution</h2><pre>" (solution-text b) "</pre>"
+                "<section class=\"panel content-panel\"><h2>Solution</h2><pre>"
+                (solution-text b) "</pre></section>"
                 (score-section b)
                 (shares-section b)
                 (split-section b)
-                "<h2>Quote</h2><pre>"
+                "<section class=\"panel content-panel\"><h2>Quote</h2><pre>"
                 (let ((graffiti (explorer-block-graffiti b)))
                   (if (and (bytevector? graffiti)
                            (> (bytevector-length graffiti) 0))
                       (explorer-text graffiti)
                       "&mdash;"))
-                "</pre>"))))
+                "</pre></section>"))))
 
     ;;; The address page: what it mined and what it currently holds.
     ;;;
@@ -992,17 +1150,26 @@
       (explorer-page
         (string-append "Address " address)
         (join (list
-                "<h1>Address</h1>"
-                "<table>"
-                (field "address" (explorer-text address))
-                (field "balance"
-                       (string-append (explorer-sigil-amount balance)
-                                      " SGL"))
-                (field "blocks mined"
-                       (number->string (length blocks)))
-                "</table>"
-                "<h2>Blocks mined</h2>"
-                (block-table blocks)))))
+                "<section class=\"page-head\"><div><p class=\"eyebrow\">"
+                "Mining activity</p><h1>Address</h1></div>"
+                (badge "badge-violet"
+                       (string-append (number->string (length blocks))
+                                      " blocks"))
+                "</section><section class=\"metric-grid\">"
+                (metric-card "balance"
+                             (string-append
+                               (explorer-sigil-amount balance) " SGL")
+                             "current spendable balance")
+                (metric-card "blocks mined"
+                             (number->string (length blocks))
+                             "validated producer blocks")
+                "</section><section class=\"panel\"><h2>Address details</h2>"
+                (table-wrap
+                  (string-append "<table><tbody>"
+                                 (field "address" (explorer-text address))
+                                 "</tbody></table>"))
+                "</section><section class=\"panel\"><h2>Blocks mined</h2>"
+                (block-table blocks) "</section>"))))
 
     ;;; The page for a path that names nothing.
     ;;;
@@ -1012,9 +1179,12 @@
     (define (explorer-missing-page reason)
       (: string? -> string?)
       (explorer-page "Not found"
-                     (string-append "<h1>Not found</h1><p>"
-                                    (explorer-text reason)
-                                    "</p>")))
+                     (string-append
+                       "<section class=\"page-head\"><div><p class=\"eyebrow\">"
+                       "Explorer error</p><h1>Not found</h1></div>"
+                       (badge "badge-bad" "404") "</section>"
+                       "<div class=\"notice notice-error\">"
+                       (explorer-text reason) "</div>")))
 
     ;;; The page shown when there is no node database to read.
     ;;;
@@ -1025,11 +1195,15 @@
       (: string? -> string?)
       (explorer-page "No chain data"
                      (join (list
-                             "<h1>No chain data</h1>"
-                             "<p>No node database at <code>"
+                             "<section class=\"page-head\"><div>"
+                             "<p class=\"eyebrow\">Explorer unavailable</p>"
+                             "<h1>No chain data</h1></div>"
+                             (badge "badge-bad" "offline") "</section>"
+                             "<div class=\"notice notice-error\">"
+                             "No node database at <code>"
                              (explorer-text path)
                              "</code>. Start a node there, or point the"
-                             " explorer at the directory that has one.</p>"))))
+                             " explorer at the directory that has one.</div>"))))
 
     ;; ============================================================
     ;; JSON

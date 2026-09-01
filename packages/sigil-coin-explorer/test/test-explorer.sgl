@@ -1431,6 +1431,53 @@
                               (explorer-respond sigilcoin-regtest-chain dir
                                                 "/block/1"))))))))
 
+(test-group "dashboard presentation"
+  (test "summary has a dense metric dashboard and block strip before its ledger"
+    (let ((page (body-of "/")))
+      (assert-true (has? page "class=\"dashboard-hero\""))
+      (assert-true
+        (has? page
+              "<section class=\"metric-grid\" aria-label=\"Chain metrics\">"))
+      (assert-true (has? page "<article class=\"metric-card\">"))
+      (assert-true (has? page "complexity / retarget"))
+      (assert-true (has? page "class=\"panel recent-blocks-panel\""))
+      (assert-true
+        (has? page
+              "class=\"block-strip\" role=\"list\" aria-label=\"Recent blocks\""))
+      (assert-true
+        (has? page "class=\"block-tile\" href=\"/block/31\""))
+      (assert-true (has? page "Detailed block ledger"))
+      (assert-true (has? page "<thead><tr>"))))
+
+  (test "block, difficulty, and address pages share panels, badges, and dense tables"
+    (let ((block (body-of (string-append "/block/"
+                                         (number->string %coop-height))))
+          (difficulty (body-of "/difficulty"))
+          (address (body-of (string-append "/address/" %miner-a))))
+      (assert-true
+        (has? block
+              "<section class=\"panel content-panel\"><h2>Puzzle</h2>"))
+      (assert-true
+        (has? block
+              "<section class=\"panel content-panel\"><h2>Producer score</h2>"))
+      (assert-true (has? block "class=\"badge badge-violet\""))
+      (assert-true (has? block "class=\"table-scroll\""))
+      (assert-true (has? difficulty "class=\"page-head\""))
+      (assert-true (has? difficulty "class=\"panel\""))
+      (assert-true (has? address "<section class=\"metric-grid\">"))
+      (assert-true (has? address "<h2>Blocks mined</h2>"))))
+
+  (test "empty and error states have explicit visual semantics"
+    (let ((missing (explorer-missing-page "bad <height>"))
+          (offline (explorer-no-database-page "/tmp/<node>")))
+      (assert-true (has? missing "class=\"notice notice-error\""))
+      (assert-true (has? missing "class=\"badge badge-bad\">404"))
+      (assert-true (has? missing "bad &lt;height&gt;"))
+      (assert-true (has? offline "class=\"notice notice-error\""))
+      (assert-true (has? offline "class=\"badge badge-bad\">offline"))
+      (assert-true (has? offline "/tmp/&lt;node&gt;"))))
+  )
+
 (test-group "branded shared shell"
   (test "HTML shell carries the apex wordmark and resilient asset fallbacks"
     (let ((page (explorer-page "Test" "<p>body</p>")))
@@ -1438,14 +1485,21 @@
       (assert-true (has? page "href=\"https://sigilcoin.lol\""))
       (assert-true
         (has? page
-              "https://sigilcoin.lol/assets/sigilcoin-symbol-v1.png"))
+              "https://sigilcoin.lol/assets/sigilcoin-symbol.png"))
+      (assert-true
+        (has? page
+              "https://sigilcoin.lol/assets/plus-jakarta.woff2"))
+      (assert-true (not (has? page "-v1")))
       (assert-true
         (has? page
               "<span class=\"wordmark-symbol\" aria-hidden=\"true\">S</span>"))
       (assert-true (has? page "SigilCoin <small>Explorer</small>"))
+      (assert-true (has? page "class=\"badge badge-live status-badge\""))
       (assert-true (has? page "<main class=\"shell\"><p>body</p></main>"))
+      (assert-true (has? page "position:sticky"))
       (assert-true (has? page "overflow-x:auto"))
-      (assert-true (has? page ":focus-visible"))))
+      (assert-true (has? page ":focus-visible"))
+      (assert-true (has? page "prefers-reduced-motion:reduce"))))
 
   (test "CSP permits only narrow apex image and font origins"
     (let ((response (explorer-http-response
