@@ -12,6 +12,7 @@
   (or (first-existing
         (list
           (string-append "../" repo "/packages/" name)
+          (string-append "/home/trev/Workspace/sigil/" repo "/packages/" name)
           (string-append ".sigil/deps/" name)
           (string-append "../../.sigil/deps/" name)
           (string-append "../../../.sigil/deps/" name)))

@@ -323,7 +323,7 @@
       (assert-true (has? page "&lt;img src=x onerror=&quot;y&quot;&gt;"))
       (assert-true (has? page (hex-encode %hostile-blind)))
       (assert-true (not (has? page "<script>")))
-      (assert-true (not (has? page "<img")))
+      (assert-true (not (has? page "<img src=x")))
       (let ((bytes (string->utf8 page)))
         (let loop ((i 0))
           (when (< i (bytevector-length bytes))

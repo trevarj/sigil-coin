@@ -1,0 +1,423 @@
+;;; (sigil coin site) — deterministic static landing site generator
+;;;
+;;; The page is SXML rendered directly by `sigil-sxml`. CSS, JavaScript and
+;;; diagrams are ordinary versioned files copied beside it; nothing is fetched
+;;; at runtime except when a visitor deliberately follows an external link.
+
+(define-library (sigil coin site)
+  (import (sigil fs)
+          (sigil path)
+          (sigil io)
+          (sigil process)
+          (sigil sxml))
+  (export site-document
+          site-render
+          site-asset-files
+          site-generate
+          site-usage
+          site-main
+          main)
+
+  (begin
+    (define %github "https://github.com/trevarj/sigil-coin")
+    (define %whitepaper
+      "https://github.com/trevarj/sigil-coin/blob/HEAD/docs/whitepaper.md")
+    (define %consensus
+      "https://github.com/trevarj/sigil-coin/blob/HEAD/docs/consensus.md")
+    (define %explorer "https://explorer.sigilcoin.lol")
+    (define %release "https://github.com/trevarj/sigil-coin/releases")
+
+    ;;; Versioned files copied into the generated `assets` directory.
+    ;;;
+    ;;; The selected S1A2 Tight Apex symbol ships as its preserved source and
+    ;;; optimized site exports. The hero raster remains pending, so its named
+    ;;; `sigilcoin-hero.webp` slot keeps the CSS fallback.
+    ;;;
+    ;;; ```scheme
+    ;;; (member "site.css" site-asset-files) ; => pair
+    ;;; ```
+    (define site-asset-files
+      '("site.css"
+        "site.js"
+        "plus-jakarta.woff2"
+        "plus-jakarta-OFL.txt"
+        "jetbrains-mono.woff2"
+        "jetbrains-mono-OFL.txt"
+        "S1A2-tight-apex-2048.png"
+        "sigilcoin-symbol.png"
+        "sigilcoin-favicon.png"
+        "sigilcoin-symbol-SOURCES.txt"
+        "mining.svg"
+        "score-fork.svg"
+        "ecosystem.svg"
+        "spark.svg"))
+
+    (define (attrs . values) (cons '@ values))
+
+    (define (link href label . class)
+      (list 'a
+            (attrs (list 'href href)
+                   (list 'class (if (null? class) "text-link" (car class))))
+            label))
+
+    (define (fact value label)
+      (list 'li (attrs '(class "fact reveal"))
+            (list 'strong value)
+            (list 'span label)))
+
+    (define (layer number title body)
+      (list 'article (attrs '(class "layer reveal"))
+            (list 'span (attrs '(class "layer-number")) number)
+            (list 'div (list 'h3 title) (list 'p body))))
+
+    (define (command-row code)
+      (list 'div (attrs '(class "command-row"))
+            (list 'code code)
+            (list 'button
+                  (attrs '(type "button")
+                         '(class "copy-button")
+                         (list 'data-copy code)
+                         (list 'aria-label
+                               (string-append "Copy command: " code)))
+                  "Copy")))
+
+    (define (step number title body commands)
+      (list 'article (attrs '(class "path-step reveal"))
+            (list 'span (attrs '(class "step-number")) number)
+            (list 'div (attrs '(class "step-body"))
+                  (list 'h3 title)
+                  (list 'p body)
+                  (if (pair? commands)
+                      (cons 'div
+                            (cons (attrs '(class "step-commands"))
+                                  (map command-row commands)))
+                      ""))))
+
+    ;;; Build the complete landing-page SXML tree.
+    ;;;
+    ;;; The ordering is the product flow: premise, mechanism, fundamentals,
+    ;;; consensus, ecosystem, then the numbered path to participate.
+    ;;;
+    ;;; ```scheme
+    ;;; (car (site-document)) ; => html
+    ;;; ```
+    (define (site-document)
+      (: -> list?)
+      (list
+        'html (attrs '(lang "en"))
+        (list 'head
+              (list 'meta (attrs '(charset "utf-8")))
+              (list 'meta (attrs '(name "viewport")
+                                 '(content "width=device-width,initial-scale=1")))
+              (list 'meta (attrs '(name "theme-color") '(content "#080910")))
+              (list 'meta
+                    (attrs '(name "description")
+                           '(content "SigilCoin is a blockchain mined by writing short programs that solve deterministic puzzles.")))
+              (list 'meta (attrs '(property "og:title")
+                                 '(content "SigilCoin — Mine programs, not hashes.")))
+              (list 'meta
+                    (attrs '(property "og:description")
+                           '(content "Each block publishes a puzzle. Shortest valid program wins.")))
+              (list 'meta (attrs '(property "og:url")
+                                 '(content "https://sigilcoin.lol/")))
+              (list 'meta (attrs '(property "og:type") '(content "website")))
+              (list 'title "SigilCoin — mine programs, not hashes")
+              (list 'link (attrs '(rel "canonical")
+                                 '(href "https://sigilcoin.lol/")))
+              (list 'link
+                    (attrs '(rel "icon")
+                           '(type "image/png")
+                           '(sizes "64x64")
+                           '(href "assets/sigilcoin-favicon.png")))
+              (list 'link (attrs '(rel "stylesheet")
+                                 '(href "assets/site.css")))
+              (list 'script (attrs '(src "assets/site.js") '(defer "defer")) ""))
+        (list
+          'body
+          (list 'a (attrs '(class "skip-link") '(href "#main")) "Skip to content")
+          (list
+            'header (attrs '(class "site-header"))
+            (list 'a (attrs '(class "brand") '(href "#top")
+                               '(aria-label "SigilCoin home"))
+                  (list 'img
+                        (attrs '(class "brand-symbol")
+                               '(src "assets/sigilcoin-symbol.png")
+                               '(width "32")
+                               '(height "32")
+                               '(alt "")))
+                  (list 'span "SigilCoin"))
+            (list 'nav (attrs '(aria-label "Primary navigation"))
+                  (link "#how" "How it works" "nav-link")
+                  (link "#fundamentals" "Fundamentals" "nav-link")
+                  (link "#consensus" "Consensus" "nav-link")
+                  (link "#ecosystem" "Ecosystem" "nav-link")
+                  (link "#start" "Start" "nav-link")))
+          (list
+            'main (attrs '(id "main"))
+            (list
+              'section (attrs '(id "top") '(class "hero section-shell"))
+              (list 'div (attrs '(class "hero-copy"))
+                    (list 'p (attrs '(class "eyebrow")) "Proof of work, rewritten")
+                    (list 'h1 "Mine programs, not hashes.")
+                    (list 'p (attrs '(class "hero-lead"))
+                          "Puzzle. Program. Block. Each block publishes a puzzle. Shortest valid program wins.")
+                    (list 'div (attrs '(class "hero-actions"))
+                          (link %explorer "Open Explorer" "button button-primary")
+                          (link %whitepaper "Read the whitepaper" "button button-secondary"))
+                    (list 'p (attrs '(class "microcopy"))
+                          "A for-fun chain built in Sigil, with consensus rules treated seriously."))
+              (list 'div (attrs '(class "hero-visual reveal")
+                                 '(data-parallax "0.06"))
+                    (list 'div
+                          (attrs '(class "hero-raster raster-slot")
+                                 '(role "img")
+                                 '(aria-label "Program fragments converging into a SigilCoin block")
+                                 '(data-raster-src "assets/sigilcoin-hero.webp"))
+                          (list 'span "(lambda(x) …)")
+                          (list 'strong "38 bytes")
+                          (list 'span "BLOCK ACCEPTED"))
+                    (list 'img (attrs '(src "assets/mining.svg")
+                                      '(alt "Mining flow: puzzle to candidate programs to shortest valid solution to block")))))
+            (list
+              'section (attrs '(id "how") '(class "section-shell section-block"))
+              (list 'div (attrs '(class "section-heading reveal"))
+                    (list 'p (attrs '(class "eyebrow")) "How it works")
+                    (list 'h2 "A daily program-synthesis race.")
+                    (list 'p "Every node derives the same input/output examples and syntactic constraint. Puzzles are intended for LLMs and program-synthesis scripts: automation is the mode of play, not an exploit."))
+              (list 'div (attrs '(class "flow-grid"))
+                    (list 'article (attrs '(class "flow-card reveal"))
+                          (list 'b "01") (list 'h3 "Derive")
+                          (list 'p "The parent hash, height and complexity deterministically produce the puzzle."))
+                    (list 'article (attrs '(class "flow-card reveal"))
+                          (list 'b "02") (list 'h3 "Synthesize")
+                          (list 'p "Models, scripts and humans search the frozen puzzle language for a short function."))
+                    (list 'article (attrs '(class "flow-card reveal"))
+                          (list 'b "03") (list 'h3 "Verify")
+                          (list 'p "Nodes rerun the program under fixed fuel, memory, string and depth caps."))
+                    (list 'article (attrs '(class "flow-card reveal"))
+                          (list 'b "04") (list 'h3 "Extend")
+                          (list 'p "The shortest valid producer program wins; verified co-op quality breaks later ties."))))
+            (list
+              'section (attrs '(id "fundamentals")
+                              '(class "section-shell section-block"))
+              (list 'div (attrs '(class "section-heading reveal"))
+                    (list 'p (attrs '(class "eyebrow")) "Fundamentals")
+                    (list 'h2 "Small programs. Fixed rules.")
+                    (list 'p "One compact chain. Every headline number comes from the protocol, not a market feed."))
+              (list 'ul (attrs '(class "facts")
+                               '(aria-label "SigilCoin fundamentals"))
+                    (fact "Program synthesis" "proof of work")
+                    (fact "~1 block/day" "mainnet target")
+                    (fact "512 bytes" "solution cap")
+                    (fact "Zero" "premine")
+                    (fact "143029.99991970 SGL" "eventual supply")
+                    (fact "8" "maximum co-op shares")))
+            (list
+              'section (attrs '(id "consensus") '(class "section-shell section-block consensus"))
+              (list 'div (attrs '(class "section-heading reveal"))
+                    (list 'p (attrs '(class "eyebrow")) "Layered consensus")
+                    (list 'h2 "Familiar chain. Different work.")
+                    (list 'p "The protocol keeps Bitcoin's durable transaction machinery, then replaces hash grinding with bounded, deterministic program evaluation."))
+              (list 'div (attrs '(class "consensus-layout"))
+                    (list 'div (attrs '(class "layers"))
+                          (layer "01" "Bitcoin foundation"
+                                 "80-byte headers, transactions, UTXOs, script, P2WPKH, headers-first sync and block relay.")
+                          (layer "02" "Frozen puzzle machine"
+                                 "A small Scheme subset with no I/O, mutation, floating point or host eval; one bounded machine checks every example.")
+                          (layer "03" "Composite score"
+                                 "Length dominates memory, then steps, then aggregate verified share quality. Lower score wins at equal height.")
+                          (layer "04" "Margin retarget"
+                                 "Every 16 blocks, complexity moves grammar width, examples and constraint tier without moving validator caps.")
+                          (layer "05" "Co-op commit–reveal"
+                                 "Up to 8 personalized signed shares can earn mandatory payouts; commitments and reveals span adjacent blocks."))
+                    (list 'figure (attrs '(class "diagram reveal"))
+                          (list 'img (attrs '(src "assets/score-fork.svg")
+                                            '(alt "Fork choice compares height first and lower composite score second")))
+                          (list 'figcaption "Height first. Lower score second. Equal scores keep the incumbent.")))
+              (list 'div (attrs '(class "exact-grid reveal"))
+                    (list 'details
+                          (list 'summary "Score word")
+                          (list 'p "At equal height, lower W wins: solution length, memory bucket, step bucket, then aggregate verified share quality."))
+                    (list 'details
+                          (list 'summary "Fork choice")
+                          (list 'p "Greater height wins. Equal height compares W. Equal W keeps the incumbent; block hash never breaks the tie."))
+                    (list 'details
+                          (list 'summary "Retarget")
+                          (list 'p "Every 16 blocks, the median relative margin moves grammar width, example count and constraint tier. Validator caps never move."))
+                    (list 'details
+                          (list 'summary "Bounded validation")
+                          (list 'p "Programs share one 200000-step machine, 400000 allocation cells, 65536 string bytes and fixed parse/evaluation depth caps."))))
+            (list
+              'section (attrs '(id "ecosystem") '(class "section-shell section-block"))
+              (list 'div (attrs '(class "section-heading reveal"))
+                    (list 'p (attrs '(class "eyebrow")) "Ecosystem")
+                    (list 'h2 "Inspect every layer.")
+                    (list 'p "The language, implementation, protocol documents and chain view stay open and directly linked."))
+              (list 'div (attrs '(class "ecosystem-grid"))
+                    (list 'figure (attrs '(class "diagram reveal"))
+                          (list 'img (attrs '(src "assets/ecosystem.svg")
+                                            '(alt "Sigil language, SigilCoin source, consensus, explorer and community ecosystem"))))
+                    (list 'div (attrs '(class "link-grid reveal"))
+                          (link "https://usesigil.org" "Sigil language ↗" "ecosystem-link")
+                          (link %github "Source code ↗" "ecosystem-link")
+                          (link %whitepaper "Whitepaper ↗" "ecosystem-link")
+                          (link %consensus "Consensus specification ↗" "ecosystem-link")
+                          (link %explorer "Block explorer ↗" "ecosystem-link")
+                          (link "https://web.libera.chat/#systemcrafters" "Libera #systemcrafters ↗" "ecosystem-link"))))
+            (list
+              'section (attrs '(id "start") '(class "section-shell section-block start"))
+              (list 'div (attrs '(class "section-heading reveal"))
+                    (list 'p (attrs '(class "eyebrow")) "Get started")
+                    (list 'h2 "Download. Wallet. Sync. Solve.")
+                    (list 'p "The CLI is the node, wallet and miner. Read each command before running it."))
+              (list 'div (attrs '(class "path"))
+                    (step "1" "Download"
+                          "Published builds appear on Releases. If none matches your system, build the source with the repository's pinned Nix environment."
+                          #f)
+                    (list 'div (attrs '(class "step-links reveal"))
+                          (link %release "Latest release" "button button-primary")
+                          (link %github "Source fallback" "button button-secondary"))
+                    (step "2" "Create and back up your wallet"
+                          "Run the address command once. Warning: back up .sigilcoin/wallet/wallet.key before receiving SGL. Losing that file loses access; never share it."
+                          '("sigilcoin address"))
+                    (step "3" "Sync the chain"
+                          "Download and validate headers and blocks from the configured public seed."
+                          '("sigilcoin sync"))
+                    (step "4" "Solve and submit"
+                          "Print today's examples and constraint, ask a model or synthesizer for a candidate, then submit the shortest source you found."
+                          '("sigilcoin puzzle"
+                            "sigilcoin mine --solution '(lambda(x)...)'"))
+                    (list 'article (attrs '(class "prompt-card reveal"))
+                          (list 'div (attrs '(class "prompt-heading"))
+                                (list 'h3 "Compact LLM prompt")
+                                (list 'button
+                                      (attrs '(type "button")
+                                             '(class "copy-button")
+                                             '(data-copy "Write the shortest valid SigilCoin puzzle-language one-argument function that reproduces every given input/output pair, obeys the stated syntactic constraint, and fits in 512 source bytes. Return source only.")
+                                             '(aria-label "Copy compact LLM prompt"))
+                                      "Copy"))
+                          (list 'pre (list 'code "Write the shortest valid SigilCoin puzzle-language one-argument function that reproduces every given input/output pair, obeys the stated syntactic constraint, and fits in 512 source bytes. Return source only.")))))
+            (list 'section (attrs '(class "final-cta section-shell reveal"))
+                  (list 'img (attrs '(src "assets/spark.svg") '(alt "")))
+                  (list 'h2 "The next block is a program waiting to be shortened.")
+                  (link %explorer "See the current puzzle" "button button-primary")))
+          (list
+            'footer (attrs '(class "site-footer section-shell"))
+            (list 'a (attrs '(class "brand") '(href "#top"))
+                  (list 'img
+                        (attrs '(class "brand-symbol")
+                               '(src "assets/sigilcoin-symbol.png")
+                               '(width "32")
+                               '(height "32")
+                               '(alt "")))
+                  (list 'span "SigilCoin"))
+            (list 'p "Built with Sigil. No analytics. No trackers.")
+            (list 'div (attrs '(class "footer-links"))
+                  (link %github "Source")
+                  (link %whitepaper "Whitepaper")
+                  (link %consensus "Consensus")
+                  (link %explorer "Explorer"))))))
+
+    ;;; Render the deterministic HTML document.
+    ;;;
+    ;;; ```scheme
+    ;;; (string-prefix? "<!DOCTYPE html>" (site-render)) ; => #t
+    ;;; ```
+    (define (site-render)
+      (: -> string?)
+      (string-append "<!DOCTYPE html>\n" (sxml->html (site-document)) "\n"))
+
+    (define (asset-source-directory)
+      (let loop ((candidates '("packages/sigil-coin-site/assets"
+                               "assets"
+                               "../assets")))
+        (cond ((null? candidates)
+               (error "site-generate: cannot find package assets"))
+              ((directory? (car candidates)) (car candidates))
+              (else (loop (cdr candidates))))))
+
+    (define (copy-assets source output)
+      (: string? string? -> void?)
+      (for-each
+        (lambda (name)
+          (copy-file (path-join source name)
+                     (path-join output name)))
+        site-asset-files))
+
+    ;;; Generate the complete static site under `output`.
+    ;;;
+    ;;; Existing generated files are replaced byte-for-byte, making repeated
+    ;;; runs deterministic. Unrelated files are left alone.
+    ;;;
+    ;;; ```scheme
+    ;;; (site-generate "build/site")
+    ;;; ```
+    (define (site-generate output)
+      (: string? -> void?)
+      (let ((assets-output (path-join output "assets")))
+        (ensure-directory assets-output)
+        (write-file-string (path-join output "index.html") (site-render))
+        (write-file-string
+          (path-join output "robots.txt")
+          "User-agent: *\nAllow: /\nSitemap: https://sigilcoin.lol/sitemap.xml\n")
+        (write-file-string
+          (path-join output "sitemap.xml")
+          (string-append
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+            "<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">"
+            "<url><loc>https://sigilcoin.lol/</loc></url></urlset>\n"))
+        (copy-assets (asset-source-directory) assets-output)))
+
+    (define (application-args raw)
+      (let loop ((xs raw))
+        (cond ((null? xs) raw)
+              ((string=? (car xs) "--") (cdr xs))
+              (else (loop (cdr xs))))))
+
+    (define (option args name fallback)
+      (let loop ((xs args))
+        (cond ((null? xs) fallback)
+              ((and (string=? (car xs) name) (pair? (cdr xs))) (car (cdr xs)))
+              (else (loop (cdr xs))))))
+
+    (define (flag? args name)
+      (let loop ((xs args))
+        (cond ((null? xs) #f)
+              ((string=? (car xs) name) #t)
+              (else (loop (cdr xs))))))
+
+    ;;; Command help for the static generator.
+    ;;;
+    ;;; ```scheme
+    ;;; (display (site-usage))
+    ;;; ```
+    (define (site-usage)
+      (: -> string?)
+      (string-append
+        "sigilcoin-site — generate the static SigilCoin website\n\n"
+        "usage: sigilcoin-site [--output DIR]\n\n"
+        "  --output DIR  output directory (default: build/site)\n"
+        "  -h, --help    print this help\n"))
+
+    ;;; Parse command arguments and generate the static site.
+    ;;;
+    ;;; ```sh
+    ;;; sigilcoin-site --output build/site
+    ;;; ```
+    (define (site-main)
+      (: -> void?)
+      (let ((args (application-args (cdr (command-line)))))
+        (if (or (flag? args "--help") (flag? args "-h"))
+            (display (site-usage))
+            (let ((output (option args "--output" "build/site")))
+              (site-generate output)
+              (display (string-append "site: wrote " output "\n"))))))
+
+    ;;; Bundle entry point.
+    ;;;
+    ;;; ```sh
+    ;;; sigilcoin-site
+    ;;; ```
+    (define (main)
+      (: -> void?)
+      (site-main))))

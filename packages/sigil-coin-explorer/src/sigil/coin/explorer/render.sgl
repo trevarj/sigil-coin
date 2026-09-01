@@ -358,17 +358,22 @@
 
     (define %style
       (string-append
-        "body{font-family:monospace;margin:2rem auto;max-width:60rem;"
-        "color:#1b1b1b;background:#fbfbf8}"
-        "h1,h2{font-weight:normal}"
-        "table{border-collapse:collapse;width:100%}"
-        "th,td{border-bottom:1px solid #ddd;padding:.35rem .5rem;"
-        "text-align:left;vertical-align:top}"
-        "th{background:#f0efe8}"
-        "pre{white-space:pre-wrap;word-break:break-all;background:#f0efe8;"
-        "padding:.5rem;margin:0}"
-        "nav a{margin-right:1rem}"
-        ".q{color:#444}"))
+        "@font-face{font-family:Plus Jakarta Sans;src:url(https://sigilcoin.lol/assets/plus-jakarta-v1.woff2) format('woff2');font-display:swap}"
+        "@font-face{font-family:JetBrains Mono;src:url(https://sigilcoin.lol/assets/jetbrains-mono-v1.woff2) format('woff2');font-display:swap}"
+        ":root{color-scheme:dark;--bg:#080910;--panel:#11131e;--line:#2a2e43;--text:#f5f3ff;--muted:#aaa9bd;--violet:#a98cff;--cyan:#5ee7f1}"
+        "*{box-sizing:border-box}html{background:var(--bg)}"
+        "body{margin:0;color:var(--text);background:radial-gradient(circle at 80% 0,rgba(169,140,255,.12),transparent 28rem),var(--bg);font-family:Plus Jakarta Sans,Inter,system-ui,sans-serif;line-height:1.55}"
+        ".shell{width:min(72rem,calc(100% - 2rem));margin:auto;padding:2rem 0 5rem}"
+        ".topbar{display:flex;align-items:center;justify-content:space-between;gap:1.5rem;padding:1rem max(1rem,calc((100vw - 72rem)/2));border-bottom:1px solid var(--line);background:rgba(8,9,16,.88)}"
+        ".wordmark{display:flex;align-items:center;gap:.65rem;color:var(--text);font-weight:800;text-decoration:none}.wordmark-symbol{display:grid;width:2rem;height:2rem;place-items:center;border:1px solid rgba(240,192,64,.65);border-radius:35% 65% 62% 38%;background-image:url(https://sigilcoin.lol/assets/sigilcoin-symbol-v1.png),linear-gradient(135deg,rgba(240,192,64,.3),rgba(169,140,255,.14));background-position:center;background-size:cover;color:#f0c040;font-family:JetBrains Mono,monospace;font-size:.75rem}.wordmark small{color:var(--muted);font-weight:500}"
+        "nav{display:flex;flex-wrap:wrap;gap:1rem}nav a{color:var(--muted);text-decoration:none}nav a:hover{color:var(--text)}"
+        "a{color:var(--cyan);text-underline-offset:.2em}h1,h2{letter-spacing:-.035em}h1{font-size:clamp(2rem,5vw,3.6rem);line-height:1.05}h2{margin-top:2.4rem}"
+        "table{display:block;width:100%;overflow-x:auto;border-collapse:collapse;border:1px solid var(--line);border-radius:.6rem;background:rgba(17,19,30,.8)}"
+        "th,td{min-width:7rem;border-bottom:1px solid var(--line);padding:.58rem .7rem;text-align:left;vertical-align:top}"
+        "th{color:#d7d3e6;background:#171a28;font-size:.82rem}"
+        "pre,code{font-family:JetBrains Mono,ui-monospace,SFMono-Regular,Consolas,monospace}pre{white-space:pre-wrap;word-break:break-all;background:#0c0e17;border:1px solid var(--line);border-radius:.4rem;padding:.75rem;margin:0}"
+        ".q{color:var(--muted)}:focus-visible{outline:3px solid var(--cyan);outline-offset:3px}"
+        "@media(max-width:680px){.topbar{align-items:flex-start;flex-direction:column}.shell{width:min(100% - 1rem,72rem)}nav{gap:.75rem}th,td{padding:.45rem;min-width:6rem}}"))
 
     (define (join parts)
       (apply string-append parts))
@@ -398,11 +403,15 @@
               "<title>" (explorer-escape title) "</title>"
               "<style>" %style "</style>"
               "</head><body>"
-              "<nav><a href=\"/\">summary</a>"
+              "<header class=\"topbar\">"
+              "<a class=\"wordmark\" href=\"https://sigilcoin.lol\">"
+              "<span class=\"wordmark-symbol\" aria-hidden=\"true\">S</span>"
+              "<span>SigilCoin <small>Explorer</small></span></a>"
+              "<nav aria-label=\"Explorer navigation\"><a href=\"/\">summary</a>"
               "<a href=\"/blocks\">blocks</a>"
               "<a href=\"/difficulty\">difficulty</a>"
-              "<a href=\"/api/summary\">api</a></nav>"
-              body
+              "<a href=\"/api/summary\">api</a></nav></header>"
+              "<main class=\"shell\">" body "</main>"
               "</body></html>\n")))
 
     (define (block-link b)
