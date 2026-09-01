@@ -119,8 +119,10 @@ current terminal:
 ```sh
 cd /path/to/workspace/sigil-coin
 MODE=testnet \
-PEER=REMOTE_FIXED_IP:19446 \
-P2P_BIND=LOCAL_PRIVATE_IP \
+PEER=REMOTE_FIXED_IPV4:19446 \
+P2P_BIND=LOCAL_PRIVATE_IPV4 \
+REMOTE_PEER_IP=REMOTE_FIXED_IPV4 \
+TESTNET_EXPOSURE_ACK=peer-ip-allowlisted \
 bash deploy/scripts/run-local.sh
 ```
 
