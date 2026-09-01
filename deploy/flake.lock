@@ -47,12 +47,12 @@
         "rev": "7e5a6c21cf46a326cfb937c23270a408bb10278f",
         "revCount": 3361,
         "type": "git",
-        "url": "file:///home/trev/Workspace/sigil/sigil"
+        "url": "file:///workspace/sigil"
       },
       "original": {
         "rev": "7e5a6c21cf46a326cfb937c23270a408bb10278f",
         "type": "git",
-        "url": "file:///home/trev/Workspace/sigil/sigil"
+        "url": "file:///workspace/sigil"
       }
     },
     "sigil-ansi": {
@@ -82,12 +82,12 @@
         "rev": "7547072e87636423ab57f0dbeb538c2c8c6b440d",
         "revCount": 109,
         "type": "git",
-        "url": "file:///home/trev/Workspace/sigil/sigil-bitcoin"
+        "url": "file:///workspace/sigil-bitcoin"
       },
       "original": {
         "rev": "7547072e87636423ab57f0dbeb538c2c8c6b440d",
         "type": "git",
-        "url": "file:///home/trev/Workspace/sigil/sigil-bitcoin"
+        "url": "file:///workspace/sigil-bitcoin"
       }
     },
     "sigil-crypto": {

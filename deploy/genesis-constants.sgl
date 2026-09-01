@@ -10,8 +10,8 @@
 ;;; Run from the repository root:
 ;;;
 ;;;   cache=$(mktemp -d); trap 'rm -rf "$cache"' EXIT
-;;;   nix develop /home/trev/Workspace/sigil -c env XDG_CACHE_HOME="$cache" \
-;;;     /home/trev/Workspace/sigil/sigil/build/dev/bin/sigil \
+;;;   nix develop /path/to/workspace -c env XDG_CACHE_HOME="$cache" \
+;;;     /path/to/workspace/sigil/build/dev/bin/sigil \
 ;;;     deploy/genesis-constants.sgl --redirects ./dev-redirects.sgl
 ;;;
 ;;; The empty cache is deliberate: launch-critical constants must compile from

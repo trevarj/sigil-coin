@@ -30,13 +30,18 @@ private stack.
 
 No apt, brew, global npm, or global pip install is part of either workflow.
 
-## RackNerd private testnet
+Direct use of `deploy/flake.nix` assumes revision-pinned `sigil` and
+`sigil-bitcoin` clones at `/workspace`. `run-local.sh` and the Docker build do
+not depend on those defaults: they override both inputs from the detected
+sibling layout shown above.
 
-The examples use the SSH alias `racknerd-chi`. On first use, create a remote
-workspace owned by the login user:
+## Remote Docker host private testnet
+
+The examples use the neutral SSH host or alias `your-remote-host`. On first
+use, create a remote workspace owned by the login user:
 
 ```sh
-ssh racknerd-chi 'sudo install -d -o "$USER" -g "$(id -gn)" -m 0750 /srv/sigilcoin'
+ssh your-remote-host 'sudo install -d -o "$USER" -g "$(id -gn)" -m 0750 /srv/sigilcoin'
 cd /path/to/workspace/sigil-coin
 cp deploy/docker/.env.example deploy/docker/.env
 $EDITOR deploy/docker/.env
@@ -46,10 +51,10 @@ Set `PEER` to the other approved machine's fixed `IP:19446`. Set the numeric
 container identity from the remote host rather than assuming 1000:
 
 ```sh
-export SIGIL_UID=$(ssh racknerd-chi id -u)
-export SIGIL_GID=$(ssh racknerd-chi id -g)
+export SIGIL_UID=$(ssh your-remote-host id -u)
+export SIGIL_GID=$(ssh your-remote-host id -g)
 export EXPLORER_UID=1001 # choose a numeric UID different from SIGIL_UID
-export REMOTE_HOST=racknerd-chi
+export REMOTE_HOST=your-remote-host
 export REMOTE_DIR=/srv/sigilcoin
 export MODE=testnet
 export ENV_FILE=$PWD/deploy/docker/.env
@@ -92,14 +97,14 @@ The testnet Compose mapping hardcodes the explorer host bind to
 add TLS during the private test. Reach it through SSH:
 
 ```sh
-ssh -N -L 18080:127.0.0.1:8080 racknerd-chi
+ssh -N -L 18080:127.0.0.1:8080 your-remote-host
 # Open http://127.0.0.1:18080/ locally.
 ```
 
 ### Status and logs
 
 ```sh
-ssh racknerd-chi
+ssh your-remote-host
 cd /srv/sigilcoin/sigil-coin/deploy/docker
 docker compose --env-file .env -f compose.testnet.yml ps
 docker compose --env-file .env -f compose.testnet.yml logs -f --tail=100 listener sync explorer
@@ -207,10 +212,10 @@ and offline; never commit or rsync them back into a source checkout.
 Before an upgrade, stop database users and take a backup as above. Confirm the
 older binary is schema-compatible with the current database; an image rollback
 does not migrate or restore state. Then preserve the currently selected image
-on RackNerd:
+on the remote Docker host:
 
 ```sh
-ssh racknerd-chi
+ssh your-remote-host
 cd /srv/sigilcoin/sigil-coin/deploy/docker
 # `config --images` resolves SIGIL_IMAGE from the shell or .env.
 current_image=$(docker compose --env-file .env -f compose.testnet.yml config --images | sort -u)
@@ -225,7 +230,7 @@ status and explorer summary. State is not deleted by rsync or Compose.
 To roll back the image without rebuilding or changing state:
 
 ```sh
-ssh racknerd-chi
+ssh your-remote-host
 cd /srv/sigilcoin/sigil-coin/deploy/docker
 rollback_image=${SIGIL_ROLLBACK_IMAGE:-sigilcoin-local:testnet-rollback}
 SIGIL_IMAGE="$rollback_image" docker compose --env-file .env \
@@ -245,7 +250,7 @@ refuse mainnet unless the operator explicitly sets the exact value:
 
 ```sh
 ALLOW_MAINNET=yes MODE=mainnet bash deploy/scripts/run-local.sh
-ALLOW_MAINNET=yes MODE=mainnet REMOTE_HOST=racknerd-chi \
+ALLOW_MAINNET=yes MODE=mainnet REMOTE_HOST=your-remote-host \
   REMOTE_DIR=/srv/sigilcoin bash deploy/scripts/deploy-remote.sh
 ```
 

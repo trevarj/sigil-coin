@@ -19,9 +19,10 @@
   #
   # The two sibling checkouts ARE inputs, because they are outside the tree
   # entirely and a relative `path:` input would resolve against the store
-  # copy of this flake rather than the working tree. They default to the
-  # operator's local clones, pinned by revision, because sigil-coin's
-  # dependency set is currently ahead of what is pushed: at the time of
+  # copy of this flake rather than the working tree. Direct flake use defaults
+  # to revision-pinned clones below /workspace. The local and Docker helpers
+  # override these inputs from their detected sibling layout. The dependency
+  # set is currently ahead of what is pushed: at the time of
   # writing, local sigil-bitcoin HEAD is 7547072 and includes both the durable
   # parent-block validation seam and strict per-chain P2P magic enforcement.
   # Pinning by rev also means an uncommitted change in a sibling checkout can never leak into a
@@ -31,23 +32,22 @@
   # Point them anywhere with --override-input:
   #
   #   nix build /path/to/sigil-coin?dir=deploy#sigilcoin \
-  #     --override-input sigil-bitcoin github:trevarj/sigil-bitcoin/<rev>
+  #     --override-input sigil-bitcoin "github:<forge-owner>/sigil-bitcoin/<rev>"
   #
   # and bump the pins the same way a lock file is bumped:
   #
   #   nix flake update sigil-bitcoin \
   #     --override-input sigil-bitcoin git+file:///path/to/sigil-bitcoin?rev=<new>
   inputs = {
-    # The same nixpkgs revision the workspace devshell at
-    # /home/trev/Workspace/sigil/flake.nix locks.
+    # The same nixpkgs revision the workspace development shell locks.
     nixpkgs.url = "github:NixOS/nixpkgs/e72e4f299401a3689d4b3d5fc6496b11db7064eb";
 
     sigil = {
-      url = "git+file:///home/trev/Workspace/sigil/sigil?rev=7e5a6c21cf46a326cfb937c23270a408bb10278f";
+      url = "git+file:///workspace/sigil?rev=7e5a6c21cf46a326cfb937c23270a408bb10278f";
       flake = false;
     };
     sigil-bitcoin = {
-      url = "git+file:///home/trev/Workspace/sigil/sigil-bitcoin?rev=7547072e87636423ab57f0dbeb538c2c8c6b440d";
+      url = "git+file:///workspace/sigil-bitcoin?rev=7547072e87636423ab57f0dbeb538c2c8c6b440d";
       flake = false;
     };
 

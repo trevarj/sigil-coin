@@ -31,8 +31,7 @@ The launch checklist is `../LAUNCH.md`.
 ## Wiring it into a host
 
 Nothing outside `deploy/` was changed, and the workspace flake at
-`/home/trev/Workspace/sigil/flake.nix` is untouched. The operator has to do
-two things.
+`/path/to/workspace/flake.nix` is untouched. The operator has to do two things.
 
 **1. Add the flake as an input** to the host configuration. The `?dir=deploy`
 is not optional: `flake.nix` lives in `deploy/` but its source is the
@@ -41,19 +40,21 @@ sigil-coin repository above it, which it reads through
 error that says so rather than building the wrong thing.
 
 ```nix
-inputs.sigilcoin.url = "git+file:///home/trev/Workspace/sigil/sigil-coin?dir=deploy";
+inputs.sigilcoin.url = "git+file:///workspace/sigil-coin?dir=deploy";
 ```
 
 **This is intentionally a local-testnet flake until the repositories are
 pushed.** The current `sigil-bitcoin` pin includes unpublished commits, so a
-`github:trevarj/sigil-coin?dir=deploy` input cannot reproduce this build yet.
-After the manual testnet and explicit push approval, replace all three local
-`git+file:` source inputs with public forge URLs at the pushed revisions and
-re-run every flake check before calling the deployment portable.
+`github:<forge-owner>/sigil-coin?dir=deploy` input cannot reproduce this build
+yet. After the manual testnet and explicit push approval, replace all three
+local `git+file:` source inputs with public forge URLs at the pushed revisions
+and re-run every flake check before calling the deployment portable.
 
-The two sibling checkouts are flake inputs pinned by revision
-(`git+file:///…/sigil` and `git+file:///…/sigil-bitcoin`), as are the
-fourteen `from-git` Sigil libraries the two dependency graphs need. The
+Direct flake use assumes the two sibling checkouts exist below `/workspace` as
+revision-pinned inputs (`git+file:///workspace/sigil` and
+`git+file:///workspace/sigil-bitcoin`). The local and Docker helpers override
+those defaults from their detected sibling layout. The fourteen `from-git`
+Sigil libraries needed by the two dependency graphs are also pinned. The
 `sigil-bitcoin` pin is `424a4a83beb9e81ab7e292f4d51c05ce16306450`, which
 provides the durable-parent seven-argument block connector and is currently
 available only in the local checkout. An older pin can
@@ -70,7 +71,7 @@ as the CLI, so one derivation ships `bin/sigilcoin` and
 The build is real, not evaluated. Verified here:
 
 ```sh
-cd /home/trev/Workspace/sigil/sigil-coin/deploy
+cd /path/to/workspace/sigil-coin/deploy
 nix build .#sigilcoin --print-build-logs
 ```
 
