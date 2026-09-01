@@ -1,0 +1,115 @@
+name: sigilcoin-testnet
+
+x-sigilcoin-service: &sigilcoin-service
+  image: ${SIGIL_IMAGE:-sigilcoin-local:testnet}
+  build:
+    context: ../..
+    dockerfile: deploy/docker/Dockerfile
+    additional_contexts:
+      sigil: ../../../sigil
+      sigil-bitcoin: ../../../sigil-bitcoin
+  user: "${SIGIL_UID:-1000}:${SIGIL_GID:-1000}"
+  read_only: true
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,nodev,size=64m
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  init: true
+  restart: unless-stopped
+  pids_limit: 128
+  mem_limit: 768m
+  cpus: "1.0"
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+  environment: &testnet-environment
+    CHAIN: testnet
+    DATA_DIR: /var/lib/sigilcoin
+    HOME: /tmp
+  healthcheck:
+    test: ["CMD", "/usr/local/bin/sigilcoin-entrypoint", "health-node"]
+    interval: 30s
+    timeout: 10s
+    retries: 3
+    start_period: 15s
+
+services:
+  listener:
+    <<: *sigilcoin-service
+    command: ["listener"]
+    environment:
+      <<: *testnet-environment
+      LISTEN_BIND: 0.0.0.0
+      HOST_P2P_BIND: ${P2P_BIND:-127.0.0.1}
+      TESTNET_EXPOSURE_ACK: ${TESTNET_EXPOSURE_ACK:-}
+      REMOTE_PEER_IP: ${REMOTE_PEER_IP:-}
+      PEER: ${PEER:-}
+      P2P_PORT: "19446"
+      ACCEPT_TIMEOUT_MS: ${ACCEPT_TIMEOUT_MS:-60000}
+      READ_TIMEOUT_MS: ${READ_TIMEOUT_MS:-10000}
+      MAX_STEPS: ${MAX_STEPS:-4096}
+      MAX_TX: ${MAX_TX:-256}
+    ports:
+      - "${P2P_BIND:-127.0.0.1}:${P2P_PORT:-19446}:19446/tcp"
+    volumes:
+      - type: bind
+        source: ${SIGIL_TESTNET_STATE_DIR:-./state/testnet}
+        target: /var/lib/sigilcoin
+        bind:
+          create_host_path: false
+
+  sync:
+    <<: *sigilcoin-service
+    command: ["sync-loop"]
+    environment:
+      <<: *testnet-environment
+      PEER: ${PEER:-}
+      SYNC_INTERVAL: ${SYNC_INTERVAL:-60}
+      RESOLVE_TIMEOUT_MS: ${RESOLVE_TIMEOUT_MS:-1000}
+      CONNECT_TIMEOUT_MS: ${CONNECT_TIMEOUT_MS:-3000}
+      READ_TIMEOUT_MS: ${READ_TIMEOUT_MS:-10000}
+      MAX_STEPS: ${MAX_STEPS:-4096}
+      MAX_BLOCKS: ${MAX_BLOCKS:-256}
+    depends_on:
+      listener:
+        condition: service_healthy
+    volumes:
+      - type: bind
+        source: ${SIGIL_TESTNET_STATE_DIR:-./state/testnet}
+        target: /var/lib/sigilcoin
+        bind:
+          create_host_path: false
+
+  explorer:
+    <<: *sigilcoin-service
+    user: "${EXPLORER_UID:-1001}:${SIGIL_GID:-1000}"
+    command: ["explorer"]
+    pids_limit: 64
+    mem_limit: 256m
+    cpus: "0.5"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/sigilcoin-entrypoint", "health-explorer"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    environment:
+      <<: *testnet-environment
+      EXPLORER_HOST: 0.0.0.0
+      EXPLORER_PORT: "8080"
+    ports:
+      - "127.0.0.1:${EXPLORER_PORT:-8080}:8080/tcp"
+    depends_on:
+      sync:
+        condition: service_healthy
+    volumes:
+      - type: bind
+        source: ${SIGIL_TESTNET_STATE_DIR:-./state/testnet}
+        target: /var/lib/sigilcoin
+        read_only: true
+        bind:
+          create_host_path: false
