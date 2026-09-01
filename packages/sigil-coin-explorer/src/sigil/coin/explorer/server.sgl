@@ -1,7 +1,7 @@
 ;;; (sigil coin explorer server) — routing and the HTTP/1.1 front door
 ;;;
-;;; A read-only site with six routes and no client-side code needs one thing
-;;; from a web server: parse a request line, hand back a response, close.
+;;; A read-only site with a compiled first-party dashboard asset needs one
+;;; thing from a web server: parse a request line, hand back a response, close.
 ;;; That is what this is. It is built on `(sigil socket)`, which ships in
 ;;; `sigil-stdlib`, rather than on `sigil-http`: the published `sigil-http`
 ;;; is part of the 0.9 `sigil` workspace and pulls that workspace's
@@ -25,6 +25,7 @@
 ;;;   GET /api/difficulty      the difficulty history, as JSON
 ;;;   GET /api/block/<h|id>    one block, as JSON
 ;;;   GET /api/address/<a>     one address, as JSON
+;;;   GET /assets/explorer.js  compiled live-dashboard client
 ;;;
 ;;; ## One handle per request
 ;;;
@@ -52,6 +53,7 @@
           (sigil process)
           (sigil bitcoin node)
           (sigil coin node)
+          (sigil coin explorer client)
           (sigil coin explorer store)
           (sigil coin explorer render))
   (export
@@ -117,6 +119,7 @@
 
     (define %html "text/html; charset=utf-8")
     (define %json "application/json; charset=utf-8")
+    (define %javascript "application/javascript; charset=utf-8")
 
     ;;; Status code of a handler result.
     (define (explorer-response-status response)
@@ -139,6 +142,10 @@
     ;; ============================================================
     ;; Routing
     ;; ============================================================
+
+    ;; The compiled asset is recognized before any database is opened.
+    (define (client-asset-path? path)
+      (equal? (explorer-path-segments path) '("assets" "explorer.js")))
 
     ;; A block named either by height or by its 64-character display id.
     (define (lookup-block store token)
@@ -170,6 +177,9 @@
       (: explorer-store? string? -> list?)
       (let ((segments (explorer-path-segments path)))
         (cond
+          ;; Compiled client asset
+          ((client-asset-path? path)
+           (respond 200 %javascript (explorer-client-javascript)))
           ;; Summary
           ((null? segments)
            (respond 200 %html
@@ -281,15 +291,19 @@
     ;;; ```
     (define (explorer-handle store path db-path)
       (: any? string? string? -> list?)
-      (if (explorer-store? store)
-          (explorer-route store path)
-          ;; 503, not 404: the page exists, the data source does not, and a
-          ;; bot polling the API should back off rather than give up.
-          (respond 503
-                   (if (json-path? path) %json %html)
-                   (if (json-path? path)
-                       (explorer-error-json "no-database" db-path)
-                       (explorer-no-database-page db-path)))))
+      (cond
+        ((client-asset-path? path)
+         (respond 200 %javascript (explorer-client-javascript)))
+        ((explorer-store? store)
+         (explorer-route store path))
+        (else
+         ;; 503, not 404: the page exists, the data source does not, and a
+         ;; bot polling the API should back off rather than give up.
+         (respond 503
+                  (if (json-path? path) %json %html)
+                  (if (json-path? path)
+                      (explorer-error-json "no-database" db-path)
+                      (explorer-no-database-page db-path))))))
 
     ;;; Open the database, answer one request, close.
     ;;;
@@ -298,23 +312,25 @@
     ;;; ```
     (define (explorer-respond chain data-dir path)
       (: chain-config? string? string? -> list?)
-      (let ((store (explorer-open chain data-dir)))
-        (if (not store)
-            (explorer-handle #f path (explorer-db-path chain data-dir))
-            (let ((response
-                    (guard (e (#t (respond
-                                    500
-                                    (if (json-path? path) %json %html)
-                                    (if (json-path? path)
-                                        (explorer-error-json
-                                          "internal-error"
-                                          "the explorer could not read that")
-                                        (explorer-missing-page
-                                          "The explorer could not read that.")))))
-                      (explorer-handle store path
-                                       (explorer-db-path chain data-dir)))))
-              (explorer-close store)
-              response))))
+      (if (client-asset-path? path)
+          (explorer-handle #f path (explorer-db-path chain data-dir))
+          (let ((store (explorer-open chain data-dir)))
+            (if (not store)
+                (explorer-handle #f path (explorer-db-path chain data-dir))
+                (let ((response
+                        (guard (e (#t (respond
+                                        500
+                                        (if (json-path? path) %json %html)
+                                        (if (json-path? path)
+                                            (explorer-error-json
+                                              "internal-error"
+                                              "the explorer could not read that")
+                                            (explorer-missing-page
+                                              "The explorer could not read that.")))))
+                          (explorer-handle store path
+                                           (explorer-db-path chain data-dir)))))
+                  (explorer-close store)
+                  response)))))
 
     ;; ============================================================
     ;; HTTP/1.1
@@ -355,10 +371,9 @@
           ;; live view; nothing here may be cached as if it were final.
           "Cache-Control: no-store\r\n"
           "X-Content-Type-Options: nosniff\r\n"
-          ;; The shell has no scripts. Only the apex site's versioned symbol
-          ;; and optional webfonts are allowed; text and system fallbacks keep
-          ;; the explorer usable when either asset is unavailable.
-          "Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; img-src https://sigilcoin.lol; font-src https://sigilcoin.lol; base-uri 'none'; frame-ancestors 'none'\r\n"
+          ;; Scripts and polling stay same-origin. Only the apex site's symbol
+          ;; and optional webfonts are otherwise allowed.
+          "Content-Security-Policy: default-src 'none'; script-src 'self'; connect-src 'self'; style-src 'unsafe-inline'; img-src https://sigilcoin.lol; font-src https://sigilcoin.lol; base-uri 'none'; frame-ancestors 'none'\r\n"
           "Connection: close\r\n"
           "\r\n"
           (if body text ""))))

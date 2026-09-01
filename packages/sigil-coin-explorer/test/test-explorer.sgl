@@ -395,7 +395,7 @@
   (coin-puzzle-for (parent-hash-at height) height (complexity-at height)))
 
 (define %all-paths
-  (list "/" "/blocks" "/difficulty"
+  (list "/" "/blocks" "/difficulty" "/assets/explorer.js"
         (string-append "/block/" (number->string %coop-height))
         "/block/1" "/block/31" "/block/nope"
         (string-append "/address/" %miner-a)
@@ -580,6 +580,18 @@
       (assert-equal 503 (explorer-response-status
                           (explorer-respond sigilcoin-regtest-chain dir
                                             "/difficulty")))
+      (assert-true (not (file-exists?
+                          (explorer-db-path sigilcoin-regtest-chain dir))))))
+
+  (test "the compiled client asset works without a database"
+    (let* ((dir (fresh-dir))
+           (response (explorer-respond sigilcoin-regtest-chain dir
+                                       "/assets/explorer.js")))
+      (assert-equal 200 (explorer-response-status response))
+      (assert-equal "application/javascript; charset=utf-8"
+                    (explorer-response-content-type response))
+      (assert-equal (explorer-client-javascript)
+                    (explorer-response-body response))
       (assert-true (not (file-exists?
                           (explorer-db-path sigilcoin-regtest-chain dir)))))))
 
@@ -1056,7 +1068,7 @@
                                         (number->string %coop-height)))))
       (assert-true (has? page "&lt;script&gt;alert(1)&lt;/script&gt;"))
       (assert-true (not (has? page "<script>")))
-      (assert-true (not (has? page "</script>")))
+      (assert-true (not (has? page "<script>alert")))
       (assert-true (not (has? page "<img src=x")))
       (assert-true (has? page "&lt;img src=x onerror=&quot;y&quot;&gt;"))
       (assert-true (has? page "&#39;sq&#39;"))))
@@ -1081,13 +1093,17 @@
             (loop (+ i 1)))))
       (assert-true #t)))
 
-  (test "no HTML route anywhere leaks an unescaped script tag"
+  (test "no HTML route anywhere leaks an inline or attacker script tag"
     (for-each
       (lambda (route)
         (let ((response (explorer-respond sigilcoin-regtest-chain %dir route)))
           (when (has? (explorer-response-content-type response) "text/html")
-            (assert-true (not (has? (explorer-response-body response)
-                                    "<script"))))))
+            (let ((page (explorer-response-body response)))
+              (assert-true (not (has? page "<script>")))
+              (assert-true (not (has? page "<script>alert")))
+              (assert-true
+                (has? page
+                      "<script src=\"/assets/explorer.js\" defer></script>"))))))
       %all-paths)
     (assert-true #t))
 
@@ -1434,6 +1450,15 @@
 (test-group "dashboard presentation"
   (test "summary has a dense metric dashboard and block strip before its ledger"
     (let ((page (body-of "/")))
+      (assert-true (has? page "data-explorer-live"))
+      (assert-true (has? page "data-tip-height=\"31\""))
+      (assert-true (has? page "id=\"live-connection\""))
+      (assert-true (has? page "id=\"live-waiting\""))
+      (assert-true (has? page "id=\"live-tip-height\""))
+      (assert-true (has? page "id=\"live-complexity\""))
+      (assert-true (has? page "id=\"live-puzzle-seed\""))
+      (assert-true (has? page "id=\"live-block-strip\""))
+      (assert-true (has? page "data-height=\"31\""))
       (assert-true (has? page "class=\"dashboard-hero\""))
       (assert-true
         (has? page
@@ -1499,16 +1524,36 @@
       (assert-true (has? page "position:sticky"))
       (assert-true (has? page "overflow-x:auto"))
       (assert-true (has? page ":focus-visible"))
-      (assert-true (has? page "prefers-reduced-motion:reduce"))))
+      (assert-true (has? page "prefers-reduced-motion:reduce"))
+      (assert-true
+        (has? page
+              "<script src=\"/assets/explorer.js\" defer></script>"))))
 
-  (test "CSP permits only narrow apex image and font origins"
+  (test "compiled client is polling, visibility-aware, and DOM-only"
+    (let ((javascript (explorer-client-javascript)))
+      (assert-true (has? javascript "fetch('/api/summary'"))
+      (assert-true (has? javascript "cache: 'no-store'"))
+      (assert-true (has? javascript "visibilitychange"))
+      (assert-true (has? javascript "document.hidden"))
+      (assert-true (has? javascript "nextHeight !== tipHeight || nextId !== tipId"))
+      (assert-true (not (has? javascript "setTimeout(() => window.location.reload")))
+      (assert-true (has? javascript "document.createElement"))
+      (assert-true (has? javascript "textContent"))
+      (assert-true (has? javascript "window.location.reload()"))
+      (assert-true (not (has? javascript "innerHTML")))
+      (assert-true (not (has? javascript "insertAdjacentHTML")))
+      (assert-true (not (has? javascript "eval(")))
+      (assert-true (not (has? javascript "new Function")))))
+
+  (test "CSP allows only the same-origin client and polling connection"
     (let ((response (explorer-http-response
                       (list 200 "text/html; charset=utf-8"
                             (explorer-page "Test" "ok")))))
       (assert-true
         (has? response
-              "Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; img-src https://sigilcoin.lol; font-src https://sigilcoin.lol; base-uri 'none'; frame-ancestors 'none'"))
-      (assert-true (not (has? response "script-src")))
+              "Content-Security-Policy: default-src 'none'; script-src 'self'; connect-src 'self'; style-src 'unsafe-inline'; img-src https://sigilcoin.lol; font-src https://sigilcoin.lol; base-uri 'none'; frame-ancestors 'none'"))
+      (assert-true (not (has? response "unsafe-eval")))
+      (assert-true (not (has? response "script-src 'unsafe-inline'")))
       (assert-true (not (has? response "https://cdn"))))))
 
 (run-tests)

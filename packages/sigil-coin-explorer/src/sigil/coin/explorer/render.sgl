@@ -23,8 +23,8 @@
 ;;;
 ;;; `explorer-text` is the two stages composed, and it is what every page
 ;;; calls. Nothing here interpolates block data into a `<script>` or a
-;;; `style` attribute, so HTML escaping is sufficient: there is no
-;;; JavaScript context on any page and no client-side framework to feed.
+;;; `style` attribute. The first-party client reads JSON and assigns hostile
+;;; strings with `textContent`, never as markup.
 ;;;
 ;;; ```scheme
 ;;; (explorer-text (string->utf8 "<script>alert(1)</script>"))
@@ -370,9 +370,9 @@
         "h1,h2{letter-spacing:-.035em}h1{margin:.25rem 0;font-size:clamp(2rem,4vw,3.4rem);line-height:1.05}h2{margin:0 0 1rem;font-size:1.15rem}p{margin:.55rem 0 1rem}.q{color:var(--muted)}.mono,code,pre,td:first-child,.metric-value{font-family:JetBrains Mono,ui-monospace,SFMono-Regular,Consolas,monospace;font-variant-numeric:tabular-nums}"
         ".badge{display:inline-flex;align-items:center;gap:.35rem;width:max-content;padding:.18rem .5rem;border:1px solid #4c515b;border-radius:999px;background:#20242a;color:#c6cbd3;font-family:JetBrains Mono,ui-monospace,monospace;font-size:.69rem;font-weight:700;letter-spacing:.04em;line-height:1.25;text-transform:uppercase}.badge:before{width:.38rem;height:.38rem;border-radius:50%;background:currentColor;content:''}.badge-live,.badge-good{border-color:rgba(87,211,140,.35);background:rgba(87,211,140,.09);color:var(--good)}.badge-warn{border-color:rgba(246,166,35,.38);background:rgba(246,166,35,.09);color:var(--amber)}.badge-bad{border-color:rgba(255,107,107,.4);background:rgba(255,107,107,.09);color:var(--bad)}.badge-violet{border-color:rgba(167,139,250,.4);background:rgba(167,139,250,.09);color:var(--violet)}.status-badge{margin-left:.1rem}"
         ".dashboard-hero,.page-head{display:flex;align-items:end;justify-content:space-between;gap:1.5rem;margin-bottom:1.2rem;padding:.35rem 0}.eyebrow{margin:0 0 .45rem;color:var(--amber);font-family:JetBrains Mono,ui-monospace,monospace;font-size:.73rem;font-weight:700;letter-spacing:.09em;text-transform:uppercase}.hero-note{max-width:36rem;margin:0;color:var(--muted);text-align:right}"
-        ".metric-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:.65rem;margin-bottom:1rem}.metric-card{min-width:0;min-height:7.3rem;padding:1rem;border:1px solid var(--line);border-top:2px solid var(--line-hot);border-radius:.55rem;background:linear-gradient(145deg,rgba(246,166,35,.035),transparent 45%),var(--panel);box-shadow:0 10px 26px rgba(0,0,0,.14)}.metric-label{display:block;margin-bottom:.65rem;color:var(--muted);font-size:.71rem;font-weight:750;letter-spacing:.07em;text-transform:uppercase}.metric-value{display:block;overflow:hidden;color:var(--text);font-size:clamp(1.05rem,2vw,1.5rem);font-weight:700;line-height:1.25;text-overflow:ellipsis;white-space:nowrap}.metric-value.accent,.metric-value .accent{color:var(--amber)}.metric-detail{display:block;overflow:hidden;margin-top:.42rem;color:var(--muted);font-size:.74rem;text-overflow:ellipsis;white-space:nowrap}"
+        ".metric-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:.65rem;margin-bottom:1rem}.metric-card{min-width:0;min-height:7.3rem;padding:1rem;border:1px solid var(--line);border-top:2px solid var(--line-hot);border-radius:.55rem;background:linear-gradient(145deg,rgba(246,166,35,.035),transparent 45%),var(--panel);box-shadow:0 10px 26px rgba(0,0,0,.14)}.metric-card.is-updated{animation:metric-pulse .9s ease-out}.metric-label{display:block;margin-bottom:.65rem;color:var(--muted);font-size:.71rem;font-weight:750;letter-spacing:.07em;text-transform:uppercase}.metric-value{display:block;overflow:hidden;color:var(--text);font-size:clamp(1.05rem,2vw,1.5rem);font-weight:700;line-height:1.25;text-overflow:ellipsis;white-space:nowrap}.metric-value.accent,.metric-value .accent{color:var(--amber)}.metric-detail{display:block;overflow:hidden;margin-top:.42rem;color:var(--muted);font-size:.74rem;text-overflow:ellipsis;white-space:nowrap}"
         ".panel{margin:0 0 1rem;padding:1rem;border:1px solid var(--line);border-radius:.6rem;background:rgba(21,24,29,.94);box-shadow:0 14px 34px rgba(0,0,0,.14)}.panel-head{display:flex;align-items:center;justify-content:space-between;gap:1rem;margin-bottom:.75rem}.panel-head h2{margin:0}.panel h3{margin:1rem 0 .65rem;font-size:.82rem;letter-spacing:.04em;text-transform:uppercase;color:var(--muted)}.content-panel{margin-top:1rem}.content-panel>p.q{max-width:75rem}.detail-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(18rem,.6fr);gap:1rem}.stack{display:grid;gap:1rem}.stack>.panel{margin:0}"
-        ".block-strip{display:flex;gap:.55rem;overflow-x:auto;padding:.1rem .05rem .55rem;scroll-snap-type:x proximity;scrollbar-color:var(--line) transparent}.block-tile{flex:0 0 13.5rem;scroll-snap-align:start;display:grid;gap:.45rem;padding:.75rem;border:1px solid var(--line);border-left:3px solid var(--amber);border-radius:.45rem;background:var(--surface);color:var(--text);text-decoration:none;transition:border-color .15s ease,transform .15s ease}.block-tile:hover{border-color:var(--orange);color:var(--text);transform:translateY(-2px)}.block-tile-head{display:flex;align-items:center;justify-content:space-between;gap:.5rem}.block-height{color:var(--amber);font-family:JetBrains Mono,ui-monospace,monospace;font-size:1rem;font-weight:800}.block-hash{overflow:hidden;color:var(--muted);font-family:JetBrains Mono,ui-monospace,monospace;font-size:.71rem;text-overflow:ellipsis;white-space:nowrap}.block-meta{display:flex;gap:.55rem;color:#c2c7ce;font-size:.7rem}.block-meta span+span{padding-left:.55rem;border-left:1px solid var(--line)}"
+        ".block-strip{display:flex;gap:.55rem;overflow-x:auto;padding:.1rem .05rem .55rem;scroll-snap-type:x proximity;scrollbar-color:var(--line) transparent}.block-strip>.empty-state{flex:1}.block-tile{flex:0 0 13.5rem;scroll-snap-align:start;display:grid;gap:.45rem;padding:.75rem;border:1px solid var(--line);border-left:3px solid var(--amber);border-radius:.45rem;background:var(--surface);color:var(--text);text-decoration:none;transition:border-color .15s ease,transform .15s ease}.block-tile.is-new{animation:block-arrive .85s cubic-bezier(.2,.8,.2,1)}.block-tile:hover{border-color:var(--orange);color:var(--text);transform:translateY(-2px)}.block-tile-head{display:flex;align-items:center;justify-content:space-between;gap:.5rem}.block-height{color:var(--amber);font-family:JetBrains Mono,ui-monospace,monospace;font-size:1rem;font-weight:800}.block-hash{overflow:hidden;color:var(--muted);font-family:JetBrains Mono,ui-monospace,monospace;font-size:.71rem;text-overflow:ellipsis;white-space:nowrap}.block-meta{display:flex;gap:.55rem;color:#c2c7ce;font-size:.7rem}.block-meta span+span{padding-left:.55rem;border-left:1px solid var(--line)}.live-state{display:flex;align-items:center;justify-content:flex-end;flex-wrap:wrap;gap:.5rem}.waiting-indicator{color:var(--muted);font-family:JetBrains Mono,ui-monospace,monospace;font-size:.74rem}.waiting-indicator:before{display:inline-block;width:.42rem;height:.42rem;margin-right:.45rem;border-radius:50%;background:var(--amber);content:'';animation:waiting-pulse 1.8s ease-in-out infinite}.is-reorg .waiting-indicator{color:var(--bad)}@keyframes block-arrive{0%{opacity:0;transform:translateX(-2rem);box-shadow:0 0 0 rgba(246,166,35,0)}55%{opacity:1;transform:translateX(0);box-shadow:0 0 1.5rem rgba(246,166,35,.42)}100%{box-shadow:0 0 0 rgba(246,166,35,0)}}@keyframes metric-pulse{0%,100%{border-top-color:var(--line-hot);box-shadow:0 10px 26px rgba(0,0,0,.14)}35%{border-top-color:var(--amber);box-shadow:0 0 1.25rem rgba(246,166,35,.28)}}@keyframes waiting-pulse{0%,100%{opacity:.35;transform:scale(.75)}50%{opacity:1;transform:scale(1.15)}}"
         ".table-scroll{overflow:auto;max-width:100%;border:1px solid var(--line);border-radius:.45rem}.table-scroll table{border:0}table{width:100%;border-collapse:separate;border-spacing:0;background:var(--surface);font-size:.79rem}th,td{min-width:6.5rem;padding:.52rem .65rem;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}thead th{position:sticky;z-index:2;top:0;background:#20242a;color:#d9dde3;font-size:.69rem;letter-spacing:.055em;text-transform:uppercase}tbody th{background:#171a1f;color:#c6cbd3;font-size:.75rem}tbody tr:last-child>td,tbody tr:last-child>th{border-bottom:0}tbody tr{transition:background .12s ease}tbody tr:hover{background:rgba(246,166,35,.055)}td a{font-family:JetBrains Mono,ui-monospace,monospace}.hash-cell{max-width:26rem;overflow-wrap:anywhere}"
         "pre,code{font-family:JetBrains Mono,ui-monospace,SFMono-Regular,Consolas,monospace}pre{overflow:auto;max-height:32rem;margin:0;padding:.75rem;border:1px solid var(--line);border-radius:.4rem;background:#0c0e11;color:#dfe3e8;white-space:pre-wrap;word-break:break-all}"
         ".notice{margin:1rem 0;padding:.85rem 1rem;border:1px solid var(--line);border-left:3px solid var(--cyan);border-radius:.4rem;background:rgba(85,220,232,.06)}.notice-warn{border-left-color:var(--amber);background:rgba(246,166,35,.07)}.notice-error{border-color:rgba(255,107,107,.35);border-left-color:var(--bad);background:rgba(255,107,107,.07)}.empty-state{display:grid;min-height:9rem;place-items:center;padding:2rem;border:1px dashed #3b4049;border-radius:.5rem;background:rgba(16,18,22,.7);color:var(--muted);text-align:center}"
@@ -438,6 +438,7 @@
               "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
               "<title>" (explorer-escape title) "</title>"
               "<style>" %style "</style>"
+              "<script src=\"/assets/explorer.js\" defer></script>"
               "</head><body>"
               "<header class=\"topbar\">"
               "<a class=\"wordmark\" href=\"https://sigilcoin.lol\">"
@@ -523,7 +524,8 @@
         (join (list
                 "<a class=\"block-tile\" href=\"/block/" height
                 "\" role=\"listitem\" aria-label=\"Block " height
-                "\" title=\""
+                "\" data-height=\"" height "\" data-block-id=\""
+                (explorer-escape id) "\" title=\""
                 (explorer-escape id) "\">"
                 "<span class=\"block-tile-head\"><span class=\"block-height\">#"
                 height "</span>"
@@ -541,11 +543,13 @@
                 "</span><span>Q " (optional-number quality) "</span></span></a>"))))
 
     (define (block-strip blocks)
-      (if (null? blocks)
-          "<div class=\"empty-state\">No blocks yet.</div>"
-          (string-append
-            "<div class=\"block-strip\" role=\"list\" aria-label=\"Recent blocks\">"
-            (join (map block-tile blocks)) "</div>")))
+      (string-append
+        "<div id=\"live-block-strip\" class=\"block-strip\" role=\"list\" aria-label=\"Recent blocks\" data-limit=\""
+        (number->string explorer-default-page-size) "\">"
+        (if (null? blocks)
+            "<div class=\"empty-state\">No blocks yet.</div>"
+            (join (map block-tile blocks)))
+        "</div>"))
 
     ;; ============================================================
     ;; Puzzle, score, shares and split sections
@@ -851,6 +855,19 @@
               "</strong><span class=\"metric-detail\">" detail
               "</span></article>")))
 
+    (define (live-metric-card value-id detail-id label value detail)
+      (join (list
+              "<article class=\"metric-card\"><span class=\"metric-label\">" label
+              "</span><strong id=\"" value-id
+              "\" class=\"metric-value\">" value
+              "</strong><span id=\"" detail-id
+              "\" class=\"metric-detail\">" detail
+              "</span></article>")))
+
+    (define (live-field id label value)
+      (string-append "<tr><th scope=\"row\">" label
+                     "</th><td id=\"" id "\">" value "</td></tr>"))
+
     ;; ============================================================
     ;; Pages
     ;; ============================================================
@@ -869,10 +886,16 @@
         (explorer-page
           (string-append chain " explorer")
           (join (list
+                  "<div data-explorer-live data-tip-height=\""
+                  (number->string (explorer-summary-tip-height summary))
+                  "\" data-tip-id=\"" (explorer-escape tip-id) "\">"
                   "<section class=\"dashboard-hero\"><div>"
                   "<p class=\"eyebrow\">Chain dashboard</p><h1>"
-                  (explorer-escape chain) "</h1></div><div>"
-                  (badge "badge-live" (explorer-escape chain))
+                  (explorer-escape chain) "</h1></div><div class=\"live-state\">"
+                  "<span id=\"live-connection\" class=\"badge badge-warn\" data-state=\"syncing\" aria-live=\"polite\">syncing</span>"
+                  "<span id=\"live-waiting\" class=\"waiting-indicator\">Waiting for block #"
+                  (number->string (explorer-summary-next-height summary))
+                  "</span><span id=\"live-announcement\" class=\"sr-only\" aria-live=\"polite\"></span>"
                   "<p class=\"hero-note\">Validated chain state and the next"
                   " program-golf puzzle, served directly from this node.</p>"
                   "</div></section>"
@@ -880,7 +903,8 @@
                       "<div class=\"notice notice-warn\"><strong>Waiting for chain data.</strong> This node has no chain data yet.</div>"
                       "")
                   "<section class=\"metric-grid\" aria-label=\"Chain metrics\">"
-                  (metric-card
+                  (live-metric-card
+                    "live-tip-height" "live-next-height-detail"
                     "tip height"
                     (string-append "<span class=\"accent\">#"
                                    (number->string
@@ -889,20 +913,23 @@
                     (string-append "next height "
                                    (number->string
                                      (explorer-summary-next-height summary))))
-                  (metric-card
+                  (live-metric-card
+                    "live-tip-id" "live-tip-id-detail"
                     "tip block"
                     (string-append "<span title=\"" (explorer-escape tip-id)
                                    "\">" (explorer-escape (short-id tip-id))
                                    "</span>")
                     (string-append "<span class=\"mono\">"
                                    (explorer-escape tip-id) "</span>"))
-                  (metric-card
+                  (live-metric-card
+                    "live-tip-time" "live-tip-time-detail"
                     "tip time"
                     (explorer-escape
                       (explorer-format-time
                         (explorer-summary-tip-time summary)))
                     "node-reported UTC")
-                  (metric-card
+                  (live-metric-card
+                    "live-block-count" "live-header-detail"
                     "validated blocks"
                     (number->string (explorer-summary-block-count summary))
                     (string-append
@@ -910,7 +937,8 @@
                       " headers to height "
                       (number->string
                         (explorer-summary-header-height summary))))
-                  (metric-card
+                  (live-metric-card
+                    "live-supply" "live-supply-detail"
                     "supply issued"
                     (string-append
                       (explorer-sigil-amount
@@ -918,7 +946,8 @@
                     (string-append "of "
                       (explorer-sigil-amount
                         (explorer-summary-max-supply summary)) " SGL"))
-                  (metric-card
+                  (live-metric-card
+                    "live-reward" "live-halving-detail"
                     "current reward"
                     (string-append
                       (explorer-sigil-amount
@@ -929,7 +958,8 @@
                           (string-append "next halving at height "
                                          (number->string height))
                           "never (reward has decayed to zero)")))
-                  (metric-card
+                  (live-metric-card
+                    "live-complexity" "live-retarget-detail"
                     "complexity / retarget"
                     (if (number? complexity)
                         (string-append "C " (number->string complexity))
@@ -944,41 +974,46 @@
                             (explorer-summary-next-retarget-height summary)))
                         "retarget data unavailable"))
                   "</section>"
-                  "<section class=\"panel content-panel\"><h2>Puzzle for height "
+                  "<section class=\"panel content-panel\"><h2 id=\"live-puzzle-heading\">Puzzle for height "
                   (number->string (explorer-summary-next-height summary))
                   "</h2><p class=\"q\">The deterministic target for the next"
                   " producer. Lower valid source length wins.</p>"
                   (table-wrap
                     (join (list
                             "<table><tbody>"
-                            (field "par"
-                                   (optional-number
-                                     (explorer-summary-puzzle-par summary)))
+                            (live-field
+                              "live-puzzle-par" "par"
+                              (optional-number
+                                (explorer-summary-puzzle-par summary)))
                             (let ((ci
                                     (explorer-summary-puzzle-constraint summary)))
                               (if (number? ci)
                                   (join (list
-                                          (field "constraint"
-                                                 (string-append
-                                                   (number->string ci)
-                                                   " &mdash; "
-                                                   (explorer-escape
-                                                     (let ((text
-                                                       (explorer-summary-puzzle-constraint-text
-                                                         summary)))
-                                                       (if (string? text)
-                                                           text "")))))
-                                          (field "examples (k)"
-                                                 (optional-number
-                                                   (explorer-summary-puzzle-k
-                                                     summary)))))
+                                          (live-field
+                                            "live-puzzle-constraint"
+                                            "constraint"
+                                            (string-append
+                                              (number->string ci)
+                                              " &mdash; "
+                                              (explorer-escape
+                                                (let ((text
+                                                  (explorer-summary-puzzle-constraint-text
+                                                    summary)))
+                                                  (if (string? text)
+                                                      text "")))))
+                                          (live-field
+                                            "live-puzzle-k" "examples (k)"
+                                            (optional-number
+                                              (explorer-summary-puzzle-k
+                                                summary)))))
                                   ""))
-                            (field "seed"
-                                   (let ((seed
-                                           (explorer-summary-puzzle-seed summary)))
-                                     (if (string? seed)
-                                         (explorer-escape seed)
-                                         "&mdash;")))
+                            (live-field
+                              "live-puzzle-seed" "seed"
+                              (let ((seed
+                                      (explorer-summary-puzzle-seed summary)))
+                                (if (string? seed)
+                                    (explorer-escape seed)
+                                    "&mdash;")))
                             "</tbody></table>")))
                   (examples-table (explorer-summary-puzzle-examples summary))
                   "</section>"
@@ -995,7 +1030,7 @@
                                         " shown"))
                   "</div>" (block-strip blocks)
                   "<h3>Detailed block ledger</h3>" (block-table blocks)
-                  "</section>")))))
+                  "</section></div>")))))
 
     ;;; The difficulty history page: complexity and achieved margin over
     ;;; time, which is the chain's own record of how fast the field is

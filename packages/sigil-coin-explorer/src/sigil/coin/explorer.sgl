@@ -31,7 +31,8 @@
 ;;; ```
 
 (define-library (sigil coin explorer)
-  (import (sigil coin explorer store)
+  (import (sigil coin explorer client)
+          (sigil coin explorer store)
           (sigil coin explorer render)
           (sigil coin explorer server))
   (export
@@ -196,6 +197,9 @@
     explorer-difficulty-json
     explorer-address-json
     explorer-error-json
+
+    ;; Compiled client
+    explorer-client-javascript
 
     ;; Server
     explorer-request-path
