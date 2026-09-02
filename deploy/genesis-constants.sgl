@@ -1,11 +1,9 @@
-;;; Print the genesis constants for a quote and timestamp.
+;;; Print every canonical genesis value from the configured quote and timestamp.
 ;;;
-;;; Launch-day tool. `packages/sigil-coin-node/src/sigil/coin/node/chain.sgl`
-;;; and `packages/sigil-coin-node/src/sigil/coin/node/genesis.sgl` carry four
-;;; checked-in values per chain — quote, timestamp, serialized header hex and
-;;; display id — and all four have to move together, because the quote IS the
-;;; genesis coinbase and changing it changes the hash. This prints what the
-;;; new values must be.
+;;; Launch-critical constants must all come from this tool. It rebuilds the
+;;; mainnet, reset public-testnet, and regtest coinbases from current source and
+;;; prints the serialized coinbase, merkle root, nonce, header, hash, and display
+;;; id which move together whenever the generated witness changes.
 ;;;
 ;;; Run from the repository root:
 ;;;
@@ -16,33 +14,50 @@
 ;;;
 ;;; The empty cache is deliberate: launch-critical constants must compile from
 ;;; current source rather than falling back to bytecode left by an older build.
-;;;
-;;; Edit QUOTE and TIME below, run it, then paste the two hex strings into
-;;; `coin-genesis-header-constant` and `coin-genesis-id-constant` in the
-;;; genesis module, and quote/time into the chain module.
-;;; `test-node.sgl` rebuilds genesis from the quote and asserts the
-;;; constants, so a mismatch fails the suite rather than shipping.
+;;; The inputs below come directly from `(sigil coin node chain)`;
+;;; `test-node.sgl` independently rebuilds each genesis and checks the emitted
+;;; header and id constants.
 
 (import (sigil io)
         (sigil bitcoin encoding)
         (sigil bitcoin utils)
-        (sigil coin node genesis))
+        (sigil bitcoin tx)
+        (sigil bitcoin consensus)
+        (sigil coin node genesis)
+        (sigil coin node chain))
 
-;; ---- edit these two ----------------------------------------------------
-(define QUOTE "Sigil - Practical Symbolic Power")
-(define TIME 1785542400) ;; seconds since the Unix epoch, UTC
-;; ------------------------------------------------------------------------
+(define %genesis-inputs
+  (list (list "mainnet" coin-genesis-quote coin-genesis-time)
+        (list "testnet" coin-testnet-genesis-quote coin-testnet-genesis-time)
+        (list "regtest" coin-regtest-genesis-quote coin-regtest-genesis-time)))
 
-(println "quote: ~a" QUOTE)
-;; BYTES, not characters. The quote becomes coinbase graffiti verbatim via
-;; `string->utf8`, and the graffiti cap (400 B) and block cap (16384 B)
-;; are byte limits. `string-length` would under-count any non-ASCII quote and
-;; report a quote as legal that the consensus rules reject.
-(println "quote-bytes: ~a" (bytevector-length (string->utf8 QUOTE)))
-(println "time: ~a" TIME)
-(println "header-hex: ~a" (coin-genesis-header-hex QUOTE TIME))
-(println "hash: ~a" (hex-encode (coin-genesis-hash QUOTE TIME)))
-;; The display id is the hash written the other way round, which is the form
-;; humans quote and the form `coin-genesis-id-constant` stores.
-(println "id: ~a"
-         (hex-encode (reverse-bytevector (coin-genesis-hash QUOTE TIME))))
+(define (print-genesis input)
+  (let* ((name (car input))
+         (quote (cadr input))
+         (time (caddr input))
+         (built (coin-genesis-block quote time))
+         (coinbase (car (block-transactions built)))
+         (header (block-header-field built))
+         (hash (block-header-hash header)))
+    (println "network: ~a" name)
+    (println "quote: ~a" quote)
+    ;; BYTES, not characters. The quote becomes coinbase graffiti verbatim via
+    ;; `string->utf8`, and the graffiti cap (400 B) and block cap (16384 B)
+    ;; are byte limits.
+    (println "quote-bytes: ~a" (bytevector-length (string->utf8 quote)))
+    (println "time: ~a" time)
+    (println "coinbase-hex: ~a"
+             (hex-encode (transaction-serialize coinbase)))
+    (println "merkle-root: ~a"
+             (hex-encode (block-header-merkle-root header)))
+    (println "nonce: ~a" (block-header-nonce header))
+    (println "header-hex: ~a" (hex-encode (block-header-serialize header)))
+    (println "hash: ~a" (hex-encode hash))
+    ;; The display id reverses the internal header hash.
+    (println "id: ~a" (hex-encode (reverse-bytevector hash)))))
+
+(let loop ((inputs %genesis-inputs) (first? #t))
+  (unless (null? inputs)
+    (unless first? (println ""))
+    (print-genesis (car inputs))
+    (loop (cdr inputs) #f)))

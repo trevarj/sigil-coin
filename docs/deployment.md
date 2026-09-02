@@ -12,6 +12,27 @@ commit, push, or deploy unless an operator runs it.
 > firewalls, resource limits, log rotation, monitoring, backups, and incident
 > shutdown before selecting it.
 
+## Public testnet reset boundary
+
+The configured public testnet starts from a new genesis:
+
+- marker `SigilCoin public testnet reset - 2026-09-02`,
+- timestamp `1788307200` (`2026-09-02T00:00:00Z`),
+- display id
+  `15447f3226699f537969cbea4b493bbbe25a4d856832bf28bce3e7df579e6ddc`.
+
+This is not an activation on the previous chain. Old public-testnet databases,
+history, and backups of that state are incompatible; old-chain balances do not
+carry over. The `d3 7a 91 c5` magic is intentionally unchanged, so a successful
+frame handshake does not prove that a peer has the reset genesis.
+
+Deployment scripts never delete operator data. Before deploying the reset to a
+host that ran the old chain, stop every database user, take an offline archive
+if desired, move the old `SIGIL_TESTNET_STATE_DIR` aside, and create a fresh
+empty directory. Never open the old directory with the reset binary or restore
+an old-chain backup into reset state. The exact non-destructive Docker cutover
+is in [testnet.md](testnet.md#reset-cutover).
+
 ## Workspace and tools
 
 Keep the three checkouts as siblings:
@@ -164,6 +185,12 @@ The sync service runs one bounded pass at a time and retries after
 environment. Operators must still review log retention, filesystem use,
 restart counts, and public connection pressure.
 
+Status reports branch-aware `issued-supply` from active UTXOs and the separate
+height-only `scheduled-supply-cap`. Issued supply may trail that cap because a
+solo block mints only `floor(4*S/5)` of scheduled subsidy; cooperative blocks
+mint full scheduled subsidy and route fees and integer residuals to the
+producer.
+
 ## Explorer reverse proxy and TLS
 
 `compose.testnet.yml` hardcodes the host mapping to
@@ -270,9 +297,10 @@ docker compose --env-file .env -f compose.testnet.yml up -d
 ```
 
 A live `cp` or `tar` may capture torn SQLite state. Store backups encrypted and
-offline; never commit them or rsync them into source. Restore into an empty
-location, start sync before explorer so SQLite can recover normally, and
-compare status and balance with an independent node.
+offline; never commit them or rsync them into source. Restore only a backup
+whose recorded genesis matches the current chain, into an empty location.
+Start sync before explorer so SQLite can recover normally, then compare reset
+genesis, status, issued supply, and balance with an independent node.
 
 ## Upgrade and rollback
 
@@ -296,16 +324,19 @@ SIGIL_IMAGE="$rollback_image" docker compose --env-file .env \
   -f compose.testnet.yml up -d --no-build --force-recreate
 ```
 
-An image rollback does not migrate or restore state. If schema compatibility is
-uncertain, restore the matching backup. Do not use an incident or testnet
-success as authorization to push or deploy mainnet.
+An image rollback does not migrate or restore state. Both database schema and
+genesis must be compatible. Never roll a reset node back onto previous-testnet
+state; if compatibility is uncertain, preserve the current directory and
+restore a matching reset-genesis backup into an empty location. An incident or
+testnet success does not authorize a mainnet push or deployment.
 
 ## Mainnet placeholder
 
 Mainnet uses port `19444`, separate state, and loopback explorer port `8081`.
-Its final genesis is non-final. The existing guard is unchanged: both helper
-scripts and every container refuse mainnet unless the operator sets exactly
-`ALLOW_MAINNET=yes`.
+Its current coherent placeholder genesis was regenerated with the tightened
+witness source, but its launch timestamp and resulting final constants remain
+non-final. Both helper scripts and every container refuse mainnet unless the
+operator sets exactly `ALLOW_MAINNET=yes`.
 
 ```sh
 ALLOW_MAINNET=yes MODE=mainnet bash deploy/scripts/run-local.sh

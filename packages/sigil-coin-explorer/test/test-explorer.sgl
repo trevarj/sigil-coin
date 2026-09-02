@@ -3,8 +3,8 @@
 ;;; This file opens a real regtest database, then writes headers and
 ;;; bodies into it exactly as a synced node would have — version 5 headers,
 ;;; `bits = 0x207F0000 | C`, a `nonce` that is the score word recomputed
-;;; from the body, five-push coinbases, and coinbase outputs shaped by the
-;;; §6.5 split. Everything the explorer then reads back is real bytes off a
+;;; from the body, five-push coinbases, and contribution-aware coinbase
+;;; outputs. Everything the explorer then reads back is real bytes off a
 ;;; real SQLite file.
 ;;;
 ;;; The puzzles, solutions, score words and margins are the CONSENSUS
@@ -27,6 +27,7 @@
         (sigil array)
         (sigil string)
         (sigil sqlite)
+        (sigil process)
         (sigil json)
         (sigil bitcoin utils)
         (sigil bitcoin encoding)
@@ -50,6 +51,9 @@
   (let ((dir (make-temp-directory)))
     (unless dir (error "fresh-dir: could not create a temp directory"))
     dir))
+
+(define (remove-tree dir)
+  (process-run "rm" "-rf" dir))
 
 (define %miner-a "sgl1q70nakelv6wvuk2e63ah8lg68kq3nx7q2g3taul")
 (define %miner-b "sgl1qw508d6qejxtdg4y5r3zarvary0c5xw7kr43pwr")
@@ -103,13 +107,18 @@
                (make-bytevector 32 i))
     solution: (as-bytes solution)))
 
-;; Convert consensus's exact split plan into coinbase outputs. Only output
-;; zero has a producer-chosen script; every co-op script comes from consensus.
-(define (split-outputs value shares producer-script carrier-script)
+;; Convert consensus's payout plan into coinbase outputs. The malformed
+;; synthetic shares use contribution 1 only to give their stored block a
+;; deterministic actual payout; detail preview must not trust those values.
+(define (payout-outputs subsidy shares producer-script carrier-script)
   (map (lambda (entry)
          (txout value: (car entry)
                 script-pubkey: (or (cdr entry) producer-script)))
-       (coin-split-plan value shares carrier-script)))
+       (coin-payout-plan subsidy
+                         0
+                         shares
+                         (map (lambda (share) 1) shares)
+                         carrier-script)))
 
 ;; Aggregate only successful pure previews. These deliberately malformed
 ;; synthetic shares make the header claim zero Q.
@@ -131,7 +140,7 @@
   (let* ((parent-hash (block-header-hash parent-header))
          (spec (coin-puzzle-for parent-hash height complexity))
          (report (puzzle-run-examples solution (puzzle-spec-examples spec)))
-         (value (coin-block-reward height))
+         (subsidy (coin-block-reward height))
          (payload (coin-coinbase-payload
                     height: height
                     solution: (as-bytes solution)
@@ -148,8 +157,8 @@
                                              payload)
                                          sequence: %sequence-final
                                          witness: '()))
-                     outputs: (split-outputs value shares producer-script
-                                             carrier-script)
+                     outputs: (payout-outputs subsidy shares producer-script
+                                              carrier-script)
                      lock-time: 0))
          (transactions (list coinbase)))
     (unless (puzzle-report-ok? report)
@@ -189,6 +198,34 @@
                          (preview-quality context shares)))))
       transactions: transactions)))
 
+;; Preserve a block's payload and score claim while replacing its single
+;; coinbase value. This constructs deliberately invalid issuance for explorer
+;; failure-display coverage; it is never submitted to a node.
+(define (with-solo-coinbase-value b value)
+  (let* ((header (block-header-field b))
+         (coinbase (car (block-transactions b)))
+         (old-output (car (transaction-outputs coinbase)))
+         (replacement
+           (transaction
+             version: (transaction-version coinbase)
+             inputs: (transaction-inputs coinbase)
+             outputs: (list
+                        (txout value: value
+                               script-pubkey:
+                                 (txout-script-pubkey old-output)))
+             lock-time: (transaction-lock-time coinbase)))
+         (transactions (list replacement)))
+    (block
+      header-field:
+        (block-header
+          version: (block-header-version header)
+          previous-block: (block-header-previous-block header)
+          merkle-root: (merkle-root (map transaction-txid transactions))
+          time: (block-header-time header)
+          bits: (block-header-bits header)
+          nonce: (block-header-nonce header))
+      transactions: transactions)))
+
 ;; Write a block into the node's own tables, the way a synced node would.
 (define (store-block! db b height)
   (let* ((header (block-header-field b))
@@ -209,6 +246,24 @@
                   "(hash, height, status, block_hex, validated, updated_at)"
                   " VALUES (?,?,'valid',?,1,0)")
                 hash height (hex-encode (block-serialize b)))
+    ;; Mirror the connector's active UTXO rows so summary supply is the
+    ;; branch-aware sum of actual coinbase outputs, not a height formula.
+    (let* ((coinbase (car (block-transactions b)))
+           (txid (hex-encode (transaction-txid coinbase)))
+           (time (block-header-time header)))
+      (let loop ((outputs (transaction-outputs coinbase)) (index 0))
+        (unless (null? outputs)
+          (sqlite-run
+            db
+            "INSERT OR REPLACE INTO utxos(txid, output_index, value, script_pubkey, coinbase, height, time, created_by, spent_by, spent_height, active) VALUES (?, ?, ?, ?, 1, ?, ?, ?, NULL, NULL, 1)"
+            txid
+            index
+            (txout-value (car outputs))
+            (hex-encode (txout-script-pubkey (car outputs)))
+            height
+            time
+            hash)
+          (loop (cdr outputs) (+ index 1)))))
     hash))
 
 (define (store-header-only! db header height)
@@ -417,6 +472,25 @@
         (assert-equal %tip-height
                       (explorer-summary-tip-height
                         (explorer-chain-summary store))))))
+
+  (test "summary supply is the active UTXO sum, below its scheduled cap"
+    (let ((issued
+            (let loop ((xs %blocks) (sum 0))
+              (if (null? xs)
+                  sum
+                  (loop (cdr xs)
+                        (+ sum
+                           (transaction-output-value
+                             (car (block-transactions (cdr (car xs)))))))))))
+      (with-store
+        (lambda (store)
+          (let ((summary (explorer-chain-summary store)))
+            (assert-equal issued (explorer-summary-supply summary))
+            (assert-equal coin-max-supply
+                          (explorer-summary-max-supply summary))
+            (assert-true
+              (< issued (coin-cumulative-supply %tip-height))))))
+      (assert-equal issued (dict-get (json-of "/api/summary") "supply"))))
 
   (test "every block declares consensus "
     (with-store
@@ -762,6 +836,8 @@
       (assert-true (has? page "memory MB"))
       (assert-true (has? page "steps SB"))
       (assert-true (has? page "aggregate Q"))
+      (assert-true (has? page "authenticated; rank-inert"))
+      (assert-false (has? page "breaks ties"))
       (assert-true (has? page "score word W"))
       (assert-true (has? page (explorer-escape
                                 (explorer-under-par-text
@@ -778,10 +854,35 @@
     (assert-equal "unknown" (explorer-margin-text #f))))
 
 ;; ============================================================
-;; Co-op shares and the reward split
+;; Co-op shares and coinbase payouts
 ;; ============================================================
 
 (test-group "co-op shares"
+  (test "list reads never preview shares or expected payouts"
+    (with-store
+      (lambda (store)
+        (let* ((blocks
+                 (explorer-recent-blocks store explorer-default-page-size))
+               (b (let loop ((xs blocks))
+                    (cond ((null? xs) #f)
+                          ((= %coop-height
+                              (explorer-block-height (car xs)))
+                           (car xs))
+                          (else (loop (cdr xs)))))))
+          (assert-true (explorer-block? b))
+          (for-each
+            (lambda (share)
+              (assert-equal 'not-evaluated
+                            (explorer-share-problem share))
+              (assert-equal #f (explorer-share-contribution share))
+              (assert-equal #f (explorer-share-steps share))
+              (assert-equal #f (explorer-share-cells share)))
+            (explorer-block-shares b))
+          (for-each
+            (lambda (output)
+              (assert-equal #f (explorer-output-expected output)))
+            (explorer-block-outputs b))))))
+
   (test "malformed share previews stay named and unverified"
     (with-store
       (lambda (store)
@@ -840,59 +941,91 @@
                               (explorer-share-pubkey-hex (car xs))))
               (loop (cdr xs) (cdr raw))))))))
 
-  (test "the split is producer 2, share 1, carrier 1, and sums to the reward"
+  (test "failed previews omit the expected cooperative payout"
     (with-store
       (lambda (store)
         (let* ((b (explorer-block-by-height store %coop-height))
                (outputs (explorer-block-outputs b))
-               (reward (coin-block-reward %coop-height)))
-          ;; 1 producer + 3 shares + 1 carrier
+               (subsidy (coin-block-reward %coop-height))
+               (share-pool (quotient subsidy 10))
+               (share-value (quotient share-pool 3))
+               (carrier-value (quotient subsidy 20)))
+          ;; 1 producer + 3 shares + 1 carrier.
           (assert-equal 5 (length outputs))
           (assert-equal '(producer share share share carrier)
                         (map explorer-output-role outputs))
-          (assert-equal reward (explorer-block-total-output b))
-          (assert-equal reward (explorer-block-reward b))
-          ;; Every output carries exactly what §6.5 says it should.
+          (assert-equal subsidy (explorer-block-total-output b))
+          (assert-equal subsidy (explorer-block-reward b))
+          ;; Actual bytes carry the deterministic equal-contribution fixture.
+          (assert-equal share-value
+                        (explorer-output-value (list-ref outputs 1)))
+          (assert-equal carrier-value
+                        (explorer-output-value (list-ref outputs 4)))
+          (assert-equal (- subsidy carrier-value (* 3 share-value))
+                        (explorer-output-value (car outputs)))
+          ;; Every pure preview failed, so no expected comparison is invented.
           (for-each (lambda (o)
-                      (assert-equal (explorer-output-expected o)
-                                    (explorer-output-value o)))
+                      (assert-equal #f (explorer-output-expected o)))
                     outputs)
-          (let ((unit (quotient reward 6)))
-            (assert-equal unit (explorer-output-value (list-ref outputs 1)))
-            (assert-equal unit (explorer-output-value (list-ref outputs 4)))
-            (assert-equal (- reward (* 4 unit))
-                          (explorer-output-value (car outputs))))
-          ;; The share payouts on the page are the share outputs.
+          ;; The share payouts on the page are the actual share outputs.
           (assert-equal (map explorer-share-payout (explorer-block-shares b))
                         (list (explorer-output-value (list-ref outputs 1))
                               (explorer-output-value (list-ref outputs 2))
                               (explorer-output-value (list-ref outputs 3))))))))
 
-  (test "a share-less block pays the producer alone"
+  (test "a share-less block mints 80% to the producer"
     (with-store
       (lambda (store)
         (let* ((b (explorer-block-by-height store 12))
-               (outputs (explorer-block-outputs b)))
+               (outputs (explorer-block-outputs b))
+               (minted (quotient (* 4 (coin-block-reward 12)) 5)))
           (assert-equal '() (explorer-block-shares b))
           (assert-equal 0 (explorer-block-share-count b))
           (assert-equal 1 (length outputs))
           (assert-equal 'producer (explorer-output-role (car outputs)))
-          (assert-equal (coin-block-reward 12)
-                        (explorer-output-value (car outputs)))))))
+          (assert-equal minted (explorer-output-value (car outputs)))
+          (assert-equal minted (explorer-output-expected (car outputs)))
+          (assert-equal minted (explorer-block-total-output b))))))
 
-  (test "the block page renders the shares and the split"
+  (test "negative inferred fees omit the expected payout"
+    (let* ((dir (fresh-dir))
+           (n (node-open sigilcoin-regtest-chain dir))
+           (genesis (node-best-header n))
+           (complexity coin-genesis-complexity))
+      (node-close n)
+      (let* ((solution
+               (hidden-solution (block-header-hash genesis) 1 complexity))
+             (valid
+               (build-block genesis 1 complexity solution '() '()
+                            "negative fee fixture" %script-a %script-a))
+             (under-minted (with-solo-coinbase-value valid 0))
+             (db (sqlite-open
+                   (explorer-db-path sigilcoin-regtest-chain dir)))
+             (hash (store-block! db under-minted 1)))
+        (set-tip! db hash 1)
+        (sqlite-close db)
+        (let ((store (explorer-open sigilcoin-regtest-chain dir)))
+          (let* ((b (explorer-block-by-height store 1))
+                 (outputs (explorer-block-outputs b)))
+            (assert-equal 0 (explorer-block-total-output b))
+            (assert-equal 1 (length outputs))
+            (assert-equal #f (explorer-output-expected (car outputs))))
+          (explorer-close store)))
+      (remove-tree dir)))
+
+  (test "the block page renders shares and actual-versus-preview payout"
     (let ((page (body-of (string-append "/block/"
                                         (number->string %coop-height)))))
       (assert-true (has? page "<h2>Co-op shares</h2>"))
       (assert-true (has? page "personal par"))
       (assert-true (has? page "aggregate Q"))
       (assert-true (has? page "blind"))
-      (assert-true (has? page "<h2>Reward split</h2>"))
+      (assert-true (has? page "<h2>Coinbase payout</h2>"))
+      (assert-true (has? page "actual coinbase total"))
+      (assert-true (has? page "payout preview"))
       (assert-true (has? page "carrier (the previous producer)"))
       (assert-true (has? page "commitments carried: 2"))
-      (assert-true (has? page (explorer-sigil-amount
-                                (quotient (coin-block-reward %coop-height)
-                                          6))))
+      (assert-true (has? page "Shares divide floor(10%"))
       (with-store
         (lambda (store)
           (for-each
@@ -900,7 +1033,7 @@
               (assert-true (has? page (explorer-share-address s))))
             (explorer-block-shares
               (explorer-block-by-height store %coop-height)))))
-      ;; The split table shows the producer and the carrier explicitly.
+      ;; The payout table shows the producer and carrier explicitly.
       (assert-true (has? page ">producer<"))
       (assert-true (has? page (explorer-sigil-amount
                                 (explorer-block-total-output
@@ -909,14 +1042,21 @@
                                       (explorer-block-by-height
                                         store %coop-height)))))))))
 
-  (test "the consensus split is exact at every share count"
+  (test "the consensus payout total is exact at every share count"
     (let loop ((r 0) (shares '()))
       (when (<= r 8)
-        (let* ((value 10000000001)
-               (entries (coin-split-plan value (reverse shares) %script-a)))
+        (let* ((subsidy 10000000001)
+               (fees 17)
+               (ordered (reverse shares))
+               (entries
+                 (coin-payout-plan subsidy fees ordered
+                                   (map (lambda (share) 1) ordered)
+                                   %script-a))
+               (minted (if (= r 0)
+                           (+ (quotient (* 4 subsidy) 5) fees)
+                           (+ subsidy fees))))
           (assert-equal (+ 1 r (if (> r 0) 1 0)) (length entries))
-          (assert-equal value
-                        (apply + (map car entries))))
+          (assert-equal minted (apply + (map car entries))))
         (loop (+ r 1)
               (cons (make-share (+ r 1) "x") shares))))
     (assert-true #t)))
@@ -1228,7 +1368,7 @@
                             (dict-get (car rows) "role"))
               (assert-equal (explorer-output-value (car xs))
                             (dict-get (car rows) "value"))
-              (assert-equal (explorer-output-expected (car xs))
+              (assert-equal (or (explorer-output-expected (car xs)) 'null)
                             (dict-get (car rows) "expected"))
               (loop (cdr xs) (cdr rows))))))))
 
@@ -1262,6 +1402,8 @@
       (let ((store (explorer-open sigilcoin-regtest-chain dir)))
         (let ((s (explorer-chain-summary store)))
           (assert-equal 0 (explorer-summary-tip-height s))
+          (assert-equal 0 (explorer-summary-supply s))
+          (assert-equal coin-max-supply (explorer-summary-max-supply s))
           (assert-equal 128 (explorer-summary-complexity s))
           (assert-equal 128 (explorer-summary-next-complexity s))
           (assert-true (pair? (explorer-summary-puzzle-examples s))))
@@ -1356,7 +1498,7 @@
             (assert-equal 'wrong-field-count (explorer-block-problem broken))
             (assert-equal #f (explorer-block-solution broken))
             (assert-equal '() (explorer-block-shares broken))
-            ;; The outputs are still readable, and the split labels them.
+            ;; The outputs are still readable, and payout roles label them.
             (assert-equal 1 (length (explorer-block-outputs broken))))
           (explorer-close store))
         (assert-equal 200 (explorer-response-status
@@ -1465,6 +1607,10 @@
               "<section class=\"metric-grid\" aria-label=\"Chain metrics\">"))
       (assert-true (has? page "<article class=\"metric-card\">"))
       (assert-true (has? page "complexity / retarget"))
+      (assert-true (has? page "issued supply"))
+      (assert-true (has? page "scheduled maximum supply"))
+      (assert-true (has? page "next scheduled subsidy"))
+      (assert-false (has? page "supply issued"))
       (assert-true (has? page "class=\"panel recent-blocks-panel\""))
       (assert-true
         (has? page
@@ -1487,6 +1633,8 @@
               "<section class=\"panel content-panel\"><h2>Producer score</h2>"))
       (assert-true (has? block "class=\"badge badge-violet\""))
       (assert-true (has? block "class=\"table-scroll\""))
+      (assert-true (has? block "scheduled subsidy"))
+      (assert-true (has? block "actual coinbase total"))
       (assert-true (has? difficulty "class=\"page-head\""))
       (assert-true (has? difficulty "class=\"panel\""))
       (assert-true (has? address "<section class=\"metric-grid\">"))
@@ -1535,6 +1683,7 @@
       (assert-true (has? javascript "cache: 'no-store'"))
       (assert-true (has? javascript "visibilitychange"))
       (assert-true (has? javascript "document.hidden"))
+      (assert-true (has? javascript "scheduled maximum supply"))
       (assert-true (has? javascript "nextHeight !== tipHeight || nextId !== tipId"))
       (assert-true (not (has? javascript "setTimeout(() => window.location.reload")))
       (assert-true (has? javascript "document.createElement"))

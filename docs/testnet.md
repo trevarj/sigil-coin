@@ -13,17 +13,68 @@ because a testnet gate passed.
 
 - Chain: `sigilcoin-testnet`, selected with `--testnet`.
 - DNS seed and P2P endpoint: `seed.testnet.sigilcoin.lol:19446`.
-- P2P transport: TCP port `19446`.
+- P2P transport: TCP port `19446`, network magic `d3 7a 91 c5`.
 - Address HRP: `tsgl`, producing `tsgl1...` addresses.
-- Genesis and consensus rules: the existing canonical testnet values.
+- Genesis marker: `SigilCoin public testnet reset - 2026-09-02`.
+- Genesis timestamp: `1788307200` (`2026-09-02T00:00:00Z`).
+- Genesis display id:
+  `15447f3226699f537969cbea4b493bbbe25a4d856832bf28bce3e7df579e6ddc`.
+- Genesis internal hash reported by node status:
+  `dc6d9e57dfe7e3bc28bf3268854d5ae2bb3b494beacb6979539f6926327f4415`.
 - Minimum spacing: one hour.
+- Maximum future drift: five minutes.
 - Explorer: `https://explorer.testnet.sigilcoin.lol` through a host TLS reverse
   proxy to the container's loopback-only `127.0.0.1:8080` mapping.
 - Exercise duration: 30 consecutive days, with day-7 and day-30 gates.
 
 One hour is the network's target operating cadence and enforced minimum block
-spacing. It is not a participation schedule. Community miners are not assigned
-slots, are not required to remain online, and must not mine catch-up bursts.
+spacing. A header may lead a validating clock by at most five minutes, so that
+allowance cannot make an immediate successor legal; the CLI waits until the
+one-hour floor is within the drift window. This is not a participation schedule.
+Community miners are not assigned slots, are not required to remain online, and
+must not mine catch-up bursts.
+
+## Reset cutover
+
+This public testnet is a genesis reset, not a height activation. It starts at
+height 0 from the marker and timestamp above. Heights from the previous public
+testnet are not canonical on the reset chain. Old databases, histories, and
+backups of that state are incompatible. An archived wallet key may still be a
+valid key format, but no old-chain balance or history carries over; keep the
+whole old directory out of reset operation.
+
+The network magic remains `d3 7a 91 c5`; magic alone therefore does not
+distinguish an old node from the reset. Genesis validation is the boundary.
+Upgrade every participant before reconnecting.
+
+Before starting reset software on a host that ran the old testnet:
+
+1. Stop listener, sync, explorer, miners, and every CLI process that can open
+   the database.
+2. If the history is worth retaining, take a verified offline archive and
+   label it with the old genesis and source revision.
+3. Move the old state directory aside. Do not open it with the reset binary.
+4. Create a new empty state directory with restrictive permissions.
+5. Start the reset node and verify the display genesis id above before adding
+   peers or mining.
+
+For the Docker default, an operator may perform the non-destructive directory
+cutover explicitly:
+
+```sh
+cd /srv/sigilcoin/sigil-coin/deploy/docker
+docker compose --env-file .env -f compose.testnet.yml stop
+state_dir=${SIGIL_TESTNET_STATE_DIR:-"$PWD/state/testnet"}
+[[ $state_dir == /* ]] || state_dir=$PWD/${state_dir#./}
+archive="${state_dir}.pre-reset-$(date -u +%Y%m%dT%H%M%SZ)"
+mv -- "$state_dir" "$archive"
+install -d -m 0700 "$state_dir"
+docker compose --env-file .env -f compose.testnet.yml up -d
+```
+
+Nothing in the node or deployment automation deletes old operator data. If an
+archive is not wanted, disposal remains a deliberate operator action outside
+startup.
 
 ## Safety boundary
 
@@ -107,8 +158,12 @@ ss -ltn
 ```
 
 Require P2P on the intended public interface, explorer host port only at
-`127.0.0.1:8080`, healthy containers, the canonical testnet genesis, and no
-unexpected listener.
+`127.0.0.1:8080`, healthy containers, and no unexpected listener. Before
+connecting miners, node status must report internal genesis hash
+`dc6d9e57dfe7e3bc28bf3268854d5ae2bb3b494beacb6979539f6926327f4415`,
+while explorer/API display order is
+`15447f3226699f537969cbea4b493bbbe25a4d856832bf28bce3e7df579e6ddc`.
+Any previous-testnet tip is a failed cutover.
 
 ## Community bootstrap
 
@@ -125,9 +180,10 @@ sigilcoin sync --peer seed.testnet.sigilcoin.lol:19446 --testnet \
 ```
 
 A community operator may manually configure any trusted reachable testnet peer.
-DNS is bootstrap, not an authority over consensus. Every node validates the
-canonical genesis and rules independently. A `sgl1...` address or a genesis
-mismatch is grounds to stop; testnet addresses must begin `tsgl1...`.
+DNS is bootstrap, not an authority over consensus. Every node independently
+validates the reset genesis and rules. A previous-testnet history, an `sgl1...`
+address, or any genesis mismatch is grounds to stop; reset-testnet addresses
+must begin `tsgl1...`.
 
 ## Local Nix loopback workflow
 
@@ -196,7 +252,8 @@ Record evidence in UTC. Do not record environment dumps or wallet material.
 At least daily:
 
 1. Capture node status: tip height/hash, validated bodies, next complexity,
-   peer successes/failures, and last sync outcome.
+   peer successes/failures, last sync outcome, `issued-supply`, and
+   `scheduled-supply-cap`.
 2. Compare the seed with at least one independently operated node at the same
    height.
 3. Probe DNS, public P2P, HTTPS explorer, and confirm TCP/8080 remains private.
@@ -221,19 +278,27 @@ Complete these before day 7 and repeat representative cases before day 30:
 - Maturity: show H1 coinbase immature through H99 and spendable at H100, then
   send a small amount between disposable `tsgl1...` wallets.
 - Co-op: carry a commitment at H and its authorized reveal at H+1; require
-  non-zero aggregate Q and positive share/carrier payouts.
-- Reorg: create equal-height siblings in a controlled window, extend one, and
-  require all nodes and explorer canonical views to converge without database
-  editing.
+  authenticated non-zero `Q`, a contribution in `1..4`, canonical output
+  order, the 10% contribution-weighted share pool, 5% carrier target, and the
+  producer's fee and integer residual.
+- Solo issuance: require `floor(4*S/5)+F` in the only coinbase output and show
+  the unused scheduled reserve as unminted.
+- Supply: compare branch-aware `issued-supply` from active UTXOs with the
+  separately labeled `scheduled-supply-cap`; issued supply may be lower after
+  solo blocks and must never exceed the cap.
+- Reorg: create equal-height siblings in a controlled window, verify rank by
+  `(L, MB, SB)` with `Q` report-only, extend the selected incumbent, and require
+  all nodes and explorer canonical views to converge after the explicit child
+  without database editing.
 - Restart: cleanly restart each service and preserve tip, balance, peers, and
   explorer state.
 - Hard kill: once while the listener is idle, kill only one node, recover via
   normal SQLite opening/sync, and verify no lost validated state.
-- Restore: restore an offline backup onto an empty test location and verify
-  status, disposable address, balance, sync, and explorer routes.
+- Restore: restore a reset-genesis offline backup onto an empty test location
+  and verify status, disposable address, balance, sync, and explorer routes.
 - Explorer: check canonical block/PBE/score/Q/co-op and address HTML/JSON,
-  read-only behavior, and escaping of harmless hostile-looking graffiti such
-  as `<b>test</b>`.
+  issued-supply and scheduled-maximum labels, read-only behavior, and escaping
+  of harmless hostile-looking graffiti such as `<b>test</b>`.
 
 Never coordinate a fault drill that takes every reachable bootstrap node down
 at once. Announce a bounded drill window, but do not assign mining obligations
@@ -276,10 +341,11 @@ Before every upgrade:
 5. Compare status, resource use, public P2P, and explorer routes with the
    pre-upgrade baseline and an independent node.
 
-Rollback only to a reviewed schema-compatible image. If compatibility is
-uncertain, stop and restore the matching backup instead of trying binaries
-against a newer database. Never make an unreviewed source push or a mainnet
-push to repair the public testnet.
+Rollback only to a reviewed image compatible with both the database schema and
+the reset genesis. Never restore a previous-testnet database or backup into the
+reset data directory. If compatibility is uncertain, stop and preserve the
+current directory rather than trying binaries against it. Never make an
+unreviewed source or mainnet push to repair public testnet.
 
 ## Incident shutdown
 
@@ -310,9 +376,10 @@ Continue only when all of these are evidenced:
 1. Seed and an independent node agree on canonical tip and validated bodies.
 2. DNS bootstrap, public TCP/19446, and HTTPS explorer work off-host while
    direct TCP/8080 remains unreachable.
-3. H16 retarget, H100 maturity/transfer, and one commit/reveal/Q/payout cycle
-   pass where their heights have been reached. If public cadence has not yet
-   reached a boundary, extend the gate rather than waive it.
+3. H16 retarget, H100 maturity/transfer, solo under-minting, issued-versus-
+   scheduled supply labels, and one contribution-weighted commit/reveal payout
+   cycle pass where their heights have been reached. If cadence has not reached
+   a boundary, extend the gate rather than waive it.
 4. A reorg, clean restart, hard-kill recovery, offline backup, and restore pass.
 5. Explorer canonical/read-only/XSS checks pass.
 6. Logs and metrics show bounded CPU, memory, disk, PIDs, file descriptors,
@@ -329,15 +396,18 @@ The public testnet exercise completes only when:
 
 - it operated for 30 consecutive days with the one-hour cadence used as a
   network target, not an enforced community participation schedule;
-- seed and independent nodes finish on the same canonical tip, validated body
-  count, next complexity, and UTXO-derived balances;
+- seed and independent nodes finish on the same reset-genesis canonical tip,
+  validated body count, next complexity, branch-aware issued supply, and
+  UTXO-derived balances;
 - every observed retarget and the H100 maturity boundary are correct;
 - at least two commit/reveal/co-op cycles from distinct periods produce valid
-  non-zero Q and payouts;
-- repeated reorg, restart, hard-kill, backup, restore, upgrade, and rollback
-  exercises recover without manual database editing or wallet loss;
+  authenticated `Q` and contribution-weighted 10%/5% payouts;
+- repeated reorg, restart, hard-kill, reset-genesis backup, restore, upgrade,
+  and rollback exercises recover without manual database editing or wallet
+  loss;
 - explorer HTML/JSON remains correct, read-only, TLS-only publicly, and
-  XSS-safe, with port 8080 loopback-only;
+  XSS-safe, with issued-supply and scheduled-maximum labels and port 8080
+  loopback-only;
 - abuse, logs, resources, uptime, and database growth have a reviewed 30-day
   record with no unresolved trend or incident;
 - bootstrap from `seed.testnet.sigilcoin.lol:19446` works for a fresh community

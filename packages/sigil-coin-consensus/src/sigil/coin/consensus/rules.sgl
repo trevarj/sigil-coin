@@ -6,17 +6,14 @@
 ;;; cadence, which leaves room for a solution to be found and propagated
 ;;; without letting a miner sprint a private chain forward.
 ;;;
-;;; The spacing floor is the one rule here that is chain policy rather than
-;;; a fixed constant: mainnet uses `coin-min-block-spacing`, and a local
-;;; test chain that has to mine consecutive blocks in seconds passes its own
-;;; floor to `coin-validate-header-context`. The floor a chain applies comes
-;;; from its chain config, so this package stays pure and knows only the
-;;; mainnet default.
+;;; The spacing floor and future-drift allowance are chain policy. Mainnet
+;;; uses `coin-min-block-spacing` and `coin-max-future-drift`; other chains
+;;; pass both values to `coin-validate-header-context`. This package stays
+;;; pure and knows only those compatible mainnet defaults.
 ;;;
-;;; On top of the spacing floor the usual Bitcoin timestamp rules apply: a
-;;; header's time must exceed the median of the last `coin-median-time-span`
-;;; headers, and may not sit more than `coin-max-future-drift` seconds ahead
-;;; of the validating node's clock.
+;;; Alongside spacing and drift, the usual Bitcoin median-time rule applies:
+;;; a header's time must exceed the median of the last
+;;; `coin-median-time-span` headers.
 ;;;
 ;;; Both are implemented here rather than imported: `sigil-bitcoin-consensus`
 ;;; supplies header linkage, serialization and proof-of-work helpers, but no
@@ -82,18 +79,25 @@
     (define (last-of xs)
       (if (null? (cdr xs)) (car xs) (last-of (cdr xs))))
 
-    ;; Resolve the optional spacing floor. Raising here is deliberate: the
-    ;; floor comes from the node's own chain config, never from the network.
-    (define (spacing-argument args)
-      (cond
-        ((null? args) coin-min-block-spacing)
-        ((not (null? (cdr args)))
-         (error "coin-validate-header-context: too many arguments"))
-        ((and (number? (car args)) (exact? (car args))
-              (integer? (car args)) (>= (car args) 0))
-         (car args))
-        (else
-          (error "coin-validate-header-context: expected a spacing floor"))))
+    (define (policy-seconds? value)
+      (and (number? value) (exact? value) (integer? value) (>= value 0)))
+
+    ;; Resolve optional spacing and drift policy. Raising here is deliberate:
+    ;; both values come from the node's chain config, never from the network.
+    (define (pacing-arguments args)
+      (if (> (length args) 2)
+          (error "coin-validate-header-context: too many arguments"))
+      (let ((min-spacing (if (null? args)
+                             coin-min-block-spacing
+                             (car args)))
+            (max-future-drift (if (or (null? args) (null? (cdr args)))
+                                  coin-max-future-drift
+                                  (cadr args))))
+        (if (not (policy-seconds? min-spacing))
+            (error "coin-validate-header-context: expected a spacing floor"))
+        (if (not (policy-seconds? max-future-drift))
+            (error "coin-validate-header-context: expected a future-drift allowance"))
+        (cons min-spacing max-future-drift)))
 
     ;; The trailing `count` items of `xs`, or all of them when it is shorter.
     (define (trailing xs count)
@@ -156,10 +160,11 @@
     ;;; median to clear; the future-drift rule still applies to it. `now` is
     ;;; the validating node's clock in Unix seconds.
     ;;;
-    ;;; The optional `min-spacing` argument is the chain's spacing floor in
-    ;;; seconds; omitting it applies `coin-min-block-spacing`, the mainnet
-    ;;; floor. It is resolved before the guard because a bad floor is a node
-    ;;; misconfiguration, not a bad header, and must not be reported as one.
+    ;;; Optional `min-spacing` and `max-future-drift` arguments carry chain
+    ;;; policy in seconds. Omitting both applies the mainnet defaults; passing
+    ;;; only spacing preserves the historical API and defaults drift to
+    ;;; `coin-max-future-drift`. They are resolved before the guard because
+    ;;; bad policy is node misconfiguration, not a malformed network header.
     ;;;
     ;;; Rejection reasons are `malformed-header`, `bad-prev-hash`,
     ;;; `insufficient-spacing`, `time-too-old` and `time-too-far-ahead`. On
@@ -168,13 +173,15 @@
     ;;; ```scheme
     ;;; (coin-result-reason (coin-validate-header-context '() header now))
     ;;; ; => #f, when the header is not from the future
-    ;;; (coin-ok? (coin-validate-header-context headers header now 1))
-    ;;; ; => #t, on a chain whose floor is one second
+    ;;; (coin-ok? (coin-validate-header-context headers header now 3600 300))
+    ;;; ; => #t, under a one-hour floor and five-minute drift allowance
     ;;; ```
     (define (coin-validate-header-context previous-headers header now
-                                          . maybe-min-spacing)
+                                          . maybe-pacing)
       (: any? any? any? integer? ... -> coin-result?)
-      (let ((min-spacing (spacing-argument maybe-min-spacing)))
+      (let* ((pacing (pacing-arguments maybe-pacing))
+             (min-spacing (car pacing))
+             (max-future-drift (cdr pacing)))
         (guard (e (#t (coin-error 'malformed-header
                                   "header context check raised")))
           (cond
@@ -187,7 +194,7 @@
             (else
               (let ((time (block-header-time (validate-block-header header))))
                 (cond
-                  ((> time (+ now coin-max-future-drift))
+                  ((> time (+ now max-future-drift))
                    (coin-error 'time-too-far-ahead
                                "header time is too far in the future"))
                   ((null? previous-headers) (coin-ok header))

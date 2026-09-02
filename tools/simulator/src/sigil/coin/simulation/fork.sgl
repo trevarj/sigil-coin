@@ -1,0 +1,148 @@
+;;; (sigil coin simulation fork) — deterministic observer-side settlement
+;;;
+;;; This helper models only the consensus-visible sibling/child transition. It
+;;; is intentionally not a network simulator: candidates are observed in
+;;; `(arrival, actor)` order, the first sibling is incumbent, and only an
+;;; explicit child settles the height.
+
+(define-library (sigil coin simulation fork)
+  (import (sigil math)
+          (sigil list)
+          (sigil string)
+          (sigil bitcoin consensus)
+          (sigil coin consensus))
+  (export
+    coin-fork-candidate
+    coin-fork-candidate-actor
+    coin-fork-candidate-height
+    coin-fork-candidate-arrival
+    coin-fork-candidate-header
+    coin-run-fork-observer)
+
+  (begin
+
+    ;; A candidate is deliberately just `(actor height arrival header)`. The
+    ;; simulator keeps no peer, relay, or topology state behind this record.
+    (define (coin-fork-candidate actor height arrival header)
+      (: string? integer? integer? block-header? -> list?)
+      (if (not (string? actor))
+          (error "coin-fork-candidate: expected an actor string"))
+      (if (not (and (number? height) (exact? height) (integer? height)
+                    (>= height 0)))
+          (error "coin-fork-candidate: expected a non-negative height"))
+      (if (not (and (number? arrival) (exact? arrival) (integer? arrival)
+                    (>= arrival 0)))
+          (error "coin-fork-candidate: expected a non-negative arrival"))
+      (if (not (block-header? header))
+          (error "coin-fork-candidate: expected a block header"))
+      (if (coin-failed? (coin-score-check (block-header-nonce header)))
+          (error "coin-fork-candidate: header carries an illegal score word"))
+      (list actor height arrival header))
+
+    (define (coin-fork-candidate-actor candidate)
+      (list-ref candidate 0))
+
+    (define (coin-fork-candidate-height candidate)
+      (list-ref candidate 1))
+
+    (define (coin-fork-candidate-arrival candidate)
+      (list-ref candidate 2))
+
+    (define (coin-fork-candidate-header candidate)
+      (list-ref candidate 3))
+
+    (define (candidate-score candidate)
+      (block-header-nonce (coin-fork-candidate-header candidate)))
+
+    ;; Arrival order is observer state. Actor is only the deterministic tie
+    ;; breaker for simultaneous observations; score never reorders the trace.
+    (define (observation-before? a b)
+      (or (< (coin-fork-candidate-arrival a)
+             (coin-fork-candidate-arrival b))
+          (and (= (coin-fork-candidate-arrival a)
+                  (coin-fork-candidate-arrival b))
+               (string<? (coin-fork-candidate-actor a)
+                         (coin-fork-candidate-actor b)))))
+
+    (define (trace-row candidate event outcome incumbent child-observed?)
+      (list (coin-fork-candidate-arrival candidate)
+            (coin-fork-candidate-actor candidate)
+            (coin-fork-candidate-height candidate)
+            event
+            outcome
+            (coin-fork-candidate-actor incumbent)
+            (candidate-score incumbent)
+            (candidate-score candidate)
+            child-observed?))
+
+    ;;; Observe one sibling height and, optionally, its explicit child.
+    ;;;
+    ;;; The result is an alist with `height`, `selected`, `child`, `settled?`,
+    ;;; and `trace`. A child must be exactly one height higher and link to the
+    ;;; incumbent selected at the instant it arrives. Every sibling after that
+    ;;; child still calls production `coin-replaces-tip?` with `extended? #t`.
+    (define (coin-run-fork-observer candidates)
+      (: list? -> list?)
+      (if (not (and (list? candidates) (pair? candidates)))
+          (error "coin-run-fork-observer: expected candidates"))
+      (let* ((ordered (list-sort observation-before? candidates))
+             (first (car ordered))
+             (height (coin-fork-candidate-height first)))
+        (let loop ((rest (cdr ordered))
+                   (selected first)
+                   (child #f)
+                   (trace (list (trace-row first 'sibling 'incumbent
+                                           first #f))))
+          (if (null? rest)
+              `((height . ,height)
+                (selected . ,selected)
+                (child . ,child)
+                (settled? . ,(and child #t))
+                (trace . ,(reverse trace)))
+              (let* ((candidate (car rest))
+                     (candidate-height
+                       (coin-fork-candidate-height candidate)))
+                (cond
+                  ((= candidate-height height)
+                   (let* ((extended? (and child #t))
+                          (replace?
+                            (coin-replaces-tip?
+                              (candidate-score selected)
+                              extended?
+                              (candidate-score candidate)))
+                          (comparison
+                            (coin-score-compare
+                              (candidate-score candidate)
+                              (candidate-score selected)))
+                          (next-selected (if replace? candidate selected))
+                          (outcome
+                            (cond
+                              (extended? 'settled-late)
+                              (replace? 'replaces-incumbent)
+                              ((= comparison 0) 'equal-rank-retained)
+                              (else 'rank-loss))))
+                     (if (and extended? replace?)
+                         (error "coin-run-fork-observer: settled sibling replaced tip"))
+                     (loop (cdr rest)
+                           next-selected
+                           child
+                           (cons (trace-row candidate 'sibling outcome
+                                            next-selected extended?)
+                                 trace))))
+                  ((= candidate-height (+ height 1))
+                   (if child
+                       (error "coin-run-fork-observer: observed a second child"))
+                   (if (not (equal?
+                              (block-header-previous-block
+                                (coin-fork-candidate-header candidate))
+                              (block-header-hash
+                                (coin-fork-candidate-header selected))))
+                       (error "coin-run-fork-observer: child does not link to incumbent"))
+                   (loop (cdr rest)
+                         selected
+                         candidate
+                         (cons (trace-row candidate 'child 'child-settles
+                                          selected #t)
+                               trace)))
+                  (else
+                    (error "coin-run-fork-observer: candidate height is outside fork"))))))))))

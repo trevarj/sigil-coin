@@ -483,13 +483,12 @@
       (payout default: #f)
       (problem default: #f))
 
-    ;;; One coinbase output, with the role §6.5 gives it and the value that
-    ;;; section says it should carry.
+    ;;; One coinbase output, with its consensus role, actual value, and the
+    ;;; payout preview's expected value when a detail view could derive one.
     ;;;
-    ;;; `expected` is the split arithmetic's own answer; when it disagrees
-    ;;; with `value` the page says so rather than hiding it, because a block
-    ;;; whose outputs do not match the split is a block a node should have
-    ;;; rejected.
+    ;;; A missing `expected` is deliberate: list pages never evaluate share
+    ;;; programs, and detail pages omit the comparison if any share preview
+    ;;; fails or the coinbase total would imply negative fees.
     (define-struct explorer-output
       (index integer?)
       (role default: #f)
@@ -575,15 +574,36 @@
                       spec: spec
                       commits: '()))))))
 
+    ;; Run pure share previews only for a detail view. The result list stays
+    ;; aligned with canonical share order and never grants verified-cache
+    ;; provenance.
+    (define (preview-shares context shares detail?)
+      (if (and detail? context)
+          (map (lambda (share)
+                 (coin-check-share-solution context share))
+               shares)
+          '()))
+
+    ;; Contributions from an all-successful, aligned preview list. One
+    ;; failure makes the expected payout unavailable for the whole coinbase.
+    (define (preview-contributions shares previews)
+      (let loop ((ss shares) (ps previews) (out '()))
+        (cond ((null? ss)
+               (and (null? ps) (reverse out)))
+              ((or (null? ps) (not (coin-ok? (car ps)))) #f)
+              (else
+                (loop (cdr ss)
+                      (cdr ps)
+                      (cons (list-ref
+                              (coin-result-value (car ps))
+                              2)
+                            out))))))
+
     ;; One consensus share flattened for display. Signature and blind are
-    ;; decoded as hex, never verified or interpreted by the explorer. Derived
-    ;; work fields come only from consensus's pure preview, which cannot
-    ;; populate the fully-verified share cache.
-    (define (make-share chain index share payout context detail?)
+    ;; decoded as hex, never verified or interpreted by the explorer.
+    (define (make-share chain index share payout preview context detail?)
       (let* ((pubkey (coin-share-pubkey share))
              (solution (coin-share-solution share))
-             (preview (and detail? context
-                           (coin-check-share-solution context share)))
              (preview-value (and preview (coin-ok? preview)
                                  (coin-result-value preview)))
              (personalized (and preview-value (list-ref preview-value 0)))
@@ -625,33 +645,49 @@
             ((and (> share-count 0) (= index (+ share-count 1))) 'carrier)
             (else 'unexpected)))
 
-    ;; Label actual outputs against consensus's exact split plan.
-    (define (make-outputs chain outputs shares carrier-script)
-      (let* ((total (let loop ((xs outputs) (sum 0))
-                      (if (null? xs)
-                          sum
-                          (loop (cdr xs) (+ sum (txout-value (car xs)))))))
-             (share-count (and (list? shares) (length shares)))
-             (plan (and (list? shares)
-                        (guard (e (#t #f))
-                          (coin-split-plan total shares carrier-script)))))
-        (let loop ((xs outputs) (i 0) (expected plan) (out '()))
-          (if (null? xs)
-              (reverse out)
-              (let ((script (txout-script-pubkey (car xs))))
-                (loop (cdr xs)
-                      (+ i 1)
-                      (if (pair? expected) (cdr expected) '())
-                      (cons (explorer-output
-                              index: i
-                              role: (output-role i share-count)
-                              value: (txout-value (car xs))
-                              script: script
-                              address: (explorer-script->address-for-chain
-                                         chain script)
-                              expected: (and (pair? expected)
-                                             (car (car expected))))
-                            out)))))))
+    ;; Attach roles and a detail-only expected payout plan to actual outputs.
+    (define (make-outputs chain outputs share-count expected-plan)
+      (let loop ((xs outputs) (i 0) (expected expected-plan) (out '()))
+        (if (null? xs)
+            (reverse out)
+            (let ((script (txout-script-pubkey (car xs))))
+              (loop (cdr xs)
+                    (+ i 1)
+                    (if (pair? expected) (cdr expected) '())
+                    (cons (explorer-output
+                            index: i
+                            role: (output-role i share-count)
+                            value: (txout-value (car xs))
+                            script: script
+                            address: (explorer-script->address-for-chain
+                                       chain script)
+                            expected: (and (pair? expected)
+                                           (car (car expected))))
+                          out))))))
+
+    (define (coinbase-output-total outputs)
+      (and (pair? outputs)
+           (let loop ((xs outputs) (sum 0))
+             (if (null? xs)
+                 sum
+                 (loop (cdr xs) (+ sum (txout-value (car xs))))))))
+
+    ;; Infer fees from actual minted value. Invalid negative fees and any
+    ;; failed cooperative preview deliberately leave the comparison absent.
+    (define (expected-payout-plan detail? subsidy total shares contributions
+                                  carrier-script)
+      (and detail?
+           (number? total)
+           (list? shares)
+           contributions
+           (let ((fees (- total
+                          (if (null? shares)
+                              (quotient (* 4 subsidy) 5)
+                              subsidy))))
+             (and (>= fees 0)
+                  (guard (e (#t #f))
+                    (coin-payout-plan subsidy fees shares contributions
+                                      carrier-script))))))
 
     ;; Wire payloads and nested
     ;; SHARES/COMMITS fields are decoded only by consensus-owned codecs.
@@ -680,24 +716,36 @@
              (commits (and commits-result (coin-ok? commits-result)
                            (coin-result-value commits-result)))
              (share-count (and shares (length shares)))
-             (parent-block (and (pair? shares)
+             (parent-block (and detail? (pair? shares)
                                 (stored-block store parent-hash)))
              (carrier-script (and parent-block
                                   (coin-carrier-script parent-block)))
              (chain (explorer-store-config store))
-             (outputs (if parsed
-                          (make-outputs chain
-                                        (coinbase-outputs parsed)
-                                        shares carrier-script)
-                          '()))
+             (raw-outputs (if parsed (coinbase-outputs parsed) '()))
+             (total-output (coinbase-output-total raw-outputs))
+             (context (and detail? (pair? shares)
+                           (share-context store height parent-hash)))
+             (previews (preview-shares context
+                                       (if shares shares '())
+                                       detail?))
+             (contributions
+               (and (list? shares)
+                    (preview-contributions shares previews)))
+             (expected-plan
+               (expected-payout-plan
+                 detail?
+                 (explorer-block-reward base)
+                 total-output
+                 shares
+                 contributions
+                 carrier-script))
+             (outputs (make-outputs chain raw-outputs share-count expected-plan))
              (graffiti (and payload
                             (coin-coinbase-payload-graffiti payload)))
              (solution (and payload
                             (coin-coinbase-payload-solution payload)))
              (par (and view (car view)))
-             (length-used (and solution (bytevector-length solution)))
-             (context (and detail? (pair? shares)
-                           (share-context store height parent-hash))))
+             (length-used (and solution (bytevector-length solution))))
         (explorer-block
           height: height
           id: (explorer-block-id base)
@@ -747,12 +795,14 @@
           score-quality: (and score (list-ref score 3))
           share-count: share-count
           shares: (let loop ((xs (if shares shares '()))
+                             (previews previews)
                              (i 0)
                              (payouts (share-payouts outputs))
                              (out '()))
                     (if (null? xs)
                         (reverse out)
                         (loop (cdr xs)
+                              (if (pair? previews) (cdr previews) '())
                               (+ i 1)
                               (if (pair? payouts) (cdr payouts) '())
                               (cons (make-share chain
@@ -760,16 +810,14 @@
                                                 (car xs)
                                                 (and (pair? payouts)
                                                      (car payouts))
+                                                (and (pair? previews)
+                                                     (car previews))
                                                 context
                                                 detail?)
                                     out))))
           commit-count: (and commits (length commits))
           outputs: outputs
-          total-output: (let loop ((xs outputs) (sum 0))
-                          (if (null? xs)
-                              (and (pair? outputs) sum)
-                              (loop (cdr xs)
-                                    (+ sum (explorer-output-value (car xs))))))
+          total-output: total-output
           author: (explorer-author-tag graffiti)
           margin: (explorer-margin par length-used))))
 
@@ -786,8 +834,8 @@
     ;; body. Every step is guarded: a block row is bytes a peer sent.
     ;;
     ;; `detail?` is what a block PAGE passes and a list page does not: it
-    ;; re-runs each co-op share's program to report what it cost. Nothing on
-    ;; a list page evaluates anything.
+    ;; re-runs each co-op share's program to report its work and preview the
+    ;; expected contribution-weighted payout. List pages evaluate nothing.
     (define (make-block store hrow detail?)
       (let* ((hash-text (row-ref hrow 'hash))
              (prev-text (row-ref hrow 'prev_hash))
@@ -834,7 +882,9 @@
     ;; Chain summary
     ;; ============================================================
 
-    ;;; The numbers a summary page shows.
+    ;;; The numbers a summary page shows. `supply` is actual active-branch
+    ;;; issuance from the UTXO set; `max-supply` is the scheduled emission
+    ;;; curve's lifetime maximum.
     (define-struct explorer-summary
       (chain-name string?)
       (tip-height integer?)
@@ -922,7 +972,9 @@
           block-count: (count-of
                          store
                          "SELECT COUNT(*) AS count FROM blocks WHERE validated = 1")
-          supply: (guard (e (#t 0)) (coin-cumulative-supply tip-height))
+          supply: (count-of
+                    store
+                    "SELECT COALESCE(SUM(value), 0) AS count FROM utxos WHERE active = 1")
           max-supply: coin-max-supply
           next-height: next-height
           next-reward: (guard (e (#t 0)) (coin-block-reward next-height))

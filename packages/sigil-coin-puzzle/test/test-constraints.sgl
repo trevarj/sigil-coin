@@ -228,7 +228,7 @@
     (assert-equal "(lambda(x)(list x x))" (puzzle-constraint-wrap 0 "(list x x)"))
     (assert-equal "(lambda(x)(letrec((f(lambda(y)y)))(f x)))"
                   (puzzle-constraint-wrap 3 "x"))
-    (assert-equal "(lambda(x)(fold(lambda(a b)a)x '()))"
+    (assert-equal "(lambda(x)(fold(lambda(a b)a)x'()))"
                   (puzzle-constraint-wrap 7 "x"))
     ;; every other rule is satisfied by the body and the domain, not a wrapper
     (let loop ((ci 0))
@@ -240,9 +240,30 @@
                               (puzzle-constraint-wrap ci "(car x)")))
             (loop (+ ci 1))))))
 
-  (test "a repaired program still computes the same thing"
+  (test "tightening trims runs and delimiter-adjacent whitespace"
+    (let* ((body
+             (string-append " " (string #\tab) (string #\return) "\n"
+                            "(list x " (string #\tab) " (+ x x) "
+                            (string #\return) " ' y) \n"))
+           (source (puzzle-constraint-wrap 0 body)))
+      (assert-equal "(lambda(x)(list x(+ x x)'y))" source)
+      (assert-equal '(lambda (x) (list x (+ x x) (quote y)))
+                    (ast-of source))))
+
+  (test "tightening preserves escaped string bytes"
+    (let* ((literal
+             (string-append "\"" "a" "\\" "\"" "  " (string #\tab)
+                            "b" "\\" "\\" " c" "\""))
+           (body (string-append " \n(list " literal "  x)"
+                                (string #\return) " "))
+           (loose (string-append "(lambda(x)" body ")"))
+           (tight (puzzle-constraint-wrap 0 body)))
+      (assert-equal (string-append "(lambda(x)(list" literal "x))") tight)
+      (assert-equal (ast-of loose) (ast-of tight))))
+
+  (test "a tightened repaired program still computes the same thing"
     ;; `f` is the identity and `fold` over the empty list returns its init,
-    ;; so both wrappers are semantics-preserving.
+    ;; so tightening all three wrappers preserves their example behavior.
     (assert-true (wrap-runs? 0 "(+ x 1)" %examples))
     (assert-true (wrap-runs? 3 "(+ x 1)" %examples))
     (assert-true (wrap-runs? 7 "(+ x 1)" %examples)))
@@ -262,9 +283,9 @@
     ;; would silently eat the headroom under `puzzle-max-source-bytes`.
     (assert-equal 11 (- (string-length (puzzle-constraint-wrap 0 ""))
                         0))
-    (assert-equal 29 (- (string-length (puzzle-constraint-wrap 3 ""))
+    (assert-equal 28 (- (string-length (puzzle-constraint-wrap 3 ""))
                         (string-length (puzzle-constraint-wrap 0 ""))))
-    (assert-equal 24 (- (string-length (puzzle-constraint-wrap 7 ""))
+    (assert-equal 23 (- (string-length (puzzle-constraint-wrap 7 ""))
                         (string-length (puzzle-constraint-wrap 0 "")))))
 
   (test "an out-of-range constraint cannot be wrapped"

@@ -55,9 +55,12 @@
     coin-testnet-genesis-id-constant
     coin-regtest-genesis-id-constant
     coin-target-block-spacing
+    coin-testnet-network-magic
     coin-testnet-min-block-spacing
     coin-regtest-min-block-spacing
+    coin-testnet-max-future-drift
     coin-chain-min-block-spacing
+    coin-chain-max-future-drift
     coin-chain-address-hrp
     coin-irc-channel
     coin-genesis-quote

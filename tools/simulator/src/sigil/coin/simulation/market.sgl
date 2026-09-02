@@ -1,0 +1,706 @@
+;;; (sigil coin simulation market) — deterministic actor and fee model
+;;;
+;;; This is a bounded observer-side policy experiment, not consensus, an
+;;; equilibrium model, or a network simulator. Fork settlement occurs only
+;;; when the observer sees an explicit child of its selected incumbent.
+
+(define-library (sigil coin simulation market)
+  (import (sigil math)
+          (sigil list)
+          (sigil string)
+          (sigil json)
+          (sigil bitcoin consensus)
+          (sigil coin consensus)
+          (sigil coin simulation fork))
+  (export coin-run-market-simulation)
+
+  (begin
+
+    (define %height-count 12)
+    (define %sentinel-height 13)
+    (define %start-clock 1800000000)
+    (define %min-spacing 3600)
+    (define %max-future-drift 300)
+    (define %modeled-block-overhead 1400)
+    (define %transaction-byte-cap
+      (- coin-max-block-bytes %modeled-block-overhead))
+
+    (define %miner-actors
+      '("fair-eager" "fair-fee-waiting" "strong-golfer"
+        "future-dater" "urgent-censor"))
+    (define %user-actors
+      '("steady" "urgent-high-fee" "bursty" "low-zero-fee-spam"))
+
+    (define (need condition message)
+      (if (not condition)
+          (error (string-append "market simulation: " message))))
+
+    (define (sum values)
+      (let loop ((xs values) (total 0))
+        (if (null? xs) total (loop (cdr xs) (+ total (car xs))))))
+
+    (define (count-if pred values)
+      (let loop ((xs values) (count 0))
+        (if (null? xs)
+            count
+            (loop (cdr xs) (if (pred (car xs)) (+ count 1) count)))))
+
+    (define (maximum-or-zero values)
+      (if (null? values) 0 (car (reverse (list-sort < values)))))
+
+    (define (mean-or-zero values)
+      (if (null? values) 0 (quotient (sum values) (length values))))
+
+    (define (ref record key)
+      (cdr (assq key record)))
+
+    (define (last-of values)
+      (if (null? (cdr values))
+          (car values)
+          (last-of (cdr values))))
+
+    ;; Transactions are deterministic byte/fee envelopes. Selection mirrors
+    ;; arrival-order first-fit; no fee priority or wire-size claim is added.
+    (define (transaction-envelope id actor arrival bytes fee)
+      `((id . ,id)
+        (actor . ,actor)
+        (arrival . ,arrival)
+        (bytes . ,bytes)
+        (fee . ,fee)))
+
+    (define (tx-id tx) (ref tx 'id))
+    (define (tx-actor tx) (ref tx 'actor))
+    (define (tx-arrival tx) (ref tx 'arrival))
+    (define (tx-bytes tx) (ref tx 'bytes))
+    (define (tx-fee tx) (ref tx 'fee))
+
+    (define (round-transactions height round-start)
+      (let ((steady
+              (list (transaction-envelope
+                      (format "steady-~a" height)
+                      "steady"
+                      (+ round-start 500)
+                      800
+                      800)))
+            (urgent
+              (list (transaction-envelope
+                      (format "urgent-~a" height)
+                      "urgent-high-fee"
+                      (+ round-start 3000 (* 100 (modulo height 3)))
+                      700
+                      6000)))
+            (bursty
+              (if (= 0 (modulo height 3))
+                  (let loop ((offsets '(900 1800 2700 3400))
+                             (index 1)
+                             (out '()))
+                    (if (null? offsets)
+                        (reverse out)
+                        (loop (cdr offsets)
+                              (+ index 1)
+                              (cons (transaction-envelope
+                                      (format "burst-~a-~a" height index)
+                                      "bursty"
+                                      (+ round-start (car offsets))
+                                      1500
+                                      1200)
+                                    out))))
+                  '()))
+            (spam
+              (let loop ((offsets '(100 700 1300)) (index 1) (out '()))
+                (if (null? offsets)
+                    (reverse out)
+                    (loop (cdr offsets)
+                          (+ index 1)
+                          (cons (transaction-envelope
+                                  (format "spam-~a-~a" height index)
+                                  "low-zero-fee-spam"
+                                  (+ round-start (car offsets))
+                                  3600
+                                  (if (= 0 (modulo (+ height index) 2)) 0 50))
+                                out))))))
+        (append steady urgent bursty spam)))
+
+    (define (tx-before? a b)
+      (or (< (tx-arrival a) (tx-arrival b))
+          (and (= (tx-arrival a) (tx-arrival b))
+               (string<? (tx-id a) (tx-id b)))))
+
+    (define (sort-transactions transactions)
+      (list-sort tx-before? transactions))
+
+    ;; Return `(arrived future)` at one candidate's deterministic clock.
+    (define (split-arrived transactions clock)
+      (let loop ((xs transactions) (arrived '()) (future '()))
+        (if (null? xs)
+            (list (reverse arrived) (reverse future))
+            (if (<= (tx-arrival (car xs)) clock)
+                (loop (cdr xs) (cons (car xs) arrived) future)
+                (loop (cdr xs) arrived (cons (car xs) future))))))
+
+    ;; Return `(selected carryover censored)`. Only the urgent-censor actor
+    ;; omits urgent transactions; the future-dater has ordinary policy.
+    (define (select-transactions transactions miner)
+      (let loop ((xs transactions) (used 0)
+                 (selected '()) (carryover '()) (censored '()))
+        (if (null? xs)
+            (list (reverse selected) (reverse carryover) (reverse censored))
+            (let* ((tx (car xs))
+                   (censor?
+                     (and (string=? miner "urgent-censor")
+                          (string=? (tx-actor tx) "urgent-high-fee"))))
+              (cond
+                (censor?
+                 (loop (cdr xs) used selected (cons tx carryover)
+                       (cons tx censored)))
+                ((<= (+ used (tx-bytes tx)) %transaction-byte-cap)
+                 (loop (cdr xs) (+ used (tx-bytes tx))
+                       (cons tx selected) carryover censored))
+                (else
+                  (loop (cdr xs) used selected (cons tx carryover)
+                        censored)))))))
+
+    (define %score-eager (coin-score-encode 36 80 300 0))
+    (define %score-fee-waiting (coin-score-encode 35 80 300 0))
+    (define %score-strong (coin-score-encode 30 64 240 0))
+    ;; The two adversarial roles intentionally share the frozen producer tuple.
+    (define %score-future (coin-score-encode 33 72 270 0))
+    (define %score-censor (coin-score-encode 33 72 270 0))
+
+    (need (= %score-future %score-censor)
+          "future-dater and urgent-censor score tuples diverged")
+
+    (define (fee-wait-delay height)
+      (if (= 0 (modulo height 4)) 750 500))
+
+    (define (strong-delay height)
+      (cond ((= 1 (modulo height 4)) 200)
+            ((= 2 (modulo height 4)) 800)
+            ((= 3 (modulo height 4)) 450)
+            (else 900)))
+
+    (define (adversary-delay height)
+      (cond ((= 1 (modulo height 3)) 350)
+            ((= 2 (modulo height 3)) 700)
+            (else 500)))
+
+    (define (legal-candidate parent height timestamp legal-clock actor delay score)
+      (let* ((arrival (+ legal-clock delay))
+             (header
+               (block-header
+                 version: 5
+                 previous-block: (block-header-hash parent)
+                 merkle-root: (make-bytevector 32 0)
+                 time: timestamp
+                 bits: 0
+                 nonce: score))
+             (checked
+               (coin-validate-header-context
+                 (list parent) header arrival
+                 %min-spacing %max-future-drift)))
+        (need (coin-ok? checked) "a modeled legal candidate failed pacing")
+        (coin-fork-candidate actor height arrival header)))
+
+    (define (round-candidates parent height timestamp legal-clock)
+      (list
+        (legal-candidate parent height timestamp legal-clock
+                         "fair-eager" 0 %score-eager)
+        (legal-candidate parent height timestamp legal-clock
+                         "fair-fee-waiting" (fee-wait-delay height)
+                         %score-fee-waiting)
+        (legal-candidate parent height timestamp legal-clock
+                         "strong-golfer" (strong-delay height)
+                         %score-strong)
+        (legal-candidate parent height timestamp legal-clock
+                         "future-dater" (adversary-delay height)
+                         %score-future)
+        (legal-candidate parent height timestamp legal-clock
+                         "urgent-censor" (adversary-delay height)
+                         %score-censor)))
+
+    (define (candidate-score candidate)
+      (block-header-nonce (coin-fork-candidate-header candidate)))
+
+    (define (candidate-clock candidate)
+      (coin-fork-candidate-arrival candidate))
+
+    (define (candidate-actor candidate)
+      (coin-fork-candidate-actor candidate))
+
+    (define (candidate-at-or-before? candidate clock)
+      (< (candidate-clock candidate) clock))
+
+    (define (candidate-outcomes height candidates child-clock winner)
+      (map
+        (lambda (candidate)
+          (list
+            (candidate-actor candidate)
+            (cond
+              ((string=? (candidate-actor candidate)
+                         (candidate-actor winner))
+               'winner)
+              ((>= (candidate-clock candidate) child-clock) 'settled-late)
+              ((= 0 (coin-score-compare
+                      (candidate-score candidate)
+                      (candidate-score winner)))
+               'equal-rank-loss)
+              (else 'rank-loss))
+            height))
+        candidates))
+
+    ;; Market row indexes are explicit because summaries consume generated rows.
+    (define %row-winner 1)
+    (define %row-future-rejections 8)
+    (define %row-fork-losses 9)
+    (define %row-settled-late 13)
+    (define %row-utilization 17)
+    (define %row-fees 18)
+    (define %row-subsidy 19)
+    (define %row-producer 20)
+    (define %row-total-coinbase 21)
+    (define %row-minted-subsidy 22)
+    (define %row-unminted 23)
+    (define %row-censorship 24)
+
+    (define %market-header
+      '(height winner round_start_clock earliest_timestamp publish_clock
+        publish_offset score_word legal_observations_before_child
+        future_drift_rejections fork_choice_losses child_actor child_height
+        child_arrival_clock settled_late_candidates mempool_before
+        transactions_included transaction_bytes block_utilization_permille
+        fees scheduled_subsidy producer_payout total_coinbase minted_subsidy
+        unminted_subsidy censorship_observations
+        winner_censorship_observations latency_mean_seconds
+        latency_max_seconds mempool_after pending_arrivals))
+
+    ;; Result: rows, all transactions, confirmed `(tx . clock)` pairs, final
+    ;; mempool/future arrivals, candidate observations, censorship observations,
+    ;; and child observations. Every row is appended only after its child.
+    (define %run
+      (let ((genesis
+              (block-header
+                version: 5
+                previous-block: (make-bytevector 32 0)
+                merkle-root: (make-bytevector 32 0)
+                time: %start-clock
+                bits: 0
+                nonce: %score-eager)))
+        (let loop ((height 1)
+                   (parent genesis)
+                   (round-start %start-clock)
+                   (mempool '())
+                   (pending '())
+                   (all-transactions '())
+                   (confirmed '())
+                   (rows '())
+                   (candidate-observations '())
+                   (censorship-observations '())
+                   (child-observations '()))
+          (if (> height %height-count)
+              (list
+                (reverse rows)
+                all-transactions
+                confirmed
+                mempool
+                pending
+                candidate-observations
+                censorship-observations
+                child-observations)
+              (let* ((timestamp (+ (block-header-time parent) %min-spacing))
+                     (legal-clock (- timestamp %max-future-drift))
+                     ;; The future-dater makes exactly one early attempt, then
+                     ;; submits its ordinary legal candidate.
+                     (future-header
+                       (block-header
+                         version: 5
+                         previous-block: (block-header-hash parent)
+                         merkle-root: (make-bytevector 32 0)
+                         time: timestamp
+                         bits: 0
+                         nonce: %score-future))
+                     (future-check
+                       (coin-validate-header-context
+                         (list parent)
+                         future-header
+                         (+ round-start 60)
+                         %min-spacing
+                         %max-future-drift))
+                     (candidates
+                       (round-candidates parent height timestamp legal-clock))
+                     ;; The earliest legal height+1 candidate is the explicit
+                     ;; child. At height 12 it is named as the sentinel rather
+                     ;; than starting a thirteenth mined market round.
+                     (child-clock (+ timestamp %min-spacing
+                                     (- %max-future-drift)))
+                     (before-child
+                       (filter
+                         (lambda (candidate)
+                           (candidate-at-or-before? candidate child-clock))
+                         candidates))
+                     (pre-fork (coin-run-fork-observer before-child))
+                     (winner (ref pre-fork 'selected))
+                     (winner-header (coin-fork-candidate-header winner))
+                     (child-header
+                       (block-header
+                         version: 5
+                         previous-block: (block-header-hash winner-header)
+                         merkle-root: (make-bytevector 32 0)
+                         time: (+ timestamp %min-spacing)
+                         bits: 0
+                         nonce: %score-eager))
+                     (child-actor
+                       (if (= height %height-count)
+                           "sentinel-child"
+                           "fair-eager"))
+                     (child
+                       (coin-fork-candidate
+                         child-actor (+ height 1) child-clock child-header))
+                     (fork
+                       (coin-run-fork-observer (append candidates (list child))))
+                     (selected (ref fork 'selected))
+                     (publish-clock (candidate-clock winner))
+                     (new-transactions
+                       (round-transactions height round-start))
+                     (all-pending
+                       (sort-transactions (append pending new-transactions)))
+                     (winner-split (split-arrived all-pending publish-clock))
+                     (available
+                       (sort-transactions (append mempool (car winner-split))))
+                     (future (cadr winner-split))
+                     (selection
+                       (select-transactions available (candidate-actor winner)))
+                     (selected-transactions (list-ref selection 0))
+                     (carryover (list-ref selection 1))
+                     (winner-censored (list-ref selection 2))
+                     ;; Observe the censor's actual candidate policy even when
+                     ;; canonical rank chooses another candidate.
+                     (censor-candidate
+                       (car (filter
+                              (lambda (candidate)
+                                (string=? "urgent-censor"
+                                          (candidate-actor candidate)))
+                              candidates)))
+                     (censor-split
+                       (split-arrived all-pending
+                                      (candidate-clock censor-candidate)))
+                     (censor-available
+                       (sort-transactions
+                         (append mempool (car censor-split))))
+                     (censor-selection
+                       (select-transactions censor-available "urgent-censor"))
+                     (censored (list-ref censor-selection 2))
+                     (transaction-bytes
+                       (sum (map tx-bytes selected-transactions)))
+                     (fees (sum (map tx-fee selected-transactions)))
+                     (subsidy (coin-block-reward height))
+                     (payout-plan
+                       (coin-payout-plan subsidy fees '() '() #f))
+                     (producer-payout (car (car payout-plan)))
+                     (total-coinbase producer-payout)
+                     (minted-subsidy (- total-coinbase fees))
+                     (unminted-subsidy (- subsidy minted-subsidy))
+                     (latencies
+                       (map (lambda (tx)
+                              (- publish-clock (tx-arrival tx)))
+                            selected-transactions))
+                     (late-count
+                       (count-if
+                         (lambda (candidate)
+                           (>= (candidate-clock candidate) child-clock))
+                         candidates))
+                     (row
+                       (list
+                         height
+                         (candidate-actor winner)
+                         round-start
+                         timestamp
+                         publish-clock
+                         (- publish-clock round-start)
+                         (candidate-score winner)
+                         (length before-child)
+                         1
+                         (- (length before-child) 1)
+                         child-actor
+                         (+ height 1)
+                         child-clock
+                         late-count
+                         (length available)
+                         (length selected-transactions)
+                         transaction-bytes
+                         (quotient
+                           (* (+ %modeled-block-overhead transaction-bytes) 1000)
+                           coin-max-block-bytes)
+                         fees
+                         subsidy
+                         producer-payout
+                         total-coinbase
+                         minted-subsidy
+                         unminted-subsidy
+                         (length censored)
+                         (length winner-censored)
+                         (mean-or-zero latencies)
+                         (maximum-or-zero latencies)
+                         (length carryover)
+                         (length future))))
+                (need (eq? 'time-too-far-ahead
+                           (coin-result-reason future-check))
+                      "future-dater attempt was not rejected")
+                (need (string=? (candidate-actor winner)
+                                (candidate-actor selected))
+                      "late sibling changed the child-settled incumbent")
+                (need (ref fork 'settled?)
+                      "market reward was considered before an explicit child")
+                (need (= (+ height 1)
+                         (coin-fork-candidate-height (ref fork 'child)))
+                      "market child height was not consecutive")
+                (need (equal?
+                        (block-header-previous-block child-header)
+                        (block-header-hash winner-header))
+                      "market child did not name selected parent")
+                (need (<= (+ %modeled-block-overhead transaction-bytes)
+                          coin-max-block-bytes)
+                      "modeled block exceeded canonical byte cap")
+                (need (= producer-payout
+                         (+ (quotient (* 4 subsidy) 5) fees))
+                      "solo market payout did not use production plan")
+                (for-each
+                  (lambda (latency)
+                    (need (>= latency 0) "negative confirmation latency"))
+                  latencies)
+                (loop
+                  (+ height 1)
+                  winner-header
+                  publish-clock
+                  carryover
+                  future
+                  (append all-transactions new-transactions)
+                  (append confirmed
+                          (map (lambda (tx) (cons tx publish-clock))
+                               selected-transactions))
+                  (cons row rows)
+                  (append candidate-observations
+                          (candidate-outcomes height candidates child-clock
+                                              winner))
+                  (append censorship-observations censored)
+                  (append child-observations
+                          (list (list height (+ height 1) child-clock
+                                      child-actor)))))))))
+
+    (define %market-rows (list-ref %run 0))
+    (define %all-transactions (list-ref %run 1))
+    (define %confirmed (list-ref %run 2))
+    (define %final-mempool (list-ref %run 3))
+    (define %pending (list-ref %run 4))
+    (define %candidate-observations (list-ref %run 5))
+    (define %censorship-observations (list-ref %run 6))
+    (define %child-observations (list-ref %run 7))
+    (define %outstanding (append %final-mempool %pending))
+
+    (define (confirmed-actor entry) (tx-actor (car entry)))
+    (define (confirmation-latency entry)
+      (- (cdr entry) (tx-arrival (car entry))))
+
+    (define (miner-summary actor)
+      (let ((actor-rows
+              (filter (lambda (row)
+                        (string=? actor (list-ref row %row-winner)))
+                      %market-rows))
+            (observations
+              (filter (lambda (entry)
+                        (string=? actor (car entry)))
+                      %candidate-observations)))
+        `((actor . ,actor)
+          (archetype .
+            ,(cond
+               ((string=? actor "fair-eager") "fair eager")
+               ((string=? actor "fair-fee-waiting") "fair fee-waiting")
+               ((string=? actor "strong-golfer") "strong golfer")
+               ((string=? actor "future-dater") "future dater")
+               (else "urgent-transaction censor")))
+          (candidates . ,(length observations))
+          (wins . ,(length actor-rows))
+          (rank_losses .
+            ,(count-if
+               (lambda (entry)
+                 (or (eq? 'rank-loss (cadr entry))
+                     (eq? 'equal-rank-loss (cadr entry))))
+               observations))
+          (settled_late_losses .
+            ,(count-if (lambda (entry) (eq? 'settled-late (cadr entry)))
+                       observations))
+          (future_drift_rejections .
+            ,(if (string=? actor "future-dater") %height-count 0))
+          (fees_collected .
+            ,(sum (map (lambda (row) (list-ref row %row-fees)) actor-rows)))
+          (scheduled_subsidy .
+            ,(sum (map (lambda (row) (list-ref row %row-subsidy)) actor-rows)))
+          (producer_payout .
+            ,(sum (map (lambda (row) (list-ref row %row-producer)) actor-rows)))
+          (total_coinbase .
+            ,(sum (map (lambda (row) (list-ref row %row-total-coinbase))
+                       actor-rows)))
+          (minted_subsidy .
+            ,(sum (map (lambda (row) (list-ref row %row-minted-subsidy))
+                       actor-rows)))
+          (unminted_subsidy .
+            ,(sum (map (lambda (row) (list-ref row %row-unminted)) actor-rows)))
+          (censorship_observations .
+            ,(if (string=? actor "urgent-censor")
+                 (length %censorship-observations)
+                 0)))))
+
+    (define (user-summary actor)
+      (let* ((generated
+               (filter (lambda (tx) (string=? actor (tx-actor tx)))
+                       %all-transactions))
+             (confirmed
+               (filter (lambda (entry)
+                         (string=? actor (confirmed-actor entry)))
+                       %confirmed))
+             (outstanding
+               (filter (lambda (tx) (string=? actor (tx-actor tx)))
+                       %outstanding))
+             (latencies (map confirmation-latency confirmed)))
+        `((actor . ,actor)
+          (archetype .
+            ,(cond
+               ((string=? actor "steady") "steady")
+               ((string=? actor "urgent-high-fee") "urgent high-fee")
+               ((string=? actor "bursty") "bursty")
+               (else "low/zero-fee spam")))
+          (generated . ,(length generated))
+          (confirmed . ,(length confirmed))
+          (outstanding . ,(length outstanding))
+          (fees_paid . ,(sum (map (lambda (entry) (tx-fee (car entry)))
+                                  confirmed)))
+          (latency_mean_seconds . ,(mean-or-zero latencies))
+          (latency_max_seconds . ,(maximum-or-zero latencies))
+          (censorship_observations .
+            ,(count-if (lambda (tx) (string=? actor (tx-actor tx)))
+                       %censorship-observations)))))
+
+    (define %all-latencies (map confirmation-latency %confirmed))
+    (define %total-generated-fees (sum (map tx-fee %all-transactions)))
+    (define %confirmed-fees
+      (sum (map (lambda (entry) (tx-fee (car entry))) %confirmed)))
+    (define %outstanding-fees (sum (map tx-fee %outstanding)))
+    (define %censorship-count (length %censorship-observations))
+
+    ;; Conservation and child counts make model drift loud without pinning an
+    ;; attack outcome that legitimately follows production rank changes.
+    (need (= 76 (length %all-transactions))
+          "deterministic transaction count drifted")
+    (need (= (* %height-count (length %miner-actors))
+             (length %candidate-observations))
+          "deterministic candidate count drifted")
+    (need (= %height-count (length %child-observations))
+          "not every mined height observed a child")
+    (need (= %sentinel-height
+             (cadr (last-of %child-observations)))
+          "height twelve was not settled by the height-thirteen sentinel")
+    (need (= %height-count
+             (sum (map (lambda (row)
+                         (list-ref row %row-future-rejections))
+                       %market-rows)))
+          "future-dater rejection count drifted")
+    (need (> %censorship-count 0)
+          "urgent-censor attack produced no observations")
+    (need (= (length %all-transactions)
+             (+ (length %confirmed) (length %outstanding)))
+          "transaction-count conservation failed")
+    (need (= %total-generated-fees
+             (+ %confirmed-fees %outstanding-fees))
+          "fee conservation failed")
+
+    (define %aggregate
+      `((heights_mined . ,%height-count)
+        (sentinel_height . ,%sentinel-height)
+        (settled_heights . ,(length %child-observations))
+        (unsettled_tip_rewards_counted . 0)
+        (transactions_generated . ,(length %all-transactions))
+        (transactions_confirmed . ,(length %confirmed))
+        (transactions_outstanding . ,(length %outstanding))
+        (fees_generated . ,%total-generated-fees)
+        (fees_confirmed . ,%confirmed-fees)
+        (fees_outstanding . ,%outstanding-fees)
+        (scheduled_subsidy .
+          ,(sum (map (lambda (row) (list-ref row %row-subsidy))
+                     %market-rows)))
+        (producer_payout .
+          ,(sum (map (lambda (row) (list-ref row %row-producer))
+                     %market-rows)))
+        (total_coinbase .
+          ,(sum (map (lambda (row) (list-ref row %row-total-coinbase))
+                     %market-rows)))
+        (minted_subsidy .
+          ,(sum (map (lambda (row) (list-ref row %row-minted-subsidy))
+                     %market-rows)))
+        (unminted_subsidy .
+          ,(sum (map (lambda (row) (list-ref row %row-unminted))
+                     %market-rows)))
+        (future_drift_rejections . ,%height-count)
+        (fork_choice_losses .
+          ,(sum (map (lambda (row) (list-ref row %row-fork-losses))
+                     %market-rows)))
+        (settled_late_candidates .
+          ,(sum (map (lambda (row) (list-ref row %row-settled-late))
+                     %market-rows)))
+        (censorship_observations . ,%censorship-count)
+        (latency_mean_seconds . ,(mean-or-zero %all-latencies))
+        (latency_max_seconds . ,(maximum-or-zero %all-latencies))
+        (utilization_mean_permille .
+          ,(mean-or-zero
+             (map (lambda (row) (list-ref row %row-utilization))
+                  %market-rows)))
+        (mempool_final . ,(length %final-mempool))
+        (pending_arrivals_final . ,(length %pending))))
+
+    (define %results
+      `((parameters .
+          ((heights_mined . ,%height-count)
+           (sentinel_height . ,%sentinel-height)
+           (start_clock . ,%start-clock)
+           (min_spacing_seconds . ,%min-spacing)
+           (max_future_drift_seconds . ,%max-future-drift)
+           (canonical_max_block_bytes . ,coin-max-block-bytes)
+           (modeled_block_overhead_bytes . ,%modeled-block-overhead)
+           (transaction_byte_cap . ,%transaction-byte-cap)))
+        (modeled_assumptions .
+          ,(list->array
+             '("transaction envelopes use modeled bytes and fees, not wire serialization"
+               "arrival-order first-fit mirrors current CLI selection; no fee priority is added"
+               "same-height siblings remain eligible until an explicit child names the incumbent"
+               "the height-13 sentinel settles height 12"
+               "fees do not enter current fork choice"
+               "future-dater retries legally and never censors"
+               "urgent-censor uses legal timestamps and never future-dates")))
+        (aggregate . ,%aggregate)
+        (miners . ,(list->array (map miner-summary %miner-actors)))
+        (users . ,(list->array (map user-summary %user-actors)))
+        (scope . "bounded deterministic observer experiment; not equilibrium, profitability, or a network simulator")))
+
+    (define %summary
+      (string-append
+        (format "Market observer: ~a mined heights plus height-~a sentinel; ~a explicit child settlements.\n"
+                %height-count %sentinel-height (length %child-observations))
+        (format "Market transactions: ~a generated / ~a confirmed; final outstanding ~a.\n"
+                (length %all-transactions)
+                (length %confirmed)
+                (length %outstanding))
+        (format "Market fees: ~a confirmed, ~a outstanding; mean/max latency ~a/~a seconds.\n"
+                %confirmed-fees
+                %outstanding-fees
+                (mean-or-zero %all-latencies)
+                (maximum-or-zero %all-latencies))
+        (format "Distinct attacks: ~a future-time rejections; ~a urgent-censorship observations.\n"
+                %height-count %censorship-count)
+        "Rewards are counted only after a child names the selected parent; no timeout or unsettled tip reward is used.\n"
+        "Market scope: deterministic bounded observer assumptions, not an equilibrium or network simulation.\n"))
+
+    ;;; Run and return the deterministic actor/fee market experiment.
+    (define (coin-run-market-simulation)
+      (: -> list?)
+      `((header . ,%market-header)
+        (rows . ,%market-rows)
+        (results . ,%results)
+        (summary . ,%summary)))))

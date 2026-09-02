@@ -1,12 +1,18 @@
-SigilCoin Wave 4 deterministic survey
-======================================
+SigilCoin schema-4 deterministic simulation
+===========================================
 Puzzles: 420 global + 8 forced-constraint rows.
-Global retries: 49/420 puzzles retried; max 3; fallbacks 0.
-Table bytes min/median/max: 63/119/319; par: 24/30/78.
-Personalized tasks: 64/64 canonical secp256k1 keys; margin milli min/median/max 8/24/42.
-First 8 mean margin/contribution sum/Q: 23/8/8; easiest 8: 36/8/8.
-Payout matrix: 162 rows over R=0..8 and emission boundaries; max supply 14302999991970 daviwils.
-Aggregate order: 3 strong shares Q12 score 131281456 outrank 8 weak Q8 score 131281520.
-Timeline: carrier carrier-A commits at H=31; producer producer-B selects reveals and payouts at H+1=32.
-Censorship rows are timing-correct payout accounting, not a profitability claim.
+Global retries: 83/420 puzzles retried; max 3; fallbacks 0.
+Table bytes min/median/max: 65/114/297; par: 24/29/72.
+Personalized shares: 683/1024 deterministic keys have a semantic under-par candidate.
+Payout matrix: 162 rows; solo mints 80% subsidy plus fees, cooperative blocks mint subsidy plus fees.
+Cooperative rows allocate a 10% contribution-weighted share pool and 5% carrier payout; producer receives fees and rounding residuals.
+Strategic mining: 21 rows over key pools 0..1024; 683/1024 semantic candidates available.
+Legacy quality counterfactual would replace in 12 rows; canonical pre/post-child replacements: 0/0.
+Copy-and-attach is blocked by rank projection; settlement is child-observed, never timeout-based.
+Market observer: 12 mined heights plus height-13 sentinel; 12 explicit child settlements.
+Market transactions: 76 generated / 71 confirmed; final outstanding 5.
+Market fees: 93250 confirmed, 8450 outstanding; mean/max latency 3609/6950 seconds.
+Distinct attacks: 12 future-time rejections; 16 urgent-censorship observations.
+Rewards are counted only after a child names the selected parent; no timeout or unsettled tip reward is used.
+Market scope: deterministic bounded observer assumptions, not an equilibrium or network simulation.
 Caveat: consensus proves distinct tasks/work only, not distinct owners or identity independence.

@@ -105,6 +105,36 @@ require_line() {
     exit 1
   }
 }
+payout_field() {
+  awk -v wanted="$2" '
+    $1 == "payout:" {
+      role = $2
+      sub(/^role=/, "", role)
+      if (role == wanted) {
+        for (i = 3; i <= NF; i++) {
+          if ($i ~ /^value=/) {
+            sub(/^value=/, "", $i)
+            print $i " SGL"
+            exit
+          }
+        }
+      }
+    }
+  ' "$1"
+}
+sgl_to_daviwils() {
+  local amount=$1
+  [[ $amount =~ ^[0-9]+\.[0-9]{8}\ SGL$ ]] || {
+    echo "local-testnet: malformed SGL amount: $amount" >&2
+    return 1
+  }
+  awk -v amount="$amount" 'BEGIN {
+    sub(/ SGL$/, "", amount)
+    split(amount, parts, /\./)
+    printf "%.0f\n", parts[1] * 100000000 + parts[2]
+  }'
+}
+
 
 if [[ -z $bin_dir ]]; then
   out=$(nix --offline build "$root/deploy#sigilcoin" --no-link --print-out-paths)
@@ -118,9 +148,9 @@ explorer=$bin_dir/sigilcoin-explorer
 }
 
 helper_dir=$root/tools/local-testnet
-sigil=$workspace/sigil/build/dev/bin/sigil
-[[ -x $sigil ]] || {
-  echo "local-testnet: development Sigil binary missing: $sigil" >&2
+sigil=$(command -v sigil || true)
+[[ -n $sigil && -x $sigil ]] || {
+  echo "local-testnet: sigil is not available on PATH" >&2
   exit 1
 }
 helper=$helper_dir/build/dev/bin/sigil-coin-local-testnet
@@ -304,19 +334,41 @@ show "$coin" reveal --height 100 --regtest --data-dir "$node_b" \
   | tee "$logs/reveal-h100.out" >/dev/null
 shares_push=$(field "$logs/reveal-h100.out" shares-push)
 share_pubkey=$(field "$logs/reveal-h100.out" pubkey)
-reveal_q=$(field "$logs/reveal-h100.out" quality)
-[[ -n $shares_push && -n $share_pubkey && $reveal_q =~ ^[1-9][0-9]*$ ]]
+reveal_contribution=$(field "$logs/reveal-h100.out" quality)
+[[ -n $shares_push && -n $share_pubkey && $reveal_contribution =~ ^[1-4]$ ]]
+timeout 120 "$coin" puzzle --regtest --data-dir "$node_a" \
+  >"$logs/puzzle-h101.out"
+scheduled_subsidy=$(sgl_to_daviwils "$(field "$logs/puzzle-h101.out" reward)")
 show "$coin" mine --regtest --data-dir "$node_a" --reveal "$shares_push" \
   --graffiti "H101 carries contributor reveal" \
   | tee "$logs/mine-h101.out" >/dev/null
 require_line "$logs/mine-h101.out" '^height: 101$'
-require_line "$logs/mine-h101.out" "^accepted-share: $share_pubkey quality=$reveal_q$"
+require_line "$logs/mine-h101.out" "^accepted-share: $share_pubkey contribution=$reveal_contribution$"
 q=$(field "$logs/mine-h101.out" aggregate-q)
-[[ $q == "$reveal_q" ]]
-require_line "$logs/mine-h101.out" "^payout: role=share id=$share_pubkey value=[1-9][0-9]*\\.[0-9]{8} SGL$"
+[[ $q == "$reveal_contribution" ]]
+require_line "$logs/mine-h101.out" "^payout: role=share id=$share_pubkey contribution=$reveal_contribution value=[1-9][0-9]*\\.[0-9]{8} SGL$"
 require_line "$logs/mine-h101.out" '^payout: role=carrier value=[1-9][0-9]*\.[0-9]{8} SGL$'
 require_line "$logs/mine-h101.out" '^transactions: 1$'
-say "co-op CLI: B commit output -> A mine H100; B reveal output -> A mine H101; Q=$q, share/carrier payouts and tx $txid verified"
+
+fees=1000
+share_pool=$((scheduled_subsidy / 10))
+carrier_target=$((scheduled_subsidy / 20))
+contribution_sum=$reveal_contribution
+share_target=$((share_pool * reveal_contribution / contribution_sum))
+share_residual=$((share_pool - share_target))
+producer_target=$((scheduled_subsidy - carrier_target - share_pool))
+producer_expected=$((producer_target + fees + share_residual))
+minted_expected=$((scheduled_subsidy + fees))
+producer_paid=$(sgl_to_daviwils "$(payout_field "$logs/mine-h101.out" producer)")
+share_paid=$(sgl_to_daviwils "$(payout_field "$logs/mine-h101.out" share)")
+carrier_paid=$(sgl_to_daviwils "$(payout_field "$logs/mine-h101.out" carrier)")
+minted=$(sgl_to_daviwils "$(field "$logs/mine-h101.out" minted)")
+unminted=$(sgl_to_daviwils "$(field "$logs/mine-h101.out" unminted)")
+[[ $producer_paid -eq $producer_expected ]]
+[[ $share_paid -eq $share_target ]]
+[[ $carrier_paid -eq $carrier_target ]]
+[[ $minted -eq $minted_expected && $unminted -eq 0 ]]
+say "co-op CLI: B commit output -> A mine H100; B reveal output -> A mine H101; Q=$q, producer target+fees+residual, weighted 10% share pool, 5% carrier, and tx $txid verified"
 
 start_explorer
 start_listener "$node_a" "$port_a" "$logs/listen-a-1.log"

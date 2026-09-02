@@ -190,29 +190,29 @@
     ;;; `(sigil coin node chain)`. The launch date replaces that timestamp
     ;;; later, which is one argument and one regenerated constant.
     (define coin-genesis-header-constant
-      "050000000000000000000000000000000000000000000000000000000000000000000000b4a701bee9f07241ca026ac90bd801e769d5ca4024be0fe3fd18b7ebd26f7d6500376d6a80007f20f0a55516")
+      "0500000000000000000000000000000000000000000000000000000000000000000000003abfe61141772020f88eca3b4d628189441ac4d82de5f706d5b0df0c764d381200376d6a80007f20f0a55515")
 
-    ;;; Serialized canonical private testnet genesis header, as hex.
+    ;;; Serialized canonical reset public-testnet genesis header, as hex.
     ;;;
     ;;; Built from `coin-testnet-genesis-quote` and
     ;;; `coin-testnet-genesis-time` in `(sigil coin node chain)`.
     (define coin-testnet-genesis-header-constant
-      "050000000000000000000000000000000000000000000000000000000000000000000000c2dae5665d3349784ed7b82fb085c470971e33a3999e26e96d6dbd0dc31ba1198015966a80007f20f0a55516")
+      "05000000000000000000000000000000000000000000000000000000000000000000000022969f62c38af897e1ee74b36b78cd35d12d94cb154dcdf505891082d4ffb1a50067976a80007f20f0a55515")
 
     ;;; Serialized canonical regtest genesis header, as hex. Same provenance, from
     ;;; `coin-regtest-genesis-quote` and `coin-regtest-genesis-time`.
     (define coin-regtest-genesis-header-constant
-      "050000000000000000000000000000000000000000000000000000000000000000000000501a3316bcdc30940c8720722052a2099403d4987ed8c59adb437863bbc7331700b9556980007f20f0a55516")
+      "050000000000000000000000000000000000000000000000000000000000000000000000a9c7106fef8c88fb9226702db6f4c5b2db878cfbc3dcc82b59f13ee013f250e600b9556980007f20f0a55515")
 
     ;;; Display id (reversed hash) of the canonical mainnet genesis block, for
     ;;; humans. No leading zeros: there is no proof-of-work to produce them.
     (define coin-genesis-id-constant
-      "fba5dc25f4802378c2f2821f8d2699718c34edf09c4e854bf14aff714734dba4")
+      "1615333197455a3ebace8f1acdc66ae8d79a4f1a0ab3b7dc2f0078f051aef1ed")
 
-    ;;; Display id of the canonical private testnet genesis block.
+    ;;; Display id of the canonical reset public-testnet genesis block.
     (define coin-testnet-genesis-id-constant
-      "953c60759643c0701ea19e52d9e97bf57ed4fe1295830545ca7244757a3921a1")
+      "15447f3226699f537969cbea4b493bbbe25a4d856832bf28bce3e7df579e6ddc")
 
     ;;; Display id of the canonical regtest genesis block.
     (define coin-regtest-genesis-id-constant
-      "634fda21bb7b414a77e90c6ba55e6b4e202527935f1b0e93ef083c258beab1fe")))
+      "3d68493eed6f4adcb4073dc34b8a5b360fb73083f0cdbd6430c6b579ad3b69ba")))

@@ -178,7 +178,7 @@
         "    setText('live-block-count', displayNumber(data.block_count));\n"
         "    setText('live-header-detail', displayNumber(data.header_count) + ' headers to height ' + displayNumber(data.header_height));\n"
         "    setText('live-supply', amount(data.supply) + ' SGL');\n"
-        "    setText('live-supply-detail', 'of ' + amount(data.max_supply) + ' SGL');\n"
+        "    setText('live-supply-detail', 'scheduled maximum supply ' + amount(data.max_supply) + ' SGL');\n"
         "    setText('live-reward', amount(data.next_reward) + ' SGL');\n"
         "    setText('live-halving-detail', Number.isFinite(data.next_halving_height) ? 'next halving at height ' + String(data.next_halving_height) : 'never (reward has decayed to zero)');\n"
         "    setText('live-complexity', Number.isFinite(data.complexity) ? 'C ' + String(data.complexity) : 'unavailable');\n"

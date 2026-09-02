@@ -1,23 +1,26 @@
 {
-  "schema": 2,
+  "schema": 4,
   "canonical_apis": [
     "coin-puzzle-for",
     "puzzle-for/constraint",
     "coin-share-puzzle",
     "coin-check-solution",
-    "coin-check-share-solution",
-    "coin-share-margin-milli",
-    "coin-share-contribution",
+    "coin-check-share-solution/spec",
+    "coin-check-shares",
+    "coin-share-quality",
     "coin-quality",
-    "coin-score-encode",
-    "coin-score-better?",
-    "coin-split-unit",
-    "coin-split-plan",
+    "coin-score-rank-word",
+    "coin-score-compare",
+    "coin-replaces-tip?",
+    "coin-payout-plan",
+    "coin-build-block",
+    "coin-build-coop-block",
+    "coin-connect-block",
+    "coin-validate-header-context",
     "coin-block-reward",
     "coin-cumulative-supply",
-    "secp256k1-seckey-verify?",
-    "secp256k1-pubkey-create",
-    "secp256k1-pubkey-parse"
+    "secp256k1-ecdsa-sign",
+    "secp256k1-ecdsa-verify"
   ],
   "determinism": {
     "seed_formula": "byte[j]=(11+31*seed_index+7*j) mod 256",
@@ -48,7 +51,7 @@
       6,
       7
     ],
-    "pubkey_scalars": "1..64 multiples of secp256k1 G",
+    "strategy_key_scalars": "1..1024 multiples of secp256k1 G",
     "clock_or_host_randomness": false
   },
   "puzzles": {
@@ -77,16 +80,16 @@
       "mean_floor": 11
     },
     "table_bytes": {
-      "min": 63,
-      "median": 119,
-      "max": 319,
-      "mean_floor": 146
+      "min": 65,
+      "median": 114,
+      "max": 297,
+      "mean_floor": 139
     },
     "par": {
       "min": 24,
-      "median": 30,
-      "max": 78,
-      "mean_floor": 33
+      "median": 29,
+      "max": 72,
+      "mean_floor": 32
     },
     "retries": {
       "min": 0,
@@ -94,7 +97,7 @@
       "max": 3,
       "mean_floor": 0
     },
-    "retrying_puzzles": 49,
+    "retrying_puzzles": 83,
     "fallbacks": 0,
     "hidden_validation_steps": {
       "min": 30,
@@ -110,49 +113,20 @@
     }
   },
   "personalized_shares": {
-    "count": 64,
-    "global_constraint": 6,
+    "evaluated": 1024,
+    "available": 683,
+    "unavailable": 341,
     "margin_milli": {
-      "min": 8,
-      "median": 24,
-      "max": 42,
-      "mean_floor": 21
+      "min": 17,
+      "median": 18,
+      "max": 18,
+      "mean_floor": 17
     },
     "contribution_counts": {
-      "one": 64,
+      "one": 683,
       "two": 0,
       "three": 0,
       "four": 0
-    },
-    "first_eight": {
-      "indexes": [
-        1,
-        2,
-        3,
-        4,
-        5,
-        6,
-        7,
-        8
-      ],
-      "mean_margin_milli": 23,
-      "contribution_sum": 8,
-      "quality_q": 8
-    },
-    "easiest_eight": {
-      "indexes": [
-        20,
-        33,
-        61,
-        6,
-        7,
-        9,
-        5,
-        39
-      ],
-      "mean_margin_milli": 36,
-      "contribution_sum": 8,
-      "quality_q": 8
     }
   },
   "payouts": {
@@ -183,6 +157,7 @@
       7,
       8
     ],
+    "contribution_profile": "1,2,3,4 repeated in canonical share order",
     "max_supply": 14302999991970,
     "final_reward_height": 24820
   },
@@ -190,21 +165,229 @@
     "commitment_height": 31,
     "reveal_height": 32,
     "carrier_actor": "carrier-A",
-    "carrier_key": "key-63",
+    "carrier_key": "key-1023",
     "reveal_producer_actor": "producer-B",
-    "reveal_producer_key": "key-64",
+    "reveal_producer_key": "key-1024",
     "rows": 32,
-    "scope": "H/H+1 payout accounting; no profitability or equilibrium claim"
+    "scope": "H/H+1 contribution payout accounting; no profitability or equilibrium claim"
   },
-  "aggregate_ordering": {
-    "producer_length": 32,
-    "producer_cells": 80,
-    "producer_steps": 300,
-    "strong_q": 12,
-    "weak_q": 8,
-    "strong_score_word": 131281456,
-    "weak_score_word": 131281520,
-    "strong_outranks_weak": true
+  "strategic_mining": {
+    "parameters": {
+      "height": 32,
+      "subsidy": 10000000000,
+      "fees": 12345,
+      "parent_clock": 1800000000,
+      "spacing_seconds": 3600,
+      "future_drift_seconds": 300,
+      "original_arrival_clock": 1800003300,
+      "pre_child_copy_arrival_clock": 1800003360,
+      "child_arrival_clock": 1800006900,
+      "post_child_copy_arrival_clock": 1800006960,
+      "key_pools": [
+        0,
+        1,
+        8,
+        16,
+        64,
+        256,
+        1024
+      ],
+      "strategies": [
+        "none",
+        "minimum-quality",
+        "maximum-quality"
+      ]
+    },
+    "candidate_pool": {
+      "evaluated": 1024,
+      "available": 683,
+      "unavailable": 341
+    },
+    "matrix": {
+      "rows": 21,
+      "legacy_quality_rule_would_replace_rows": 12,
+      "canonical_pre_child_replacements": 0,
+      "canonical_post_child_replacements": 0,
+      "original_solver_capture_permille_min": 1000,
+      "settlement": "explicit accepted child"
+    },
+    "scope": "frozen deterministic copy-and-attach experiment; legacy quality replacement is counterfactual"
+  },
+  "market": {
+    "parameters": {
+      "heights_mined": 12,
+      "sentinel_height": 13,
+      "start_clock": 1800000000,
+      "min_spacing_seconds": 3600,
+      "max_future_drift_seconds": 300,
+      "canonical_max_block_bytes": 16384,
+      "modeled_block_overhead_bytes": 1400,
+      "transaction_byte_cap": 14984
+    },
+    "modeled_assumptions": [
+      "transaction envelopes use modeled bytes and fees, not wire serialization",
+      "arrival-order first-fit mirrors current CLI selection; no fee priority is added",
+      "same-height siblings remain eligible until an explicit child names the incumbent",
+      "the height-13 sentinel settles height 12",
+      "fees do not enter current fork choice",
+      "future-dater retries legally and never censors",
+      "urgent-censor uses legal timestamps and never future-dates"
+    ],
+    "aggregate": {
+      "heights_mined": 12,
+      "sentinel_height": 13,
+      "settled_heights": 12,
+      "unsettled_tip_rewards_counted": 0,
+      "transactions_generated": 76,
+      "transactions_confirmed": 71,
+      "transactions_outstanding": 5,
+      "fees_generated": 101700,
+      "fees_confirmed": 93250,
+      "fees_outstanding": 8450,
+      "scheduled_subsidy": 1200000000,
+      "producer_payout": 960093250,
+      "total_coinbase": 960093250,
+      "minted_subsidy": 960000000,
+      "unminted_subsidy": 240000000,
+      "future_drift_rejections": 12,
+      "fork_choice_losses": 48,
+      "settled_late_candidates": 0,
+      "censorship_observations": 16,
+      "latency_mean_seconds": 3609,
+      "latency_max_seconds": 6950,
+      "utilization_mean_permille": 902,
+      "mempool_final": 5,
+      "pending_arrivals_final": 0
+    },
+    "miners": [
+      {
+        "actor": "fair-eager",
+        "archetype": "fair eager",
+        "candidates": 12,
+        "wins": 0,
+        "rank_losses": 12,
+        "settled_late_losses": 0,
+        "future_drift_rejections": 0,
+        "fees_collected": 0,
+        "scheduled_subsidy": 0,
+        "producer_payout": 0,
+        "total_coinbase": 0,
+        "minted_subsidy": 0,
+        "unminted_subsidy": 0,
+        "censorship_observations": 0
+      },
+      {
+        "actor": "fair-fee-waiting",
+        "archetype": "fair fee-waiting",
+        "candidates": 12,
+        "wins": 0,
+        "rank_losses": 12,
+        "settled_late_losses": 0,
+        "future_drift_rejections": 0,
+        "fees_collected": 0,
+        "scheduled_subsidy": 0,
+        "producer_payout": 0,
+        "total_coinbase": 0,
+        "minted_subsidy": 0,
+        "unminted_subsidy": 0,
+        "censorship_observations": 0
+      },
+      {
+        "actor": "strong-golfer",
+        "archetype": "strong golfer",
+        "candidates": 12,
+        "wins": 12,
+        "rank_losses": 0,
+        "settled_late_losses": 0,
+        "future_drift_rejections": 0,
+        "fees_collected": 93250,
+        "scheduled_subsidy": 1200000000,
+        "producer_payout": 960093250,
+        "total_coinbase": 960093250,
+        "minted_subsidy": 960000000,
+        "unminted_subsidy": 240000000,
+        "censorship_observations": 0
+      },
+      {
+        "actor": "future-dater",
+        "archetype": "future dater",
+        "candidates": 12,
+        "wins": 0,
+        "rank_losses": 12,
+        "settled_late_losses": 0,
+        "future_drift_rejections": 12,
+        "fees_collected": 0,
+        "scheduled_subsidy": 0,
+        "producer_payout": 0,
+        "total_coinbase": 0,
+        "minted_subsidy": 0,
+        "unminted_subsidy": 0,
+        "censorship_observations": 0
+      },
+      {
+        "actor": "urgent-censor",
+        "archetype": "urgent-transaction censor",
+        "candidates": 12,
+        "wins": 0,
+        "rank_losses": 12,
+        "settled_late_losses": 0,
+        "future_drift_rejections": 0,
+        "fees_collected": 0,
+        "scheduled_subsidy": 0,
+        "producer_payout": 0,
+        "total_coinbase": 0,
+        "minted_subsidy": 0,
+        "unminted_subsidy": 0,
+        "censorship_observations": 16
+      }
+    ],
+    "users": [
+      {
+        "actor": "steady",
+        "archetype": "steady",
+        "generated": 12,
+        "confirmed": 12,
+        "outstanding": 0,
+        "fees_paid": 9600,
+        "latency_mean_seconds": 3420,
+        "latency_max_seconds": 6950,
+        "censorship_observations": 0
+      },
+      {
+        "actor": "urgent-high-fee",
+        "archetype": "urgent high-fee",
+        "generated": 12,
+        "confirmed": 11,
+        "outstanding": 1,
+        "fees_paid": 66000,
+        "latency_mean_seconds": 1931,
+        "latency_max_seconds": 4350,
+        "censorship_observations": 16
+      },
+      {
+        "actor": "bursty",
+        "archetype": "bursty",
+        "generated": 16,
+        "confirmed": 14,
+        "outstanding": 2,
+        "fees_paid": 16800,
+        "latency_mean_seconds": 3332,
+        "latency_max_seconds": 5650,
+        "censorship_observations": 0
+      },
+      {
+        "actor": "low-zero-fee-spam",
+        "archetype": "low/zero-fee spam",
+        "generated": 36,
+        "confirmed": 34,
+        "outstanding": 2,
+        "fees_paid": 850,
+        "latency_mean_seconds": 4333,
+        "latency_max_seconds": 6750,
+        "censorship_observations": 0
+      }
+    ],
+    "scope": "bounded deterministic observer experiment; not equilibrium, profitability, or a network simulator"
   },
   "caveat": "Consensus proves distinct pubkey-personalized tasks and verified work, not distinct owners or identity independence."
 }

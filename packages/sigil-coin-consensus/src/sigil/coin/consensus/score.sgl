@@ -1,7 +1,7 @@
 ;;; (sigil coin consensus score) — the 32-bit composite score word
 ;;;
-;;; canonical ranks siblings by the tuple `(L, MB, SB, 15-Q)` in that order, and
-;;; packs the whole tuple into the header's `nonce`:
+;;; The header's `W` commits the tuple `(L, MB, SB, 15-Q)` and packs it into
+;;; the header's `nonce`:
 ;;;
 ;;;   bit  31              22 21     15 14      8 7    4 3    0
 ;;;       +------------------+---------+---------+------+------+
@@ -13,28 +13,30 @@
 ;;;       fits ten bits
 ;;;   MB  bucket of the cells the producer's solution charged
 ;;;   SB  bucket of the steps it spent
-;;;   Q   aggregate verified share quality, 0..15, stored as `15-Q` so
-;;;       that more aggregate personalized work is a LOWER word
+;;;   Q   aggregate verified share quality, 0..15, stored as `15-Q`
 ;;;
-;;; WHY UNSIGNED `<` IS THE RANKING ORDER. The fields are laid out
-;;; most-significant-first in ranking priority, each in a fixed-width slot
-;;; that its domain cannot overflow: `L-1` in 0..511 fits 10 bits, both
-;;; buckets in 0..127 fit 7, and `15-Q` in 0..15 fits 4. A packing of
-;;; disjoint fixed-width fields is exactly the base-2^width positional
-;;; numeral of the tuple, and comparison of positional numerals of equal
-;;; width IS lexicographic comparison of their digit sequences. So
-;;; `W(a) < W(b)` iff `(L,MB,SB,15-Q)(a) < (...)(b)` lexicographically, with
-;;; no case analysis anywhere on the hot path. The low nibble is reserved
-;;; zero: it makes every field derived from the block body, so the header
-;;; carries no free entropy and there is no nonce to grind.
+;;; Fork choice does not compare `W` directly. `coin-score-rank-word`
+;;; projects it to
 ;;;
-;;; Aggregate verified quality is last on purpose. It breaks ties without
-;;; ever outranking a genuinely better producer program, so it occupies
-;;; strictly lower-order bits than every producer field.
+;;;   rank(W) = W & 0xffffff0f
 ;;;
-;;; THE BUCKETED VALUE IS THE CONSENSUS VALUE. Fork choice compares header
-;;; words and never body integers, so two solutions in one bucket are
-;;; exactly tied and fall through to aggregate quality. Precision loss is
+;;; which clears exactly the `15-Q` nibble. `Q` remains authenticated by the
+;;; raw header word, checked against the body, decoded for reporting, and
+;;; available to payouts, but it cannot change which sibling wins.
+;;;
+;;; WHY UNSIGNED `<` IS THE PROJECTED RANKING ORDER. After projection, the
+;;; ranking fields are laid out most-significant-first in fixed-width slots
+;;; that their domains cannot overflow: `L-1` in 0..511 fits 10 bits and both
+;;; buckets in 0..127 fit 7. A packing of disjoint fixed-width fields is
+;;; exactly the base-2^width positional numeral of the tuple, so unsigned
+;;; comparison of projected words is lexicographic comparison of `(L,MB,SB)`.
+;;; The low nibble remains reserved zero: every bit of raw `W` is still
+;;; derived from the block body, so the header carries no free entropy and
+;;; there is no nonce to grind.
+;;;
+;;; THE BUCKETED VALUE IS THE CONSENSUS VALUE. Fork choice compares projected
+;;; words and never body integers, so two solutions in one `(L, MB, SB)` class
+;;; are exactly tied regardless of aggregate quality. Precision loss is
 ;;; deliberate: there is no second, finer order to keep consistent with.
 ;;;
 ;;; The bucketing is integer-only — six buckets per octave, ~12.2%
@@ -66,6 +68,7 @@
     coin-max-score-word
 
     ;; Ranking
+    coin-score-rank-word
     coin-score-compare
     coin-score-better?)
 
@@ -277,28 +280,46 @@
     ;; Ranking
     ;; ============================================================
 
-    ;;; Rank two score words. Lower is better.
+    ;;; Project a legal score word onto the fork-choice rank word.
     ;;;
-    ;;; Returns -1 when `a` is the better block, 1 when `b` is, and 0 when
-    ;;; the two are incomparable — same length, same buckets, same aggregate
-    ;;; quality — in which case fork choice keeps the incumbent tip.
-    ;;;
-    ;;; This is plain unsigned comparison, which is the whole point of the
-    ;;; packing: see the module header for why it equals the lexicographic
-    ;;; order on `(L, MB, SB, 15-Q)`.
+    ;;; This clears only bits 7..4, which carry `15-Q`; all producer fields
+    ;;; and the reserved low nibble are preserved. Raises unless `w` is a
+    ;;; legal score word, exactly as `coin-score-compare` does.
     ;;;
     ;;; ```scheme
-    ;;; (coin-score-compare (coin-score-pack 24 0 0 0)
-    ;;;                        (coin-score-pack 25 0 0 0))
-    ;;; ; => -1
+    ;;; (coin-score-rank-word (coin-score-pack 24 50 51 3))
+    ;;; ; => (coin-score-pack 24 50 51 15)
+    ;;; ```
+    (define (coin-score-rank-word w)
+      (: integer? -> integer?)
+      (if (not (coin-score-valid? w))
+          (error "coin-score-rank-word: not a legal score word"))
+      (bitwise-and w #xffffff0f))
+
+    ;;; Rank two score words by their projected producer fields. Lower is
+    ;;; better.
+    ;;;
+    ;;; Returns -1 when `a` is the better block, 1 when `b` is, and 0 when
+    ;;; their `(L, MB, SB)` fields are equal. Raw words that differ only in
+    ;;; authenticated aggregate quality are therefore incomparable, and fork
+    ;;; choice keeps the incumbent tip.
+    ;;;
+    ;;; Both inputs must be legal score words. Comparison projects them first,
+    ;;; then performs plain unsigned comparison; see the module header for why
+    ;;; that equals lexicographic order on `(L, MB, SB)`.
+    ;;;
+    ;;; ```scheme
+    ;;; (coin-score-compare (coin-score-pack 24 50 51 0)
+    ;;;                     (coin-score-pack 24 50 51 15))
+    ;;; ; => 0
     ;;; ```
     (define (coin-score-compare a b)
       (: integer? integer? -> integer?)
-      (require-range "coin-score-compare" "score word" a
-                     0 (- coin-max-score-word 1))
-      (require-range "coin-score-compare" "score word" b
-                     0 (- coin-max-score-word 1))
-      (cond ((< a b) -1) ((> a b) 1) (else 0)))
+      (let ((a-rank (coin-score-rank-word a))
+            (b-rank (coin-score-rank-word b)))
+        (cond ((< a-rank b-rank) -1)
+              ((> a-rank b-rank) 1)
+              (else 0))))
 
     ;;; True when `a` strictly outranks `b`.
     ;;;

@@ -21,7 +21,8 @@
           (sigil coin puzzle constraints)
           (sigil coin consensus)
           (only (sigil coin consensus shares)
-                coin-check-share-solution/spec)
+                coin-check-share-solution/spec
+                coin-check-shares-cheap)
           (sigil coin node)
           (sigil coin cli history)
           (sigil coin cli args)
@@ -37,6 +38,7 @@
     coin-print-puzzle
     coin-block-transaction-fee
     coin-select-block-transactions
+    coin-select-verified-share-candidates
     run-puzzle
     run-mine
     run-commit
@@ -310,10 +312,10 @@
     ;; which is the case a miner reads as "the next block is not due yet".
     ;; Refusing here rather than at ingest is the difference between a
     ;; sentence about the block schedule and one about header acceptance.
-    (define (require-spacing parent spacing)
+    (define (require-spacing parent spacing max-future-drift)
       (let ((earliest (+ (block-header-time parent) spacing))
             (now (exact (floor (current-second)))))
-        (when (> earliest (+ now coin-max-future-drift))
+        (when (> earliest (+ now max-future-drift))
           (error (string-append
                    "mine: too early. This chain mines a block every "
                    (number->string spacing)
@@ -322,7 +324,7 @@
                    " — "
                    (number->string (- earliest now))
                    " seconds away, further ahead than the "
-                   (number->string coin-max-future-drift)
+                   (number->string max-future-drift)
                    "-second future-drift limit allows.")))
         (max earliest now)))
 
@@ -441,7 +443,7 @@
       (println "fallback: ~a" (report-ref report 'fallback))
       (println "solve: write a ONE-ARGUMENT function reproducing every pair above, then `sigilcoin mine~a --solution '<source>'`."
                (if (assq 'personalized-pubkey report) " --share" ""))
-      (println "rank: shorter wins; ties break on memory, then steps, then aggregate verified share quality.")
+      (println "rank: shorter wins; ties break on memory, then steps. Share quality is authenticated for reporting and payouts, not ranking.")
       report)
 
     ;;; Show the  puzzle for the next block, or for `--height`.
@@ -588,12 +590,17 @@
 
     (define (share-id share) (hex (coin-share-pubkey share)))
 
-    ;; A validated candidate is `(share contribution)`. Higher consensus
-    ;; contribution wins; commitment and canonical record bytes break ties.
-    (define (valid-share<? context a b)
-      (let* ((as (car a)) (bs (car b))
+    ;; A validated candidate is `(share contribution)`.
+    (define (candidate-share candidate) (car candidate))
+    (define (candidate-contribution candidate) (list-ref candidate 1))
+
+    ;; Group candidates by pubkey, with the strongest candidate first in each
+    ;; group. Commitment and canonical record bytes make same-key ties stable.
+    (define (same-pubkey-candidate<? context a b)
+      (let* ((as (candidate-share a)) (bs (candidate-share b))
              (ap (coin-share-pubkey as)) (bp (coin-share-pubkey bs))
-             (aq (list-ref a 1)) (bq (list-ref b 1))
+             (aq (candidate-contribution a))
+             (bq (candidate-contribution b))
              (ac (coin-share-commitment context as))
              (bc (coin-share-commitment context bs)))
         (or (cli-bytes<? ap bp)
@@ -605,7 +612,21 @@
                                    (cli-bytes<? (coin-share-encode as)
                                                 (coin-share-encode bs))))))))))
 
-    (define (sort-valid-shares context candidates)
+    ;; Final reveal admission is contribution-first. Pubkey is the only tie
+    ;; breaker after same-pubkey candidates have been collapsed.
+    (define (contribution-candidate<? a b)
+      (let ((aq (candidate-contribution a))
+            (bq (candidate-contribution b))
+            (ap (coin-share-pubkey (candidate-share a)))
+            (bp (coin-share-pubkey (candidate-share b))))
+        (or (> aq bq)
+            (and (= aq bq) (cli-bytes<? ap bp)))))
+
+    (define (canonical-candidate<? a b)
+      (cli-bytes<? (coin-share-pubkey (candidate-share a))
+                   (coin-share-pubkey (candidate-share b))))
+
+    (define (sort-candidates candidates less?)
       (let loop ((xs candidates) (out '()))
         (if (null? xs)
             out
@@ -613,91 +634,152 @@
               (cdr xs)
               (let insert ((ys out))
                 (cond ((null? ys) (list (car xs)))
-                      ((valid-share<? context (car xs) (car ys))
+                      ((less? (car xs) (car ys))
                        (cons (car xs) ys))
                       (else (cons (car ys) (insert (cdr ys))))))))))
 
-    ;; Validate every raw candidate before it can consume a pubkey or R8 slot.
+    ;; Full consensus verification occurs once for every distinct raw reveal.
+    ;; Capture its verified contribution immediately because the bounded
+    ;; consensus cache is reset for the next independent candidate.
     (define (validate-share-candidates context producer shares rejections)
-      (let loop ((xs shares) (valid '())
+      (let loop ((xs shares) (seen '()) (valid '())
                  (rejected (reverse rejections)))
         (if (null? xs)
-            (cons (reverse valid) (reverse rejected))
+            (list (reverse valid) (reverse rejected))
             (let* ((share (car xs))
-                   (checked (and context
-                                 (coin-check-shares
-                                   context producer (list share)))))
-              (if (and checked (coin-ok? checked))
-                  (loop (cdr xs)
-                        (cons (list share
-                                    (coin-share-quality context share))
-                              valid)
-                        rejected)
-                  (loop (cdr xs) valid
+                   (wire (coin-share-encode share)))
+              (if (bytes-member? wire seen)
+                  (loop (cdr xs) seen valid
                         (cons (cons (share-id share)
-                                    (if checked
-                                        (string-append
-                                          (result-reason checked)
-                                          (if (eq? (coin-result-reason checked)
-                                                   'share-uncommitted)
-                                              " (expired or wrong branch)"
-                                              ""))
-                                        "no eligible parent commitments"))
-                              rejected)))))))
+                                    "duplicate pubkey (nonchosen valid candidate)")
+                              rejected))
+                  (let ((checked
+                          (and context
+                               (coin-check-shares
+                                 context producer (list share)))))
+                    (if (and checked (coin-ok? checked))
+                        (loop
+                          (cdr xs) (cons wire seen)
+                          (cons
+                            (list share
+                                  (coin-share-quality context share))
+                            valid)
+                          rejected)
+                        (loop
+                          (cdr xs) (cons wire seen) valid
+                          (cons
+                            (cons
+                              (share-id share)
+                              (if checked
+                                  (string-append
+                                    (result-reason checked)
+                                    (if (eq? (coin-result-reason checked)
+                                             'share-uncommitted)
+                                        " (expired or wrong branch)"
+                                        ""))
+                                  "no eligible parent commitments"))
+                            rejected)))))))))
 
-    ;; Choose one best validated candidate per pubkey, then enforce set-level
-    ;; source uniqueness and R8 in canonical pubkey order.
-    (define (select-valid-shares context producer validated)
-      (let dedup ((xs (sort-valid-shares context (car validated)))
-                  (previous #f) (unique '())
-                  (rejected (reverse (cdr validated))))
+    ;; Keep one fully verified candidate per pubkey. The ordering above makes
+    ;; this independent of reveal input order.
+    (define (deduplicate-valid-pubkeys context candidates rejections)
+      (let loop ((xs (sort-candidates
+                       candidates
+                       (lambda (a b)
+                         (same-pubkey-candidate<? context a b))))
+                 (previous #f)
+                 (unique '())
+                 (rejected (reverse rejections)))
         (if (null? xs)
-            (let cap ((rest (reverse unique))
-                      (solutions (list (string->utf8 producer)))
-                      (accepted '()) (rejected rejected))
-              (if (null? rest)
-                  (cons (reverse accepted) (reverse rejected))
-                  (let* ((share (car (car rest)))
-                         (solution (coin-share-solution share)))
-                    (cond
-                      ((bytes-member? solution solutions)
-                       (cap (cdr rest) solutions accepted
-                            (cons (cons (share-id share)
-                                        "duplicate solution")
-                                  rejected)))
-                      ((>= (length accepted) coin-max-shares)
-                       (cap (cdr rest) solutions accepted
-                            (cons (cons (share-id share)
-                                        "share cap is 8")
-                                  rejected)))
-                      (else
-                        (cap (cdr rest) (cons solution solutions)
-                             (cons share accepted) rejected))))))
+            (list (reverse unique) (reverse rejected))
             (let* ((candidate (car xs))
-                   (pubkey (coin-share-pubkey (car candidate))))
+                   (share (candidate-share candidate))
+                   (pubkey (coin-share-pubkey share)))
               (if (and previous (equal? pubkey previous))
-                  (dedup (cdr xs) previous unique
-                         (cons (cons (share-id (car candidate))
-                                     "duplicate pubkey (nonchosen valid candidate)")
-                               rejected))
-                  (dedup (cdr xs) pubkey (cons candidate unique)
-                         rejected))))))
+                  (loop
+                    (cdr xs) previous unique
+                    (cons
+                      (cons (share-id share)
+                            "duplicate pubkey (nonchosen valid candidate)")
+                      rejected))
+                  (loop (cdr xs) pubkey (cons candidate unique)
+                        rejected))))))
 
-    ;; Consensus rechecks the selected aggregate and remains final authority.
+    ;; Rank all distinct eligible candidates before applying R8. Duplicate
+    ;; solutions are removed in that same rank order, then the winners are
+    ;; canonicalized by pubkey while their contributions stay attached.
+    (define (select-contribution-candidates producer candidates rejections)
+      (let ((producer-bytes
+              (if (bytevector? producer)
+                  producer
+                  (string->utf8 producer))))
+        (let loop ((xs (sort-candidates
+                         candidates contribution-candidate<?))
+                   (solutions (list producer-bytes))
+                   (accepted '())
+                   (rejected (reverse rejections)))
+          (if (null? xs)
+              (list
+                (sort-candidates (reverse accepted)
+                                 canonical-candidate<?)
+                (reverse rejected))
+              (let* ((candidate (car xs))
+                     (share (candidate-share candidate))
+                     (solution (coin-share-solution share)))
+                (cond
+                  ((bytes-member? solution solutions)
+                   (loop
+                     (cdr xs) solutions accepted
+                     (cons (cons (share-id share) "duplicate solution")
+                           rejected)))
+                  ((>= (length accepted) coin-max-shares)
+                   (loop
+                     (cdr xs) solutions accepted
+                     (cons (cons (share-id share) "share cap is 8")
+                           rejected)))
+                  (else
+                    (loop (cdr xs)
+                          (cons solution solutions)
+                          (cons candidate accepted)
+                          rejected))))))))
+
+    ;;; Select at most eight already-verified `(share contribution)` tuples.
+    ;;;
+    ;;; Selection is contribution descending with pubkey ascending as the tie
+    ;;; break. The returned tuples are canonicalized by pubkey, retaining each
+    ;;; contribution beside its share.
+    (define (coin-select-verified-share-candidates producer candidates)
+      (: any? list? -> list?)
+      (list-ref
+        (select-contribution-candidates producer candidates '())
+        0))
+
     (define (validate-shares context producer shares rejections)
-      (let* ((validated (validate-share-candidates
-                          context producer shares rejections))
-             (selected (select-valid-shares context producer validated))
-             (ordered (car selected)))
-        (if (null? ordered)
-            (list ordered (cdr selected) 0)
-            (let ((checked (coin-check-shares context producer ordered)))
-              (unless (coin-ok? checked)
-                (error (string-append
-                         "mine: accepted reveal set failed consensus: "
-                         (result-reason checked))))
-              (list ordered (cdr selected)
-                    (coin-shares-quality context ordered))))))
+      (let* ((validated
+               (validate-share-candidates
+                 context producer shares rejections))
+             (deduplicated
+               (deduplicate-valid-pubkeys
+                 context (list-ref validated 0) (list-ref validated 1)))
+             (selected
+               (select-contribution-candidates
+                 producer (list-ref deduplicated 0)
+                 (list-ref deduplicated 1)))
+             (ordered (list-ref selected 0))
+             (accepted (map candidate-share ordered))
+             (contributions (map candidate-contribution ordered))
+             ;; Recheck only aggregate cheap invariants. PBE/signature work
+             ;; above is never repeated by CLI construction.
+             (aggregate
+               (and context
+                    (coin-check-shares-cheap
+                      context producer accepted))))
+        (when (and aggregate (coin-failed? aggregate))
+          (error (string-append
+                   "mine: accepted reveal set failed consensus: "
+                   (result-reason aggregate))))
+        (list accepted contributions (list-ref selected 1)
+              (coin-quality contributions))))
 
     (define (validated-parent-block n parent)
       (let ((rows (sqlite-query
@@ -707,8 +789,33 @@
         (and (pair? rows)
              (block-parse (hex-decode (row-ref (car rows) "block_hex"))))))
 
+    ;; Assemble a cooperative candidate from the reports verified during
+    ;; reveal selection. This deliberately bypasses the validating high-level
+    ;; builder so mempool size probes do not execute every share program again.
+    (define (build-verified-coop-block
+              parent height complexity solution shares contributions
+              commitments graffiti producer-script carrier-script time
+              txs fees score-word)
+      (let* ((coinbase
+               (coin-mining-coinbase/coop
+                 height solution shares contributions commitments graffiti
+                 producer-script carrier-script fees))
+             (transactions (cons coinbase txs)))
+        (block
+          header-field:
+            (block-header
+              version: coin-header-version
+              previous-block: (block-header-hash parent)
+              merkle-root: (merkle-root
+                             (map transaction-txid transactions))
+              time: time
+              bits: (coin-bits-encode complexity)
+              nonce: score-word)
+          transactions: transactions)))
+
+
     (define (print-contributions commitments commit-rejected shares
-                                    share-rejected context quality)
+                                    contributions share-rejected quality)
       (for-each (lambda (commitment)
                   (println "accepted-commitment: ~a" (hex commitment)))
                 commitments)
@@ -716,20 +823,23 @@
                   (println "rejected-commitment: ~a reason=~a"
                            (car entry) (cdr entry)))
                 commit-rejected)
-      (for-each (lambda (share)
-                  (println "accepted-share: ~a quality=~a"
-                           (share-id share)
-                           (coin-share-quality context share)))
-                shares)
+      (let loop ((ss shares) (cs contributions))
+        (unless (null? ss)
+          (println "accepted-share: ~a contribution=~a"
+                   (share-id (car ss)) (car cs))
+          (loop (cdr ss) (cdr cs))))
       (for-each (lambda (entry)
                   (println "rejected-share: ~a reason=~a"
                            (car entry) (cdr entry)))
                 share-rejected)
       (println "aggregate-q: ~a" quality))
 
-    (define (print-payouts b shares)
-      (let ((outputs (transaction-outputs (car (block-transactions b))))
-            (count (length shares)))
+    (define (print-payouts b height fees shares contributions)
+      (let* ((coinbase (car (block-transactions b)))
+             (outputs (transaction-outputs coinbase))
+             (count (length shares))
+             (minted (transaction-output-value coinbase))
+             (subsidy (coin-block-reward height)))
         (let loop ((xs outputs) (index 0))
           (unless (null? xs)
             (let ((role (cond ((= index 0) "producer")
@@ -738,11 +848,18 @@
               (println "payout: role=~a~a value=~a SGL"
                        role
                        (if (string=? role "share")
-                           (string-append " id="
-                             (share-id (list-ref shares (- index 1))))
+                           (string-append
+                             " id=" (share-id
+                                      (list-ref shares (- index 1)))
+                             " contribution="
+                             (number->string
+                               (list-ref contributions (- index 1))))
                            "")
                        (cli-daviwils->sgl (txout-value (car xs))))
-              (loop (cdr xs) (+ index 1)))))))
+              (loop (cdr xs) (+ index 1)))))
+        (println "minted: ~a SGL" (cli-daviwils->sgl minted))
+        (println "unminted: ~a SGL"
+                 (cli-daviwils->sgl (- (+ subsidy fees) minted)))))
 
     ;;; Check a candidate, then submit canonical producer work.
     ;;; `--share` checks personalized work without publishing its source.
@@ -815,7 +932,10 @@
                          (parent (report-ref context 'parent))
                          (spacing (coin-chain-min-block-spacing
                                     (node-config n)))
-                         (time (require-spacing parent spacing))
+                         (max-future-drift
+                           (coin-chain-max-future-drift (node-config n)))
+                         (time (require-spacing parent spacing
+                                                max-future-drift))
                          (decoded-commits
                            (decode-inputs
                              (cli-arg-list args "--commit")
@@ -841,8 +961,12 @@
                              parent-context solution
                              (car decoded-shares) (cdr decoded-shares)))
                          (shares (list-ref share-validation 0))
-                         (share-rejected (list-ref share-validation 1))
-                         (quality (list-ref share-validation 2))
+                         (contributions (list-ref share-validation 1))
+                         (share-rejected (list-ref share-validation 2))
+                         (quality (list-ref share-validation 3))
+                         (carrier-script
+                           (and (pair? shares)
+                                (coin-carrier-script parent-block)))
                          (score (if (= quality 0)
                                     preliminary
                                     (cli-score-report spec solution quality)))
@@ -870,7 +994,7 @@
                                  "yes" "no"))
                     (print-contributions
                       commitments (cdr commit-selection)
-                      shares share-rejected parent-context quality)
+                      shares contributions share-rejected quality)
                     (let* ((build
                              (lambda (txs fees)
                                (if (null? shares)
@@ -879,11 +1003,12 @@
                                      (report-ref context 'complexity)
                                      solution graffiti payout time
                                      txs fees commitments)
-                                   (coin-build-coop-block
-                                     parent-block height
+                                   (build-verified-coop-block
+                                     parent height
                                      (report-ref context 'complexity)
-                                     solution shares graffiti payout time
-                                     txs fees commitments))))
+                                     solution shares contributions commitments
+                                     graffiti payout carrier-script time
+                                     txs fees (cdr (assq 'word score))))))
                            (selected (coin-select-block-transactions
                                       n height build))
                            (b (build (car selected) (cdr selected)))
@@ -906,7 +1031,8 @@
                       (println "block-bytes: ~a" size)
                       (println "transactions: ~a"
                                (length (car selected)))
-                      (print-payouts b shares)
+                      (print-payouts b height (cdr selected)
+                                     shares contributions)
                       (println "submitted: yes")
                       b))))))))
 

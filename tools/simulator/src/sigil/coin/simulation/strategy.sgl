@@ -1,0 +1,833 @@
+;;; (sigil coin simulation strategy) — copy-and-attach attack experiment
+;;;
+;;; The experiment constructs production blocks and signed personalized shares.
+;;; It deliberately keeps only deterministic clocks, keys, blinds, and market
+;;; inputs so the checked artifacts are reproducible byte for byte.
+
+(define-library (sigil coin simulation strategy)
+  (import (sigil math)
+          (sigil list)
+          (sigil string)
+          (sigil io)
+          (sigil json)
+          (sigil struct)
+          (sigil secp256k1)
+          (sigil bitcoin tx)
+          (sigil bitcoin consensus)
+          (sigil coin puzzle)
+          (sigil coin puzzle constraints)
+          (sigil coin puzzle generator)
+          (sigil coin consensus)
+          (only (sigil coin consensus shares)
+                coin-check-share-solution/spec)
+          (sigil coin node rules)
+          (sigil coin node body)
+          (sigil coin node miner)
+          (sigil coin node genesis)
+          (sigil coin simulation fork))
+  (export coin-run-strategy-simulation)
+
+  (begin
+
+    (define %key-pools '(0 1 8 16 64 256 1024))
+    (define %strategy-names '(none minimum-quality maximum-quality))
+    (define %largest-key-pool 1024)
+    (define %attack-height 32)
+    (define %parent-height 31)
+    (define %parent-clock 1800000000)
+    (define %spacing 3600)
+    (define %drift 300)
+    (define %original-timestamp (+ %parent-clock %spacing))
+    (define %original-arrival (- %original-timestamp %drift))
+    (define %pre-child-copy-arrival (+ %original-arrival 60))
+    (define %child-height (+ %attack-height 1))
+    (define %child-timestamp (+ %original-timestamp %spacing))
+    (define %child-arrival (- %child-timestamp %drift))
+    (define %post-child-copy-arrival (+ %child-arrival 60))
+    (define %fees 12345)
+    (define %subsidy (coin-block-reward %attack-height))
+    (define %producer-script #u8(#x51))
+    (define %attacker-script #u8(#x51 #x51))
+    (define %funding-script #u8(#x51))
+    (define %funding-value 1000000)
+    (define %generated-anchor-predicate "(equal? x\"@\")")
+    (define %semantic-anchor-predicate "(string? x)")
+
+    (define (need condition message)
+      (if (not condition)
+          (error (string-append "strategy simulation: " message))))
+
+    (define (ref record key)
+      (cdr (assq key record)))
+
+    (define (sum values)
+      (let loop ((xs values) (total 0))
+        (if (null? xs) total (loop (cdr xs) (+ total (car xs))))))
+
+    (define (take items count)
+      (let loop ((xs items) (n count) (out '()))
+        (if (or (= n 0) (null? xs))
+            (reverse out)
+            (loop (cdr xs) (- n 1) (cons (car xs) out)))))
+
+    (define (last-of xs)
+      (if (null? (cdr xs)) (car xs) (last-of (cdr xs))))
+
+    (define (bytes<? a b)
+      (let loop ((i 0))
+        (cond
+          ((>= i (bytevector-length a)) #f)
+          ((< (bytevector-u8-ref a i) (bytevector-u8-ref b i)) #t)
+          ((> (bytevector-u8-ref a i) (bytevector-u8-ref b i)) #f)
+          (else (loop (+ i 1))))))
+
+    (define (sort-bytes items key)
+      (list-sort (lambda (a b) (bytes<? (key a) (key b))) items))
+
+    (define (bytes->hex bytes)
+      (let ((digits "0123456789abcdef"))
+        (let loop ((i 0) (out ""))
+          (if (= i (bytevector-length bytes))
+              out
+              (let ((byte (bytevector-u8-ref bytes i)))
+                (loop
+                  (+ i 1)
+                  (string-append
+                    out
+                    (substring digits (quotient byte 16)
+                               (+ 1 (quotient byte 16)))
+                    (substring digits (modulo byte 16)
+                               (+ 1 (modulo byte 16))))))))))
+
+    ;; Big-endian scalar encoding supports the full 1..1024 frozen key sweep.
+    (define (scalar-bytes n)
+      (let ((out (make-bytevector 32 0)))
+        (let loop ((i 31) (value n))
+          (if (< i 0)
+              out
+              (begin
+                (bytevector-u8-set! out i (modulo value 256))
+                (loop (- i 1) (quotient value 256)))))))
+
+    (define (blind-bytes n)
+      (let ((out (make-bytevector 32 0)))
+        (let loop ((i 0))
+          (if (= i 32)
+              out
+              (begin
+                (bytevector-u8-set!
+                  out i (modulo (+ 73 (* 29 n) (* 11 i)) 256))
+                (loop (+ i 1)))))))
+
+    (define (ordinary-inputs-non-string? spec)
+      (let loop ((pairs (puzzle-spec-examples spec)))
+        (cond
+          ((null? pairs) #f)
+          ((null? (cdr pairs))
+           (let ((anchor (car pairs)))
+             (and (string? (car anchor))
+                  (string=? puzzle-anchor-input (car anchor))
+                  (puzzle-anchor-output? (cdr anchor)))))
+          ((string? (car (car pairs))) #f)
+          (else (loop (cdr pairs))))))
+
+    ;; This is the only candidate derivation seam. String-domain personalized
+    ;; tasks remain unavailable data; no source is whitespace-golfed.
+    (define (semantic-share-candidate spec)
+      (let ((source (puzzle-spec-hidden-source spec)))
+        (and
+          (ordinary-inputs-non-string? spec)
+          (= 1 (string-count source %generated-anchor-predicate))
+          (let* ((candidate
+                   (string-replace source
+                                   %generated-anchor-predicate
+                                   %semantic-anchor-predicate))
+                 (checked
+                   (coin-check-share-solution/spec spec candidate)))
+            (and (< (bytevector-length (string->utf8 candidate))
+                    (puzzle-spec-par spec))
+                 (coin-ok? checked)
+                 (list candidate (coin-result-value checked)))))))
+
+    ;; ============================================================
+    ;; A fully validated deterministic parent chain through height 30
+    ;; ============================================================
+
+    (define (build-strategy-simulation)
+      (define %genesis-time (- %parent-clock (* %parent-height %spacing)))
+      (define %genesis-block
+        (coin-genesis-block "SigilCoin simulator strategy chain" %genesis-time))
+      (define %funding-outpoint
+        (outpoint txid: (scalar-bytes 424242) index: 0))
+      (define %initial-utxos
+        (list
+          (cons
+            %funding-outpoint
+            (utxo-entry
+              output: (txout value: %funding-value
+                             script-pubkey: %funding-script)
+              coinbase?: #f
+              height: 0
+              time: %genesis-time))))
+
+      (define (header-valid? history header height arrival complexity)
+        (and
+          (coin-ok?
+            (coin-validate-header-context history header arrival %spacing %drift))
+          (coin-ok? (coin-check-bits (block-header-bits header) complexity))
+          (= height (length history))))
+
+      ;; Full body connection is the authoritative production check. The helper
+      ;; also checks the contextual header fields the body connector intentionally
+      ;; receives only after header ingestion in a real node.
+      (define (connect-production-block parent history height complexity utxos
+                                        candidate arrival)
+        (let ((header (block-header-field candidate)))
+          (need (header-valid? history header height arrival complexity)
+                "a production block failed contextual header validation")
+          (need (coin-ok? (coin-validate-block-size candidate))
+                "a production block exceeded the canonical size limit")
+          (need (block-merkle-root-valid? candidate)
+                "a production block had a bad merkle root")
+          (coin-connect-block
+            coin-block-rules
+            bitcoin-regtest-consensus-params
+            height
+            utxos
+            candidate
+            #t
+            parent)))
+
+      ;; Result: `(blocks headers utxos)`, all oldest-first where applicable.
+      (define %base-chain
+        (let ((genesis-header (block-header-field %genesis-block)))
+          (let loop ((height 1)
+                     (blocks (list %genesis-block))
+                     (headers (list genesis-header))
+                     (utxos %initial-utxos))
+            (if (> height 30)
+                (list blocks headers utxos)
+                (let* ((parent (last-of blocks))
+                       (parent-header (last-of headers))
+                       (complexity (coin-required-complexity headers height))
+                       (timestamp (+ %genesis-time (* height %spacing)))
+                       (candidate
+                         (coin-build-block
+                           parent-header height complexity #f
+                           "strategy-chain" %producer-script timestamp))
+                       (updated
+                         (connect-production-block
+                           parent headers height complexity utxos candidate
+                           timestamp)))
+                  (loop (+ height 1)
+                        (append blocks (list candidate))
+                        (append headers (list (block-header-field candidate)))
+                        updated))))))
+
+      (define %height30-block (last-of (list-ref %base-chain 0)))
+      (define %height30-header (block-header-field %height30-block))
+      (define %height30-headers (list-ref %base-chain 1))
+      (define %height30-utxos (list-ref %base-chain 2))
+      (define %parent-complexity
+        (coin-required-complexity %height30-headers %parent-height))
+      (define %share-global-spec
+        (coin-node-puzzle
+          (block-header-hash %height30-header)
+          %parent-height
+          %parent-complexity))
+      (define %share-context
+        (coin-coop-context
+          parent-prev-hash: (block-header-hash %height30-header)
+          puzzle-height: %parent-height
+          complexity: %parent-complexity
+          spec: %share-global-spec
+          commits: '()))
+
+      ;; ============================================================
+      ;; One derivation/signature per key in the largest pool
+      ;; ============================================================
+
+      (define-struct strategy-candidate
+        (index)
+        (secret)
+        (pubkey)
+        (blind)
+        (spec)
+        (source)
+        (preview)
+        (share)
+        (commitment))
+
+      (define (make-strategy-candidate index)
+        (let* ((secret (scalar-bytes index))
+               (pubkey (secp256k1-pubkey-create secret))
+               (blind (blind-bytes index))
+               (spec (coin-share-puzzle %share-context pubkey))
+               (candidate (semantic-share-candidate spec)))
+          (need (secp256k1-seckey-verify? secret)
+                "deterministic private key was invalid")
+          (need (= 64 (bytevector-length (secp256k1-pubkey-parse pubkey)))
+                "deterministic public key was invalid")
+          (if (not candidate)
+              (strategy-candidate
+                index: index secret: secret pubkey: pubkey blind: blind
+                spec: spec source: #f preview: #f share: #f commitment: #f)
+              (let* ((source (string->utf8 (car candidate)))
+                     (preview (cadr candidate))
+                     (preimage
+                       (coin-share-preimage
+                         (coin-coop-context-parent-prev-hash %share-context)
+                         (coin-coop-context-puzzle-height %share-context)
+                         (coin-coop-context-complexity %share-context)
+                         source
+                         pubkey))
+                     (share
+                       (coin-share
+                         pubkey: pubkey
+                         signature: (secp256k1-ecdsa-sign secret preimage)
+                         blind: blind
+                         solution: source))
+                     (commitment (coin-share-commitment %share-context share)))
+                (need (coin-share-signature-ok? %share-context share)
+                      "a deterministic share signature failed")
+                (strategy-candidate
+                  index: index secret: secret pubkey: pubkey blind: blind
+                  spec: spec source: source preview: preview share: share
+                  commitment: commitment)))))
+
+      (define %candidates
+          (let loop ((index 1) (out '()))
+            (if (> index %largest-key-pool)
+                (reverse out)
+                (loop (+ index 1)
+                      (cons (make-strategy-candidate index) out)))))
+
+      (define (candidate-available? candidate)
+        (and (strategy-candidate-share candidate) #t))
+
+      (define (candidate-contribution candidate)
+        (if (candidate-available? candidate)
+            (list-ref (strategy-candidate-preview candidate) 1)
+            0))
+
+      (define (candidate-report candidate)
+        (and (candidate-available? candidate)
+             (list-ref (strategy-candidate-preview candidate) 0)))
+
+      (define %available-candidates
+        (filter candidate-available? %candidates))
+
+      (define %available-candidate-check
+        (need (>= (length %available-candidates) 8)
+              "the fixed pool produced fewer than eight semantic candidates"))
+
+      (define (candidate-pubkey-before? a b)
+        (bytes<? (strategy-candidate-pubkey a)
+                 (strategy-candidate-pubkey b)))
+
+      (define (minimum-candidate-before? a b)
+        (or (< (candidate-contribution a) (candidate-contribution b))
+            (and (= (candidate-contribution a) (candidate-contribution b))
+                 (candidate-pubkey-before? a b))))
+
+      (define (maximum-candidate-before? a b)
+        (or (> (candidate-contribution a) (candidate-contribution b))
+            (and (= (candidate-contribution a) (candidate-contribution b))
+                 (candidate-pubkey-before? a b))))
+
+      (define (pool-candidates count)
+        (take %candidates count))
+
+      ;; Return `(available committed revealed)` candidate lists. Commit and
+      ;; reveal ranking happens once, then shares are canonicalized by pubkey.
+      (define (strategy-selection count strategy)
+        (let ((available (filter candidate-available?
+                                 (pool-candidates count))))
+          (cond
+            ((eq? strategy 'none)
+             (list available '() '()))
+            ((eq? strategy 'minimum-quality)
+             (let ((ranked (list-sort minimum-candidate-before? available)))
+               (if (null? ranked)
+                   (list available '() '())
+                   (list available (list (car ranked)) (list (car ranked))))))
+            ((eq? strategy 'maximum-quality)
+             (let* ((ranked (list-sort maximum-candidate-before? available))
+                    (committed (take ranked coin-max-commitments))
+                    (revealed (take committed coin-max-shares)))
+               (list available committed revealed)))
+            (else (error "strategy simulation: unknown strategy")))))
+
+      (define %funded-height30-utxos %height30-utxos)
+      (define %fee-transaction
+        (transaction
+          version: 1
+          inputs: (list
+                    (txin previous-output: %funding-outpoint
+                          script-sig: #u8()
+                          sequence: #xffffffff
+                          witness: '()))
+          outputs: (list
+                     (txout value: (- %funding-value %fees)
+                            script-pubkey: %funding-script))
+          lock-time: 0))
+
+      (define (output-values block)
+        (map txout-value
+             (transaction-outputs (car (block-transactions block)))))
+
+      (define (maximum-or-zero values)
+        (if (null? values)
+            0
+            (car (reverse (list-sort < values)))))
+
+      (define (concentration-permille values)
+        (let ((total (sum values)))
+          (if (= total 0)
+              0
+              (quotient (* 1000 (maximum-or-zero values)) total))))
+
+      (define (hhi-million values)
+        (let ((total (sum values)))
+          (if (= total 0)
+              0
+              (quotient
+                (* 1000000 (sum (map (lambda (value) (* value value)) values)))
+                (* total total)))))
+
+      (define (check-contributions candidates contributions)
+        (cond
+          ((and (null? candidates) (null? contributions)) #t)
+          ((or (null? candidates) (null? contributions))
+           (error "verified contribution list is misaligned"))
+          (else
+            (need (= (car contributions)
+                     (candidate-contribution (car candidates)))
+                  "preview and fully verified contribution disagreed")
+            (check-contributions (cdr candidates) (cdr contributions)))))
+
+      (define %strategy-header
+        '(key_pool strategy candidates_evaluated candidates_available
+          commitments_selected reveals_selected original_q copy_q
+          original_score_word copy_score_word original_rank_word copy_rank_word
+          legacy_quality_rule_would_replace canonical_copy_replaces
+          canonical_copy_replaces_post_child original_arrival_clock
+          pre_child_copy_arrival_clock child_height child_arrival_clock
+          post_child_copy_arrival_clock child_observed settled_actor
+          original_solver_capture_permille reveal_inclusion_permille
+          top_share_payout top_share_payout_permille payout_hhi_million
+          scheduled_subsidy fees hypothetical_copy_producer_payout
+          hypothetical_copy_share_payout hypothetical_copy_carrier_payout
+          hypothetical_attacker_payout hypothetical_total_coinbase
+          hypothetical_unminted_subsidy original_no_share_payout
+          realized_original_payout realized_attacker_payout
+          realized_carrier_payout realized_total_coinbase
+          realized_unminted_subsidy))
+
+      (define (strategy-row key-pool strategy)
+        (let* ((selection (strategy-selection key-pool strategy))
+               (available (list-ref selection 0))
+               (committed (list-ref selection 1))
+               (revealed-ranked (list-ref selection 2))
+               (commitments
+                 (sort-bytes
+                   (map strategy-candidate-commitment committed)
+                   (lambda (value) value)))
+               (revealed
+                 (list-sort candidate-pubkey-before? revealed-ranked))
+               (shares (map strategy-candidate-share revealed))
+               (parent
+                 (coin-build-block
+                   %height30-header
+                   %parent-height
+                   %parent-complexity
+                   #f
+                   "strategy commitments"
+                   %producer-script
+                   %parent-clock
+                   '()
+                   0
+                   commitments))
+               (parent-utxos
+                 (connect-production-block
+                   %height30-block
+                   %height30-headers
+                   %parent-height
+                   %parent-complexity
+                   (vector-copy %funded-height30-utxos)
+                   parent
+                   %parent-clock))
+               (parent-header (block-header-field parent))
+               (parent-headers
+                 (append %height30-headers (list parent-header)))
+               (complexity
+                 (coin-required-complexity parent-headers %attack-height))
+               (producer-solution
+                 (coin-table-solution
+                   (block-header-hash parent-header)
+                   %attack-height
+                   complexity))
+               (context (coin-parent-context parent))
+               (share-check (coin-check-shares context producer-solution shares)))
+          (need (coin-ok? share-check)
+                "production coin-check-shares rejected a strategy selection")
+          (let* ((accepted (coin-result-value share-check))
+                 (contributions
+                   (map (lambda (share) (coin-share-quality context share))
+                        accepted))
+                 (quality (coin-quality contributions)))
+            (check-contributions revealed contributions)
+            (let* ((original
+                     (coin-build-block
+                       parent-header
+                       %attack-height
+                       complexity
+                       producer-solution
+                       "original public solution"
+                       %producer-script
+                       %original-timestamp
+                       (list %fee-transaction)
+                       %fees))
+                   (copy
+                     (coin-build-coop-block
+                       parent
+                       %attack-height
+                       complexity
+                       producer-solution
+                       accepted
+                       "copy and attach"
+                       %attacker-script
+                       %original-timestamp
+                       (list %fee-transaction)
+                       %fees))
+                   (original-utxos
+                     (connect-production-block
+                       parent
+                       parent-headers
+                       %attack-height
+                       complexity
+                       (vector-copy parent-utxos)
+                       original
+                       %original-arrival))
+                   (copy-utxos
+                     (connect-production-block
+                       parent
+                       parent-headers
+                       %attack-height
+                       complexity
+                       (vector-copy parent-utxos)
+                       copy
+                       %pre-child-copy-arrival))
+                   (original-header (block-header-field original))
+                   (copy-header (block-header-field copy))
+                   (original-word (block-header-nonce original-header))
+                   (copy-word (block-header-nonce copy-header))
+                   (original-q
+                     (coin-score-quality (coin-score-decode original-word)))
+                   (copy-q
+                     (coin-score-quality (coin-score-decode copy-word)))
+                   (pre-fork
+                     (coin-run-fork-observer
+                       (list
+                         (coin-fork-candidate
+                           "original-solver" %attack-height
+                           %original-arrival original-header)
+                         (coin-fork-candidate
+                           "attacker-copy-pre-child" %attack-height
+                           %pre-child-copy-arrival copy-header))))
+                   (pre-selected (ref pre-fork 'selected)))
+              (need (string=? "original-solver"
+                              (coin-fork-candidate-actor pre-selected))
+                    "canonical copy replaced the original before its child")
+              (let* ((child-complexity
+                       (coin-required-complexity
+                         (append parent-headers (list original-header))
+                         %child-height))
+                     (child
+                       (coin-build-block
+                         original-header
+                         %child-height
+                         child-complexity
+                         #f
+                         "child settles original"
+                         %producer-script
+                         %child-timestamp))
+                     (child-utxos
+                       (connect-production-block
+                         original
+                         (append parent-headers (list original-header))
+                         %child-height
+                         child-complexity
+                         original-utxos
+                         child
+                         %child-arrival))
+                     (full-fork
+                       (coin-run-fork-observer
+                         (list
+                           (coin-fork-candidate
+                             "original-solver" %attack-height
+                             %original-arrival original-header)
+                           (coin-fork-candidate
+                             "attacker-copy-pre-child" %attack-height
+                             %pre-child-copy-arrival copy-header)
+                           (coin-fork-candidate
+                             "original-child" %child-height
+                             %child-arrival (block-header-field child))
+                           (coin-fork-candidate
+                             "attacker-copy-post-child" %attack-height
+                             %post-child-copy-arrival copy-header))))
+                     (selected (ref full-fork 'selected))
+                     (canonical-pre
+                       (not (string=? "original-solver"
+                                      (coin-fork-candidate-actor pre-selected))))
+                     (canonical-post
+                       (not (string=? "original-solver"
+                                      (coin-fork-candidate-actor selected))))
+                     (legacy (> copy-q original-q))
+                     (original-values (output-values original))
+                     (copy-values (output-values copy))
+                     (copy-producer (car copy-values))
+                     (share-values
+                       (take (cdr copy-values) (length accepted)))
+                     (share-total (sum share-values))
+                     (carrier
+                       (if (null? accepted)
+                           0
+                           (list-ref copy-values (+ 1 (length accepted)))))
+                     (copy-total (sum copy-values))
+                     (original-total (sum original-values))
+                     (copy-unminted
+                       (- %subsidy (- copy-total %fees)))
+                     (original-unminted
+                       (- %subsidy (- original-total %fees)))
+                     (reveal-inclusion
+                       (if (null? available)
+                           0
+                           (quotient (* 1000 (length accepted))
+                                     (length available)))))
+                ;; Force otherwise-unused branch validation values before the
+                ;; invariant assertions; construction is not accepted on trust.
+                (need (and copy-utxos child-utxos) "connected branch state missing")
+                (need (= quality copy-q)
+                      "fully verified share quality did not authenticate header Q")
+                (need (= 0 original-q) "original no-share block did not carry Q0")
+                (need (= (coin-score-rank-word original-word)
+                         (coin-score-rank-word copy-word))
+                      "copy changed projected producer rank")
+                (need (= 0 (coin-score-compare original-word copy-word))
+                      "copy did not tie original under production comparator")
+                (need (not canonical-pre)
+                      "copy replaced original before child")
+                (need (not canonical-post)
+                      "copy replaced original after child")
+                (need (ref full-fork 'settled?)
+                      "strategy height was not settled by explicit child")
+                (if (null? accepted)
+                    (need (= (+ (quotient (* 4 %subsidy) 5) %fees)
+                             copy-total)
+                          "shareless copy did not reserve twenty percent")
+                    (need (= (+ %subsidy %fees) copy-total)
+                          "cooperative copy did not mint subsidy plus fees"))
+                (need (= (+ (quotient (* 4 %subsidy) 5) %fees)
+                         original-total)
+                      "original solo payout did not reserve twenty percent")
+                (list
+                  key-pool
+                  (symbol->string strategy)
+                  key-pool
+                  (length available)
+                  (length committed)
+                  (length accepted)
+                  original-q
+                  copy-q
+                  original-word
+                  copy-word
+                  (coin-score-rank-word original-word)
+                  (coin-score-rank-word copy-word)
+                  legacy
+                  canonical-pre
+                  canonical-post
+                  %original-arrival
+                  %pre-child-copy-arrival
+                  %child-height
+                  %child-arrival
+                  %post-child-copy-arrival
+                  (ref full-fork 'settled?)
+                  (coin-fork-candidate-actor selected)
+                  1000
+                  reveal-inclusion
+                  (maximum-or-zero share-values)
+                  (concentration-permille share-values)
+                  (hhi-million share-values)
+                  %subsidy
+                  %fees
+                  copy-producer
+                  share-total
+                  carrier
+                  (+ copy-producer share-total)
+                  copy-total
+                  copy-unminted
+                  original-total
+                  original-total
+                  0
+                  0
+                  original-total
+                  original-unminted))))))
+
+      (define %strategy-rows
+        (let pool-loop ((pools %key-pools) (rows '()))
+          (if (null? pools)
+              (reverse rows)
+              (pool-loop
+                (cdr pools)
+                (let strategy-loop ((strategies %strategy-names) (rows rows))
+                  (if (null? strategies)
+                      rows
+                      (strategy-loop
+                        (cdr strategies)
+                        (cons (strategy-row (car pools) (car strategies))
+                              rows))))))))
+
+      (define %canonical-pre-index 13)
+      (define %canonical-post-index 14)
+      (define %capture-index 22)
+      (define %legacy-index 12)
+
+      (define %matrix-check
+        (begin
+          (need (= 21 (length %strategy-rows))
+                "strategy matrix must have exactly twenty-one rows")
+          (for-each
+            (lambda (row)
+              (need (not (list-ref row %canonical-pre-index))
+                    "a strategy row replaced before child")
+              (need (not (list-ref row %canonical-post-index))
+                    "a strategy row replaced after child")
+              (need (= 1000 (list-ref row %capture-index))
+                    "original-solver capture was not 1000 permille"))
+            %strategy-rows)))
+
+      ;; One row per key. Missing semantic candidates retain puzzle identity and
+      ;; par, while every candidate-derived numeric metric is explicitly zero.
+      (define %share-header
+        '(key_index pubkey candidate_available par known_solution_bytes
+          margin_milli contribution validation_steps validation_allocations
+          retries constraint_id k width maximum_commitment16 maximum_reveal8))
+
+      (define %largest-selection
+        (strategy-selection %largest-key-pool 'maximum-quality))
+      (define %largest-committed (list-ref %largest-selection 1))
+      (define %largest-revealed (list-ref %largest-selection 2))
+
+      (define (candidate-member? candidate candidates)
+        (let loop ((xs candidates))
+          (and (pair? xs)
+               (or (= (strategy-candidate-index candidate)
+                      (strategy-candidate-index (car xs)))
+                   (loop (cdr xs))))))
+
+      (define %share-rows
+        (map
+          (lambda (candidate)
+            (let* ((spec (strategy-candidate-spec candidate))
+                   (available? (candidate-available? candidate))
+                   (report (candidate-report candidate))
+                   (length (if available?
+                               (bytevector-length
+                                 (strategy-candidate-source candidate))
+                               0))
+                   (margin (if available?
+                               (coin-share-margin-milli
+                                 (puzzle-spec-par spec) length)
+                               0)))
+              (list
+                (strategy-candidate-index candidate)
+                (bytes->hex (strategy-candidate-pubkey candidate))
+                available?
+                (puzzle-spec-par spec)
+                length
+                margin
+                (candidate-contribution candidate)
+                (if available? (puzzle-report-steps report) 0)
+                (if available? (puzzle-report-cells report) 0)
+                (puzzle-spec-retries spec)
+                (puzzle-spec-constraint spec)
+                (puzzle-spec-k spec)
+                (puzzle-complexity-width %parent-complexity)
+                (candidate-member? candidate %largest-committed)
+                (candidate-member? candidate %largest-revealed))))
+          %candidates))
+
+      (define %historical-replacements
+        (let loop ((rows %strategy-rows) (count 0))
+          (if (null? rows)
+              count
+              (loop (cdr rows)
+                    (if (list-ref (car rows) %legacy-index)
+                        (+ count 1)
+                        count)))))
+
+      (define %results
+        `((parameters .
+            ((height . ,%attack-height)
+             (subsidy . ,%subsidy)
+             (fees . ,%fees)
+             (parent_clock . ,%parent-clock)
+             (spacing_seconds . ,%spacing)
+             (future_drift_seconds . ,%drift)
+             (original_arrival_clock . ,%original-arrival)
+             (pre_child_copy_arrival_clock . ,%pre-child-copy-arrival)
+             (child_arrival_clock . ,%child-arrival)
+             (post_child_copy_arrival_clock . ,%post-child-copy-arrival)
+             (key_pools . ,(list->array %key-pools))
+             (strategies . ,(list->array
+                              (map symbol->string %strategy-names)))))
+          (candidate_pool .
+            ((evaluated . ,(length %candidates))
+             (available . ,(length %available-candidates))
+             (unavailable . ,(- (length %candidates)
+                                (length %available-candidates)))))
+          (matrix .
+            ((rows . ,(length %strategy-rows))
+             (legacy_quality_rule_would_replace_rows . ,%historical-replacements)
+             (canonical_pre_child_replacements . 0)
+             (canonical_post_child_replacements . 0)
+             (original_solver_capture_permille_min . 1000)
+             (settlement . "explicit accepted child")))
+          (scope . "frozen deterministic copy-and-attach experiment; legacy quality replacement is counterfactual")))
+
+      (define %summary
+        (string-append
+          (format "Strategic mining: 21 rows over key pools 0..1024; ~a/~a semantic candidates available.\n"
+                  (length %available-candidates) (length %candidates))
+          (format "Legacy quality counterfactual would replace in ~a rows; canonical pre/post-child replacements: 0/0.\n"
+                  %historical-replacements)
+          "Copy-and-attach is blocked by rank projection; settlement is child-observed, never timeout-based.\n"))
+
+      (define %payout-candidates
+        (list-sort candidate-pubkey-before? %largest-revealed))
+      (define %payout-shares
+        (map strategy-candidate-share %payout-candidates))
+      (define %payout-contributions
+        (map candidate-contribution %payout-candidates))
+
+      ;; Expose artifact rows plus the real signed shares reused by the
+      ;; payout/censorship surveys.
+      `((header . ,%strategy-header)
+        (rows . ,%strategy-rows)
+        (share-header . ,%share-header)
+        (share-rows . ,%share-rows)
+        (payout-shares . ,%payout-shares)
+        (payout-contributions . ,%payout-contributions)
+        (results . ,%results)
+        (summary . ,%summary)))
+
+    ;; Native secp256k1 procedures are bound by the finished simulator bundle,
+    ;; not by the compiler process. The promise keeps all key generation and
+    ;; production block validation on the executable side of that boundary.
+    (define %strategy-promise
+      (delay (build-strategy-simulation)))
+
+    (define (coin-run-strategy-simulation)
+      (: -> list?)
+      (force %strategy-promise))))

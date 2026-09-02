@@ -13,9 +13,12 @@
           (sigil coin node genesis))
   (export
     coin-target-block-spacing
+    coin-testnet-network-magic
     coin-testnet-min-block-spacing
     coin-regtest-min-block-spacing
+    coin-testnet-max-future-drift
     coin-chain-min-block-spacing
+    coin-chain-max-future-drift
     coin-chain-address-hrp
     coin-irc-channel
     coin-genesis-quote
@@ -35,11 +38,18 @@
     ;;; Intended seconds between blocks: one day.
     (define coin-target-block-spacing 86400)
 
+    ;;; Public testnet transport magic. Retained across the genesis reset so
+    ;;; the pending public-testnet connection boundary remains unchanged.
+    (define coin-testnet-network-magic #u8(#xd3 #x7a #x91 #xc5))
+
     ;;; Public testnet spacing floor: one hour.
     (define coin-testnet-min-block-spacing 3600)
 
     ;;; Regtest spacing floor.
     (define coin-regtest-min-block-spacing 1)
+
+    ;;; Public testnet future-drift allowance: five minutes.
+    (define coin-testnet-max-future-drift 300)
 
     ;;; Miner community channel.
     (define coin-irc-channel "#systemcrafters")
@@ -52,12 +62,12 @@
     ;;; launch day and regenerates canonical genesis constants.
     (define coin-genesis-time 1785542400)
 
-    ;;; Canonical testnet genesis quote.
+    ;;; Canonical reset public-testnet genesis quote.
     (define coin-testnet-genesis-quote
-      "SigilCoin private testnet - 2026-09-01")
+      "SigilCoin public testnet reset - 2026-09-02")
 
-    ;;; Fixed testnet genesis timestamp: 2026-09-01T00:00:00Z.
-    (define coin-testnet-genesis-time 1788220800)
+    ;;; Fixed testnet genesis timestamp: 2026-09-02T00:00:00Z.
+    (define coin-testnet-genesis-time 1788307200)
 
     ;;; Regtest genesis quote.
     (define coin-regtest-genesis-quote
@@ -88,6 +98,15 @@
             (error "coin-chain-min-block-spacing: chain publishes no spacing floor"))
         (cdr entry)))
 
+    ;;; Read enforced future-drift allowance from chain policy.
+    (define (coin-chain-max-future-drift chain)
+      (: chain-config? -> integer?)
+      (let ((entry (assq 'max-future-drift
+                         (chain-config-extension chain 'policy '()))))
+        (if (not (pair? entry))
+            (error "coin-chain-max-future-drift: chain publishes no drift allowance"))
+        (cdr entry)))
+
     ;;; Read the SegWit address human-readable prefix from a chain config.
     ;;;
     ;;; ```scheme
@@ -101,11 +120,12 @@
             (error "coin-chain-address-hrp: chain publishes no address HRP"))
         (cdr entry)))
 
-    (define (extensions min-spacing genesis hrp)
+    (define (extensions min-spacing max-future-drift genesis hrp)
       (list
         (cons 'address (list (cons 'hrp hrp)))
         (cons 'consensus
-              (list (cons 'rules (coin-header-rules min-spacing))
+              (list (cons 'rules (coin-header-rules min-spacing
+                                                     max-future-drift))
                     ;; Shared node passes durable validated parents after H1;
                     ;; trusted configured genesis supplies H1's parent body.
                     (cons 'block-rules
@@ -116,7 +136,7 @@
         (cons 'policy
               (list (cons 'min-block-spacing min-spacing)
                     (cons 'target-block-spacing coin-target-block-spacing)
-                    (cons 'max-future-drift coin-max-future-drift)
+                    (cons 'max-future-drift max-future-drift)
                     (cons 'median-time-span coin-median-time-span)
                     (cons 'max-block-bytes coin-max-block-bytes)
                     (cons 'max-solution-bytes coin-max-solution-bytes)
@@ -125,7 +145,8 @@
                     (cons 'max-coinbase-script-bytes
                           coin-max-coinbase-script-bytes)))))
 
-    (define (config name network-id magic port seeds min-spacing genesis hrp)
+    (define (config name network-id magic port seeds min-spacing
+                    max-future-drift genesis hrp)
       (let ((header (block-header-field genesis)))
         (chain-config name: name
                       network-id: network-id
@@ -138,7 +159,8 @@
                       genesis-header: header
                       genesis-hash: (block-header-hash header)
                       consensus-params: sigilcoin-consensus-params
-                      extensions: (extensions min-spacing genesis hrp))))
+                      extensions: (extensions min-spacing max-future-drift
+                                              genesis hrp))))
 
     (define %main-genesis
       (coin-genesis-block coin-genesis-quote coin-genesis-time))
@@ -159,6 +181,7 @@
               19444
               '(("seed.sigilcoin.lol" . 19444))
               coin-min-block-spacing
+              coin-max-future-drift
               %main-genesis
               "sgl"))
 
@@ -166,10 +189,11 @@
     (define sigilcoin-testnet-chain
       (config "sigilcoin-testnet"
               "sigilcoin-test"
-              #u8(#xd3 #x7a #x91 #xc4)
+              coin-testnet-network-magic
               19446
               '(("seed.testnet.sigilcoin.lol" . 19446))
               coin-testnet-min-block-spacing
+              coin-testnet-max-future-drift
               %testnet-genesis
               "tsgl"))
 
@@ -181,6 +205,7 @@
               19445
               '()
               coin-regtest-min-block-spacing
+              coin-max-future-drift
               %regtest-genesis
               "sgl"))
 

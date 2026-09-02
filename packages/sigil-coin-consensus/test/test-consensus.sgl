@@ -86,12 +86,11 @@
                              (list-ref t 2) (list-ref t 3)))
        %tuples))
 
-;; Lexicographic order on the ranking tuple `(L, MB, SB, 15-Q)`, written out
-;; the slow, obvious way. If the packing is right, unsigned `<` on the word
-;; agrees with this on every pair.
+;; Lexicographic order on the projected ranking tuple `(L, MB, SB)`, written
+;; out the slow, obvious way. If projection and packing are right, comparison
+;; of raw authenticated words agrees with this on every pair.
 (define (rank-tuple t)
-  (list (list-ref t 0) (list-ref t 1) (list-ref t 2)
-        (- 15 (list-ref t 3))))
+  (list (list-ref t 0) (list-ref t 1) (list-ref t 2)))
 
 (define (lex-compare a b)
   (cond
@@ -200,9 +199,27 @@
       (assert-equal 'insufficient-spacing
                     (coin-result-reason
                       (coin-validate-header-context chain close now)))
-      ;; The optional chain spacing floor still passes through.
+      ;; Spacing-only callers retain the mainnet drift default.
       (assert-true (coin-ok? (coin-validate-header-context
-                               chain close now 1))))))
+                               chain close now 1)))))
+
+  (test "future drift is inclusive at the exact chain-policy boundary"
+    (let* ((now 2000000)
+           (boundary (header-at %zero32 (+ now 300)))
+           (beyond (block-header boundary time: (+ now 301))))
+      (assert-true
+        (coin-ok? (coin-validate-header-context '() boundary now 3600 300)))
+      (assert-equal 'time-too-far-ahead
+                    (coin-result-reason
+                      (coin-validate-header-context '() beyond now 3600 300)))))
+
+  (test "malformed pacing policy raises as node misconfiguration"
+    (assert-error (coin-validate-header-context '() (header-at %zero32 1)
+                                                1 -1))
+    (assert-error (coin-validate-header-context '() (header-at %zero32 1)
+                                                1 1 "300"))
+    (assert-error (coin-validate-header-context '() (header-at %zero32 1)
+                                                1 1 300 0))))
 
 ;; ============================================================
 ;; Seed derivation (§3.1)
@@ -669,14 +686,22 @@
     (assert-equal 15 (coin-quality '(4 4 4 4)))
     (assert-equal 15 (coin-quality '(4 4 4 4 4 4 4 4))))
 
-  (test "three fifteen-percent shares outrank eight sub-five-percent shares"
-    (let ((strong (coin-quality '(4 4 4)))
-          (weak (coin-quality '(1 1 1 1 1 1 1 1))))
+  (test "aggregate quality changes authenticated W but not fork-choice rank"
+    (let* ((strong (coin-quality '(4 4 4)))
+           (weak (coin-quality '(1 1 1 1 1 1 1 1)))
+           (strong-word (coin-score-pack 40 50 51 strong))
+           (weak-word (coin-score-pack 40 50 51 weak)))
       (assert-equal 12 strong)
       (assert-equal 8 weak)
-      (assert-true
-        (coin-score-better? (coin-score-pack 40 50 51 strong)
-                               (coin-score-pack 40 50 51 weak)))))
+      (assert-true (< strong-word weak-word))
+      (assert-equal strong
+                    (coin-score-quality (coin-score-decode strong-word)))
+      (assert-equal weak
+                    (coin-score-quality (coin-score-decode weak-word)))
+      (assert-equal (coin-score-rank-word strong-word)
+                    (coin-score-rank-word weak-word))
+      (assert-equal 0 (coin-score-compare strong-word weak-word))
+      (assert-false (coin-score-better? strong-word weak-word))))
 
   (test "unrelated block data cannot move a share puzzle or quality"
     ;; Graffiti, including-block hash and including block are absent from
@@ -793,9 +818,7 @@
     (assert-false (coin-score-valid? "0"))))
 
 (test-group "sigil-coin canonical score ordering"
-  (test "unsigned comparison IS lexicographic comparison on the tuple"
-    ;; The proof obligation of §5.3: no case analysis on the hot path is
-    ;; sound only if the packing makes the two orders identical.
+  (test "projected comparison is lexicographic comparison on producer fields"
     (assert-true
       (all-pairs?
         %tuples
@@ -803,32 +826,60 @@
           (= (lex-compare (rank-tuple a) (rank-tuple b))
              (coin-score-compare
                (coin-score-pack (list-ref a 0) (list-ref a 1)
-                                   (list-ref a 2) (list-ref a 3))
+                                (list-ref a 2) (list-ref a 3))
                (coin-score-pack (list-ref b 0) (list-ref b 1)
-                                   (list-ref b 2) (list-ref b 3))))))))
+                                (list-ref b 2) (list-ref b 3))))))))
 
-  (test "length dominates memory dominates steps dominates aggregate quality"
-    (assert-true (coin-score-better? (coin-score-pack 24 127 127 0)
-                                        (coin-score-pack 25 0 0 8)))
-    (assert-true (coin-score-better? (coin-score-pack 24 50 127 0)
-                                        (coin-score-pack 24 51 0 8)))
-    (assert-true (coin-score-better? (coin-score-pack 24 50 51 0)
-                                        (coin-score-pack 24 50 52 8))))
+  (test "rank projection clears only the authenticated quality nibble"
+    (let* ((raw (coin-score-pack 300 64 65 7))
+           (rank (coin-score-rank-word raw))
+           (decoded (coin-score-decode rank)))
+      (assert-equal (bitwise-and raw #xffffff0f) rank)
+      (assert-equal (coin-score-pack 300 64 65 15) rank)
+      (assert-equal 300 (coin-score-length decoded))
+      (assert-equal 64 (coin-score-memory decoded))
+      (assert-equal 65 (coin-score-steps decoded))
+      (assert-equal 15 (coin-score-quality decoded))))
 
-  (test "aggregate quality breaks ties and only ties"
-    ;; Verified share work cannot outrank a better producer program.
-    (assert-true (coin-score-better? (coin-score-pack 24 50 51 1)
-                                        (coin-score-pack 24 50 51 0)))
-    (assert-false (coin-score-better? (coin-score-pack 25 50 51 8)
-                                         (coin-score-pack 24 50 51 0))))
+  (test "all Q values share one projected rank at fixed producer fields"
+    (let* ((baseline (coin-score-pack 24 50 51 0))
+           (rank (coin-score-rank-word baseline)))
+      (assert-true
+        (let loop ((quality 0))
+          (if (> quality 15)
+              #t
+              (let ((word (coin-score-pack 24 50 51 quality)))
+                (and (= rank (coin-score-rank-word word))
+                     (= 0 (coin-score-compare baseline word))
+                     (not (coin-score-better? baseline word))
+                     (not (coin-score-better? word baseline))
+                     (loop (+ quality 1)))))))))
 
-  (test "equal words are incomparable, so the incumbent tip is kept"
-    (assert-equal 0 (coin-score-compare (coin-score-pack 24 50 51 3)
-                                           (coin-score-pack 24 50 51 3)))
-    (assert-false (coin-score-better? (coin-score-pack 24 50 51 3)
-                                         (coin-score-pack 24 50 51 3))))
+  (test "length then memory then steps remain strictly ordered"
+    (let ((shorter (coin-score-pack 24 127 127 0))
+          (longer (coin-score-pack 25 0 0 15))
+          (less-memory (coin-score-pack 24 50 127 0))
+          (more-memory (coin-score-pack 24 51 0 15))
+          (fewer-steps (coin-score-pack 24 50 51 0))
+          (more-steps (coin-score-pack 24 50 52 15)))
+      (assert-equal -1 (coin-score-compare shorter longer))
+      (assert-equal 1 (coin-score-compare longer shorter))
+      (assert-equal -1 (coin-score-compare less-memory more-memory))
+      (assert-equal 1 (coin-score-compare more-memory less-memory))
+      (assert-equal -1 (coin-score-compare fewer-steps more-steps))
+      (assert-equal 1 (coin-score-compare more-steps fewer-steps))))
 
-  (test "the order is a strict weak ordering"
+  (test "different raw words in one rank class keep the incumbent"
+    (let ((q3 (coin-score-pack 24 50 51 3))
+          (q12 (coin-score-pack 24 50 51 12)))
+      (assert-true (not (= q3 q12)))
+      (assert-equal 3 (coin-score-quality (coin-score-decode q3)))
+      (assert-equal 12 (coin-score-quality (coin-score-decode q12)))
+      (assert-equal 0 (coin-score-compare q3 q12))
+      (assert-false (coin-score-better? q3 q12))
+      (assert-false (coin-score-better? q12 q3))))
+
+  (test "the projected order is a strict weak ordering"
     ;; Irreflexive.
     (assert-true
       (let loop ((ws %words))
@@ -862,9 +913,13 @@
                          (not (coin-score-better? c a)))))
             (if (and ab bc) ac #t))))))
 
-  (test "comparison rejects anything that is not a 32-bit word"
+  (test "projection and comparison reject the same illegal word domain"
+    (assert-error (coin-score-rank-word -1))
+    (assert-error (coin-score-rank-word coin-max-score-word))
+    (assert-error (coin-score-rank-word 1))
     (assert-error (coin-score-compare -1 0))
-    (assert-error (coin-score-compare 0 coin-max-score-word))))
+    (assert-error (coin-score-compare 0 coin-max-score-word))
+    (assert-error (coin-score-compare 1 0))))
 
 ;; ============================================================
 ;; Retargeting (§9)

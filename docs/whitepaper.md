@@ -231,33 +231,40 @@ An attempt is keyed by `(seed, height, retry)` and runs under a shared budget
 of 20000 evaluator steps covering every evaluation it performs:
 
 1. Draw one production from the constraint-compatible prefix of the frozen
-   24-entry grammar at width `w(C)` and wrap it in a one-argument lambda. This
-   is the hidden function.
-2. Print it, and reject if it does not parse, exceeds 512 bytes, or violates
-   the height's constraint.
-3. Draw `k(C)` pairwise-distinct inputs from the constraint's input domain.
-   Reject if any input literal exceeds 8 bytes.
-4. Apply the hidden function to each input. Reject if any application fails,
-   exhausts the attempt budget, returns a procedure, returns a non-value, or
-   returns a literal longer than 24 bytes.
-5. Reject if all `k` outputs are equal. A constant function would win the
-   height trivially.
-6. Reject if any 1-arity builtin reproduces every pair. `car` is three bytes;
-   a puzzle it solves is a race everyone wins at once.
-7. Build the table solution (section 6), print it, parse it,
-   constraint-check it, and run it against all `k` pairs under the real
-   consensus caps. Reject if any of that fails.
-8. `par = min(|hidden source|, |table|)`. Reject if `par < 24`.
+   24-entry grammar at width `w(C)`. Canonically render its one-argument lambda,
+   apply any deterministic constraint wrapper, and lexically tighten the
+   complete source.
+2. Reject if the tightened hidden source does not parse, exceeds 512 bytes, or
+   violates the height's constraint.
+3. Draw `k(C)` pairwise-distinct inputs from the constraint's domain and apply
+   the hidden function. Reject oversized literals, execution failures,
+   procedures, non-values, constant outputs, or a puzzle solved by a one-arity
+   builtin.
+4. Build the table source from the final examples, apply the same wrapper and
+   lexical tightening boundary, then parse, constraint-check, and execute it
+   under the real consensus caps.
+5. Set `par` to the shorter tightened source length. Reject if either source
+   falls below the 24-byte minimum par floor.
+
+The tightener is lexical, not a textual golf pass. Outside strings it consumes
+spaces, tabs, line feeds, and carriage returns, retaining one ASCII space only
+between adjacent bare-token characters. Parentheses, double quotes, and quote
+shorthand require no separator. Inside strings, bytes are copied unchanged;
+backslash copies itself and the following byte, and only an unescaped double
+quote ends the string. The language has no comments to preserve. The canonical
+AST printer remains the canonical single-space renderer. Only complete
+generated witnesses cross this tightening boundary, and they are re-parsed and
+re-executed afterward.
 
 The constraint is drawn from a dedicated stream keyed on a reserved retry
 value, so re-rolls never move it: the constraint is a function of
 `(seed, height, C)` alone, and a miner knows the day's rule before the
 generator has settled on a puzzle.
 
-After 64 rejections a frozen fallback puzzle is used, with its constraint
-forced to the unconstrained rule and its examples fixed. The fallback re-runs
-every acceptance check and raises if one fails, because a failure there is a
-bug in the generator rather than a bad block.
+After 64 rejections the ordinary generator uses its frozen, verified fallback.
+Explicit-constraint and personalized generation instead use verified
+constraint-preserving fallbacks, and the personalized fallback retains the
+mandatory key anchor. Every fallback passes the same tightened-source checks.
 
 `par` is an upper bound on the true optimum and never a lower one. A miner may
 find something shorter; no computable check can rule that out, and finding
@@ -335,79 +342,82 @@ the point. Par exists only to feed the retarget signal.
 ## 6. Liveness: the table solution
 
 A generated puzzle that nobody can solve would stall the chain permanently.
-The chain therefore guarantees, for every height, every constraint and every
+The chain therefore guarantees, for every height, every constraint, and every
 complexity, a solution that any miner can construct mechanically from public
 data.
 
-A miner has the parent header, hence `prev_hash`, `H` and `C(H)`, hence the
-seed, hence the whole puzzle. Running the same generator every validator runs
-yields the `k` pairs and the constraint. From those, the **table solution**:
+A miner has the parent header, hence `prev_hash`, `H`, and `C(H)`, hence the
+seed and the whole puzzle. Running the same generator every validator runs
+yields the examples, constraint, tightened hidden source, tightened table
+source, and par.
 
-```
-(lambda(x)(if(equal? x 'i_0)'o_0 (if(equal? x 'i_1)'o_1 ... 'o_{k-1})))
+The table source is a lexically tight nested `if`; schematically:
+
+```text
+(lambda(x)(if(equal? x'i_0)'o_0(if(equal? x'i_1)'o_1 ...'o_{k-1})))
 ```
 
 The last output is the default branch, so `k` pairs produce `k-1` tests. It
-reproduces every pair by construction, because `equal?` on the puzzle value
+reproduces every pair by construction because `equal?` on the puzzle value
 domain is exactly the comparison consensus uses to check an example.
 
-Two constraints need a repair wrapper, both mechanical and both
-semantics-preserving: `letrec-required` wraps the body in
-`(letrec((f(lambda(y)y)))(f BODY))`, costing 29 bytes, and `fold-required`
-wraps it in `(fold(lambda(a b)a)BODY '())`, costing 24, since `fold` over the
-empty list returns its init. Every other rule is satisfied by the choice of
-body and example domain: the generator draws digit-free values under
-`no-digits`, excludes symbols and prints quote-free literals under `no-quote`,
-and restricts integers to single digits under `small-literals`.
+Two constraints need semantics-preserving repair wrappers:
+`letrec-required` wraps the body in
+`(letrec((f(lambda(y)y)))(f BODY))`, adding 29 bytes over the bare wrapper;
+`fold-required` wraps it in `(fold(lambda(a b)a)BODY'())`, adding 23. Every
+other rule is satisfied by the body and example domain.
 
 ### 6.1 Executable liveness bound
 
-Per branch the table costs `18 + |i| + |o|` bytes, with the input literal
-capped at 8 and the output at 24. Ten examples do not fit every repair:
+After tightening, each added table branch costs `16 + |i| + |o|` bytes. Exact
+generator bounds are:
 
-```
-letrec repair, k = 10 : 40 + 9 * (18 + 8 + 24) + 25 = 515   INFEASIBLE
-fold repair,   k = 10 : 35 + 9 * 50 + 25            = 510   2 bytes spare
-letrec repair, k =  8 : 40 + 7 * 50 + 25            = 415   97 bytes spare
-```
+| Case | Maximum bytes | Headroom below 512 |
+| --- | ---: | ---: |
+| global, `k=10`, widest `letrec` repair | 496 | 16 |
+| global, `k=10`, `fold` repair | 491 | 21 |
+| global, frozen `k=8` | 400 | 112 |
+| personalized, frozen `k=8` | 443 | 69 |
 
-The implementation caught it, because the generator does not evaluate the
-arithmetic — it builds the actual string, measures it, parses it,
-constraint-checks it, and runs it against all `k` pairs before the puzzle may
-be published. Liveness is verified by construction on every accepted puzzle,
-not argued from a formula that a later change could invalidate.
+Ten global examples now fit but leave too little room under the shared source
+cap, especially once personalized witnesses are considered. The example count
+therefore remains frozen at 8; difficulty above it comes from grammar width,
+which does not lengthen the table.
 
-The example count is frozen at a maximum of 8 as a result: a proven worst case
-of 415 bytes with 19% headroom, enough to absorb one further repair wrapper.
-Difficulty above that point comes from grammar width, which does not lengthen
-the table.
+The implementation never trusts the arithmetic alone. It constructs each
+actual hidden and table source, tightens it, measures it, parses it,
+constraint-checks it, and executes it against every example before the puzzle
+may be published. Liveness is verified on every accepted puzzle.
 
 ### 6.2 What the table means for the game
 
-Overfitting is always available and always loses. The table is, by
-construction, the longest thing anyone would submit: it is a transcription of
-the answer key. Any program that captures the underlying structure is shorter,
-and length is the primary ranking key. So the floor is a legal move that wins
-nothing, and every byte below it is the competition.
+The table is always an available mechanical solution, but not necessarily the
+shortest generated witness: `par` is the minimum of the verified hidden and
+table lengths. Structural programs can beat par; overlong transcription remains
+legal for a producer but ranks worse, and shares must be strictly under their
+personalized par.
 
-Genesis is built rather than mined — there is no parent hash to derive a
-puzzle from until a first block exists — and its coinbase carries the table
-solution of the frozen genesis puzzle. Genesis is therefore a real, verifiable
-block whose program reproduces its own published examples. Its reward is zero
-and its single output is a bare `OP_RETURN`: no premine, provably unspendable
-rather than merely unspent.
+Tests and tools do not manufacture useful shares by deleting whitespace from a
+generated witness. A deterministic semantic fixture exists only when every
+ordinary personalized example input is non-string: replace the exact tight
+anchor predicate `(equal? x"@")` with `(string? x)`, run the production share
+checker, and keep it only if it is strictly shorter than par. A specification
+with an ordinary string input has no such candidate.
 
----
+Genesis is built rather than mined and carries the table solution of the
+frozen genesis puzzle. It is a real, verifiable block whose program reproduces
+its examples. Its reward is zero and its single output is an unspendable
+`OP_RETURN`: no premine.
 
 ## 7. Scoring and fork choice
 
-### 7.1 The score word
+### 7.1 The authenticated score word
 
 The header has no spare room, and none is asked for. Three fields are
 repurposed: `version` is pinned to 5, `bits` carries the difficulty parameter
-(section 8), and `nonce` carries a 32-bit composite score word `W`.
+(section 8), and `nonce` carries a 32-bit score word `W`.
 
-```
+```text
 bit  31              22 21     15 14      8 7    4 3    0
     +------------------+---------+---------+------+------+
     |      L - 1       |   MB    |   SB    |15-Q  | 0000 |
@@ -415,26 +425,27 @@ bit  31              22 21     15 14      8 7    4 3    0
        10 bits           7 bits    7 bits   4 bits 4 bits
 ```
 
-- `L` is the producer's solution length in bytes, 1..512, stored biased by one
-- `MB` is a bucket of the cells the solution charged
-- `SB` is a bucket of the steps it spent
-- `Q` is aggregate verified share quality, 0..15, stored as `15-Q` so that
-  more verified work gives a lower word
-- the low nibble is reserved zero
+- `L` is the producer source length,
+- `MB` and `SB` bucket its verified memory cells and steps,
+- `Q` is authenticated aggregate share quality in `0..15`,
+- the low nibble is reserved zero.
 
-Lower is better, and plain unsigned comparison *is* the composite order:
-disjoint fixed-width fields laid out most-significant-first in ranking
-priority form the base-2^width numeral of the tuple, and comparing numerals of
-equal width is lexicographic comparison of their digits. Length dominates
-memory dominates steps dominates aggregate verified share quality.
+The raw word remains:
 
-Quality is last for a reason. It breaks ties without outranking a better
-producer program, so it occupies strictly lower-order bits than every producer
-field. Raw reveal count remains separate and controls only the reward split.
+```text
+W = (L-1)<<22 | MB<<15 | SB<<8 | (15-Q)<<4
+```
 
-Because every field is derived from the block body and the low nibble is
-reserved, the header carries **zero free entropy**. There is no nonce to
-grind.
+It commits the body and exposes `Q` for reporting, but fork choice never
+compares it raw. Consensus projects the rank word:
+
+```text
+RW = W & 0xffffff0f
+```
+
+Lower `RW` is lexicographic order `(L, MB, SB)`. Clearing bits 7..4 makes `Q`
+rank-inert while retaining its authenticated body commitment and its role in
+contribution reporting. The reserved low nibble leaves no free header entropy.
 
 ### 7.2 Bucketing
 
@@ -454,11 +465,10 @@ bucket7(x) = 0                                        if x = 0
 `bucket7(1) = 1`, `bucket7(2) = 7`, `bucket7(300) = 50`, `bucket7(340) = 51`,
 `bucket7(400000) = 112`, `bucket7(200000) = 106`.
 
-The bucketed value is the consensus value. Fork choice compares header words
-and never body integers, so two solutions in one bucket are exactly tied and
-fall through to aggregate share quality. The precision loss is deliberate:
-there is no
-second, finer order that could drift out of agreement with the header.
+The bucketed values are consensus values. Fork choice compares projected rank
+words, so two producer solutions in the same `(L, MB, SB)` buckets are exactly
+tied regardless of authenticated `Q`. There is no finer body order that could
+drift out of agreement with the header.
 
 ### 7.3 The header-to-body commitment
 
@@ -469,40 +479,37 @@ directions, because `W` is an equality and not a bound: understating a
 solution's length claims a better block than the one carried, and overstating
 it is equally a lie.
 
-That equality is what makes header-only fork choice safe. Headers can be
-ranked before bodies arrive, and a liar does not outrank an honest chain — he
-produces an invalid block.
+That equality makes header-first ranking safe: headers can be ordered
+provisionally before bodies arrive, but a false claim becomes an invalid block
+and poisons its descendants when the body is checked.
 
-### 7.4 The order
+### 7.4 Fork choice and settlement
 
-```
-b1 is a better tip than b2  iff  height(b1) > height(b2)
-                                 or (equal height and W(b1) < W(b2))
-```
-
-with a "live beats settled" rule ahead of both: once a taller header exists,
-a height is settled and no sibling displaces it. At equal height and equal
-`W`, blocks are incomparable and the incumbent tip is kept — first-seen,
-exactly as Bitcoin resolves equal-work siblings. It is order-dependent between
-nodes and converges the moment a child arrives, because height dominates.
-
-Mapping onto the single accumulated integer the node store persists:
-
-```
-saving(b)  = 2^32 - W(b)        1 .. 2^32, with 0 reserved for an illegal W
-work       = accumulated * (2^32 + 1) + saving
+```text
+b1 is a better tip than b2 iff height(b1) > height(b2)
+                              or (equal height and RW(b1) < RW(b2))
 ```
 
-`saving <= 2^32 < 2^32 + 1`, so the digits never collide, and `accumulated` is
-strictly increasing along any chain, so no chain ranks below its own ancestor.
+At equal height and equal projected rank, neither sibling replaces the other.
+The first valid arrival remains incumbent; neither raw `W`, `Q`, nor block hash
+breaks the tie. A child must be at the next height and link to the selected
+incumbent. Once that child is observed, the parent's height is settled and
+later siblings cannot replace it.
 
-**There is no block-hash tie-break.** Such a tie-break would be grindable
-through 400 bytes of coinbase graffiti, and ties are common because an optimal
-program is often unique. Equal `W` never displaces an incumbent. Hash
-comparison exists only for stable display ordering in the explorer and CLI,
-where it decides nothing.
+The persisted chain key uses the same projection:
 
----
+```text
+saving(W) = 2^32 - (W & 0xffffff0f)
+work      = accumulated * (2^32 + 1) + saving
+```
+
+The `Q`-neutral saving keeps database ranking identical to direct comparison.
+Status may recover producer length from the projected rank, but cannot infer
+quality because those bits were deliberately cleared.
+
+There is no block-hash tie-break. Such a tie-break would be grindable through
+coinbase graffiti, while an exact rank tie is deliberately local first-seen
+arrival behavior until child settlement.
 
 ## 8. Difficulty
 
@@ -526,10 +533,10 @@ milli-units:
 m_i = clamp( floor(1000 * (par_i - L_i) / par_i), -1000, 1000 )
 ```
 
-Relative, because par varies by a factor of six across observed puzzles: an
-absolute "beat par by N bytes" threshold would mean something different at
-every height. Division floors toward negative infinity, specified explicitly,
-so "missed par by a hair" and "missed par exactly" are different signals.
+Relative, because par varies by puzzle: an absolute "beat par by N bytes"
+threshold would reward the same proportional improvement differently at
+different heights. Division floors toward negative infinity, so negative
+margins are unambiguous.
 
 ### 8.2 The adjustment
 
@@ -554,10 +561,9 @@ rounding rule is needed and no single outlier moves it. Sixteen blocks is
 about 13 days at mainnet spacing; Bitcoin's 2016 would be 4.6 years at
 one block a day, which is not feedback.
 
-`C(0) = 128` and stays there through the first, partial window; the first
-retarget is at height 16 over heights 0 through 15, genesis included, whose
-par is well defined. A reorg recomputes `C` from the new branch's own 16
-blocks.
+`C(0) = 128`. The first retarget is at height 16 over the complete window
+0 through 15, including genesis, whose par is well defined. A reorg recomputes
+`C` from the new branch's own 16 blocks.
 
 ### 8.3 What difficulty cannot do
 
@@ -663,40 +669,64 @@ normalized AST: AST canonicalization is a large new consensus surface, and the
 family of trivially-varied programs it would catch is better *paid* than
 arbitrated.
 
-### 9.3 The split
+Canonical order is not miner preference order. The reference miner fully
+verifies every distinct eligible reveal, ranks it by contribution descending
+with pubkey ascending as the tie-break, keeps at most eight, then sorts the
+selected shares by pubkey for serialization.
 
-With `V = subsidy + fees` and `R` accepted shares:
+### 9.3 Contributions and payouts
 
-```
-weights : producer 2, each share 1, carrier 1 (when R >= 1)
-u       = floor(V / (2 + R + carrier))
-output 0     producer : V - R*u - carrier*u
-output 1..R  share i  : u, paid to P2WPKH of the signed pubkey
-output R+1   carrier  : u, paid to the script of block H-1's coinbase output 0
-```
+Each fully verified share contributes 1 through 4 according to its under-par
+margin:
 
-The outputs sum to `V` exactly, so Bitcoin's value conservation passes
-unchanged and the remainder — at most 10 daviwils — goes to the producer
-rather than burning or leaking into fees. At the maximum of 8 shares the
-producer keeps 2/11 of the block plus the remainder.
-
-The carrier output is the answer to "why would a producer carry anyone else's
-commitments?" He is paid, one block later, by the *next* producer, for having
-carried commitments that were revealed. He cannot fake it: fabricated
-commitments earn nothing, because nobody can reveal them.
-
-Including shares costs the producer real reward. What pays for it is aggregate
-verified quality `Q`, not reveal count:
-
-```
-margin       = floor(1000 * (personalized_par - L) / personalized_par)
-contribution = 1 + min(3, floor(margin / 50))
+```text
+margin_milli = floor(1000 * (personalized_par - L) / personalized_par)
+contribution = 1 + min(3, floor(margin_milli / 50))
 Q            = min(15, sum(contribution))
 ```
 
-A valid share contributes 1 through 4 according to how far it beats its own
-par. `Q` improves the score only after producer length, memory and steps tie.
-Raw reveal count controls only the reward split.
+The aligned contributions price the share pool. Capped `Q` remains committed
+in the raw header word for authentication and reporting, but never changes
+fork-choice rank.
+
+Let `S` be scheduled subsidy and `F` fees. With no shares, the coinbase has one
+unconstrained producer output:
+
+```text
+producer = floor(4*S/5) + F
+```
+
+The rest of `S` is not minted.
+
+With one through eight shares, let `C` be the sum of their verified
+contributions:
+
+```text
+carrier    = floor(S/20)
+share_pool = floor(S/10)
+share_i    = floor(share_pool * c_i / C)       independently
+producer   = S + F - carrier - sum(share_i)
+```
+
+The cooperative coinbase mints exactly `S+F`. Fees and every floor-division
+residual go to the producer, so 85% producer, 10% shares, and 5% carrier are
+targets rather than exact percentages.
+
+Output 0 is the producer, outputs `1..R` are P2WPKH scripts for shares in
+canonical pubkey order, and output `R+1` is output 0's script from the parent
+coinbase. Every required share and carrier output remains present even when
+its value is zero. Thus `S<10` produces zero-valued share outputs, `S<20`
+produces a zero-valued carrier, `S=1` mints zero solo but one cooperatively,
+and `S=0` routes all fees to the producer.
+
+For `S=5,000,000,000`, `F=0`, and contributions `(1,2,4)`, shares receive
+`71,428,571`, `142,857,142`, and `285,714,285`; carrier receives
+`250,000,000`; producer receives `4,250,000,002`, including the two-unit
+residual.
+
+The carrier output pays the parent producer a fixed 5% target once a valid
+reveal exists. Fabricated commitments earn nothing, and carrying more
+commitments does not multiply the output.
 
 ### 9.4 Unrevealed commitments
 
@@ -709,32 +739,39 @@ best one, which is a feature.
 
 ---
 
-## 10. Emission and supply
+## 10. Scheduled subsidy and actual issuance
 
-Emission is a pure function of height, in daviwils (1 SGL = 100000000
-daviwils):
+The scheduled subsidy is a pure function of height, in daviwils
+(`1 SGL = 100000000` daviwils):
 
-```
+```text
 height 0        0                       genesis pays nothing
 heights 1..30   1 SGL                   warmup
 heights >= 31   floor(100 SGL / 2^floor((height - 1) / 730))
 ```
 
-At roughly one block a day, a halving interval of 730 blocks is about two
-years. The shift is exact integer division, so the tail decays to zero rather
-than to a fraction: height 24820 is the last block that pays anything, and the
-total ever emitted is **14302999991970 daviwils** (143029.99991970 SGL). That
-is a hard cap, not an asymptote.
+At roughly one block a day, 730 blocks is about two years. The shift is exact
+integer division, so height 24820 is the last height with a nonzero scheduled
+subsidy. Summing the schedule gives **14302999991970 daviwils**
+(143029.99991970 SGL). That is the scheduled maximum and an upper cap, not a
+claim that every unit will be issued.
 
-There is no premine and no founder's reward. The genesis coinbase pays zero to
-an unspendable `OP_RETURN`. Coinbase outputs mature after 100 blocks.
+Actual issuance follows coinbase outputs. A solo block mints
+`floor(4*S/5)` of subsidy; its remaining reserve is unminted. A cooperative
+block mints the full `S`. Fees are transferred from existing inputs back
+through coinbase and create no new supply. Because ordinary transactions
+conserve value, the sum of active-chain UTXOs is the branch-aware issued
+supply. The node prints that as `issued-supply` beside the current-height
+`scheduled-supply-cap`. The explorer overview reports the same active issued
+supply beside the scheduled lifetime maximum.
 
-The warmup exists so that the first month of a chain nobody has debugged in
-public does not mint 100 SGL a block while the first bugs are found.
+There is no premine or founder's reward. Genesis pays zero to an unspendable
+`OP_RETURN`, and coinbase outputs mature after 100 blocks. The warmup limits
+the scheduled subsidy while the first month of a new chain is debugged.
 
-There is no fee market. Fees exist because Bitcoin's transaction format has
-them, and the wallet pays a token amount by default; a chain that mines one
-block a day by writing programs has nothing to auction.
+There is no fee market. Fees remain because Bitcoin transactions have them and
+the wallet pays a token amount by default; every fee reaches the producer
+under both payout modes.
 
 ---
 
@@ -769,13 +806,18 @@ correctness-neutral by construction: a node that never hits it validates the
 same chain, slower.
 
 **Validation is ordered cheapest-first, and that ordering is a requirement.**
-Nothing evaluates a solution before the block has passed size, payload decode
-and header-field checks. Size first, because it bounds everything after;
-constraint byte scans before parses; parses before evaluation; commitment
-membership before signature verification before evaluation. Solution
-evaluation stays ahead of the transaction connector, because the connector
-mutates the UTXO set it is handed and a later rejection would leave a caller's
-in-memory set carrying a rejected block's outputs.
+After size, merkle, header, and canonical payload checks, the node performs
+cheap share shape/order/commitment checks, derives fees, and checks the payout
+shape before source preparation, signatures, or PBE. A solo payout must already
+equal `floor(4*S/5)+F`; a cooperative payout must have `R+2` outputs, canonical
+scripts, carrier `floor(S/20)`, and total `S+F`.
+
+Only then are personalized sources prepared, signatures verified, the producer
+executed, and each share executed exactly once. Verified contributions feed
+both authenticated `Q` and the exact payout check. A malicious proportional
+allocation with correct cheap shape and total is therefore rejected after
+share verification; malformed shape or total runs no PBE. The transaction
+connector remains last because it mutates the UTXO set it is handed.
 
 One integration rule is worth stating in public, because getting it wrong
 produces a node that rejects every valid block: **never call Bitcoin's block
@@ -790,27 +832,31 @@ passed into the connector.
 
 **Node.** `sigilcoin` opens a chain the same way a Bitcoin node does: the
 SigilCoin rules record travels in the chain config's extensions, so nothing in
-`sigil-bitcoin` needs to know what a puzzle is. Headers-first sync, block
-relay and peer management are Bitcoin's, unchanged. State is SQLite in a data
-directory. Two chains ship: `sigilcoin-main`, magic `8f d1 c0 a5`, port 19444,
-one block a day; and `sigilcoin-regtest`, byte-reversed magic, port 19445, and
-a one-second spacing floor so tests can mine consecutively. The magic bytes
-collide with no known Bitcoin-family network, all have the high bit set so the
-frame prefix is not valid UTF-8, and are pairwise distinct so a misaligned
-read cannot match.
+`sigil-bitcoin` needs to know what a puzzle is. Headers-first sync, block relay,
+and peer management remain Bitcoin-shaped. State is SQLite in a data
+directory. Three chains ship: mainnet on port 19444; reset public testnet on
+19446 with one-hour minimum spacing and five-minute future drift; and
+disposable regtest on 19445 with one-second spacing.
+
+The reset public testnet begins at a new genesis marked
+`SigilCoin public testnet reset - 2026-09-02` at timestamp `1788307200`.
+Previous public-testnet databases and history are incompatible. Operators must
+archive or move an old directory and start with an empty one; the software
+never deletes operator state automatically.
 
 **Wallet.** Keys, bech32 addresses with HRP `sgl` (so addresses read `sgl1…`),
 balance and spending, in the CLI. The key lives in the node's data directory
 and is the operator's to back up.
 
-**Explorer.** A read-only HTTP site over the node's database: chain summary,
-block list, block detail with the puzzle, the score decomposition and the
-share table, address pages, a difficulty history, and a JSON endpoint for each.
-It never writes, and it never trusts a block: graffiti and solution text are
-miner-chosen bytes and are sanitized and escaped on every path. It does not
-re-verify share signatures — consensus already settled that — so a share table
-reports what a block claims, which is the honest thing for a reader of a
-validated chain.
+**Explorer.** A read-only HTTP site over the node database: chain summary,
+block list, block detail with puzzle, score decomposition, shares, and payouts,
+address pages, difficulty history, and JSON endpoints. Summary issued supply is
+the active-UTXO aggregate; scheduled maximum remains a separate cap. List pages
+never execute share programs. A detail page may run the public share checker to
+preview verified contributions and expected payouts, but omits the comparison
+if any preview fails or inferred fees would be negative. It never uses node
+validation caches, writes state, or trusts miner text: graffiti and source are
+sanitized and escaped.
 
 **Deployment.** A NixOS module for the seed node and the explorer, with the
 node holding its own port and the explorer bound to loopback behind a reverse
@@ -832,17 +878,17 @@ structure worth synthesizing. The same survey found execution metrics at
 0.03% of the fuel cap and 0.08% of the allocation cap, supporting fixed,
 bounded verification.
 
-**The example count is 8 because executable bounds beat estimates.** Ten
-examples need 515 bytes under one repair wrapper and leave only two bytes under
-another. The count was frozen at 8, where the global worst case is 415 bytes
-and the personalized worst case is 458 bytes.
+**The example count is 8 because executable bounds beat estimates.** Tightening
+reduces each added table branch to 16 fixed bytes. Ten global examples fit at
+496 bytes under the widest repair but leave only 16 bytes of source headroom.
+The shared cap remains 8, with exact global and personalized bounds of 400 and
+443 bytes.
 
 **Liveness is verified, not argued.** The generator does not rely on size
-arithmetic alone. Every accepted puzzle has had its
-fallback solution constructed, printed, parsed, constraint-checked and run
-against every published pair, under the real consensus caps, before it can be
-published. The documented size bound is documentation; the check is the
-guarantee.
+arithmetic alone. Every accepted puzzle has both generated witnesses wrapped,
+lexically tightened, measured, parsed, constraint-checked, and executed against
+every published pair under the real consensus caps. The documented bound is
+explanation; the executable check is the guarantee.
 
 The same discipline runs through the rest: buckets and margins are exact
 integer arithmetic with explicit floors because a float would diverge; the
@@ -876,10 +922,11 @@ to an ASIC.
 
 **Payout keys can be ground.** Personalized puzzles prevent one source from
 being replayed under several keys, but keys are free to generate. A miner can
-sample pubkeys, derive their public puzzles and work only on unusually easy
-ones. The mandatory full-key anchor makes every chosen solution bind to that
-key; it does not make key selection scarce. `Q <= 15` bounds the block-level
-benefit, but there is no identity or anti-grinding rule.
+sample pubkeys, derive their public puzzles, and work only on unusually easy
+ones. The full-key anchor binds every chosen source to that key but does not
+make key selection scarce. `Q <= 15` caps the authenticated report, not
+fork-choice benefit; contribution-ranked reveal selection and payout remain
+susceptible to key sampling.
 
 **The difficulty ceiling is finite.** `C` raises example count and grammar
 width, but every published puzzle must carry a fallback table that fits the
@@ -897,28 +944,26 @@ any competitor who submits their best. The manipulation is real, it is
 self-financed, and there is no in-protocol detection of it.
 
 **A block producer can silently omit others' commitments.** He chooses what
-his block carries. The carrier output pays him to include them and aggregate verified share
-quality can break a producer-score tie, but a miner who expects to win most
-heights is better off excluding everyone, and there is no in-protocol defence.
-The mitigations are that he controls only one height and forfeits both the
-carrier payout and the quality tie-break. If censorship shows up in
-practice, the cheapest fix is to make commitment count a soft input to
-retargeting — a chain carrying no commitments is treated as easier — which
-costs the censor difficulty rather than requiring a new mechanism. That is not
-built, and should not be until the behaviour is observed.
+his block carries. A later carrier output pays the parent producer to make
+commitment paths available, but authenticated quality cannot break a rank tie.
+The censor controls one height and may forgo a future carrier output or current
+share participation; there is no further in-protocol defence. If censorship
+shows up, making commitment count a soft retarget input may be the cheapest
+response. That is not built and should not be until behavior is observed.
 
 **The producer's own program can be copied.** It is revealed in the block that
-claims it and cannot be committed in advance. No hash tie-break, aggregate
-verified quality, and the settled-height rule make copying unprofitable in
-most cases. A thief who copies the program and matches `Q` produces an
-incomparable sibling: nodes keep the first one seen, and the next block settles
-the height. That is the honest limit of same-block reveal protection.
+claims it and cannot be committed in advance. A copy retains the same
+`(L, MB, SB)` projected rank even if attacker shares increase authenticated
+`Q`, so a later copy cannot replace the first-seen incumbent. A child linking
+that incumbent then settles the height against all later siblings. Before the
+child, different observers can still receive equal-rank siblings in different
+orders.
 
-**The producer/share/carrier split is a guess.** Its exact weights are 2/1/1.
-Unit and integration tests on regtest prove output shape, conservation and
-payment binding, but no public co-op network has tested the incentives. If the
-split is wrong in one direction producers carry fewer shares than `Q` rewards;
-in the other, sharing is not worth a sharer's effort.
+**The payout policy is a guess.** Solo minting targets 80%. Cooperative blocks
+target 85% for the producer, divide 10% by contributions, pay 5% to the parent
+carrier, and route fees and integer residuals to the producer. Tests prove
+shape, conservation, and binding, but no public co-op network has tested these
+incentives. Changing them after launch is a hard fork.
 
 **The retarget window of 16 is short.** The margin distribution is
 heavy-tailed — most blocks do not beat par at all — so a 16-sample median can
@@ -926,10 +971,10 @@ jump, and `C` could oscillate inside the 4x clamp. Sixteen was chosen because
 a young chain needs feedback more than it needs stability. A 32-block window
 is the fix if it oscillates.
 
-**Fork choice is first-seen at equal score.** Ties are common, so the tip at
-equal height and equal score depends on message arrival order. It converges as
-soon as a child arrives, but a node syncing from scratch may briefly land on a
-different sibling than its peers.
+**Fork choice is first-seen at equal projected rank.** Ties are common, so the
+incumbent at equal `(height, L, MB, SB)` depends on arrival order. It converges
+when a child arrives, but a node syncing from scratch may briefly retain a
+different equal-rank sibling.
 
 **The chain has never run on a public network.** Two nodes on one machine over
 loopback is the extent of what has been exercised. Every claim in this
@@ -947,15 +992,16 @@ robust as it sounds.
 
 ## 15. Implementation status
 
-Source tree implements canonical design end to end: puzzle generation and
-constraints; seed derivation and bounded cache; solution scoring and retarget;
-co-op shares, blind-bearing reveal, commitments and reward split; durable-parent
-node validation and block building; CLI puzzle/mine/commit/reveal; read-only,
+The source tree implements the canonical design end to end: tight generated
+witnesses; seed derivation and bounded cache; projected score ranking and
+retargeting; contribution-aware co-op payouts; durable-parent node validation;
+CLI puzzle/mine/commit/reveal; branch-aware issued supply; and read-only,
 escaped explorer pages and JSON.
 
-Mainnet genesis quote is configured, but timestamp and derived constants remain
-explicitly non-final until operator chooses launch day. Regtest genesis is fixed
-and used by integration tests.
+Mainnet's timestamp and derived constants remain explicitly non-final until
+the operator chooses launch day. Tightening regenerated the current coherent
+mainnet placeholder and fixed regtest constants. The public testnet is an
+explicit genesis reset; old testnet state is not migrated.
 
 ## 16. Constants
 
@@ -972,8 +1018,8 @@ and used by integration tests.
 | grammar width `w` | 6..24 of 24 productions |
 | ordinary input / output literal cap | 8 / 24 bytes |
 | personalized anchor | `"@"` -> 66-character full-pubkey encoding |
-| personalized share threshold | strictly below personalized par |
-| share quality | 1..4 per share, aggregate `Q <= 15` |
+| share contribution | 1..4 per verified share |
+| aggregate `Q` | 0..15, authenticated/reporting only |
 | minimum par | 24 bytes |
 | generator retries | 64, then a frozen fallback |
 | generator budget | 20000 steps per attempt |
@@ -985,7 +1031,9 @@ and used by integration tests.
 | header version | 5 |
 | `bits` | `0x207F0000 \| C` |
 | `nonce` | the score word `W` |
+| fork-choice rank | `(L, MB, SB)` via `W & 0xffffff0f` |
 | max shares / commitments | 8 / 16 |
+| payout | solo `floor(4*S/5)+F`; cooperative 10% weighted shares, 5% carrier, producer residual |
 | coinbase scriptSig | 8 .. 6588 bytes |
 | graffiti cap | 400 bytes |
 | block size cap | 16384 bytes |
@@ -996,12 +1044,16 @@ and used by integration tests.
 | warmup | heights 1..30 at 1 SGL |
 | reward / halving | 100 SGL, halving every 730 blocks |
 | last paying height | 24820 |
-| total supply | 14302999991970 daviwils |
+| scheduled maximum supply | 14302999991970 daviwils |
 | address format | bech32, HRP `sgl` |
 | mainnet magic / port | `8f d1 c0 a5` / 19444 |
+| public-testnet magic / port | `d3 7a 91 c5` / 19446 |
 | regtest magic / port | `a5 c0 d1 8f` / 19445 |
 | protocol version / user agent | 70015 / `/sigilcoin-node:0.1.0/` |
-| genesis quote | `Sigil - Practical Symbolic Power` |
+| mainnet genesis quote / current display id | `Sigil - Practical Symbolic Power` / `1615333197455a3ebace8f1acdc66ae8d79a4f1a0ab3b7dc2f0078f051aef1ed` |
+| reset-testnet quote / timestamp | `SigilCoin public testnet reset - 2026-09-02` / `1788307200` |
+| reset-testnet display id | `15447f3226699f537969cbea4b493bbbe25a4d856832bf28bce3e7df579e6ddc` |
+| regtest display id | `3d68493eed6f4adcb4073dc34b8a5b360fb73083f0cdbd6430c6b579ad3b69ba` |
 
 ---
 

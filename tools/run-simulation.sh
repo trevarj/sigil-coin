@@ -2,10 +2,8 @@
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
-workspace=$(cd "$root/.." && pwd)
-sigil="$workspace/sigil/build/dev/bin/sigil"
 out="$root/tools/simulation-output"
-expected="0a87130cd6387bf778669516aa806471d7e60e21e24c51ba5b15ca7395a5c277"
+expected="a23487ab2bb4eea4eb18b42169ae26b6ce6582967daf69d1c1af192f99ed578e"
 
 case "${1:-}" in
   ""|--check) ;;
@@ -13,16 +11,17 @@ case "${1:-}" in
 esac
 
 cd "$root/tools/simulator"
-if [[ ! -d .sigil/deps/sigil-crypto ]]; then
-  nix develop "$workspace" -c "$sigil" deps install \
+if [[ ! -e .sigil/deps/sigil-crypto || ! -e .sigil/deps/sigil-coin-node ]]; then
+  nix develop "$root" -c sigil deps install \
     --redirects "$root/dev-redirects.sgl" >/dev/null
 fi
-nix develop "$workspace" -c "$sigil" build \
+nix develop "$root" -c sigil build \
   --redirects "$root/dev-redirects.sgl" >/dev/null
 cd "$root"
+rm -f "$out"/*
 tools/simulator/build/dev/bin/sigil-coin-simulator
 
-files=(censorship.csv ordering.csv payouts.csv puzzles.csv results.json shares.csv summary.txt)
+files=(censorship.csv market.csv payouts.csv puzzles.csv results.json shares.csv strategy.csv summary.txt)
 (
   cd "$out"
   sha256sum "${files[@]}" > SHA256SUMS

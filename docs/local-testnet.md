@@ -36,10 +36,14 @@ CLI/helper command has a timeout. Listener and explorer processes have
 900-second safety deadlines. `INT`/`TERM` stop them and exit; idempotent `EXIT`
 cleanup runs once. `--keep` preserves data, never processes.
 
-`tools/local-testnet` has one narrow purpose: `solve-share` obtains an under-par
-test solution because the CLI has no solver. It does not construct or submit
-blocks. Commit aggregation, reveal aggregation, mining, validation, and payouts
-all use canonical CLI operations.
+`tools/local-testnet` has one narrow purpose: `solve-share` obtains a genuine
+semantic under-par fixture because the CLI has no solver. It requires every
+ordinary personalized example input to be non-string, replaces the exact tight
+anchor predicate `(equal? x"@")` with `(string? x)`, runs
+`coin-check-share-solution/spec`, and returns the candidate only when it is
+strictly shorter than par. It never removes whitespace or fabricates a
+contribution. Commit aggregation, reveal aggregation, mining, full share
+validation, and payouts all use canonical CLI operations.
 
 ## What automated run approves
 
@@ -51,18 +55,22 @@ all use canonical CLI operations.
 4. Syncs B to H99, obtains a fixture solution, and has B emit two commitments.
    A feeds B's `commits-push` to `mine --commit` at H100 and requires both
    commitments to be accepted.
-5. Sends `0.50000000 SGL` from A to B, syncs B to H100, and has B emit a reveal.
-   A feeds B's `shares-push` to `mine --reveal` at H101 and requires accepted
-   share, non-zero aggregate Q, contributor share payout, producer carrier
-   payout, and payment transaction.
+5. Sends `0.50000000 SGL` from A to B with a `0.00001000 SGL` fee, syncs B to
+   H100, and has B emit a reveal. A feeds B's `shares-push` to H101 and requires
+   the verified contribution and authenticated aggregate `Q` to agree. At the
+   100 SGL scheduled subsidy, it requires producer `85.00001000 SGL`, share
+   `10.00000000 SGL`, carrier `5.00000000 SGL`, total coinbase
+   `100.00001000 SGL`, and zero unminted subsidy.
 6. Runs A listener, B sync, and explorer over loopback. Stops A, reopens its
    database, mines H102 on durable H101, restarts A, and re-syncs B.
 7. Requires both nodes to agree on H102 tip hash, next C, block count, and 102
    validated bodies. B must have the `0.50000000 SGL` spendable transfer plus
-   immature share payout.
+   the immature `10.00000000 SGL` share payout.
 8. Validates `/api/summary`, `/api/block/100`, `/api/block/101`,
-   `/api/difficulty`, and `/api/address/<B>`, including exact Q and positive
-   share/carrier outputs.
+   `/api/difficulty`, and `/api/address/<B>`, including authenticated `Q`,
+   verified contribution, expected/actual 85%/10%/5% payout roles,
+   branch-aware issued supply, the node's current scheduled cap, the explorer's
+   scheduled lifetime maximum, and unminted reserve.
 
 Approval is one final `PASS` line. Any mismatch, timeout, process death, HTTP
 failure, missing payout, missing transaction, or state disagreement exits
@@ -129,8 +137,9 @@ kill "$listener"; wait "$listener" 2>/dev/null || true
 REVEAL=$($C reveal --height 100 --regtest --data-dir "$B" |
   awk '/^shares-push:/{print $2}')
 $C mine --reveal "$REVEAL" --regtest --data-dir "$A"
-# Expected: height 101, accepted-share, aggregate-q > 0, share/carrier payouts,
-# transactions: 1, submitted: yes.
+# Expected: height 101, accepted-share with contribution 1..4, aggregate-q
+# equal to that contribution, producer/share/carrier payouts, minted and
+# unminted totals, transactions: 1, submitted: yes.
 ```
 
 Run sync and explorer checks, then stop everything and remove wallet state:
@@ -146,36 +155,52 @@ explorer=$!
 $C status --regtest --data-dir "$A"
 $C status --regtest --data-dir "$B"
 $C balance --regtest --data-dir "$B"
-curl -fsS http://127.0.0.1:36002/api/summary | jq .
+curl -fsS http://127.0.0.1:36002/api/summary | jq \
+  '{tip_height,supply,max_supply}'
 curl -fsS http://127.0.0.1:36002/api/block/100 | jq .commitments
 curl -fsS http://127.0.0.1:36002/api/block/101 | jq \
-  '{height,share_count,quality:.score.quality,transactions,outputs}'
-curl -fsS "http://127.0.0.1:36002/api/address/$B_ADDR" | jq .
+  '{height,reward,total_output,share_count,
+    quality:.score.quality,shares,outputs}'
 kill "$explorer" "$listener"; wait "$explorer" "$listener" 2>/dev/null || true
 rm -rf "$A" "$B"
 ```
 
-Approve only when statuses agree, H100 contains contributor commitment, H101 has
-non-zero Q plus positive `share` and `carrier` outputs, B has transfer and share
-payout, and explorer endpoints return HTTP 200 JSON.
+Approve only when statuses agree, H100 contains the contributor commitments,
+and H101 reports one verified contribution with authenticated non-zero `Q`.
+For the frozen one-share transaction, require producer `85.00001000 SGL`,
+share `10.00000000 SGL`, carrier `5.00000000 SGL`, minted
+`100.00001000 SGL`, and unminted `0.00000000 SGL`. B must hold the
+`0.50000000 SGL` transfer plus its immature share payout, and explorer
+endpoints must return HTTP 200 JSON. Node status must keep branch-aware issued
+supply separate from the current scheduled cap; explorer summary must keep it
+separate from the scheduled lifetime maximum.
 
-## Recorded local results
+## Current payout and supply expectations
 
-Two clean runs on 2026-08-31 used current source-built binaries from
-`build/dev/bin`, built inside the workspace Nix development shell:
+The drill derives every amount from scheduled subsidy and verified
+contributions:
 
 ```text
-run 1: PASS runtime=112s, H102 tip=d55faf2…eed1b29, C(next)=16
-run 2: PASS runtime=42s,  H102 tip=b879e75…842f7b9, C(next)=16
-both: historical C(H15/H16/H17)=128/32/32 at tip 99
-both: B commits-push -> A mine --commit H100; 2 commitments accepted
-both: B shares-push -> A mine --reveal H101; Q=1
-both: share payout=25.00000250 SGL; carrier payout=25.00000250 SGL
-both: payment selected; B balance=25.50000250 SGL (0.50000000 spendable)
-both: 102 validated bodies/node; summary/block/difficulty/address JSON approved
+H101 scheduled subsidy: 100.00000000 SGL
+H101 fees:               0.00001000 SGL
+verified contribution:   1..4 (one share, so it receives the whole pool)
+producer:                85.00001000 SGL
+share:                   10.00000000 SGL
+carrier:                  5.00000000 SGL
+coinbase total:         100.00001000 SGL
+unminted subsidy:         0.00000000 SGL
+B balance:               10.50000000 SGL
+                          (0.50000000 spendable, 10.00000000 immature)
 ```
 
-Run 1 included fixture build time; run 2 reused built fixture. Full transcripts
-and JSON remain under `/tmp/sigilcoin-local-testnet.KPVqUB` and
-`/tmp/sigilcoin-local-testnet.Is9yrz`. Native `mine-coop` bridge is removed.
-No blocker remains.
+The producer's nominal 85% is a target: fees and any proportional rounding
+residual also go to output 0. A later solo block mints only
+`floor(4*S/5)` plus fees, so final active-UTXO `issued-supply` may be lower than
+the height-only `scheduled-supply-cap`.
+
+The helper exits instead of inventing a share when a deterministic
+personalized fixture has a string ordinary input or when the semantic
+replacement is not valid and under par. A successful run prints one final
+`PASS`; `--keep` preserves that run's transcript and JSON under its reported
+temporary directory.
+

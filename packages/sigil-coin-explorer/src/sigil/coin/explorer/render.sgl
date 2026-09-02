@@ -512,7 +512,8 @@
                  blocks)))
 
     (define %block-headings
-      '("height" "time" "miner" "bytes" "par" "margin" "reward" "quote"))
+      '("height" "time" "miner" "bytes" "par" "margin"
+        "scheduled subsidy" "quote"))
 
     (define (block-tile b)
       (let ((id (explorer-block-id b))
@@ -552,7 +553,7 @@
         "</div>"))
 
     ;; ============================================================
-    ;; Puzzle, score, shares and split sections
+    ;; Puzzle, score, shares and payout sections
     ;; ============================================================
 
     (define (hex-word n)
@@ -614,11 +615,11 @@
     (define (score-section b)
       (join (list
               "<section class=\"panel content-panel\"><h2>Producer score</h2>"
-              "<p class=\"q\">Lower is better. Length dominates memory,"
-              " memory dominates steps, and aggregate personalized-share"
-              " quality Q breaks remaining ties. Memory and steps are"
-              " 7-bit buckets: raw counts are not recoverable from a"
-              " header.</p>"
+              "<p class=\"q\">Lower is better for projected fork rank. Length"
+              " dominates memory, memory dominates steps, and aggregate"
+              " personalized-share quality Q remains authenticated in raw W"
+              " but is cleared before comparison. Memory and steps are 7-bit"
+              " buckets: raw counts are not recoverable from a header.</p>"
               (table-wrap
                 (join (list
                         "<table><thead><tr>"
@@ -646,7 +647,7 @@
                                     (badge "badge-violet"
                                       (optional-number
                                         (explorer-block-score-quality b)))
-                                    "<span class=\"q\">breaks ties only</span>"))
+                                    "<span class=\"q\">authenticated; rank-inert</span>"))
                         "</tr><tr>"
                         (rows (list "score word W"
                                     (explorer-escape
@@ -710,9 +711,9 @@
                     "<section class=\"panel content-panel\"><h2>Co-op shares</h2>"
                     (if (null? shares)
                         (string-append
-                          "<div class=\"empty-state\">No shares. The producer took the"
-                          " whole reward."
-                          "</div>")
+                          "<div class=\"empty-state\">No shares. The solo"
+                          " coinbase mints floor(80% of scheduled subsidy)"
+                          " plus fees; the remaining subsidy is unminted.</div>")
                         (join (list
                                 "<p class=\"q\">Each share solves its own"
                                 " pubkey-personalized version of the parent"
@@ -761,28 +762,46 @@
           "</tr>")))
 
     (define %output-headings
-      '("#" "role" "paid to" "value" "split says" ""))
+      '("#" "role" "paid to" "actual value" "payout preview" ""))
 
-    (define (split-section b)
+    (define (expected-output-total outputs)
+      (let loop ((xs outputs) (sum 0))
+        (cond ((null? xs) sum)
+              ((number? (explorer-output-expected (car xs)))
+               (loop (cdr xs)
+                     (+ sum (explorer-output-expected (car xs)))))
+              (else #f))))
+
+    (define (payout-section b)
       (let ((outputs (explorer-block-outputs b)))
-            (if (null? outputs)
-                ""
-                (join (list
-                        "<section class=\"panel content-panel\"><h2>Reward split</h2>"
-                        "<p class=\"q\">Weights are producer 2, each share 1,"
-                        " carrier 1; the floor's remainder goes to the"
-                        " producer, so the outputs sum to the reward"
-                        " exactly and nothing is burned.</p>"
-                        "<div class=\"table-scroll\"><table><thead><tr>"
-                        (headings %output-headings) "</tr></thead><tbody>"
-                        (join (map output-row outputs))
-                        "<tr>"
-                        (rows (list "" "<b>total</b>" ""
-                                    (amount-cell
-                                      (explorer-block-total-output b))
-                                    (amount-cell (explorer-block-reward b))
-                                    "<span class=\"q\">subsidy</span>"))
-                        "</tr></tbody></table></div></section>")))))
+        (if (null? outputs)
+            ""
+            (join (list
+                    "<section class=\"panel content-panel\"><h2>Coinbase payout</h2>"
+                    (if (and (number? (explorer-block-share-count b))
+                             (> (explorer-block-share-count b) 0))
+                        (string-append
+                          "<p class=\"q\">Cooperative blocks mint scheduled"
+                          " subsidy plus fees. Shares divide floor(10% of"
+                          " scheduled subsidy) by previewed contribution,"
+                          " the carrier receives floor(5% of scheduled"
+                          " subsidy), and the producer receives fees and every"
+                          " integer remainder.</p>")
+                        (string-append
+                          "<p class=\"q\">Solo blocks mint floor(80% of"
+                          " scheduled subsidy) plus fees. The remaining"
+                          " scheduled subsidy is unminted.</p>"))
+                    "<div class=\"table-scroll\"><table><thead><tr>"
+                    (headings %output-headings) "</tr></thead><tbody>"
+                    (join (map output-row outputs))
+                    "<tr>"
+                    (rows (list "" "<b>actual coinbase total</b>" ""
+                                (amount-cell
+                                  (explorer-block-total-output b))
+                                (amount-cell
+                                  (expected-output-total outputs))
+                                "<span class=\"q\">minted</span>"))
+                    "</tr></tbody></table></div></section>")))))
 
     (define %difficulty-headings
       '("height" "C" "par" "bytes" "margin" ""))
@@ -939,16 +958,16 @@
                         (explorer-summary-header-height summary))))
                   (live-metric-card
                     "live-supply" "live-supply-detail"
-                    "supply issued"
+                    "issued supply"
                     (string-append
                       (explorer-sigil-amount
                         (explorer-summary-supply summary)) " SGL")
-                    (string-append "of "
+                    (string-append "scheduled maximum supply "
                       (explorer-sigil-amount
                         (explorer-summary-max-supply summary)) " SGL"))
                   (live-metric-card
                     "live-reward" "live-halving-detail"
-                    "current reward"
+                    "next scheduled subsidy"
                     (string-append
                       (explorer-sigil-amount
                         (explorer-summary-next-reward summary)) " SGL")
@@ -957,7 +976,7 @@
                       (if (number? height)
                           (string-append "next halving at height "
                                          (number->string height))
-                          "never (reward has decayed to zero)")))
+                          "never (subsidy has decayed to zero)")))
                   (live-metric-card
                     "live-complexity" "live-retarget-detail"
                     "complexity / retarget"
@@ -1133,7 +1152,7 @@
                                             (explorer-text author)
                                             " (self-declared)</span>")
                              "<span class=\"q\">none declared</span>")))
-                (field "reward"
+                (field "scheduled subsidy"
                        (string-append
                          (explorer-sigil-amount (explorer-block-reward b))
                          " SGL"))
@@ -1166,7 +1185,7 @@
                 (solution-text b) "</pre></section>"
                 (score-section b)
                 (shares-section b)
-                (split-section b)
+                (payout-section b)
                 "<section class=\"panel content-panel\"><h2>Quote</h2><pre>"
                 (let ((graffiti (explorer-block-graffiti b)))
                   (if (and (bytevector? graffiti)

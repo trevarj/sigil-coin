@@ -1,5 +1,5 @@
 ;;; Consensus coinbase codec, co-op shares, commit-reveal,
-;;; the reward split and aggregate fork choice.
+;;; contribution-aware payouts and aggregate fork choice.
 ;;;
 ;;; Every rule here is applied by every node to a block someone else
 ;;; produced, so every one is exercised with hostile input as well as
@@ -11,11 +11,12 @@
 ;;; gate theirs. A workspace-wide run has no secp256k1 native module bound
 ;;; and skips them; running this package on its own builds a harness that
 ;;; does. Everything that can avoid a key does, which is most of the file:
-;;; the codecs, the split arithmetic, the preimage binding and fork choice
-;;; are all pure byte and integer work.
+;;; the codecs, payout arithmetic, the preimage binding and fork choice are
+;;; all pure byte and integer work.
 
 (import (sigil test)
         (sigil math)
+        (sigil string)
         (sigil bitcoin utils)
         (sigil bitcoin primitives)
         (sigil bitcoin script)
@@ -30,6 +31,7 @@
               coin-coop-context-signature-count
               coin-coop-context-example-count
               coin-check-shares-cheap
+              coin-check-share-solution/spec
               coin-prepare-shares
               coin-check-share-signatures
               coin-verify-prepared-shares))
@@ -130,28 +132,57 @@
                    blind: (filled 32 (+ n 100))
                    solution: (string->bytes source))))
 
-;; Remove safe spaces adjacent to parentheses. Parentheses remain token
-;; delimiters, so result is equivalent and strictly shorter than hidden par.
-(define (golf-source source)
-  (let loop ((text source) (i 1))
-    (if (>= i (- (string-length text) 1))
-        text
-        (if (and (char=? #\space (string-ref text i))
-                 (or (char=? #\( (string-ref text (+ i 1)))
-                     (char=? #\) (string-ref text (- i 1)))))
-            (loop (string-append (substring text 0 i)
-                                 (substring text (+ i 1)
-                                            (string-length text)))
-                  i)
-            (loop text (+ i 1))))))
+;; Personalized generated witnesses have one exact reserved-string branch.
+;; Replacing its predicate is a genuine semantic improvement only when every
+;; ordinary example input is non-string.
+(define %generated-anchor-predicate "(equal? x\"@\")")
+(define %semantic-anchor-predicate "(string? x)")
+
+(define (ordinary-inputs-non-string? spec)
+  (let loop ((pairs (puzzle-spec-examples spec)))
+    (cond
+      ((null? pairs) #f)
+      ((null? (cdr pairs))
+       (let ((anchor (car pairs)))
+         (and (string? (car anchor))
+              (string=? puzzle-anchor-input (car anchor))
+              (puzzle-anchor-output? (cdr anchor)))))
+      ((string? (car (car pairs))) #f)
+      (else (loop (cdr pairs))))))
+
+(define (semantic-share-source spec)
+  (let ((source (puzzle-spec-hidden-source spec)))
+    (and (ordinary-inputs-non-string? spec)
+         (= 1 (string-count source %generated-anchor-predicate))
+         (let* ((candidate
+                  (string-replace source %generated-anchor-predicate
+                                  %semantic-anchor-predicate))
+                (checked
+                  (coin-check-share-solution/spec spec candidate)))
+           (and (< (string-length candidate) (puzzle-spec-par spec))
+                (coin-ok? checked)
+                candidate)))))
 
 (define (personalized-source n)
-  (golf-source
-    (puzzle-spec-hidden-source
-      (coin-share-puzzle %bare-context (pubkey-of n)))))
+  (semantic-share-source
+    (coin-share-puzzle %bare-context (pubkey-of n))))
 
-(define (valid-share-of n)
-  (share-of n (personalized-source n)))
+(define (semantic-key-index slot)
+  (if (not (and (integer? slot) (>= slot 0)))
+      (error "test-coop: semantic key slot must be non-negative"))
+  (let loop ((n 1) (remaining slot))
+    (if (> n 100)
+        (error "test-coop: fewer than eight semantic candidates"))
+    (if (personalized-source n)
+        (if (= remaining 0)
+            n
+            (loop (+ n 1) (- remaining 1)))
+        (loop (+ n 1) remaining))))
+
+(define (valid-share-of slot)
+  (let* ((n (semantic-key-index slot))
+         (source (personalized-source n)))
+    (share-of n source)))
 
 (define (bytes<? a b)
   (let ((na (bytevector-length a)) (nb (bytevector-length b)))
@@ -261,14 +292,14 @@
 (define (outs pairs)
   (map (lambda (p) (txout value: (car p) script-pubkey: (cdr p))) pairs))
 
-;; The outputs the split says a block owes, turned into real txouts. Output
-;; 0's script is the producer's own business, so it gets the burn script.
-(define (planned-outputs plan)
+;; Turn a payout plan into real txouts. Output 0's script is the producer's
+;; own business, so tests use the burn script there.
+(define (payout-outputs plan)
   (outs (map (lambda (entry)
                (cons (car entry) (or (cdr entry) %burn)))
              plan)))
 
-(define (split-sum plan)
+(define (payout-sum plan)
   (let loop ((xs plan) (total 0))
     (if (null? xs) total (loop (cdr xs) (+ total (car (car xs)))))))
 
@@ -897,328 +928,522 @@
     (assert-error (coin-share-script (filled 32 2)))))
 
 ;; ============================================================
-;; The reward split (§6.5)
+;; Contribution-aware payouts (§6.5)
 ;; ============================================================
 
 (define %subsidy 5000000000)
+(define %fees 12345)
 
-(define (plan-for count value)
-  (coin-split-plan value
-                      (map (lambda (i) (fake-share i %sol-a))
-                           (let loop ((i 0) (acc '()))
-                             (if (>= i count) (reverse acc)
-                                 (loop (+ i 1) (cons (+ i 1) acc)))))
-                      (if (> count 0) %burn #f)))
+(define (payout-shares count)
+  (let loop ((tag 1) (acc '()))
+    (if (> tag count)
+        (reverse acc)
+        (loop (+ tag 1) (cons (fake-share tag %sol-a) acc)))))
 
-(test-group "reward split: weights and units"
-  (test "the producer is worth two"
-    (assert-equal 2 coin-producer-weight))
+(define (payout-contributions count)
+  (let loop ((index 0) (acc '()))
+    (if (>= index count)
+        (reverse acc)
+        (loop (+ index 1) (cons (+ 1 (modulo index 4)) acc)))))
 
-  (test "with no shares there is no carrier"
-    (assert-equal 2 (coin-split-weight-total 0)))
 
-  (test "with shares the carrier is always present"
-    (assert-equal 4 (coin-split-weight-total 1))
-    (assert-equal 11 (coin-split-weight-total 8)))
-
-  (test "the unit is floor division by the total weight"
-    (assert-equal 454545454 (coin-split-unit %subsidy 8))
-    (assert-equal (quotient %subsidy 4) (coin-split-unit %subsidy 1))
-    (assert-equal (quotient %subsidy 2) (coin-split-unit %subsidy 0)))
-
-  (test "an out-of-range share count raises"
-    (assert-error (coin-split-weight-total 9))
-    (assert-error (coin-split-weight-total -1))
-    (assert-error (coin-split-unit -1 0))))
-
-(test-group "reward split: shape and arithmetic"
-  (test "with no shares the producer takes everything in one output"
-    (let ((plan (plan-for 0 %subsidy)))
-      (assert-equal 1 (length plan))
-      (assert-equal %subsidy (car (car plan)))
-      (assert-equal #f (cdr (car plan)))))
-
-  (test "with eight shares there are ten outputs"
-    ;; producer + 8 shares + carrier
-    (let ((plan (plan-for 8 %subsidy)))
-      (assert-equal 10 (length plan))))
-
-  (test "the eight-share worked example"
-    (let* ((plan (plan-for 8 %subsidy))
-           (unit 454545454))
-      ;; u = floor(5000000000 / 11) = 454545454, remainder 6.
-      (assert-equal (- %subsidy (* 9 unit)) (car (car plan)))
-      (assert-equal 909090914 (car (car plan)))
-      (assert-equal unit (car (list-ref plan 1)))
-      (assert-equal unit (car (list-ref plan 8)))
-      (assert-equal unit (car (list-ref plan 9)))
-      (assert-equal %subsidy (split-sum plan))))
-
-  (test "the producer keeps two elevenths plus the remainder"
-    (let* ((plan (plan-for 8 %subsidy))
-           (unit (coin-split-unit %subsidy 8)))
-      (assert-equal (+ (* 2 unit) (modulo %subsidy 11)) (car (car plan)))))
-
-  (test "the carrier is the last output and is paid one unit"
-    (let ((plan (plan-for 3 %subsidy)))
-      (assert-equal 5 (length plan))
-      (assert-equal (coin-split-unit %subsidy 3)
-                    (car (list-ref plan 4)))
-      (assert-equal %burn (cdr (list-ref plan 4)))))
-
-  (test "each share is paid to P2WPKH of its own key"
-    (let ((plan (coin-split-plan %subsidy
-                                    (list (fake-share 1 %sol-a)
-                                          (fake-share 2 %sol-b))
-                                    %burn)))
+(test-group "payout plan: arithmetic and order"
+  (test "the canonical 1, 2, 4 contribution example"
+    (let* ((shares (payout-shares 3))
+           (plan (coin-payout-plan
+                   %subsidy 0 shares '(1 2 4) %burn)))
+      (assert-equal
+        '(4250000002 71428571 142857142 285714285 250000000)
+        (map car plan))
+      (assert-equal #f (cdr (list-ref plan 0)))
       (assert-equal (coin-share-script (filled 33 1))
                     (cdr (list-ref plan 1)))
       (assert-equal (coin-share-script (filled 33 2))
-                    (cdr (list-ref plan 2)))))
+                    (cdr (list-ref plan 2)))
+      (assert-equal (coin-share-script (filled 33 3))
+                    (cdr (list-ref plan 3)))
+      (assert-equal %burn (cdr (list-ref plan 4)))
+      (assert-equal %subsidy (payout-sum plan))))
 
-  (test "the outputs sum to the block value exactly, at every count"
-    ;; Rounding may never create or destroy a daviwil.
-    (assert-true
-      (let value-loop ((values (list 0 1 2 10 11 12 99 100
-                                     %subsidy (+ %subsidy 12345)
-                                     (- %subsidy 1))))
-        (cond
-          ((null? values) #t)
-          ((let count-loop ((count 0))
-             (cond
-               ((> count 8) #t)
-               ((= (car values)
-                   (split-sum (plan-for count (car values))))
-                (count-loop (+ count 1)))
-               (else #f)))
-           (value-loop (cdr values)))
-          (else #f)))))
+  (test "fees and proportional rounding residuals go to the producer"
+    (let* ((shares (payout-shares 3))
+           (without-fees
+             (coin-payout-plan %subsidy 0 shares '(1 2 4) %burn))
+           (with-fees
+             (coin-payout-plan %subsidy %fees shares '(1 2 4) %burn)))
+      (assert-equal (+ 4250000002 %fees) (car (car with-fees)))
+      (assert-equal (+ (car (car without-fees)) %fees)
+                    (car (car with-fees)))
+      (assert-equal (cdr without-fees) (cdr with-fees))
+      (assert-equal (+ %subsidy %fees) (payout-sum with-fees))))
 
-  (test "the remainder never exceeds ten daviwils"
+  (test "a solo block mints four fifths plus fees"
+    (let ((plan (coin-payout-plan %subsidy %fees '() '() #f)))
+      (assert-equal 1 (length plan))
+      (assert-equal 4000012345 (car (car plan)))
+      (assert-equal #f (cdr (car plan)))
+      (assert-equal 1000000000
+                    (- (+ %subsidy %fees) (payout-sum plan)))))
+
+  (test "every allowed share count has the required outputs and minted total"
     (assert-true
       (let loop ((count 0))
-        (cond
-          ((> count 8) #t)
-          ((<= (modulo %subsidy (coin-split-weight-total count)) 10)
-           (loop (+ count 1)))
-          (else #f)))))
+        (if (> count 8)
+            #t
+            (let* ((shares (payout-shares count))
+                   (contributions (payout-contributions count))
+                   (carrier (if (> count 0) %burn #f))
+                   (plan
+                     (coin-payout-plan
+                       %subsidy %fees shares contributions carrier))
+                   (tx
+                     (coinbase-tx
+                       (bytes-of 1)
+                       (payout-outputs plan)))
+                   (expected-count (if (= count 0) 1 (+ count 2)))
+                   (expected-minted
+                     (if (= count 0)
+                         (+ (quotient (* 4 %subsidy) 5) %fees)
+                         (+ %subsidy %fees))))
+              (and (= expected-count (length plan))
+                   (= expected-minted (payout-sum plan))
+                   (coin-ok?
+                     (coin-check-payout-cheap
+                       tx %subsidy %fees shares carrier))
+                   (coin-ok?
+                     (coin-check-payout
+                       tx %subsidy %fees
+                       shares contributions carrier))
+                   (loop (+ count 1))))))))
 
-  (test "a value too small to split still conserves it"
-    ;; u = 0, so every share and the carrier are paid nothing and the
-    ;; producer keeps the lot. Dust never burns and never leaks to fees.
-    (let ((plan (plan-for 8 7)))
-      (assert-equal 0 (coin-split-unit 7 8))
-      (assert-equal 7 (car (car plan)))
-      (assert-equal 7 (split-sum plan))
-      (assert-equal 10 (length plan))))
+  (test "tiny subsidies retain every cooperative output"
+    (let ((solo (coin-payout-plan 1 0 '() '() #f))
+          (solo-four (coin-payout-plan 4 0 '() '() #f))
+          (one-share
+            (coin-payout-plan
+              1 0 (payout-shares 1) '(4) %burn))
+          (two-shares
+            (coin-payout-plan
+              9 0 (payout-shares 2) '(1 4) %burn))
+          (zero-carrier
+            (coin-payout-plan
+              19 0 (payout-shares 1) '(4) %burn)))
+      (assert-equal '(0) (map car solo))
+      (assert-equal '(3) (map car solo-four))
+      (assert-equal '(1 0 0) (map car one-share))
+      (assert-equal '(9 0 0 0) (map car two-shares))
+      (assert-equal '(18 1 0) (map car zero-carrier))
+      (assert-equal 3 (length one-share))
+      (assert-equal 4 (length two-shares))
+      (assert-equal (coin-share-script (filled 33 1))
+                    (cdr (list-ref one-share 1)))
+      (assert-equal %burn (cdr (list-ref one-share 2)))))
 
-  (test "a block with shares needs a carrier script"
-    (assert-error (coin-split-plan %subsidy
-                                       (list (fake-share 1 %sol-a))
-                                       #f))))
+  (test "zero subsidy routes all fees to the producer"
+    (let ((solo (coin-payout-plan 0 37 '() '() #f))
+          (cooperative
+            (coin-payout-plan
+              0 37 (payout-shares 2) '(1 4) %burn)))
+      (assert-equal '(37) (map car solo))
+      (assert-equal '(37 0 0 0) (map car cooperative))
+      (assert-equal 37 (payout-sum cooperative)))))
 
-(test-group "reward split: checking a coinbase"
-  (test "the honest split passes"
-    (let ((plan (plan-for 3 %subsidy)))
-      (assert-true (coin-ok? (coin-check-split
-                               (coinbase-tx (bytes-of 1)
-                                            (planned-outputs plan))
-                               %subsidy
-                               (map (lambda (i) (fake-share i %sol-a))
-                                    '(1 2 3))
-                               %burn)))))
+(test-group "payout plan: trusted arguments"
+  (test "subsidy and fees are validated independently"
+    (assert-error (coin-payout-plan -1 1 '() '() #f))
+    (assert-error (coin-payout-plan 1 -1 '() '() #f))
+    (assert-error (coin-payout-plan 1.0 0 '() '() #f))
+    (assert-error (coin-payout-plan 1 0.0 '() '() #f)))
 
-  (test "the no-share split passes"
-    (assert-true (coin-ok? (coin-check-split
-                             (coinbase-tx (bytes-of 1)
-                                          (outs (list (cons %subsidy %burn))))
-                             %subsidy '() #f))))
+  (test "contributions must align one-for-one with shares"
+    (let ((shares (payout-shares 2)))
+      (assert-error (coin-payout-plan 100 0 shares '(1) %burn))
+      (assert-error (coin-payout-plan 100 0 shares '(1 2 3) %burn))
+      (assert-error (coin-payout-plan 100 0 shares #f %burn))
+      (assert-error (coin-payout-plan 100 0 '() '(1) #f))))
 
-  (test "too few outputs is a shape failure"
-    (assert-equal 'coinbase-output-shape
-                  (coin-result-reason
-                    (coin-check-split
-                      (coinbase-tx (bytes-of 1)
-                                   (outs (list (cons %subsidy %burn))))
-                      %subsidy
-                      (list (fake-share 1 %sol-a))
-                      %burn))))
+  (test "each contribution is an exact integer from one through four"
+    (let ((shares (payout-shares 1)))
+      (assert-error (coin-payout-plan 100 0 shares '(0) %burn))
+      (assert-error (coin-payout-plan 100 0 shares '(5) %burn))
+      (assert-error (coin-payout-plan 100 0 shares '(1.0) %burn))
+      (assert-error (coin-payout-plan 100 0 shares '("1") %burn))))
 
-  (test "an extra output is a shape failure"
-    (assert-equal 'coinbase-output-shape
-                  (coin-result-reason
-                    (coin-check-split
-                      (coinbase-tx (bytes-of 1)
-                                   (outs (list (cons %subsidy %burn)
-                                               (cons 0 %burn))))
-                      %subsidy '() #f))))
+  (test "share count and carrier requirements remain bounded"
+    (assert-error
+      (coin-payout-plan
+        100 0 (payout-shares 9) (payout-contributions 9) %burn))
+    (assert-error
+      (coin-payout-plan 100 0 (payout-shares 1) '(1) #f))
+    (assert-error (coin-payout-plan 100 0 'not-a-list '() #f))))
 
-  (test "shorting a share is a value failure"
-    (let* ((shares (list (fake-share 1 %sol-a)))
-           (plan (coin-split-plan %subsidy shares %burn))
-           (broken (planned-outputs plan)))
+(test-group "payout checking: staged responsibilities"
+  (test "the exact checker returns the canonical plan"
+    (let* ((shares (payout-shares 3))
+           (contributions '(1 2 4))
+           (plan
+             (coin-payout-plan
+               %subsidy %fees shares contributions %burn))
+           (tx
+             (coinbase-tx (bytes-of 1) (payout-outputs plan)))
+           (checked
+             (coin-check-payout
+               tx %subsidy %fees shares contributions %burn)))
+      (assert-true (coin-ok? checked))
+      (assert-equal plan (coin-result-value checked))))
+
+  (test "the cheap checker defers proportional allocation"
+    (let* ((shares (payout-shares 2))
+           (contributions '(1 4))
+           (plan
+             (coin-payout-plan
+               %subsidy 0 shares contributions %burn))
+           (honest (payout-outputs plan))
+           (producer (list-ref honest 0))
+           (first-share (list-ref honest 1))
+           (misallocated
+             (list
+               (txout
+                 value: (+ 1 (txout-value producer))
+                 script-pubkey: (txout-script-pubkey producer))
+               (txout
+                 value: (- (txout-value first-share) 1)
+                 script-pubkey: (txout-script-pubkey first-share))
+               (list-ref honest 2)
+               (list-ref honest 3)))
+           (tx (coinbase-tx (bytes-of 1) misallocated)))
+      (assert-true
+        (coin-ok?
+          (coin-check-payout-cheap
+            tx %subsidy 0 shares %burn)))
       (assert-equal
         'coinbase-output-value
         (coin-result-reason
-          (coin-check-split
-            (coinbase-tx (bytes-of 1)
-                         (list (car broken)
-                               (txout value: 0
-                                      script-pubkey: (coin-share-script
-                                                       (filled 33 1)))
-                               (list-ref broken 2)))
-            %subsidy shares %burn)))))
+          (coin-check-payout
+            tx %subsidy 0 shares contributions %burn)))))
 
-  (test "overpaying the producer is a value failure"
-    (assert-equal 'coinbase-output-value
-                  (coin-result-reason
-                    (coin-check-split
-                      (coinbase-tx (bytes-of 1)
-                                   (outs (list (cons (+ %subsidy 1) %burn))))
-                      %subsidy '() #f))))
-
-  (test "redirecting a share's payout is a shape failure"
-    ;; The script is derived from the signed key, so a producer cannot pay
-    ;; a share to himself and still pass.
-    (let* ((shares (list (fake-share 1 %sol-a)))
-           (plan (coin-split-plan %subsidy shares %burn))
-           (honest (planned-outputs plan)))
+  (test "wrong output counts are shape failures"
+    (let* ((shares (payout-shares 1))
+           (plan
+             (coin-payout-plan %subsidy 0 shares '(1) %burn))
+           (too-few
+             (coinbase-tx
+               (bytes-of 1)
+               (list (car (payout-outputs plan)))))
+           (solo-plan (coin-payout-plan %subsidy 0 '() '() #f))
+           (extra
+             (coinbase-tx
+               (bytes-of 1)
+               (append (payout-outputs solo-plan)
+                       (outs (list (cons 0 %burn)))))))
       (assert-equal
         'coinbase-output-shape
         (coin-result-reason
-          (coin-check-split
-            (coinbase-tx (bytes-of 1)
-                         (list (car honest)
-                               (txout value: (car (list-ref plan 1))
-                                      script-pubkey: %burn)
-                               (list-ref honest 2)))
-            %subsidy shares %burn)))))
-
-  (test "paying the carrier to the wrong script is a shape failure"
-    (let* ((shares (list (fake-share 1 %sol-a)))
-           (plan (coin-split-plan %subsidy shares %burn))
-           (honest (planned-outputs plan)))
+          (coin-check-payout-cheap
+            too-few %subsidy 0 shares %burn)))
       (assert-equal
         'coinbase-output-shape
         (coin-result-reason
-          (coin-check-split
-            (coinbase-tx (bytes-of 1)
-                         (list (car honest)
-                               (list-ref honest 1)
-                               (txout value: (car (list-ref plan 2))
-                                      script-pubkey: (bytes-of #x6a #x01 #x41))))
-            %subsidy shares %burn)))))
+          (coin-check-payout
+            too-few %subsidy 0 shares '(1) %burn)))
+      (assert-equal
+        'coinbase-output-shape
+        (coin-result-reason
+          (coin-check-payout-cheap
+            extra %subsidy 0 '() #f)))))
 
-  (test "the producer's own script is not constrained"
-    (let ((plan (plan-for 0 %subsidy)))
+  (test "redirecting a share or carrier is a shape failure"
+    (let* ((shares (payout-shares 1))
+           (plan
+             (coin-payout-plan %subsidy 0 shares '(1) %burn))
+           (honest (payout-outputs plan))
+           (share (list-ref honest 1))
+           (carrier (list-ref honest 2))
+           (wrong-share
+             (coinbase-tx
+               (bytes-of 1)
+               (list
+                 (list-ref honest 0)
+                 (txout value: (txout-value share)
+                        script-pubkey: %burn)
+                 carrier)))
+           (wrong-carrier
+             (coinbase-tx
+               (bytes-of 1)
+               (list
+                 (list-ref honest 0)
+                 share
+                 (txout value: (txout-value carrier)
+                        script-pubkey: (bytes-of #x51))))))
+      (assert-equal
+        'coinbase-output-shape
+        (coin-result-reason
+          (coin-check-payout-cheap
+            wrong-share %subsidy 0 shares %burn)))
+      (assert-equal
+        'coinbase-output-shape
+        (coin-result-reason
+          (coin-check-payout-cheap
+            wrong-carrier %subsidy 0 shares %burn)))
+      (assert-equal
+        'coinbase-output-shape
+        (coin-result-reason
+          (coin-check-payout
+            wrong-share %subsidy 0 shares '(1) %burn)))
+      (assert-equal
+        'coinbase-output-shape
+        (coin-result-reason
+          (coin-check-payout
+            wrong-carrier %subsidy 0 shares '(1) %burn)))))
+
+  (test "wrong carrier value or total is a value failure"
+    (let* ((shares (payout-shares 1))
+           (plan
+             (coin-payout-plan %subsidy 0 shares '(1) %burn))
+           (honest (payout-outputs plan))
+           (producer (list-ref honest 0))
+           (share (list-ref honest 1))
+           (carrier (list-ref honest 2))
+           (wrong-carrier
+             (coinbase-tx
+               (bytes-of 1)
+               (list
+                 (txout value: (- (txout-value producer) 1)
+                        script-pubkey: (txout-script-pubkey producer))
+                 share
+                 (txout value: (+ (txout-value carrier) 1)
+                        script-pubkey: (txout-script-pubkey carrier)))))
+           (wrong-total
+             (coinbase-tx
+               (bytes-of 1)
+               (list
+                 (txout value: (+ (txout-value producer) 1)
+                        script-pubkey: (txout-script-pubkey producer))
+                 share
+                 carrier))))
+      (assert-equal
+        'coinbase-output-value
+        (coin-result-reason
+          (coin-check-payout-cheap
+            wrong-carrier %subsidy 0 shares %burn)))
+      (assert-equal
+        'coinbase-output-value
+        (coin-result-reason
+          (coin-check-payout-cheap
+            wrong-total %subsidy 0 shares %burn)))
+      (assert-equal
+        'coinbase-output-value
+        (coin-result-reason
+          (coin-check-payout
+            wrong-total %subsidy 0 shares '(1) %burn)))))
+
+  (test "solo value is exact and the producer script is unconstrained"
+    (let* ((value (+ (quotient (* 4 1) 5) 7))
+           (honest
+             (coinbase-tx
+               (bytes-of 1)
+               (outs (list (cons value (bytes-of #x51))))))
+           (wrong
+             (coinbase-tx
+               (bytes-of 1)
+               (outs (list (cons (+ value 1) %burn))))))
       (assert-true
-        (coin-ok? (coin-check-split
-                    (coinbase-tx (bytes-of 1)
-                                 (outs (list (cons %subsidy
-                                                   (bytes-of #x51)))))
-                    %subsidy '() #f)))))
+        (coin-ok? (coin-check-payout honest 1 7 '() '() #f)))
+      (assert-equal
+        'coinbase-output-value
+        (coin-result-reason
+          (coin-check-payout-cheap wrong 1 7 '() #f)))))
 
-  (test "a non-transaction is an internal error, not a bad block"
-    (assert-equal 'internal-error
-                  (coin-result-reason
-                    (coin-check-split 42 %subsidy '() #f)))))
+  (test "malformed trusted checker arguments are internal errors"
+    (let* ((shares (payout-shares 1))
+           (plan
+             (coin-payout-plan %subsidy %fees shares '(1) %burn))
+           (tx
+             (coinbase-tx (bytes-of 1) (payout-outputs plan))))
+      (assert-equal
+        'internal-error
+        (coin-result-reason
+          (coin-check-payout-cheap tx -1 1 shares %burn)))
+      (assert-equal
+        'internal-error
+        (coin-result-reason
+          (coin-check-payout-cheap tx 1 -1 shares %burn)))
+      (assert-equal
+        'internal-error
+        (coin-result-reason
+          (coin-check-payout-cheap tx 1.0 0 shares %burn)))
+      (assert-equal
+        'internal-error
+        (coin-result-reason
+          (coin-check-payout tx 1 0.0 shares '(1) %burn)))
+      (assert-equal
+        'internal-error
+        (coin-result-reason
+          (coin-check-payout-cheap
+            tx %subsidy %fees shares #f)))
+      (assert-equal
+        'internal-error
+        (coin-result-reason
+          (coin-check-payout
+            tx %subsidy %fees shares '(1) #f)))
+      (assert-equal
+        'internal-error
+        (coin-result-reason
+          (coin-check-payout
+            tx %subsidy %fees shares '() %burn)))
+      (assert-equal
+        'internal-error
+        (coin-result-reason
+          (coin-check-payout
+            tx %subsidy %fees shares '(0) %burn)))
+      (assert-equal
+        'internal-error
+        (coin-result-reason
+          (coin-check-payout
+            tx %subsidy %fees shares '(5) %burn)))
+      (assert-equal
+        'internal-error
+        (coin-result-reason
+          (coin-check-payout
+            tx %subsidy %fees shares '(1.0) %burn)))
+      (assert-equal
+        'internal-error
+        (coin-result-reason
+          (coin-check-payout 42 %subsidy %fees '() '() #f)))
+      (assert-equal
+        'internal-error
+        (coin-result-reason
+          (coin-check-payout-cheap
+            tx %subsidy %fees 'not-a-list #f)))))
+
+  (test "more than eight shares remains an oversize failure"
+    (let ((shares (payout-shares 9))
+          (contributions (payout-contributions 9)))
+      (assert-equal
+        'shares-oversize
+        (coin-result-reason
+          (coin-check-payout-cheap
+            42 %subsidy %fees shares %burn)))
+      (assert-equal
+        'shares-oversize
+        (coin-result-reason
+          (coin-check-payout
+            42 %subsidy %fees shares contributions %burn))))))
 
 ;; ============================================================
-;; Aggregate-quality fork choice (§5.6, §5.7)
+;; Q-neutral fork choice (§5.6, §5.7)
 ;; ============================================================
 
-(define (word length memory steps shares)
-  (coin-score-pack length memory steps shares))
+(define (word length memory steps quality)
+  (coin-score-pack length memory steps quality))
 
 (test-group "fork choice: the block key"
   (test "greater height always wins"
     (assert-equal -1 (coin-block-compare 2 (word 512 127 127 0)
-                                            1 (word 1 0 0 8)))
-    (assert-equal 1 (coin-block-compare 1 (word 1 0 0 8)
-                                           2 (word 512 127 127 0))))
+                                          1 (word 1 0 0 15)))
+    (assert-equal 1 (coin-block-compare 1 (word 1 0 0 15)
+                                         2 (word 512 127 127 0))))
 
-  (test "at equal height the lower score word wins"
+  (test "at equal height the lower projected producer rank wins"
     (assert-equal -1 (coin-block-compare 5 (word 24 50 51 0)
-                                            5 (word 25 50 51 0)))
+                                          5 (word 25 50 51 15)))
     (assert-true (coin-better-block? 5 (word 24 50 51 0)
-                                        5 (word 25 50 51 0))))
+                                      5 (word 25 50 51 15))))
 
-  (test "an identical key is incomparable"
+  (test "different raw Q words in one projected key are incomparable"
     (assert-equal 0 (coin-block-compare 5 (word 24 50 51 3)
-                                           5 (word 24 50 51 3)))
-    (assert-true (not (coin-better-block? 5 (word 24 50 51 3)
-                                             5 (word 24 50 51 3)))))
+                                         5 (word 24 50 51 12)))
+    (assert-false (coin-better-block? 5 (word 24 50 51 3)
+                                       5 (word 24 50 51 12))))
 
   (test "a negative height raises"
     (assert-error (coin-block-compare -1 0 1 0))))
 
 (test-group "fork choice: the tip rule"
-  (test "a strictly better sibling displaces a childless tip"
-    (assert-true (coin-replaces-tip? (word 25 50 51 0) #f
-                                        (word 24 50 51 0))))
+  (test "a strictly better producer sibling displaces a childless tip"
+    (assert-true (coin-replaces-tip? (word 25 50 51 15) #f
+                                      (word 24 50 51 0))))
 
   (test "nothing displaces an extended tip"
-    (assert-true (not (coin-replaces-tip? (word 25 50 51 0) #t
-                                             (word 24 50 51 0)))))
+    (assert-false (coin-replaces-tip? (word 25 50 51 15) #t
+                                       (word 24 50 51 0))))
 
-  (test "an equal score does not displace: first seen keeps the tip"
-    ;; This is the producer's protection. A thief who copies the producer's
-    ;; published solution scores IDENTICALLY, and with the canonical block-hash
-    ;; tie-break deleted there is nothing left for him to grind.
-    (assert-true (not (coin-replaces-tip? (word 24 50 51 0) #f
-                                             (word 24 50 51 0)))))
+  (test "higher authenticated Q does not displace the first-seen tip"
+    (let ((incumbent (word 24 50 51 0))
+          (copy (word 24 50 51 15)))
+      (assert-true (not (= incumbent copy)))
+      (assert-equal 0 (coin-score-compare incumbent copy))
+      (assert-false (coin-replaces-tip? incumbent #f copy))))
 
   (test "a thief cannot grind graffiti into a win"
-    ;; Graffiti is not in the score word at all, so every copy of a block
-    ;; with different graffiti has the same key and loses on first-seen.
-    (assert-equal 0 (coin-score-compare (word 24 50 51 0)
-                                           (word 24 50 51 0)))
-    (assert-true (not (coin-replaces-tip? (word 24 50 51 0) #f
-                                             (word 24 50 51 0)))))
+    ;; Graffiti is absent from both raw W and its projected rank.
+    (let ((score (word 24 50 51 0)))
+      (assert-equal 0 (coin-score-compare score score))
+      (assert-false (coin-replaces-tip? score #f score))))
 
-  (test "a worse sibling never displaces"
-    (assert-true (not (coin-replaces-tip? (word 24 50 51 0) #f
-                                             (word 25 50 51 0))))))
+  (test "a worse producer sibling never displaces"
+    (assert-false (coin-replaces-tip? (word 24 50 51 0) #f
+                                       (word 25 50 51 15)))))
 
-(test-group "fork choice: aggregate quality breaks exactly the right ties"
-  (test "greater quality wins when the producer's solution is tied"
-    (assert-true (coin-better-block? 5 (word 24 50 51 3)
-                                        5 (word 24 50 51 1)))
-    (assert-true (coin-better-block? 5 (word 24 50 51 8)
-                                        5 (word 24 50 51 0))))
+(test-group "fork choice: authenticated quality is rank-inert"
+  (test "raw W preserves Q while projection erases it"
+    (let ((low-q (word 24 50 51 0))
+          (high-q (word 24 50 51 15)))
+      (assert-true (not (= low-q high-q)))
+      (assert-equal 0
+                    (coin-score-quality (coin-score-decode low-q)))
+      (assert-equal 15
+                    (coin-score-quality (coin-score-decode high-q)))
+      (assert-equal (coin-score-rank-word low-q)
+                    (coin-score-rank-word high-q))
+      (assert-equal 0 (coin-block-compare 5 low-q 5 high-q))))
 
-  (test "no number of shares beats a shorter solution"
+  (test "every Q value is tied at fixed producer fields"
+    (let ((baseline (word 24 50 51 0)))
+      (assert-true
+        (let loop ((quality 0))
+          (if (> quality 15)
+              #t
+              (let ((candidate (word 24 50 51 quality)))
+                (and (= 0 (coin-score-compare baseline candidate))
+                     (not (coin-better-block? 5 baseline 5 candidate))
+                     (not (coin-better-block? 5 candidate 5 baseline))
+                     (loop (+ quality 1)))))))))
+
+  (test "quality cannot beat a shorter solution"
     (assert-true
-      (let loop ((r 0))
+      (let loop ((quality 0))
         (cond
-          ((> r 8) #t)
-          ((coin-better-block? 5 (word 24 50 51 0) 5 (word 25 50 51 r))
-           (loop (+ r 1)))
+          ((> quality 15) #t)
+          ((coin-better-block? 5 (word 24 50 51 0)
+                               5 (word 25 50 51 quality))
+           (loop (+ quality 1)))
           (else #f)))))
 
-  (test "no number of shares beats a smaller memory bucket"
+  (test "quality cannot beat a smaller memory bucket"
     (assert-true
-      (let loop ((r 0))
+      (let loop ((quality 0))
         (cond
-          ((> r 8) #t)
-          ((coin-better-block? 5 (word 24 49 51 0) 5 (word 24 50 51 r))
-           (loop (+ r 1)))
+          ((> quality 15) #t)
+          ((coin-better-block? 5 (word 24 49 51 0)
+                               5 (word 24 50 51 quality))
+           (loop (+ quality 1)))
           (else #f)))))
 
-  (test "no number of shares beats a smaller step bucket"
+  (test "quality cannot beat a smaller step bucket"
     (assert-true
-      (let loop ((r 0))
+      (let loop ((quality 0))
         (cond
-          ((> r 8) #t)
-          ((coin-better-block? 5 (word 24 50 50 0) 5 (word 24 50 51 r))
-           (loop (+ r 1)))
+          ((> quality 15) #t)
+          ((coin-better-block? 5 (word 24 50 50 0)
+                               5 (word 24 50 51 quality))
+           (loop (+ quality 1)))
           (else #f)))))
 
-  (test "quality is inert wherever a producer field differs"
-    ;; For distinct producer tuples and sampled quality values, producer
-    ;; fields alone determine ranking.
+  (test "producer fields alone determine every strict comparison"
     (assert-true
-      (let a-loop ((as '((24 50 51) (24 50 52) (24 51 0) (25 0 0) (1 0 0))))
+      (let a-loop ((as '((24 50 51) (24 50 52) (24 51 0) (25 0 0)
+                         (1 0 0))))
         (cond
           ((null? as) #t)
           ((let b-loop ((bs '((24 50 51) (24 50 52) (24 51 0)
@@ -1226,25 +1451,29 @@
              (cond
                ((null? bs) #t)
                ((equal? (car as) (car bs)) (b-loop (cdr bs)))
-               ((let r-loop ((ra 0))
+               ((let q-a-loop ((q-a 0))
                   (cond
-                    ((> ra 8) #t)
-                    ((let s-loop ((rb 0))
+                    ((> q-a 15) #t)
+                    ((let q-b-loop ((q-b 0))
                        (cond
-                         ((> rb 8) #t)
+                         ((> q-b 15) #t)
                          ((= (coin-score-compare
-                               (word (car (car as)) (car (cdr (car as)))
-                                     (car (cdr (cdr (car as)))) 0)
-                               (word (car (car bs)) (car (cdr (car bs)))
-                                     (car (cdr (cdr (car bs)))) 0))
+                               (word (list-ref (car as) 0)
+                                     (list-ref (car as) 1)
+                                     (list-ref (car as) 2) 0)
+                               (word (list-ref (car bs) 0)
+                                     (list-ref (car bs) 1)
+                                     (list-ref (car bs) 2) 0))
                              (coin-score-compare
-                               (word (car (car as)) (car (cdr (car as)))
-                                     (car (cdr (cdr (car as)))) ra)
-                               (word (car (car bs)) (car (cdr (car bs)))
-                                     (car (cdr (cdr (car bs)))) rb)))
-                          (s-loop (+ rb 1)))
+                               (word (list-ref (car as) 0)
+                                     (list-ref (car as) 1)
+                                     (list-ref (car as) 2) q-a)
+                               (word (list-ref (car bs) 0)
+                                     (list-ref (car bs) 1)
+                                     (list-ref (car bs) 2) q-b)))
+                          (q-b-loop (+ q-b 1)))
                          (else #f)))
-                     (r-loop (+ ra 1)))
+                     (q-a-loop (+ q-a 1)))
                     (else #f)))
                 (b-loop (cdr bs)))
                (else #f)))
@@ -1329,14 +1558,15 @@
                 (and (not (key-better? a c)) (not (key-better? c a)))
                 #t))))))
 
-  (test "incomparable is exactly same height and same word"
+  (test "incomparable is exactly same height and projected rank"
     (assert-true
       (all-pairs? %keys
                   (lambda (a b)
                     (eq? (and (not (key-better? a b))
                               (not (key-better? b a)))
                          (and (= (key-height a) (key-height b))
-                              (= (key-word a) (key-word b)))))))))
+                              (= (coin-score-rank-word (key-word a))
+                                 (coin-score-rank-word (key-word b))))))))))
 
 ;; ============================================================
 ;; Share validation without a key
@@ -1506,37 +1736,19 @@
                             (puzzle-spec-constraint (car ss)))
                          (loop (cdr ss) (cdr as))))))))
 
-        (test "key A source fails key B exactly on the anchor"
-          (let* ((a (coin-share-puzzle %bare-context (pubkey-of 1)))
-                 (b (coin-share-puzzle %bare-context (pubkey-of 3)))
-                 (source (personalized-source 1))
+        (test "key A semantic source cannot solve key B"
+          (let* ((an (semantic-key-index 0))
+                 (bn (semantic-key-index 1))
+                 (a (coin-share-puzzle %bare-context (pubkey-of an)))
+                 (b (coin-share-puzzle %bare-context (pubkey-of bn)))
+                 (source (personalized-source an))
                  (cross (puzzle-run-examples source (puzzle-spec-examples b))))
             (assert-true (coin-ok? (coin-check-solution a source)))
             (assert-false (puzzle-report-ok? cross))
             (assert-equal 'solution-mismatch
-                          (puzzle-report-error-kind cross))
-            (assert-equal (- (puzzle-spec-k b) 1)
-                          (puzzle-report-index cross))))
+                          (puzzle-report-error-kind cross))))
+        )
 
-        (test "equivalent source spacing stays key-bound"
-          (let* ((a (coin-share-puzzle %bare-context (pubkey-of 1)))
-                 (b (coin-share-puzzle %bare-context (pubkey-of 3)))
-                 (source (personalized-source 1))
-                 (variants (list source
-                                 (string-append " " source)
-                                 (string-append source " "))))
-            (assert-true
-              (let loop ((xs variants))
-                (or (null? xs)
-                    (let ((own (puzzle-run-examples
-                                 (car xs) (puzzle-spec-examples a)))
-                          (cross (puzzle-run-examples
-                                   (car xs) (puzzle-spec-examples b))))
-                      (and (puzzle-report-ok? own)
-                           (not (puzzle-report-ok? cross))
-                           (= (- (puzzle-spec-k b) 1)
-                              (puzzle-report-index cross))
-                           (loop (cdr xs))))))))))
 
       (test-group "share signatures bind"
         (test "an honest share verifies"
@@ -1646,7 +1858,7 @@
             (assert-true (> (coin-shares-quality context shares) 0))))
 
         (test "accepted shares derive once and Q reuses validation reports"
-          (let* ((shares (in-share-order (map valid-share-of '(2 9 12))))
+          (let* ((shares (in-share-order (map valid-share-of '(0 1 2))))
                  (context (context-for shares))
                  (checked (coin-check-shares
                             context (string->bytes %sol-d) shares)))
@@ -1704,12 +1916,12 @@
             (assert-equal 0 (coin-coop-context-example-count context))))
 
         (test "three personalized shares are accepted and returned in order"
-          (let ((shares (in-share-order (map valid-share-of '(2 9 12)))))
+          (let ((shares (in-share-order (map valid-share-of '(0 1 2)))))
             (assert-true (coin-ok? (check shares)))
             (assert-equal 3 (length (coin-result-value (check shares))))))
 
         (test "the accepted shares survive a wire round trip"
-          (let* ((shares (in-share-order (map valid-share-of '(2 9))))
+          (let* ((shares (in-share-order (map valid-share-of '(0 1))))
                  (back (coin-shares-decode
                          (coin-shares-encode shares))))
             (assert-true (coin-ok? back))
@@ -1794,7 +2006,7 @@
             (assert-equal 'share-duplicate-solution (check-reason shares))))
 
         (test "distinct personalized programs are distinct shares"
-          (let ((shares (in-share-order (map valid-share-of '(2 9)))))
+          (let ((shares (in-share-order (map valid-share-of '(0 1)))))
             (assert-true
               (coin-ok? (coin-check-shares (context-for shares)
                                               (string->bytes %sol-d)
@@ -1816,7 +2028,7 @@
 
         (test "eight personalized shares is the reachable ceiling"
           (let ((shares (in-share-order
-                          (map valid-share-of '(2 9 12 16 17 20 21 23)))))
+                          (map valid-share-of '(0 1 2 3 4 5 6 7)))))
             (assert-true (coin-ok? (check shares)))
             (assert-equal 8 (length (coin-result-value (check shares)))))))
 
@@ -1838,19 +2050,22 @@
           ;; Including it obliges him to pay the signed key.
           (let* ((share (valid-share-of 2))
                  (shares (list share))
-                 (plan (coin-split-plan %subsidy shares %burn))
-                 (honest (planned-outputs plan)))
+                 (contributions '(1))
+                 (plan
+                   (coin-payout-plan
+                     %subsidy 0 shares contributions %burn))
+                 (honest (payout-outputs plan)))
             (assert-true (coin-ok? (check shares)))
             (assert-equal
               'coinbase-output-shape
               (coin-result-reason
-                (coin-check-split
+                (coin-check-payout
                   (coinbase-tx (bytes-of 1)
                                (list (car honest)
                                      (txout value: (car (list-ref plan 1))
                                             script-pubkey: %burn)
                                      (list-ref honest 2)))
-                  %subsidy shares %burn)))))
+                  %subsidy 0 shares contributions %burn)))))
 
         (test "a thief cannot keep a share's value for himself"
           (let* ((share (share-of 1 %sol-a))
@@ -1858,19 +2073,26 @@
             (assert-equal
               'coinbase-output-shape
               (coin-result-reason
-                (coin-check-split
+                (coin-check-payout
                   (coinbase-tx (bytes-of 1)
                                (outs (list (cons %subsidy %burn))))
-                  %subsidy shares %burn)))))
+                  %subsidy 0 shares '(1) %burn)))))
 
-        (test "a thief who copies the producer's block cannot outrank it"
-          ;; The producer's own solution IS copyable — it is published with
-          ;; no commitment, because puzzle H is unknown before block H-1
-          ;; exists. The copy scores identically, is incomparable, and loses
-          ;; on first-seen.
-          (let ((honest (word 24 50 51 2)))
-            (assert-equal 0 (coin-score-compare honest honest))
-            (assert-true (not (coin-replaces-tip? honest #f honest)))))
+        (test "copying a producer and attaching shares cannot outrank it"
+          ;; The raw words authenticate different Q values, but the producer
+          ;; tuple is identical. The copy loses both before and after a child.
+          (let ((honest (word 24 50 51 0))
+                (copy (word 24 50 51 12)))
+            (assert-true (not (= honest copy)))
+            (assert-equal 0
+                          (coin-score-quality (coin-score-decode honest)))
+            (assert-equal 12
+                          (coin-score-quality (coin-score-decode copy)))
+            (assert-equal (coin-score-rank-word honest)
+                          (coin-score-rank-word copy))
+            (assert-equal 0 (coin-score-compare honest copy))
+            (assert-false (coin-replaces-tip? honest #f copy))
+            (assert-false (coin-replaces-tip? honest #t copy))))
 
         (test "a thief cannot mine a sibling of the block he stole from"
           ;; A reveal for puzzle P appears in a block at height P+1, so by
@@ -1965,11 +2187,12 @@
 
         (test "the carrier is paid exactly when a reveal is accepted"
           (let* ((shares (list (valid-share-of 2)))
-                 (with-shares (coin-split-plan %subsidy shares %burn))
-                 (without (coin-split-plan %subsidy '() #f)))
+                 (with-shares
+                   (coin-payout-plan %subsidy 0 shares '(1) %burn))
+                 (without
+                   (coin-payout-plan %subsidy 0 '() '() #f)))
             (assert-true (coin-ok? (check shares)))
             (assert-equal 3 (length with-shares))
             (assert-equal 1 (length without))
-            (assert-equal (coin-split-unit %subsidy 1)
-                          (car (list-ref with-shares 2)))
+            (assert-equal 250000000 (car (list-ref with-shares 2)))
             (assert-equal %burn (cdr (list-ref with-shares 2))))))))

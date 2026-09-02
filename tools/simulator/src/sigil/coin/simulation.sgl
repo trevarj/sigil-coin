@@ -1,6 +1,6 @@
-;;; Reproducible SigilCoin survey and economic simulation.
+;;; Reproducible SigilCoin puzzle, payout, market, and strategy simulation.
 ;;;
-;;; Run through `tools/run-simulation.sh`; outputs contain no clock, host
+;;; Run through `tools/run-simulation.sh`; outputs contain no wall clock, host
 ;;; randomness, or machine-dependent values.
 
 (define-library (sigil coin simulation)
@@ -10,614 +10,596 @@
           (sigil io)
           (sigil fs)
           (sigil json)
-          (sigil secp256k1)
           (sigil coin puzzle)
           (sigil coin puzzle constraints)
           (sigil coin puzzle generator)
-          (sigil coin consensus))
+          (sigil coin consensus)
+          (sigil coin simulation market)
+          (sigil coin simulation strategy))
   (export main)
   (begin
 
-(define %output-dir "tools/simulation-output")
-(define %seed-count 12)
-(define %heights '(0 1 16 255 4096))
-(define %complexities '(16 255 256 512 1024 2560 4095))
-(define %forced-seed 23)
-(define %forced-height 8192)
-(define %forced-complexity 4095)
-(define %pubkey-count 64)
-(define %payout-heights '(0 1 30 31 730 731 1460 24820 24821))
-(define %fees '(0 12345))
+    (define %output-dir "tools/simulation-output")
+    (define %seed-count 12)
+    (define %heights '(0 1 16 255 4096))
+    (define %complexities '(16 255 256 512 1024 2560 4095))
+    (define %forced-seed 23)
+    (define %forced-height 8192)
+    (define %forced-complexity 4095)
+    (define %payout-heights '(0 1 30 31 730 731 1460 24820 24821))
+    (define %fees '(0 12345))
+    (define %carrier-script #u8(#x51))
 
-(define (need condition message)
-  (if (not condition) (error (string-append "simulation: " message))))
+    (define (need condition message)
+      (if (not condition)
+          (error (string-append "simulation: " message))))
 
-(define (seed-of k)
-  (let ((bv (make-bytevector 32 0)))
-    (let loop ((i 0))
-      (if (= i 32)
-          bv
-          (begin
-            (bytevector-u8-set! bv i (modulo (+ 11 (* 31 k) (* 7 i)) 256))
-            (loop (+ i 1)))))))
+    (define (seed-of k)
+      (let ((bytes (make-bytevector 32 0)))
+        (let loop ((i 0))
+          (if (= i 32)
+              bytes
+              (begin
+                (bytevector-u8-set!
+                  bytes i (modulo (+ 11 (* 31 k) (* 7 i)) 256))
+                (loop (+ i 1)))))))
 
-(define (bytes->hex bv)
-  (let ((digits "0123456789abcdef"))
-    (let loop ((i 0) (out ""))
-      (if (= i (bytevector-length bv))
-          out
-          (let ((b (bytevector-u8-ref bv i)))
-            (loop (+ i 1)
-                  (string-append out
-                    (substring digits (quotient b 16) (+ 1 (quotient b 16)))
-                    (substring digits (modulo b 16) (+ 1 (modulo b 16))))))))))
+    (define (field->string value)
+      (cond
+        ((string? value) value)
+        ((symbol? value) (symbol->string value))
+        ((boolean? value) (if value "1" "0"))
+        (else (number->string value))))
 
-(define (field->string value)
-  (cond
-    ((string? value) value)
-    ((symbol? value) (symbol->string value))
-    ((boolean? value) (if value "1" "0"))
-    (else (number->string value))))
+    (define (csv rows)
+      (string-append
+        (string-join
+          (map (lambda (row)
+                 (string-join (map field->string row) ","))
+               rows)
+          "\n")
+        "\n"))
 
-(define (csv rows)
-  (string-append
-    (string-join (map (lambda (row)
-                        (string-join (map field->string row) ","))
-                      rows)
-                 "\n")
-    "\n"))
+    (define (write-output name content)
+      (write-file-string (string-append %output-dir "/" name) content))
 
-(define (write-output name content)
-  (write-file-string (string-append %output-dir "/" name) content))
+    (define (sum values)
+      (let loop ((xs values) (total 0))
+        (if (null? xs) total (loop (cdr xs) (+ total (car xs))))))
 
-(define (sum values)
-  (let loop ((xs values) (total 0))
-    (if (null? xs) total (loop (cdr xs) (+ total (car xs))))))
+    (define (count-if pred values)
+      (let loop ((xs values) (count 0))
+        (if (null? xs)
+            count
+            (loop (cdr xs) (if (pred (car xs)) (+ count 1) count)))))
 
-(define (count-if pred values)
-  (let loop ((xs values) (count 0))
-    (if (null? xs)
-        count
-        (loop (cdr xs) (if (pred (car xs)) (+ count 1) count)))))
+    (define (take items count)
+      (let loop ((xs items) (n count) (out '()))
+        (if (or (= n 0) (null? xs))
+            (reverse out)
+            (loop (cdr xs) (- n 1) (cons (car xs) out)))))
 
-(define (minimum values) (car (list-sort < values)))
-(define (maximum values) (car (reverse (list-sort < values))))
-(define (median values) (list-ref (list-sort < values) (quotient (length values) 2)))
+    (define (minimum-or-zero values)
+      (if (null? values) 0 (car (list-sort < values))))
 
-(define (stats values)
-  `((min . ,(minimum values))
-    (median . ,(median values))
-    (max . ,(maximum values))
-    (mean_floor . ,(quotient (sum values) (length values)))))
+    (define (maximum-or-zero values)
+      (if (null? values) 0 (car (reverse (list-sort < values)))))
 
-;; Remove whitespace made redundant by a reader delimiter. Personalized
-;; sources always contain the quoted `"@"` anchor, so this produces a real,
-;; validated under-par candidate without pretending to run a synthesizer.
-(define (reader-delimiter? c)
-  (or (char=? c #\() (char=? c #\)) (char=? c #\') (char=? c #\")))
+    (define (minimum values) (car (list-sort < values)))
+    (define (maximum values) (car (reverse (list-sort < values))))
+    (define (median values)
+      (list-ref (list-sort < values) (quotient (length values) 2)))
 
-(define (golf-source source)
-  (let loop ((text source) (i 1))
-    (if (>= i (- (string-length text) 1))
-        text
-        (if (and (char=? #\space (string-ref text i))
-                 (or (reader-delimiter? (string-ref text (+ i 1)))
-                     (reader-delimiter? (string-ref text (- i 1)))))
-            (loop (string-append (substring text 0 i)
-                                 (substring text (+ i 1)
-                                            (string-length text)))
-                  i)
-            (loop text (+ i 1))))))
+    (define (stats values)
+      (if (null? values)
+          '((min . 0) (median . 0) (max . 0) (mean_floor . 0))
+          `((min . ,(minimum values))
+            (median . ,(median values))
+            (max . ,(maximum values))
+            (mean_floor . ,(quotient (sum values) (length values))))))
 
-;; ============================================================
-;; Puzzle survey
-;; ============================================================
+    (define (ref record key)
+      (cdr (assq key record)))
 
-;; Row: mode, seed, height, C, constraint id/name, k, width, table bytes, par,
-;; retries, hidden bytes, hidden validation steps/cells, table steps/cells.
-(define (puzzle-row mode seed-index height complexity ci spec)
-  (let* ((hidden (puzzle-spec-hidden-source spec))
-         (table (puzzle-spec-table-solution spec))
-         (hidden-check (coin-check-solution spec hidden))
-         (table-check (coin-check-solution spec table)))
-    (need (coin-ok? hidden-check) "generated hidden source failed validation")
-    (need (coin-ok? table-check) "generated table source failed validation")
-    (let ((hidden-report (coin-result-value hidden-check))
-          (table-report (coin-result-value table-check)))
-      (list mode seed-index height complexity ci
-            (puzzle-constraint-name ci)
-            (puzzle-spec-k spec)
-            (puzzle-complexity-width complexity)
-            (string-length table)
-            (puzzle-spec-par spec)
-            (puzzle-spec-retries spec)
-            (string-length hidden)
-            (puzzle-report-steps hidden-report)
-            (puzzle-report-cells hidden-report)
-            (puzzle-report-steps table-report)
-            (puzzle-report-cells table-report)))))
+    ;; ============================================================
+    ;; Puzzle survey
+    ;; ============================================================
 
-(define %global-puzzle-rows
-  (let seed-loop ((seed-index 0) (rows '()))
-    (if (= seed-index %seed-count)
-        (reverse rows)
-        (seed-loop
-          (+ seed-index 1)
-          (let height-loop ((heights %heights) (rows rows))
-            (if (null? heights)
-                rows
-                (height-loop
-                  (cdr heights)
-                  (let complexity-loop ((complexities %complexities)
-                                        (rows rows))
-                    (if (null? complexities)
-                        rows
-                        (let* ((height (car heights))
-                               (complexity (car complexities))
-                               (spec (coin-puzzle-for
+    ;; Row: mode, seed, height, C, constraint id/name, k, width, table bytes,
+    ;; par, retries, hidden bytes, hidden steps/cells, table steps/cells.
+    (define (puzzle-row mode seed-index height complexity ci spec)
+      (let* ((hidden (puzzle-spec-hidden-source spec))
+             (table (puzzle-spec-table-solution spec))
+             (hidden-check (coin-check-solution spec hidden))
+             (table-check (coin-check-solution spec table)))
+        (need (coin-ok? hidden-check)
+              "generated hidden source failed validation")
+        (need (coin-ok? table-check)
+              "generated table source failed validation")
+        (let ((hidden-report (coin-result-value hidden-check))
+              (table-report (coin-result-value table-check)))
+          (list mode seed-index height complexity ci
+                (puzzle-constraint-name ci)
+                (puzzle-spec-k spec)
+                (puzzle-complexity-width complexity)
+                (string-length table)
+                (puzzle-spec-par spec)
+                (puzzle-spec-retries spec)
+                (string-length hidden)
+                (puzzle-report-steps hidden-report)
+                (puzzle-report-cells hidden-report)
+                (puzzle-report-steps table-report)
+                (puzzle-report-cells table-report)))))
+
+    (define %global-puzzle-rows
+      (let seed-loop ((seed-index 0) (rows '()))
+        (if (= seed-index %seed-count)
+            (reverse rows)
+            (seed-loop
+              (+ seed-index 1)
+              (let height-loop ((heights %heights) (rows rows))
+                (if (null? heights)
+                    rows
+                    (height-loop
+                      (cdr heights)
+                      (let complexity-loop ((complexities %complexities)
+                                            (rows rows))
+                        (if (null? complexities)
+                            rows
+                            (let* ((height (car heights))
+                                   (complexity (car complexities))
+                                   (spec
+                                     (coin-puzzle-for
                                        (if (= height 0)
                                            (make-bytevector 32 0)
                                            (seed-of seed-index))
-                                       height complexity))
-                               (ci (puzzle-spec-constraint spec)))
-                          (complexity-loop
-                            (cdr complexities)
-                            (cons (puzzle-row "global" seed-index height
-                                              complexity ci spec)
+                                       height
+                                       complexity))
+                                   (ci (puzzle-spec-constraint spec)))
+                              (complexity-loop
+                                (cdr complexities)
+                                (cons
+                                  (puzzle-row
+                                    "global" seed-index height complexity
+                                    ci spec)
                                   rows))))))))))))
 
-(define %forced-puzzle-rows
-  (let loop ((ci 0) (rows '()))
-    (if (> ci 7)
-        (reverse rows)
-        (let ((spec (puzzle-for/constraint
-                      (seed-of %forced-seed) %forced-height
-                      %forced-complexity ci)))
-          (loop (+ ci 1)
-                (cons (puzzle-row "forced" %forced-seed %forced-height
-                                  %forced-complexity ci spec)
+    (define %forced-puzzle-rows
+      (let loop ((ci 0) (rows '()))
+        (if (> ci 7)
+            (reverse rows)
+            (let ((spec
+                    (puzzle-for/constraint
+                      (seed-of %forced-seed)
+                      %forced-height
+                      %forced-complexity
+                      ci)))
+              (loop (+ ci 1)
+                    (cons
+                      (puzzle-row
+                        "forced" %forced-seed %forced-height
+                        %forced-complexity ci spec)
                       rows))))))
 
-(define %puzzle-rows (append %global-puzzle-rows %forced-puzzle-rows))
+    (define %puzzle-rows
+      (append %global-puzzle-rows %forced-puzzle-rows))
 
-(define (puzzle-column index rows) (map (lambda (row) (list-ref row index)) rows))
+    (define (puzzle-column index rows)
+      (map (lambda (row) (list-ref row index)) rows))
 
-(define %constraint-mix
-  (let loop ((ci 0) (out '()))
-    (if (> ci 7)
-        (reverse out)
-        (loop (+ ci 1)
-              (cons (cons (puzzle-constraint-name ci)
-                          (count-if (lambda (row) (= ci (list-ref row 4)))
-                                    %global-puzzle-rows))
-                    out)))))
+    (define %constraint-mix
+      (let loop ((ci 0) (out '()))
+        (if (> ci 7)
+            (reverse out)
+            (loop
+              (+ ci 1)
+              (cons
+                (cons
+                  (puzzle-constraint-name ci)
+                  (count-if
+                    (lambda (row) (= ci (list-ref row 4)))
+                    %global-puzzle-rows))
+                out)))))
 
-;; ============================================================
-;; Valid deterministic compressed pubkeys and personalized shares
-;; ============================================================
+    ;; ============================================================
+    ;; Signed-share and copy-and-attach strategy experiment
+    ;; ============================================================
 
-;; Encode scalar 1..64; canonical libsecp256k1 derives and parses every key.
-(define (scalar-bytes n)
-  (let ((out (make-bytevector 32 0)))
-    (let loop ((i 31) (value n))
-      (if (< i 0)
-          out
-          (begin
-            (bytevector-u8-set! out i (modulo value 256))
-            (loop (- i 1) (quotient value 256)))))))
+    (define (emit-simulation)
+      (define %strategy (coin-run-strategy-simulation))
+      (define %strategy-header (ref %strategy 'header))
+      (define %strategy-rows (ref %strategy 'rows))
+      (define %share-header (ref %strategy 'share-header))
+      (define %share-rows (ref %strategy 'share-rows))
+      (define %payout-shares (ref %strategy 'payout-shares))
+      (define %payout-contributions (ref %strategy 'payout-contributions))
+      (define %strategy-results (ref %strategy 'results))
+      (define %strategy-summary (ref %strategy 'summary))
 
-(define %pubkeys
-  (let loop ((i 1) (out '()))
-    (if (> i %pubkey-count)
-        (reverse out)
-        (let* ((secret (scalar-bytes i))
-               (pubkey (secp256k1-pubkey-create secret))
-               (parsed (secp256k1-pubkey-parse pubkey)))
-          (need (secp256k1-seckey-verify? secret)
-                "canonical secp256k1 rejected deterministic secret")
-          (need (and (bytevector? parsed)
-                     (= 64 (bytevector-length parsed)))
-                "canonical secp256k1 rejected derived pubkey")
-          (need (not (member pubkey out)) "duplicate derived pubkey")
-          (loop (+ i 1) (cons pubkey out))))))
+      (define (share-available? row)
+        (list-ref row 2))
 
-(need (= %pubkey-count (length %pubkeys)) "pubkey count drifted")
+      (define %available-share-rows
+        (filter share-available? %share-rows))
+      (define %share-margins
+        (map (lambda (row) (list-ref row 5)) %available-share-rows))
+      (define %share-contributions
+        (map (lambda (row) (list-ref row 6)) %available-share-rows))
 
-(define %share-prev-hash (seed-of 99))
-(define %share-height 4096)
-(define %share-complexity 4095)
-(define %share-global-spec
-  (coin-puzzle-for %share-prev-hash %share-height %share-complexity))
-;; Row: index, pubkey, par, known golf bytes, margin, contribution,
-;; validation steps/cells, retries, constraint, k, width.
-(define %share-rows
-  (let loop ((keys %pubkeys) (index 1) (rows '()))
-    (if (null? keys)
-        (reverse rows)
-        (let* ((context
-                 (coin-coop-context parent-prev-hash: %share-prev-hash
-                                    puzzle-height: %share-height
-                                    complexity: %share-complexity
-                                    spec: %share-global-spec
-                                    commits: '()))
-               (spec (coin-share-puzzle context (car keys)))
-               (base (if (= (string-length (puzzle-spec-hidden-source spec))
-                            (puzzle-spec-par spec))
-                         (puzzle-spec-hidden-source spec)
-                         (puzzle-spec-table-solution spec)))
-               (source (golf-source base))
-               (source-bytes (string->utf8 source))
-               (share (coin-share pubkey: (car keys)
-                                  signature: (make-bytevector 64 0)
-                                  blind: (make-bytevector 32 0)
-                                  solution: source-bytes))
-               (checked (coin-check-share-solution context share))
-               (length (bytevector-length source-bytes)))
-          (need (coin-ok? checked) "personalized known solution failed validation")
-          (let* ((preview (coin-result-value checked))
-                 (preview-spec (list-ref preview 0))
-                 (report (list-ref preview 1))
-                 (contribution (list-ref preview 2))
-                 (margin (coin-share-margin-milli
-                           (puzzle-spec-par preview-spec) length)))
-            ;; Independent arithmetic cross-check; API result remains measured value.
-            (need (= contribution (coin-share-contribution margin))
-                  "personalized quality API/arithmetic mismatch")
-            (loop (cdr keys) (+ index 1)
-                  (cons (list index (bytes->hex (car keys))
-                              (puzzle-spec-par preview-spec) length margin
-                              contribution
-                              (puzzle-report-steps report)
-                              (puzzle-report-cells report)
-                              (puzzle-spec-retries preview-spec)
-                              (puzzle-spec-constraint preview-spec)
-                              (puzzle-spec-k preview-spec)
-                              (puzzle-complexity-width %share-complexity))
-                        rows)))))))
+      (define %strategy-check
+        (begin
+          (need (= 1024 (length %share-rows))
+                "strategy key pool did not contain 1024 rows")
+          (need (= 8 (length %payout-shares))
+                "payout survey did not receive eight real signed shares")
+          (need (= (length %payout-shares) (length %payout-contributions))
+                "payout share contributions were not aligned")))
 
-(define (share-margin row) (list-ref row 4))
-(define (share-contribution row) (list-ref row 5))
-(define (take items n)
-  (let loop ((xs items) (n n) (out '()))
-    (if (or (= n 0) (null? xs))
-        (reverse out)
-        (loop (cdr xs) (- n 1) (cons (car xs) out)))))
+      ;; ============================================================
+      ;; Contribution-aware payout matrix
+      ;; ============================================================
 
-(define %first-eight (take %share-rows 8))
-(define %easiest-eight
-  (take (list-sort
-          (lambda (a b)
-            (or (> (share-margin a) (share-margin b))
-                (and (= (share-margin a) (share-margin b))
-                     (< (car a) (car b)))))
-          %share-rows)
-        8))
+      (define (contribution-profile count)
+        (let loop ((index 0) (out '()))
+          (if (= index count)
+              (reverse out)
+              (loop (+ index 1)
+                    (cons (+ 1 (modulo index 4)) out)))))
 
-(define (cohort-summary rows)
-  (let ((margins (map share-margin rows))
-        (contributions (map share-contribution rows)))
-    `((indexes . ,(list->array (map car rows)))
-      (mean_margin_milli . ,(quotient (sum margins) (length margins)))
-      (contribution_sum . ,(sum contributions))
-      (quality_q . ,(coin-quality contributions)))))
+      (define (profile->string contributions)
+        (if (null? contributions)
+            "-"
+            (string-join (map number->string contributions) ";")))
 
-;; ============================================================
-;; Reward, censorship, and aggregate ordering simulations
-;; ============================================================
+      ;; Row uses a frozen 1,2,3,4,... contribution cycle. Shares are genuine
+      ;; signed personalized records; the profile deliberately surveys formula
+      ;; behavior independently from the particular candidates' measured mix.
+      (define (payout-row height fees share-count)
+        (let* ((subsidy (coin-block-reward height))
+               (shares (take %payout-shares share-count))
+               (contributions (contribution-profile share-count))
+               (plan
+                 (coin-payout-plan
+                   subsidy fees shares contributions
+                   (if (> share-count 0) %carrier-script #f)))
+               (producer (car (car plan)))
+               (share-values (map car (take (cdr plan) share-count)))
+               (share-total (sum share-values))
+               (carrier
+                 (if (= share-count 0)
+                     0
+                     (car (list-ref plan (+ share-count 1)))))
+               (total-minted (sum (map car plan)))
+               (minted-subsidy (- total-minted fees))
+               (unminted-subsidy (- subsidy minted-subsidy)))
+          (need (= total-minted (+ producer share-total carrier))
+                "payout plan did not conserve its outputs")
+          (if (= share-count 0)
+              (need (= total-minted (+ (quotient (* 4 subsidy) 5) fees))
+                    "solo payout did not reserve twenty percent")
+              (need (= total-minted (+ subsidy fees))
+                    "cooperative payout did not mint subsidy plus fees"))
+          (list
+            height
+            fees
+            share-count
+            (or (> height 0)
+                (and (= share-count 0) (= fees 0)))
+            subsidy
+            (profile->string contributions)
+            (sum contributions)
+            producer
+            (minimum-or-zero share-values)
+            (maximum-or-zero share-values)
+            share-total
+            carrier
+            total-minted
+            minted-subsidy
+            unminted-subsidy
+            (coin-cumulative-supply height))))
 
-(define %carrier-script #u8(#x51))
+      (define %payout-rows
+        (let height-loop ((heights %payout-heights) (rows '()))
+          (if (null? heights)
+              (reverse rows)
+              (height-loop
+                (cdr heights)
+                (let fee-loop ((fees %fees) (rows rows))
+                  (if (null? fees)
+                      rows
+                      (fee-loop
+                        (cdr fees)
+                        (let share-loop ((count 0) (rows rows))
+                          (if (> count coin-max-shares)
+                              rows
+                              (share-loop
+                                (+ count 1)
+                                (cons
+                                  (payout-row
+                                    (car heights) (car fees) count)
+                                  rows)))))))))))
 
-(define (sample-shares count)
-  (map (lambda (pubkey)
-         (coin-share pubkey: pubkey
-                     signature: (make-bytevector 64 0)
-                     blind: (make-bytevector 32 0)
-                     solution: #u8(49)))
-       (take %pubkeys count)))
+      (define %payout-check
+        (need (= (* (length %payout-heights) (length %fees) 9)
+                 (length %payout-rows))
+              "payout matrix row count drifted"))
 
-;; Canonical plan values: producer, each share, shares total, carrier.
-(define (split-values value count)
-  (let* ((plan (coin-split-plan value (sample-shares count)
-                                (if (> count 0) %carrier-script #f)))
-         (producer (car (car plan)))
-         (unit (if (> count 0) (car (list-ref plan 1)) 0))
-         (shares-total (sum (map car (take (cdr plan) count))))
-         (carrier (if (> count 0) (car (list-ref plan (+ count 1))) 0))
-         (arithmetic-unit
-           (quotient value (+ coin-producer-weight count
-                              (if (> count 0) 1 0)))))
-    ;; Independent arithmetic only cross-checks canonical plan/API outputs.
-    (need (= (coin-split-unit value count) arithmetic-unit)
-          "split-unit API/arithmetic mismatch")
-    (need (= unit (if (> count 0) arithmetic-unit 0))
-          "split-plan share/API mismatch")
-    (need (= producer
-             (- value (* (+ count (if (> count 0) 1 0)) arithmetic-unit)))
-          "split-plan producer/arithmetic mismatch")
-    (need (= value (+ producer shares-total carrier))
-          "split-plan conservation mismatch")
-    (list producer unit shares-total carrier)))
+      ;; ============================================================
+      ;; Commitment/reveal censorship accounting
+      ;; ============================================================
 
-;; Row: canonical emission and split-plan results, plus ownership accounting.
-(define %payout-rows
-  (let height-loop ((heights %payout-heights) (rows '()))
-    (if (null? heights)
-        (reverse rows)
-        (height-loop
-          (cdr heights)
-          (let fee-loop ((fees %fees) (rows rows))
-            (if (null? fees)
-                rows
-                (fee-loop
-                  (cdr fees)
-                  (let share-loop ((r 0) (rows rows))
-                    (if (> r 8)
-                        rows
-                        (let* ((height (car heights))
-                               (fee (car fees))
-                               (subsidy (coin-block-reward height))
-                               (value (+ subsidy fee))
-                               (split (split-values value r))
-                               (producer (list-ref split 0))
-                               (independent (list-ref split 2))
-                               (carrier (list-ref split 3))
-                               (self-current (+ producer independent)))
-                          (share-loop
-                            (+ r 1)
-                            (cons (list height fee r
-                                        (or (> height 0)
-                                            (and (= r 0) (= fee 0)))
-                                        subsidy value
-                                        (coin-cumulative-supply height)
-                                        producer (list-ref split 1) independent
-                                        carrier self-current
-                                        (+ self-current carrier))
-                                  rows))))))))))))
+      (define %commitment-height 31)
+      (define %reveal-height 32)
+      (define %censorship-subsidy (coin-block-reward %reveal-height))
+      (define %censorship-fees 12345)
+      (define %carrier-actor "carrier-A")
+      (define %carrier-key "key-1023")
+      (define %producer-actor "producer-B")
+      (define %producer-key "key-1024")
 
-;; Commitments ride block H. Block H+1 producer selects reveals and its
-;; canonical split pays H+1 producer, sharers, then block-H carrier.
-(define %commitment-height 31)
-(define %reveal-height (+ %commitment-height 1))
-(define %censorship-value (+ (coin-block-reward %reveal-height) 12345))
-(define %carrier-actor "carrier-A")
-(define %carrier-key "key-63")
-(define %producer-actor "producer-B")
-(define %producer-key "key-64")
+      (define (timeline-row share-count strategy sharer-actor
+                            commitments available selected note)
+        (let* ((shares (take %payout-shares selected))
+               (contributions (take %payout-contributions selected))
+               (plan
+                 (coin-payout-plan
+                   %censorship-subsidy %censorship-fees
+                   shares contributions
+                   (if (> selected 0) %carrier-script #f)))
+               (producer (car (car plan)))
+               (share-values (map car (take (cdr plan) selected)))
+               (shares-total (sum share-values))
+               (carrier
+                 (if (= selected 0)
+                     0
+                     (car (list-ref plan (+ selected 1)))))
+               (total-minted (sum (map car plan)))
+               (minted-subsidy (- total-minted %censorship-fees))
+               (unminted-subsidy
+                 (- %censorship-subsidy minted-subsidy)))
+          (list
+            %commitment-height
+            %reveal-height
+            strategy
+            %carrier-actor
+            %carrier-key
+            %producer-actor
+            %producer-key
+            sharer-actor
+            (format "keys-1..~a" share-count)
+            commitments
+            available
+            selected
+            (sum contributions)
+            (coin-quality contributions)
+            %censorship-subsidy
+            %censorship-fees
+            producer
+            shares-total
+            (minimum-or-zero share-values)
+            (maximum-or-zero share-values)
+            carrier
+            total-minted
+            minted-subsidy
+            unminted-subsidy
+            (+ producer
+               (if (string=? sharer-actor %producer-actor)
+                   shares-total
+                   0))
+            note)))
 
-(define (quality-for count)
-  (coin-quality
-    (let loop ((n count) (out '()))
-      (if (= n 0) out (loop (- n 1) (cons 1 out))))))
+      (define %censorship-rows
+        (let count-loop ((count 1) (rows '()))
+          (if (> count coin-max-shares)
+              (reverse rows)
+              (count-loop
+                (+ count 1)
+                (append
+                  (reverse
+                    (list
+                      (timeline-row
+                        count "carry-and-reveal-external" "external-sharers"
+                        count count count
+                        "H carrier includes; H+1 producer reveals")
+                      (timeline-row
+                        count "carrier-censors-commitments" "external-sharers"
+                        0 0 0
+                        "H omission makes H+1 reveals ineligible")
+                      (timeline-row
+                        count "producer-censors-reveals" "external-sharers"
+                        count count 0
+                        "H commits exist; H+1 producer omits reveals")
+                      (timeline-row
+                        count "carry-and-reveal-self-controlled" %producer-actor
+                        count count count
+                        "H+1 producer controls distinct share keys")))
+                  rows)))))
 
-(define (timeline-row r strategy sharer-actor commitments available selected note)
-  (let* ((split (split-values %censorship-value selected))
-         (producer (list-ref split 0))
-         (shares-total (list-ref split 2))
-         (carrier (list-ref split 3)))
-    (list %commitment-height %reveal-height strategy
-          %carrier-actor %carrier-key %producer-actor %producer-key
-          sharer-actor (format "keys-1..~a" r)
-          commitments available selected producer shares-total carrier
-          (+ producer (if (string=? sharer-actor %producer-actor)
-                          shares-total 0))
-          (quality-for selected) note)))
+      (define %censorship-check
+        (need (= 32 (length %censorship-rows))
+              "censorship matrix row count drifted"))
 
-(define %censorship-rows
-  (let r-loop ((r 1) (rows '()))
-    (if (> r 8)
-        (reverse rows)
-        (r-loop
-          (+ r 1)
-          (append
-            (reverse
-              (list
-                (timeline-row r "carry-and-reveal-external" "external-sharers"
-                              r r r "H carrier includes; H+1 producer reveals")
-                (timeline-row r "carrier-censors-commitments" "external-sharers"
-                              0 0 0 "H omission makes H+1 reveals ineligible")
-                (timeline-row r "producer-censors-reveals" "external-sharers"
-                              r r 0 "H commits exist; H+1 producer omits reveals")
-                (timeline-row r "carry-and-reveal-self-controlled" %producer-actor
-                              r r r "H+1 producer controls distinct share keys")))
-            rows)))))
+      ;; ============================================================
+      ;; Explicit-child market
+      ;; ============================================================
 
-(define %producer-length 32)
-(define %producer-cells 80)
-(define %producer-steps 300)
-(define %strong-contributions '(4 4 4))
-(define %weak-contributions '(1 1 1 1 1 1 1 1))
-(define %strong-q (coin-quality %strong-contributions))
-(define %weak-q (coin-quality %weak-contributions))
-(define %strong-word
-  (coin-score-encode %producer-length %producer-cells %producer-steps %strong-q))
-(define %weak-word
-  (coin-score-encode %producer-length %producer-cells %producer-steps %weak-q))
-(need (= %strong-q 12) "three strong shares must produce Q12")
-(need (= %weak-q 8) "eight weak shares must produce Q8")
-(need (coin-score-better? %strong-word %weak-word)
-      "coin-score-better? must rank Q12 above Q8")
-;; Independent packed-word arithmetic cross-checks canonical ordering API.
-(need (eq? (coin-score-better? %strong-word %weak-word)
-           (< %strong-word %weak-word))
-      "score ordering API/arithmetic mismatch")
+      (define %market (coin-run-market-simulation))
+      (define %market-header (ref %market 'header))
+      (define %market-rows (ref %market 'rows))
+      (define %market-results (ref %market 'results))
+      (define %market-summary (ref %market 'summary))
 
-(define %ordering-rows
-  (list
-    (list "strong" 3 150 4 12 %strong-word 1)
-    (list "weak" 8 1 1 8 %weak-word 2)))
+      ;; ============================================================
+      ;; Schema-4 results and generated text
+      ;; ============================================================
 
-;; ============================================================
-;; Outputs and summary
-;; ============================================================
+      (define %puzzle-retries (puzzle-column 10 %global-puzzle-rows))
 
-(define %easiest-indexes (map car %easiest-eight))
+      (define %results
+        `((schema . 4)
+          (canonical_apis .
+            ,(list->array
+               '("coin-puzzle-for"
+                 "puzzle-for/constraint"
+                 "coin-share-puzzle"
+                 "coin-check-solution"
+                 "coin-check-share-solution/spec"
+                 "coin-check-shares"
+                 "coin-share-quality"
+                 "coin-quality"
+                 "coin-score-rank-word"
+                 "coin-score-compare"
+                 "coin-replaces-tip?"
+                 "coin-payout-plan"
+                 "coin-build-block"
+                 "coin-build-coop-block"
+                 "coin-connect-block"
+                 "coin-validate-header-context"
+                 "coin-block-reward"
+                 "coin-cumulative-supply"
+                 "secp256k1-ecdsa-sign"
+                 "secp256k1-ecdsa-verify")))
+          (determinism .
+            ((seed_formula . "byte[j]=(11+31*seed_index+7*j) mod 256")
+             (seed_count . ,%seed-count)
+             (heights . ,(list->array %heights))
+             (complexities . ,(list->array %complexities))
+             (forced_constraints . ,(list->array '(0 1 2 3 4 5 6 7)))
+             (strategy_key_scalars . "1..1024 multiples of secp256k1 G")
+             (clock_or_host_randomness . #f)))
+          (puzzles .
+            ((global_count . ,(length %global-puzzle-rows))
+             (forced_count . ,(length %forced-puzzle-rows))
+             (constraint_mix . ,%constraint-mix)
+             (k . ,(stats (puzzle-column 6 %global-puzzle-rows)))
+             (width . ,(stats (puzzle-column 7 %global-puzzle-rows)))
+             (table_bytes . ,(stats (puzzle-column 8 %global-puzzle-rows)))
+             (par . ,(stats (puzzle-column 9 %global-puzzle-rows)))
+             (retries . ,(stats %puzzle-retries))
+             (retrying_puzzles .
+               ,(count-if (lambda (n) (> n 0)) %puzzle-retries))
+             (fallbacks .
+               ,(count-if
+                  (lambda (n) (= n puzzle-max-generator-retries))
+                  %puzzle-retries))
+             (hidden_validation_steps .
+               ,(stats (puzzle-column 12 %global-puzzle-rows)))
+             (hidden_validation_allocations .
+               ,(stats (puzzle-column 13 %global-puzzle-rows)))))
+          (personalized_shares .
+            ((evaluated . ,(length %share-rows))
+             (available . ,(length %available-share-rows))
+             (unavailable . ,(- (length %share-rows)
+                                (length %available-share-rows)))
+             (margin_milli . ,(stats %share-margins))
+             (contribution_counts .
+               ((one . ,(count-if (lambda (n) (= n 1))
+                                 %share-contributions))
+                (two . ,(count-if (lambda (n) (= n 2))
+                                 %share-contributions))
+                (three . ,(count-if (lambda (n) (= n 3))
+                                   %share-contributions))
+                (four . ,(count-if (lambda (n) (= n 4))
+                                  %share-contributions))))))
+          (payouts .
+            ((rows . ,(length %payout-rows))
+             (heights . ,(list->array %payout-heights))
+             (fees . ,(list->array %fees))
+             (share_counts . ,(list->array '(0 1 2 3 4 5 6 7 8)))
+             (contribution_profile . "1,2,3,4 repeated in canonical share order")
+             (max_supply . ,coin-max-supply)
+             (final_reward_height . ,coin-final-reward-height)))
+          (censorship_timeline .
+            ((commitment_height . ,%commitment-height)
+             (reveal_height . ,%reveal-height)
+             (carrier_actor . ,%carrier-actor)
+             (carrier_key . ,%carrier-key)
+             (reveal_producer_actor . ,%producer-actor)
+             (reveal_producer_key . ,%producer-key)
+             (rows . ,(length %censorship-rows))
+             (scope . "H/H+1 contribution payout accounting; no profitability or equilibrium claim")))
+          (strategic_mining . ,%strategy-results)
+          (market . ,%market-results)
+          (caveat . "Consensus proves distinct pubkey-personalized tasks and verified work, not distinct owners or identity independence.")))
 
-(define %puzzle-retries (puzzle-column 10 %global-puzzle-rows))
-(define %share-margins (map share-margin %share-rows))
-(define %share-contributions (map share-contribution %share-rows))
+      (define %summary
+        (string-append
+          "SigilCoin schema-4 deterministic simulation\n"
+          "===========================================\n"
+          (format "Puzzles: ~a global + ~a forced-constraint rows.\n"
+                  (length %global-puzzle-rows)
+                  (length %forced-puzzle-rows))
+          (format "Global retries: ~a/~a puzzles retried; max ~a; fallbacks ~a.\n"
+                  (count-if (lambda (n) (> n 0)) %puzzle-retries)
+                  (length %global-puzzle-rows)
+                  (maximum %puzzle-retries)
+                  (count-if
+                    (lambda (n) (= n puzzle-max-generator-retries))
+                    %puzzle-retries))
+          (format "Table bytes min/median/max: ~a/~a/~a; par: ~a/~a/~a.\n"
+                  (minimum (puzzle-column 8 %global-puzzle-rows))
+                  (median (puzzle-column 8 %global-puzzle-rows))
+                  (maximum (puzzle-column 8 %global-puzzle-rows))
+                  (minimum (puzzle-column 9 %global-puzzle-rows))
+                  (median (puzzle-column 9 %global-puzzle-rows))
+                  (maximum (puzzle-column 9 %global-puzzle-rows)))
+          (format "Personalized shares: ~a/~a deterministic keys have a semantic under-par candidate.\n"
+                  (length %available-share-rows)
+                  (length %share-rows))
+          (format "Payout matrix: ~a rows; solo mints 80% subsidy plus fees, cooperative blocks mint subsidy plus fees.\n"
+                  (length %payout-rows))
+          "Cooperative rows allocate a 10% contribution-weighted share pool and 5% carrier payout; producer receives fees and rounding residuals.\n"
+          %strategy-summary
+          %market-summary
+          "Caveat: consensus proves distinct tasks/work only, not distinct owners or identity independence.\n"))
 
-(define %results
-  `((schema . 2)
-    (canonical_apis . ,(list->array
-                         '("coin-puzzle-for"
-                           "puzzle-for/constraint"
-                           "coin-share-puzzle"
-                           "coin-check-solution"
-                           "coin-check-share-solution"
-                           "coin-share-margin-milli"
-                           "coin-share-contribution"
-                           "coin-quality"
-                           "coin-score-encode"
-                           "coin-score-better?"
-                           "coin-split-unit"
-                           "coin-split-plan"
-                           "coin-block-reward"
-                           "coin-cumulative-supply"
-                           "secp256k1-seckey-verify?"
-                           "secp256k1-pubkey-create"
-                           "secp256k1-pubkey-parse")))
-    (determinism . ((seed_formula . "byte[j]=(11+31*seed_index+7*j) mod 256")
-                    (seed_count . ,%seed-count)
-                    (heights . ,(list->array %heights))
-                    (complexities . ,(list->array %complexities))
-                    (forced_constraints . ,(list->array '(0 1 2 3 4 5 6 7)))
-                    (pubkey_scalars . "1..64 multiples of secp256k1 G")
-                    (clock_or_host_randomness . #f)))
-    (puzzles . ((global_count . ,(length %global-puzzle-rows))
-                (forced_count . ,(length %forced-puzzle-rows))
-                (constraint_mix . ,%constraint-mix)
-                (k . ,(stats (puzzle-column 6 %global-puzzle-rows)))
-                (width . ,(stats (puzzle-column 7 %global-puzzle-rows)))
-                (table_bytes . ,(stats (puzzle-column 8 %global-puzzle-rows)))
-                (par . ,(stats (puzzle-column 9 %global-puzzle-rows)))
-                (retries . ,(stats %puzzle-retries))
-                (retrying_puzzles . ,(count-if (lambda (n) (> n 0))
-                                                %puzzle-retries))
-                (fallbacks . ,(count-if
-                                (lambda (n) (= n puzzle-max-generator-retries))
-                                %puzzle-retries))
-                (hidden_validation_steps . ,(stats (puzzle-column 12
-                                                                  %global-puzzle-rows)))
-                (hidden_validation_allocations . ,(stats (puzzle-column 13
-                                                                        %global-puzzle-rows)))))
-    (personalized_shares .
-      ((count . ,(length %share-rows))
-       (global_constraint . ,(puzzle-spec-constraint %share-global-spec))
-       (margin_milli . ,(stats %share-margins))
-       (contribution_counts .
-         ((one . ,(count-if (lambda (n) (= n 1)) %share-contributions))
-          (two . ,(count-if (lambda (n) (= n 2)) %share-contributions))
-          (three . ,(count-if (lambda (n) (= n 3)) %share-contributions))
-          (four . ,(count-if (lambda (n) (= n 4)) %share-contributions))))
-       (first_eight . ,(cohort-summary %first-eight))
-       (easiest_eight . ,(cohort-summary %easiest-eight))))
-    (payouts . ((rows . ,(length %payout-rows))
-                (heights . ,(list->array %payout-heights))
-                (fees . ,(list->array %fees))
-                (share_counts . ,(list->array '(0 1 2 3 4 5 6 7 8)))
-                (max_supply . ,coin-max-supply)
-                (final_reward_height . ,coin-final-reward-height)))
-    (censorship_timeline .
-      ((commitment_height . ,%commitment-height)
-       (reveal_height . ,%reveal-height)
-       (carrier_actor . ,%carrier-actor)
-       (carrier_key . ,%carrier-key)
-       (reveal_producer_actor . ,%producer-actor)
-       (reveal_producer_key . ,%producer-key)
-       (rows . ,(length %censorship-rows))
-       (scope . "H/H+1 payout accounting; no profitability or equilibrium claim")))
-    (aggregate_ordering .
-      ((producer_length . ,%producer-length)
-       (producer_cells . ,%producer-cells)
-       (producer_steps . ,%producer-steps)
-       (strong_q . ,%strong-q)
-       (weak_q . ,%weak-q)
-       (strong_score_word . ,%strong-word)
-       (weak_score_word . ,%weak-word)
-       (strong_outranks_weak .
-         ,(coin-score-better? %strong-word %weak-word))))
-    (caveat . "Consensus proves distinct pubkey-personalized tasks and verified work, not distinct owners or identity independence.")))
+      (define (emit-files)
+        (: -> void?)
+        (ensure-directory %output-dir)
+        (write-output
+          "puzzles.csv"
+          (csv
+            (cons
+              '(mode seed_index height complexity constraint_id constraint_name
+                k width table_bytes par retries hidden_bytes
+                hidden_validation_steps hidden_validation_allocations
+                table_validation_steps table_validation_allocations)
+              %puzzle-rows)))
+        (write-output "shares.csv"
+                      (csv (cons %share-header %share-rows)))
+        (write-output
+          "payouts.csv"
+          (csv
+            (cons
+              '(height fees share_count consensus_feasible scheduled_subsidy
+                contribution_profile contribution_sum producer_payout
+                min_share_payout max_share_payout share_payout_total
+                carrier_payout total_minted minted_subsidy unminted_subsidy
+                scheduled_supply_cap)
+              %payout-rows)))
+        (write-output
+          "censorship.csv"
+          (csv
+            (cons
+              '(commitment_height reveal_height strategy carrier_actor
+                carrier_key reveal_producer_actor reveal_producer_key
+                sharer_actor share_keys commitments_included reveals_available
+                reveals_selected contribution_sum quality_q scheduled_subsidy
+                fees producer_payout share_payout_total min_share_payout
+                max_share_payout carrier_payout total_minted minted_subsidy
+                unminted_subsidy reveal_producer_actor_total note)
+              %censorship-rows)))
+        (write-output "market.csv"
+                      (csv (cons %market-header %market-rows)))
+        (write-output "strategy.csv"
+                      (csv (cons %strategy-header %strategy-rows)))
+        (write-output "results.json"
+                      (string-append (json-encode %results indent: 2) "\n"))
+        (write-output "summary.txt" %summary)
+        (display %summary))
 
-(define %summary
-  (string-append
-    "SigilCoin Wave 4 deterministic survey\n"
-    "======================================\n"
-    (format "Puzzles: ~a global + ~a forced-constraint rows.\n"
-            (length %global-puzzle-rows) (length %forced-puzzle-rows))
-    (format "Global retries: ~a/~a puzzles retried; max ~a; fallbacks ~a.\n"
-            (count-if (lambda (n) (> n 0)) %puzzle-retries)
-            (length %global-puzzle-rows) (maximum %puzzle-retries)
-            (count-if (lambda (n) (= n puzzle-max-generator-retries))
-                      %puzzle-retries))
-    (format "Table bytes min/median/max: ~a/~a/~a; par: ~a/~a/~a.\n"
-            (minimum (puzzle-column 8 %global-puzzle-rows))
-            (median (puzzle-column 8 %global-puzzle-rows))
-            (maximum (puzzle-column 8 %global-puzzle-rows))
-            (minimum (puzzle-column 9 %global-puzzle-rows))
-            (median (puzzle-column 9 %global-puzzle-rows))
-            (maximum (puzzle-column 9 %global-puzzle-rows)))
-    (format "Personalized tasks: ~a/~a canonical secp256k1 keys; margin milli min/median/max ~a/~a/~a.\n"
-            (length %share-rows) %pubkey-count (minimum %share-margins)
-            (median %share-margins) (maximum %share-margins))
-    (format "First 8 mean margin/contribution sum/Q: ~a/~a/~a; easiest 8: ~a/~a/~a.\n"
-            (quotient (sum (map share-margin %first-eight)) 8)
-            (sum (map share-contribution %first-eight))
-            (coin-quality (map share-contribution %first-eight))
-            (quotient (sum (map share-margin %easiest-eight)) 8)
-            (sum (map share-contribution %easiest-eight))
-            (coin-quality (map share-contribution %easiest-eight)))
-    (format "Payout matrix: ~a rows over R=0..8 and emission boundaries; max supply ~a daviwils.\n"
-            (length %payout-rows) coin-max-supply)
-    (format "Aggregate order: 3 strong shares Q~a score ~a outrank 8 weak Q~a score ~a.\n"
-            %strong-q %strong-word %weak-q %weak-word)
-    (format "Timeline: carrier ~a commits at H=~a; producer ~a selects reveals and payouts at H+1=~a.\n"
-            %carrier-actor %commitment-height %producer-actor %reveal-height)
-    "Censorship rows are timing-correct payout accounting, not a profitability claim.\n"
-    "Caveat: consensus proves distinct tasks/work only, not distinct owners or identity independence.\n"))
+      (emit-files))
 
-(define (main)
-  (: -> void?)
-  (ensure-directory %output-dir)
-  (write-output
-    "puzzles.csv"
-    (csv (cons '(mode seed_index height complexity constraint_id constraint_name
-                      k width table_bytes par retries hidden_bytes
-                      hidden_validation_steps hidden_validation_allocations
-                      table_validation_steps table_validation_allocations)
-               %puzzle-rows)))
-  (write-output
-    "shares.csv"
-    (csv (cons '(key_index pubkey par known_solution_bytes margin_milli contribution
-                           validation_steps validation_allocations retries
-                           constraint_id k width first8 easiest8)
-               (map (lambda (row)
-                      (append row
-                              (list (if (<= (car row) 8) 1 0)
-                                    (if (memv (car row) %easiest-indexes) 1 0))))
-                    %share-rows))))
-  (write-output
-    "payouts.csv"
-    (csv (cons '(height fees share_count consensus_feasible subsidy total_value
-                       cumulative_emission producer independent_share_each
-                       independent_shares_total carrier
-                       self_controlled_current_total self_controlled_with_carrier)
-               %payout-rows)))
-  (write-output
-    "censorship.csv"
-    (csv (cons '(commitment_height reveal_height strategy carrier_actor
-                                  carrier_key reveal_producer_actor
-                                  reveal_producer_key sharer_actor share_keys
-                                  commitments_included reveals_available
-                                  reveals_selected producer_payout
-                                  share_payout_total carrier_payout
-                                  reveal_producer_actor_total quality_q note)
-               %censorship-rows)))
-  (write-output
-    "ordering.csv"
-    (csv (cons '(cohort share_count margin_milli_each contribution_each quality_q
-                       score_word rank)
-               %ordering-rows)))
-  (write-output "results.json"
-                (string-append (json-encode %results indent: 2) "\n"))
-  (write-output "summary.txt" %summary)
-  (display %summary))))
+    (define (main)
+      (: -> void?)
+      (emit-simulation))))

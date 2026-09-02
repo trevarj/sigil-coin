@@ -95,6 +95,7 @@
     coin-score-valid?
     coin-score-check
     coin-max-score-word
+    coin-score-rank-word
     coin-score-compare
     coin-score-better?
 
@@ -118,7 +119,7 @@
     coin-bits-decode
     coin-check-bits
 
-    ;; Co-op shares, commit-reveal and the reward split
+    ;; Co-op shares, commit-reveal and payouts
     coin-share-pubkey-bytes
     coin-share-signature-bytes
     coin-share-blind-bytes
@@ -166,11 +167,9 @@
     coin-shares-quality
     coin-check-share-solution
     coin-check-shares
-    coin-producer-weight
-    coin-split-weight-total
-    coin-split-unit
-    coin-split-plan
-    coin-check-split
+    coin-payout-plan
+    coin-check-payout-cheap
+    coin-check-payout
 
     ;; The coinbase payload
     coin-min-coinbase-script-bytes

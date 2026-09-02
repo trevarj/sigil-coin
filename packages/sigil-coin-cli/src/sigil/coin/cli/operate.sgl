@@ -191,17 +191,34 @@
                (node-peer-last-result peer)
                (node-peer-last-error peer)))
 
-    ;;; Print a node status snapshot, with SigilCoin's own numbers appended.
+    ;; Actual issued supply on the selected active branch. Ordinary
+    ;; transactions conserve this value; fees return through coinbase.
+    (define (coin-issued-supply n)
+      (: node? -> integer?)
+      (let* ((rows
+               (sqlite-query
+                 (node-db n)
+                 "SELECT COALESCE(SUM(value), 0) AS count FROM utxos WHERE active = 1"))
+             (row (and (pair? rows) (car rows)))
+             (entry (and row
+                         (or (assoc "count" row)
+                             (assq 'count row))))
+             (value (and entry (cdr entry))))
+        (if (and (number? value) (exact? value) (integer? value))
+            value
+            0)))
+
+    ;;; Print a node status snapshot with its branch-aware issued supply.
     ;;;
     ;;; The Bitcoin fields are reported under the names `sigil-bitcoin` uses
     ;;; so existing tooling can read them; the mining lines below them are
     ;;; what a SigilCoin operator actually watches.
     ;;;
     ;;; ```scheme
-    ;;; (coin-print-status (node-status n))
+    ;;; (coin-print-status (node-status n) (coin-issued-supply n))
     ;;; ```
-    (define (coin-print-status status)
-      (: node-status-snapshot? -> any?)
+    (define (coin-print-status status issued-supply)
+      (: node-status-snapshot? integer? -> any?)
       (println "chain: ~a" (node-status-snapshot-chain-name status))
       (println "best-height: ~a" (node-status-snapshot-best-height status))
       (println "best-hash: ~a" (node-status-snapshot-best-hash status))
@@ -227,8 +244,8 @@
       (println "sync-stage: ~a" (node-status-snapshot-sync-stage status))
       (println "sync-last-error: ~a"
                (node-status-snapshot-sync-last-error status))
-      ;; SigilCoin's own view: what the next block is worth and how much of
-      ;; the supply the chain has issued so far.
+      ;; SigilCoin's own view separates coins actually minted on the active
+      ;; branch from the height-only scheduled subsidy cap.
       (let* ((height (node-status-snapshot-best-block-height status))
              (next (+ height 1)))
         (println "tip-solution-bytes: ~a"
@@ -238,16 +255,20 @@
         (println "next-reward: ~a SGL"
                  (cli-daviwils->sgl (coin-block-reward next)))
         (println "issued-supply: ~a SGL"
+                 (cli-daviwils->sgl issued-supply))
+        (println "scheduled-supply-cap: ~a SGL"
                  (cli-daviwils->sgl (coin-cumulative-supply height)))
         (println "max-supply: ~a SGL" (cli-daviwils->sgl coin-max-supply)))
       status)
 
-    ;; Recover header score from rank's low saving digit for display.
+    ;; Recover the projected rank word from the persisted saving. Only its
+    ;; producer solution length is decoded; authenticated `Q` was deliberately
+    ;; erased before this rank was saved and cannot be inferred here.
     (define (coin-solution-bytes-of work)
       (let* ((saving (coin-rank-tip-saving work))
-             (word (- coin-max-score-word saving)))
-        (if (coin-score-valid? word)
-            (coin-score-length (coin-score-decode word))
+             (rank-word (- coin-max-score-word saving)))
+        (if (coin-score-valid? rank-word)
+            (coin-score-length (coin-score-decode rank-word))
             0)))
 
     ;;; Print the node's view of the chain.
@@ -259,7 +280,7 @@
       (: list? -> any?)
       (cli-with-node args
         (lambda (n)
-          (coin-print-status (node-status n)))))
+          (coin-print-status (node-status n) (coin-issued-supply n)))))
 
     ;;; Run a `peers` subcommand: `add`, `list`, `remove` or `test`.
     ;;;
@@ -377,7 +398,7 @@
             (let loop ((completed 0) (retries 0) (last-error ""))
               (if (and (> iterations 0) (>= completed iterations))
                   (let ((status (node-mark-sync-idle n)))
-                    (coin-print-status status)
+                    (coin-print-status status (coin-issued-supply n))
                     status)
                   (let* ((before (run-progress-snapshot (node-status n)))
                          (failure #f)
@@ -394,7 +415,7 @@
                             (not (string=? "failed"
                                            (node-status-snapshot-sync-stage
                                              status))))
-                       (coin-print-status status)
+                       (coin-print-status status (coin-issued-supply n))
                        (when (and (= iterations 0)
                                   (> retry-delay 0)
                                   (not (run-progress-made? before status)))
@@ -409,7 +430,8 @@
                                          (node-status-snapshot-sync-last-error
                                            status)
                                          last-error)))
-                         (coin-print-status (node-status n))
+                         (coin-print-status (node-status n)
+                                            (coin-issued-supply n))
                          (when (> retry-delay 0) (sleep retry-delay))
                          (if (and (>= retries max-retries)
                                   (> iterations 0))
@@ -700,5 +722,5 @@
               ;; Re-raised outside the guard handler: a raise from inside one
               ;; escapes every enclosing guard, including `main`'s.
               (when fatal (raise fatal))
-              (coin-print-status (node-status n))
+              (coin-print-status (node-status n) (coin-issued-supply n))
               result)))))))

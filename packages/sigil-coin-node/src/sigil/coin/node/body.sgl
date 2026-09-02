@@ -1,10 +1,11 @@
 ;;; (sigil coin node body) — canonical block-body validation
 ;;;
 ;;; Deterministic body order: size/merkle/header, payload and codecs, cheap
-;;; share shape/order/commit/dedup, exact 2/1/1 outputs, breadth-first share
-;;; source preparation, breadth-first signatures, producer PBE, share PBE,
-;;; Q/score equality, then Bitcoin connection. Personalized specs derive once;
-;;; only verified share reports may feed aggregate quality.
+;;; share shape/order/commit/dedup, cheap payout shape/value checks,
+;;; breadth-first share source preparation, breadth-first signatures, producer
+;;; PBE, share PBE, verified contributions/Q, exact payouts, score equality,
+;;; then Bitcoin connection. Personalized specs derive once; only verified
+;;; share reports may feed contributions and aggregate quality.
 
 (define-library (sigil coin node body)
   (import (sigil math)
@@ -183,8 +184,8 @@
                                 (coin-ok (list shares context payload))))))))))))))
 
     ;; Prepare sources, verify signatures, validate producer, then run share
-    ;; examples and reuse verified reports for Q. Return
-    ;; `(score shares context payload)`.
+    ;; examples and reuse verified reports for contributions and Q. Return
+    ;; `(score shares contributions context payload)`.
     (define (finish-block-claims parent-block height complexity header prepared)
       (guard (e (#t (coin-error 'internal-error
                                 "the expensive block claim check raised")))
@@ -206,7 +207,7 @@
                 (if (coin-failed? scored)
                     scored
                     (coin-ok (list (coin-result-value scored)
-                                   shares context payload))))
+                                   shares '() context payload))))
               (let ((source-check (coin-prepare-shares context shares)))
                 (record-validation-stats! context)
                 (if (coin-failed? source-check)
@@ -232,9 +233,16 @@
                                   (record-validation-stats! context)
                                   (if (coin-failed? share-check)
                                       share-check
-                                      (let* ((quality
-                                               (coin-shares-quality
-                                                 context shares))
+                                      (let* ((verified-shares
+                                               (coin-result-value share-check))
+                                             (contributions
+                                               (map
+                                                 (lambda (share)
+                                                   (coin-share-quality
+                                                     context share))
+                                                 verified-shares))
+                                             (quality
+                                               (coin-quality contributions))
                                              (base
                                                (coin-score-decode
                                                  (coin-result-value
@@ -246,7 +254,8 @@
                                                  (coin-score-steps base)
                                                  quality)))
                                         (coin-ok
-                                          (list score shares context
+                                          (list score verified-shares
+                                                contributions context
                                                 payload)))))))))))))))
 
     (define (check-block-claims parent-block height complexity b)
@@ -345,7 +354,7 @@
         (unless (= coin-header-version (block-header-version header))
           (error "coin-connect-block: wrong-version"))
         ;; Header acceptance binds complexity to chain history. Score shape,
-        ;; payload codecs and payout shape all precede ECDSA and PBE.
+        ;; payload codecs and cheap payout checks all precede ECDSA and PBE.
         (let* ((complexity (require-coin-ok
                              "coin-connect-block: bits"
                              (coin-header-complexity header))))
@@ -360,17 +369,25 @@
                  (coinbase (car (block-transactions b)))
                  (carrier (and (pair? shares)
                                (coin-carrier-script parent-block)))
-                 (total (+ ((block-rules-subsidy rules) height)
-                           (block-fees b utxos))))
+                 (subsidy ((block-rules-subsidy rules) height))
+                 (fees (block-fees b utxos)))
             (require-coin-ok
-              "coin-connect-block: split"
-              (coin-check-split coinbase total shares carrier))
+              "coin-connect-block: cheap payout"
+              (coin-check-payout-cheap
+                coinbase subsidy fees shares carrier))
             (let* ((checked
                      (finish-block-claims
                        parent-block height complexity header prepared))
                    (value
                      (require-coin-ok "coin-connect-block: score" checked))
-                   (score (car value)))
+                   (score (car value))
+                   (verified-shares (list-ref value 1))
+                   (contributions (list-ref value 2)))
+              (require-coin-ok
+                "coin-connect-block: payout"
+                (coin-check-payout
+                  coinbase subsidy fees
+                  verified-shares contributions carrier))
               (unless (= claimed score)
                 (error "coin-connect-block: score-mismatch"))))))
       ((block-rules-connect bitcoin-block-rules)

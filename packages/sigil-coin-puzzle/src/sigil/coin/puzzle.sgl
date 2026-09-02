@@ -502,10 +502,9 @@
       (: any? -> string?)
       (puzzle--print value #f))
 
-    ;;; Canonical source text for an expression. Emits the shortest form the
-    ;;; parser accepts — single spaces, no padding, `'x` for `(quote x)` — so
-    ;;; the puzzle generator can measure par directly from it. Re-parsing the
-    ;;; output yields the same AST.
+    ;;; Canonical single-space source text for an expression. Emits one space
+    ;;; between list elements, no padding, and `'x` for `(quote x)`.
+    ;;; Re-parsing the output yields the same AST.
     ;;;
     ;;; ```scheme
     ;;; (puzzle-print-expression '(if #t (quote a) 2)) ; => "(if #t 'a 2)"

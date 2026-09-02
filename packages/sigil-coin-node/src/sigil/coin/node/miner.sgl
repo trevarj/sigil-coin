@@ -56,17 +56,18 @@
            plan))
 
     ;;; Build canonical coinbase, including exact co-op payouts.
-    (define (coin-mining-coinbase/coop height solution shares commitments
-                                           graffiti producer-script
+    (define (coin-mining-coinbase/coop height solution shares contributions
+                                           commitments graffiti producer-script
                                            carrier-script . maybe-fees)
-      (: integer? any? list? list? any? bytevector? any? integer? ...
+      (: integer? any? list? list? list? any? bytevector? any? integer? ...
          -> transaction?)
       (if (not (bytevector? producer-script))
           (error "coin-mining-coinbase/coop: expected producer script"))
       (let* ((fees (require-fees "coin-mining-coinbase/coop"
                                  (optional-argument maybe-fees 0 0)))
-             (value (+ (coin-block-reward height) fees))
-             (plan (coin-split-plan value shares carrier-script)))
+             (subsidy (coin-block-reward height))
+             (plan (coin-payout-plan
+                     subsidy fees shares contributions carrier-script)))
         (transaction
           version: 1
           inputs: (list
@@ -94,7 +95,7 @@
                                      . maybe-fees)
       (: integer? any? any? bytevector? integer? ... -> transaction?)
       (coin-mining-coinbase/coop
-        height solution '() '() graffiti script-pubkey #f
+        height solution '() '() '() graffiti script-pubkey #f
         (require-fees "coin-mining-coinbase"
                       (optional-argument maybe-fees 0 0))))
 
@@ -108,9 +109,9 @@
                      ")"))
             (coin-result-value scored))))
 
-    (define (build parent-header height complexity solution shares commitments
-                   graffiti producer-script carrier-script time txs fees
-                   quality)
+    (define (build parent-header height complexity solution shares contributions
+                   commitments graffiti producer-script carrier-script time txs
+                   fees quality)
       (let* ((parent-hash (block-header-hash parent-header))
              (solution-bytes
                (coin-mining-bytes
@@ -120,8 +121,8 @@
              (score (score-or-raise parent-hash height complexity
                                     solution-bytes quality))
              (coinbase (coin-mining-coinbase/coop
-                         height solution-bytes shares commitments graffiti
-                         producer-script carrier-script fees))
+                         height solution-bytes shares contributions commitments
+                         graffiti producer-script carrier-script fees))
              (transactions (cons coinbase txs)))
         (block header-field:
                  (block-header version: coin-header-version
@@ -151,7 +152,7 @@
             (error "coin-build-block: expected transactions"))
         (if (not (list? commitments))
             (error "coin-build-block: expected commitments"))
-        (build parent-header height complexity solution '() commitments
+        (build parent-header height complexity solution '() '() commitments
                graffiti script-pubkey #f time txs fees 0)))
 
     ;;; Build a co-op block revealing personalized shares committed by parent.
@@ -194,7 +195,14 @@
         (if (not (list? commitments))
             (error "coin-build-coop-block: expected commitments"))
         (let* ((accepted (coin-result-value checked))
-               (quality (coin-shares-quality context accepted))
+               ;; Both Q and payouts consume the reports cached by the one
+               ;; full share-validation pass above.
+               (contributions
+                 (map (lambda (share)
+                        (coin-share-quality context share))
+                      accepted))
+               (quality (coin-quality contributions))
                (carrier (coin-carrier-script parent-block)))
-          (build parent-header height complexity producer accepted commitments
-                 graffiti producer-script carrier time txs fees quality))))))
+          (build parent-header height complexity producer accepted contributions
+                 commitments graffiti producer-script carrier time txs fees
+                 quality))))))

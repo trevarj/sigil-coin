@@ -40,7 +40,10 @@
         (sigil bitcoin node)
         (sigil secp256k1)
         (sigil coin puzzle)
+        (sigil coin puzzle generator)
         (sigil coin consensus)
+        (only (sigil coin consensus shares)
+              coin-check-share-solution/spec)
         (sigil coin node))
 
 ;; ============================================================
@@ -471,6 +474,17 @@
         total
         (loop (cdr rows) (+ total (row-value (car rows) "value"))))))
 
+(define (solo-coinbase-value height . maybe-fees)
+  (+ (quotient (* 4 (coin-block-reward height)) 5)
+     (if (null? maybe-fees) 0 (car maybe-fees))))
+
+(define (solo-issued-supply height)
+  (let loop ((h 1) (total 0))
+    (if (> h height)
+        total
+        (loop (+ h 1) (+ total (solo-coinbase-value h))))))
+
+
 (define (utxos-paying n script)
   (let loop ((rows (active-utxos n)) (out '()))
     (cond ((null? rows) (reverse out))
@@ -530,12 +544,12 @@
         (assert-equal 4 (best-block-height b))
         (assert-equal (hex-encode (block-hash (list-ref blocks 3)))
                       (best-block-hash b))
-        ;; Bodies, not just headers: four blocks validated, and four
-        ;; coinbase outputs in the peer's own UTXO set, worth exactly what
-        ;; SigilCoin's schedule issues.
+        ;; Bodies, not just headers: four blocks validated, and four solo
+        ;; coinbase outputs in the peer's own UTXO set. Each leaves one fifth
+        ;; of its scheduled subsidy unminted.
         (assert-equal 4 (validated-count b))
         (assert-equal 4 (length (active-utxos b)))
-        (assert-equal (coin-cumulative-supply 4) (utxo-total b))
+        (assert-equal (solo-issued-supply 4) (utxo-total b))
         (assert-equal '(1 1 1 1)
                       (map (lambda (r) (row-value r "coinbase"))
                            (active-utxos b)))
@@ -577,7 +591,7 @@
           (assert-equal 3 (best-block-height b))
           (assert-true (tip-is? b next))
           (assert-equal 3 (validated-count b))
-          (assert-equal (coin-cumulative-supply 3) (utxo-total b))
+          (assert-equal (solo-issued-supply 3) (utxo-total b))
           (node-close b)))
       (remove-tree dir-a)
       (remove-tree dir-b))))
@@ -590,11 +604,35 @@
   (coin-genesis-block coin-regtest-genesis-quote coin-regtest-genesis-time))
 (define %genesis-header (block-header-field %genesis-block))
 
-;; Known golfs for two independent H1 personalized puzzles.
-(define %share-source-1
-  "(lambda(x)(if(equal? x \"@\")\"adbliemffghlbcgeeajjfndonfkklkafgfnhbobidegaeibjppjmbhpfojnfnnahip\"(cons x(list x x))))")
-(define %share-source-6
-  "(lambda(x)(if(equal? x \"@\")\"adpaagkbinfgfdmeonpfdjbppcdkgbpadppidncdhoiiaoogbbihpkjpdhjkacioak\"(+(* x 6)52)))")
+;; A personalized source can broaden only its exact reserved-string branch.
+;; Tasks with ordinary string inputs have no fixture candidate.
+(define %generated-anchor-predicate "(equal? x\"@\")")
+(define %semantic-anchor-predicate "(string? x)")
+
+(define (ordinary-inputs-non-string? spec)
+  (let loop ((pairs (puzzle-spec-examples spec)))
+    (cond
+      ((null? pairs) #f)
+      ((null? (cdr pairs))
+       (let ((anchor (car pairs)))
+         (and (string? (car anchor))
+              (string=? puzzle-anchor-input (car anchor))
+              (puzzle-anchor-output? (cdr anchor)))))
+      ((string? (car (car pairs))) #f)
+      (else (loop (cdr pairs))))))
+
+(define (semantic-share-source spec)
+  (let ((source (puzzle-spec-hidden-source spec)))
+    (and (ordinary-inputs-non-string? spec)
+         (= 1 (string-count source %generated-anchor-predicate))
+         (let* ((candidate
+                  (string-replace source %generated-anchor-predicate
+                                  %semantic-anchor-predicate))
+                (checked
+                  (coin-check-share-solution/spec spec candidate)))
+           (and (< (string-length candidate) (puzzle-spec-par spec))
+                (coin-ok? checked)
+                candidate)))))
 
 (define (bytes<? a b)
   (let loop ((i 0))
@@ -628,6 +666,28 @@
                 signature: (secp256k1-ecdsa-sign secret preimage)
                 blind: (make-bytevector 32 101)
                 solution: bytes)))
+
+(define (generated-share secret-byte context)
+  (let* ((secret (make-bytevector 32 secret-byte))
+         (pubkey (secp256k1-pubkey-create secret))
+         (spec (coin-share-puzzle context pubkey))
+         (source (semantic-share-source spec)))
+    (and source (signed-share secret-byte source context))))
+
+(define (generated-shares count context)
+  (let loop ((secret-byte 1) (out '()))
+    (cond
+      ((= count (length out)) (sort-bytes out coin-share-pubkey))
+      ((> secret-byte 255)
+       (error "test-network: fewer than eight semantic share candidates"))
+      (else
+        (let ((candidate (generated-share secret-byte context)))
+          (loop (+ secret-byte 1)
+                (if (and candidate
+                         (not (member (coin-share-solution candidate)
+                                      (map coin-share-solution out))))
+                    (cons candidate out)
+                    out)))))))
 
 (define (block-from-coinbase parent height complexity score coinbase)
   (block header-field:
@@ -696,65 +756,112 @@
     (node-close peer)))
 
 (when %native-secp256k1?
-  (test-group "sigilcoin composite score and replay"
-  (test "aggregate Q reorganises and replay rejection does not poison"
-    (let* ((dir (fresh-dir))
-           (base (coin-build-block %genesis-header 1 coin-genesis-complexity
-                                   #f "base" %elsewhere
-                                   (+ coin-regtest-genesis-time 1)))
-           (share (signed-share 1 %share-source-1
-                                (coin-parent-context base)))
-           (commitment (coin-share-commitment
-                         (coin-parent-context base) share))
-           (parent (coin-build-block %genesis-header 1
-                                     coin-genesis-complexity #f "commit"
-                                     %elsewhere
-                                     (+ coin-regtest-genesis-time 1)
-                                     '() 0 (list commitment)))
-           (q0 (coin-build-block (block-header-field parent) 2
-                                 coin-genesis-complexity #f "solo"
-                                 %elsewhere
-                                 (+ coin-regtest-genesis-time 2)))
-           (q1 (coin-build-coop-block parent 2 coin-genesis-complexity #f
-                                      (list share) "coop" %elsewhere
-                                      (+ coin-regtest-genesis-time 2)))
-           (score0 (coin-score-decode
-                     (block-header-nonce (block-header-field q0))))
-           (score1 (coin-score-decode
-                     (block-header-nonce (block-header-field q1))))
-           (n (open-node dir)))
-      (assert-equal (coin-score-length score0) (coin-score-length score1))
-      (assert-equal (coin-score-memory score0) (coin-score-memory score1))
-      (assert-equal (coin-score-steps score0) (coin-score-steps score1))
-      (assert-true (> (coin-score-quality score1)
-                      (coin-score-quality score0)))
-      (assert-equal 1 (submit n parent))
-      (assert-equal 1 (submit n q0))
-      (assert-equal 1 (submit n q1))
-      (assert-true (tip-is? n q1))
-      ;; Reusing H1's signed share at H3 is a replay.
-      (let* ((h3 3)
-             (parent-header (block-header-field q1))
-             (solution (coin-table-solution
-                         (block-header-hash parent-header)
-                         h3 coin-genesis-complexity))
-             (scored (coin-result-value
-                       (coin-score-for-solution
-                         (block-header-hash parent-header)
-                         h3 coin-genesis-complexity solution 0)))
-             (coinbase (coin-mining-coinbase/coop
-                         h3 solution (list share) '() "replay" %elsewhere
-                         (coin-carrier-script q1) 0))
-             (replay (block-from-coinbase parent-header h3
-                                           coin-genesis-complexity
-                                           scored coinbase)))
-        (assert-equal 0 (submit n replay))
-        (assert-true (string-contains? (last-error n) "share"))
-        ;; Honest H3 still confirms after rejected replay.
-        (let ((honest (car (mine-blocks n 1 %elsewhere))))
-          (assert-true (tip-is? n honest))
-          (assert-equal 3 (validated-count n))))
-      (node-close n)))))
+  (test-group "sigilcoin Q-neutral copy-and-attach fork choice"
+    (test "valid attached shares cannot replace first-seen or settled producer"
+      (let* ((dir (fresh-dir))
+             (validation-dir (fresh-dir))
+             ;; Derive an attacker share for H1, then rebuild H1 carrying its
+             ;; commitment. The share context deliberately excludes H1's hash.
+             (prototype
+               (coin-build-block
+                 %genesis-header 1 coin-genesis-complexity #f "prototype"
+                 %elsewhere (+ coin-regtest-genesis-time 1)))
+             (share
+               (car (generated-shares 1 (coin-parent-context prototype))))
+             (commitment
+               (coin-share-commitment (coin-parent-context prototype) share))
+             (parent
+               (coin-build-block
+                 %genesis-header 1 coin-genesis-complexity #f "commit"
+                 %elsewhere (+ coin-regtest-genesis-time 1)
+                 '() 0 (list commitment)))
+             (parent-header (block-header-field parent))
+             (height 2)
+             (solution
+               (coin-table-solution
+                 (block-header-hash parent-header)
+                 height
+                 coin-genesis-complexity))
+             (arrival
+               (+ (block-header-time parent-header)
+                  coin-regtest-min-block-spacing))
+             (original
+               (coin-build-block
+                 parent-header height coin-genesis-complexity solution
+                 "original solver" %elsewhere arrival))
+             (copy-before-child
+               (coin-build-coop-block
+                 parent height coin-genesis-complexity solution (list share)
+                 "copy before child" %anyone arrival))
+             (child
+               (coin-build-block
+                 (block-header-field original)
+                 (+ height 1)
+                 coin-genesis-complexity
+                 #f
+                 "settling child"
+                 %elsewhere
+                 (+ arrival coin-regtest-min-block-spacing)))
+             (copy-after-child
+               (coin-build-coop-block
+                 parent height coin-genesis-complexity solution (list share)
+                 "copy after child" %anyone arrival))
+             (original-word
+               (block-header-nonce (block-header-field original)))
+             (copy-word
+               (block-header-nonce (block-header-field copy-before-child)))
+             (original-score (coin-score-decode original-word))
+             (copy-score (coin-score-decode copy-word))
+             (n (open-node dir))
+             (validation-node (open-node validation-dir)))
+        ;; The copy is a genuinely valid cooperative block, not a synthetic
+        ;; score claim. A separate node selects and fully validates it.
+        (assert-equal 1 (submit validation-node parent))
+        (assert-equal 1 (submit validation-node copy-before-child))
+        (assert-true (tip-is? validation-node copy-before-child))
+        (node-close validation-node)
+
+        ;; Producer work is byte-for-byte the same. Only authenticated Q and
+        ;; therefore raw W differ.
+        (assert-equal (coin-score-length original-score)
+                      (coin-score-length copy-score))
+        (assert-equal (coin-score-memory original-score)
+                      (coin-score-memory copy-score))
+        (assert-equal (coin-score-steps original-score)
+                      (coin-score-steps copy-score))
+        (assert-equal 0 (coin-score-quality original-score))
+        (assert-true (> (coin-score-quality copy-score) 0))
+        (assert-true (not (= original-word copy-word)))
+        (assert-equal
+          copy-word
+          (coin-result-value
+            (coin-block-score parent height coin-genesis-complexity
+                              copy-before-child)))
+        (assert-equal (coin-score-rank-word original-word)
+                      (coin-score-rank-word copy-word))
+        (assert-equal (coin-score-saving original-word)
+                      (coin-score-saving copy-word))
+        (assert-equal 0 (coin-score-compare original-word copy-word))
+
+        ;; First-seen retains H2. The losing copy body is downloaded but is
+        ;; not revalidated onto the active chain.
+        (assert-equal 1 (submit n parent))
+        (assert-equal 1 (submit n original))
+        (assert-true (tip-is? n original))
+        (assert-equal 0 (submit n copy-before-child))
+        (assert-true (tip-is? n original))
+
+        ;; A real H3 child settles the original. A distinct later copy of H2
+        ;; remains unable to roll the active chain back.
+        (assert-equal 1 (submit n child))
+        (assert-true (tip-is? n child))
+        (assert-equal 0 (submit n copy-after-child))
+        (assert-true (tip-is? n child))
+        (assert-equal 3 (validated-count n))
+        (assert-equal
+          (block-hash original)
+          (block-header-hash (list-ref (validated-headers n) height)))
+        (node-close n)))))
 
 ;; One canonical commit/reveal fixture shared by network acceptance tests.
 (define %coop-prototype
@@ -764,10 +871,7 @@
 (define %coop-context (coin-parent-context %coop-prototype))
 (define %coop-shares
   (if %native-secp256k1?
-      (sort-bytes
-        (list (signed-share 1 %share-source-1 %coop-context)
-              (signed-share 6 %share-source-6 %coop-context))
-        coin-share-pubkey)
+      (generated-shares 2 %coop-context)
       '()))
 (define %coop-commits
   (sort-bytes
@@ -797,24 +901,27 @@
         (node-close a)
         (set! a (open-node dir-a))
         (assert-equal 1 (submit a %coop-child))
-        (let* ((outputs (transaction-outputs
-                          (car (block-transactions %coop-child))))
-               (unit (coin-split-unit (coin-block-reward 2) 2))
-               ;; Expected Q is a pure preview: this test is not the validator
-               ;; and must not populate or depend on consensus's
-               ;; signature/commit verified-share cache.
-               (quality
-                 (coin-quality
-                   (map (lambda (share)
-                          (let ((preview
-                                  (coin-check-share-solution
-                                    %coop-context share)))
-                            (assert-true (coin-ok? preview))
-                            (list-ref (coin-result-value preview) 2)))
-                        %coop-shares))))
+        (let* ((coinbase (car (block-transactions %coop-child)))
+               (outputs (transaction-outputs coinbase))
+               (subsidy (coin-block-reward 2))
+               ;; Contributions are pure previews here: this test is not the
+               ;; validator and must not depend on its verified-share cache.
+               (contributions
+                 (map (lambda (share)
+                        (let ((preview
+                                (coin-check-share-solution
+                                  %coop-context share)))
+                          (assert-true (coin-ok? preview))
+                          (list-ref (coin-result-value preview) 2)))
+                      %coop-shares))
+               (quality (coin-quality contributions))
+               (plan (coin-payout-plan
+                       subsidy 0 %coop-shares contributions %anyone))
+               (expected-values (map car plan))
+               (carrier-value (car (reverse expected-values))))
           (assert-equal 4 (length outputs))
-          (assert-equal (list (* 2 unit) unit unit unit)
-                        (map txout-value outputs))
+          (assert-equal expected-values (map txout-value outputs))
+          (assert-equal subsidy (transaction-output-value coinbase))
           (assert-equal 2 quality)
           (assert-equal quality
                         (coin-score-quality
@@ -852,21 +959,27 @@
                          (assert-true (coin-ok? preview))
                          (list-ref (coin-result-value preview) 2)))
                      decoded)))
-            (for-each
-              (lambda (share)
+            (let share-loop ((shares %coop-shares)
+                             (values (cdr expected-values)))
+              (unless (null? shares)
                 (let ((paid (utxos-paying
                               b (coin-share-script
-                                  (coin-share-pubkey share)))))
+                                  (coin-share-pubkey (car shares))))))
                   (assert-equal 1 (length paid))
-                  (assert-equal unit (row-value (car paid) "value"))))
-              %coop-shares)
+                  (assert-equal (car values)
+                                (row-value (car paid) "value")))
+                (share-loop (cdr shares) (cdr values))))
             (let ((carrier (utxos-paying b %anyone)))
               (assert-equal 2 (length carrier))
-              (assert-equal (+ (coin-block-reward 1) unit)
-                            (let loop ((xs carrier) (sum 0))
-                              (if (null? xs) sum
-                                  (loop (cdr xs)
-                                        (+ sum (row-value (car xs) "value")))))))
+              (assert-equal
+                (+ (quotient (* 4 (coin-block-reward 1)) 5)
+                   carrier-value)
+                (let loop ((xs carrier) (sum 0))
+                  (if (null? xs) sum
+                      (loop (cdr xs)
+                            (+ sum (row-value (car xs) "value")))))))
+            (assert-equal (+ (solo-coinbase-value 1) subsidy)
+                          (utxo-total b))
             (node-close b)))
         (remove-tree dir-a)
         (remove-tree dir-b))))
@@ -922,7 +1035,7 @@
                         (block-header-hash parent-header)
                         3 coin-genesis-complexity solution 0)))
              (coinbase (coin-mining-coinbase/coop
-                         3 solution (list (car %coop-shares)) '()
+                         3 solution (list (car %coop-shares)) (list 1) '()
                          "replay" %elsewhere
                          (coin-carrier-script %coop-child) 0))
              (bad (block-from-coinbase parent-header 3
@@ -937,46 +1050,56 @@
         (assert-peer-rejects server bad peer-dir 2 "share")
         (node-close server)))))
 
-(test-group "sigilcoin aggregate-Q header fork choice"
-  (test "three Q4 claims outrank eight Q1 claims at tied producer fields"
+(test-group "sigilcoin Q-neutral header fork choice"
+  (test "different authenticated Q claims keep the first-seen header"
     (let* ((dir-a (fresh-dir))
            (dir-b (fresh-dir))
            (a (open-node dir-a))
            (base (car (mine-blocks a 1 %elsewhere)))
            (parent (block-header-field base))
-           (weak-q (coin-quality '(1 1 1 1 1 1 1 1)))
-           (strong-q (coin-quality '(4 4 4)))
-           (weak (block-header
-                   version: coin-header-version
-                   previous-block: (block-header-hash parent)
-                   merkle-root: (make-bytevector 32 8)
-                   time: (coin-next-block-time
-                           parent coin-regtest-min-block-spacing)
-                   bits: coin-genesis-bits
-                   nonce: (coin-score-pack 40 50 51 weak-q)))
-           (strong (block-header
-                     weak
-                     merkle-root: (make-bytevector 32 12)
-                     nonce: (coin-score-pack 40 50 51 strong-q))))
-      (assert-equal 8 weak-q)
-      (assert-equal 12 strong-q)
-      (assert-true (coin-score-better? (block-header-nonce strong)
-                                       (block-header-nonce weak)))
-      ;; Give peer validated parent body before bodyless competing claims.
+           (incumbent-q (coin-quality '(1 1 1 1 1 1 1 1)))
+           (challenger-q (coin-quality '(4 4 4)))
+           (incumbent
+             (block-header
+               version: coin-header-version
+               previous-block: (block-header-hash parent)
+               merkle-root: (make-bytevector 32 8)
+               time: (coin-next-block-time
+                       parent coin-regtest-min-block-spacing)
+               bits: coin-genesis-bits
+               nonce: (coin-score-pack 40 50 51 incumbent-q)))
+           (challenger
+             (block-header
+               incumbent
+               merkle-root: (make-bytevector 32 12)
+               nonce: (coin-score-pack 40 50 51 challenger-q)))
+           (incumbent-word (block-header-nonce incumbent))
+           (challenger-word (block-header-nonce challenger)))
+      (assert-equal 8 incumbent-q)
+      (assert-equal 12 challenger-q)
+      (assert-true (not (= incumbent-word challenger-word)))
+      (assert-equal (coin-score-rank-word incumbent-word)
+                    (coin-score-rank-word challenger-word))
+      (assert-equal (coin-score-saving incumbent-word)
+                    (coin-score-saving challenger-word))
+      (assert-equal 0
+                    (coin-score-compare incumbent-word challenger-word))
+
+      ;; Give the node a validated parent before two bodyless sibling claims.
       (let* ((endpoint (open-endpoint))
              (port (car endpoint))
              (listener (cdr endpoint)))
         (sync-peer-ok a listener port dir-b 1)
         (socket-close listener))
-      (assert-equal 1 (node-ingest-headers a (list weak)))
-      (assert-equal (hex-encode (block-header-hash weak))
+      (assert-equal 1 (node-ingest-headers a (list incumbent)))
+      (assert-equal (hex-encode (block-header-hash incumbent))
                     (node-status-snapshot-best-hash (node-status a)))
-      (assert-equal 1 (node-ingest-headers a (list strong)))
-      (assert-equal (hex-encode (block-header-hash strong))
+      (assert-equal 1 (node-ingest-headers a (list challenger)))
+      (assert-equal (hex-encode (block-header-hash incumbent))
                     (node-status-snapshot-best-hash (node-status a)))
-      ;; Header-only claims are the requested fallback: canonical score
-      ;; packing plus real-node fork choice, propagated through TCP. Bodies
-      ;; cannot honestly claim Q12/Q8 without eleven known personalized golfs.
+
+      ;; Header-only propagation exercises persisted rank without inventing
+      ;; cooperative bodies for these synthetic Q values.
       (let* ((endpoint (open-endpoint))
              (port (car endpoint))
              (listener (cdr endpoint)))
@@ -984,7 +1107,7 @@
         (socket-close listener))
       (node-close a)
       (let ((b (open-node dir-b)))
-        (assert-equal (hex-encode (block-header-hash strong))
+        (assert-equal (hex-encode (block-header-hash incumbent))
                       (node-status-snapshot-best-hash (node-status b)))
         (assert-equal 1 (best-block-height b))
         (assert-true (tip-is? b base))
@@ -1018,6 +1141,7 @@
           (assert-equal 100 (height-of a))
           (assert-true (not (= coin-genesis-complexity complexity-16)))
           (let* ((funding (car (block-transactions (car blocks))))
+                 (funding-value (solo-coinbase-value 1))
                  (secret (make-bytevector 32 1))
                  (amount 25000000)
                  (fee 1000)
@@ -1034,13 +1158,12 @@
                      outputs: (list
                                 (txout value: amount
                                        script-pubkey: recipient-script)
-                                (txout value: (- (coin-block-reward 1)
-                                                amount fee)
+                                (txout value: (- funding-value amount fee)
                                        script-pubkey: wallet-script))
                      lock-time: 0))
                  ;; Same P2WPKH signer used by SigilCoin's one-key wallet.
                  (transfer (transaction-sign-p2wpkh-input
-                             unsigned 0 (coin-block-reward 1) secret))
+                             unsigned 0 funding-value secret))
                  (history (validated-headers a))
                  (complexity (coin-required-complexity history 101))
                  (parent (list-ref blocks 99))
@@ -1089,10 +1212,11 @@
                 (assert-equal (transaction-txid transfer)
                               (transaction-txid
                                 (list-ref (block-transactions received) 1))))
-              ;; Spent H1 leaves, recipient and change enter, fee moves into
-              ;; H101 coinbase: supply remains exact.
+              ;; Spent H1 leaves, recipient and change enter, and the fee
+              ;; returns through H101 coinbase. Transactions conserve the
+              ;; lower actual supply minted by the 101 solo blocks.
               (assert-equal 102 (length (active-utxos b)))
-              (assert-equal (coin-cumulative-supply 101) (utxo-total b))
+              (assert-equal (solo-issued-supply 101) (utxo-total b))
               (assert-equal "" (last-error b))
               (node-close b))))
         (remove-tree dir-a)
@@ -1121,7 +1245,7 @@
                                  sequence: #xffffffff
                                  witness: '()))
                  outputs: (list
-                            (txout value: (coin-block-reward 1)
+                            (txout value: (solo-coinbase-value 1)
                                    script-pubkey: to-script))
                  lock-time: 0))
              (history (validated-headers a))
@@ -1146,10 +1270,10 @@
                (paid (utxos-paying b to-script)))
           (assert-true (tip-is? b payment))
           (assert-equal 1 (length paid))
-          (assert-equal (coin-block-reward 1)
+          (assert-equal (solo-coinbase-value 1)
                         (row-value (car paid) "value"))
           (assert-equal 101 (length (active-utxos b)))
-          (assert-equal (coin-cumulative-supply 101) (utxo-total b))
+          (assert-equal (solo-issued-supply 101) (utxo-total b))
           (node-close b))
         (remove-tree dir-a)
         (remove-tree dir-b)))))
@@ -1230,6 +1354,7 @@
                                 (hex-encode (block-hash shorter)))
                           (map (lambda (r) (row-value r "created_by"))
                                (active-utxos b)))
+            (assert-equal (solo-issued-supply 3) (utxo-total b))
             (node-close b))
           ;; Equal-score sibling is first-seen: it cannot replace `shorter`
           ;; locally or over TCP, regardless of its different block hash.
@@ -1279,6 +1404,7 @@
               (assert-true (tip-is? b child))
               (assert-equal 4 (validated-count b))
               (assert-equal 4 (length (active-utxos b)))
+              (assert-equal (solo-issued-supply 4) (utxo-total b))
               (node-close b)))))
       (remove-tree dir-a)
       (remove-tree dir-b)
@@ -1455,7 +1581,7 @@
         (assert-true (tip-is? b honest-tip))
         (assert-equal 3 (validated-count b))
         (assert-equal 3 (length (active-utxos b)))
-        (assert-equal (coin-cumulative-supply 3) (utxo-total b))
+        (assert-equal (solo-issued-supply 3) (utxo-total b))
         ;; And the peer's own record of the refusal names the rule that
         ;; fired, on the block it downloaded and then threw away.
         (let ((row (car (sqlite-query

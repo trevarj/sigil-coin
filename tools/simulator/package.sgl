@@ -19,6 +19,7 @@
     (from-git url: "codeberg:sigil/sigil-crypto" version: "^0.16.1")
     (from-path dir: "../.." package: "sigil-coin-puzzle")
     (from-path dir: "../.." package: "sigil-coin-consensus")
+    (from-path dir: "../.." package: "sigil-coin-node")
     ;; Bundle collector needs native consensus dependencies listed directly.
     (from-path dir: "../../../sigil-bitcoin" package: "sigil-secp256k1")
     (from-path dir: "../../../sigil-bitcoin" package: "sigil-bitcoin-utils")

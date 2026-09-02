@@ -24,21 +24,35 @@
     (define (field alist key)
       (cdr (assq key alist)))
 
-    ;; Parser sees parentheses as delimiters. Removing adjacent spaces keeps
-    ;; behavior while making generator source strictly under par.
-    (define (golf source)
-      (let loop ((text source) (i 1))
-        (let ((n (string-length text)))
-          (cond ((>= i (- n 1)) text)
-                ((and (char=? #\space (string-ref text i))
-                      (or (char=? #\( (string-ref text (+ i 1)))
-                          (char=? #\' (string-ref text (+ i 1)))
-                          (char=? #\" (string-ref text (+ i 1)))
-                          (char=? #\) (string-ref text (- i 1)))))
-                 (loop (string-append (substring text 0 i)
-                                      (substring text (+ i 1) n))
-                       1))
-                (else (loop text (+ i 1)))))))
+    (define %generated-anchor-predicate "(equal? x\"@\")")
+    (define %semantic-anchor-predicate "(string? x)")
+
+    ;; The final personalized pair is the reserved string anchor. Broadening
+    ;; its predicate is safe only when every ordinary input is non-string.
+    (define (ordinary-inputs-non-string? spec)
+      (let loop ((pairs (puzzle-spec-examples spec)))
+        (cond
+          ((null? pairs) #f)
+          ((null? (cdr pairs))
+           (let ((anchor (car pairs)))
+             (and (string? (car anchor))
+                  (string=? puzzle-anchor-input (car anchor))
+                  (puzzle-anchor-output? (cdr anchor)))))
+          ((string? (car (car pairs))) #f)
+          (else (loop (cdr pairs))))))
+
+    (define (semantic-share-source spec)
+      (let ((source (puzzle-spec-hidden-source spec)))
+        (and (ordinary-inputs-non-string? spec)
+             (= 1 (string-count source %generated-anchor-predicate))
+             (let* ((candidate
+                      (string-replace source %generated-anchor-predicate
+                                      %semantic-anchor-predicate))
+                    (checked
+                      (coin-check-share-solution/spec spec candidate)))
+               (and (< (string-length candidate) (puzzle-spec-par spec))
+                    (coin-ok? checked)
+                    candidate)))))
 
     ;; This fixture only supplies a test solution because the CLI has no
     ;; solver. Commit aggregation, reveal aggregation, mining and submission
@@ -56,17 +70,14 @@
                      spec: (field context 'spec)
                      commits: '()))
              (spec (coin-share-puzzle coop pubkey))
-             (solution (golf (puzzle-spec-hidden-source spec)))
-             (checked (coin-check-share-solution/spec spec solution)))
+             (solution (semantic-share-source spec)))
         (node-close n)
-        (when (or (coin-failed? checked)
-                  (>= (string-length solution) (puzzle-spec-par spec)))
+        (when (not solution)
           (error (string-append
-                   "local-testnet: could not derive strictly under-par share work; hidden="
+                   "local-testnet: personalized task has no verified "
+                   "non-string semantic share candidate; hidden="
                    (puzzle-spec-hidden-source spec)
-                   " candidate=" solution
-                   " par=" (number->string (puzzle-spec-par spec))
-                   " candidate-bytes=" (number->string (string-length solution)))))
+                   " par=" (number->string (puzzle-spec-par spec)))))
         (println "~a" solution)))
 
     (define (main)

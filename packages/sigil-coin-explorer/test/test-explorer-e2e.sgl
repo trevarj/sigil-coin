@@ -26,6 +26,8 @@
         (sigil coin puzzle)
         (sigil coin puzzle generator)
         (sigil coin consensus)
+        (only (sigil coin consensus shares)
+              coin-check-share-solution/spec)
         (sigil coin node)
         (sigil coin explorer))
 
@@ -33,6 +35,9 @@
   (let ((dir (make-temp-directory)))
     (unless dir (error "test-explorer-e2e: could not create temp directory"))
     dir))
+
+(define (remove-tree dir)
+  (process-run "rm" "-rf" dir))
 
 (define (has? text part) (string-contains? text part))
 (define (seconds-now) (current-second))
@@ -45,6 +50,9 @@
           ((equal? address (explorer-output-address (car outputs)))
            (loop (cdr outputs) (+ total (explorer-output-value (car outputs)))))
           (else (loop (cdr outputs) total)))))
+
+(define (coinbase-total b)
+  (transaction-output-value (car (block-transactions b))))
 
 (define %miner-a "sgl1q70nakelv6wvuk2e63ah8lg68kq3nx7q2g3taul")
 (define %miner-b "sgl1qw508d6qejxtdg4y5r3zarvary0c5xw7kr43pwr")
@@ -103,12 +111,36 @@
              (list-ref (coin-result-value preview) 2)))
          shares)))
 
-;; Known short solutions for the personalized H1 tasks of keys 1 and 6. First
-;; remains valid with hostile source in a dead branch.
-(define %share-source-1
-  "(lambda(x)(if(equal? x \"@\")\"adbliemffghlbcgeeajjfndonfkklkafgfnhbobidegaeibjppjmbhpfojnfnnahip\"(cons x(list x x))))")
-(define %share-source-6
-  "(lambda(x)(if(equal? x \"@\")\"adpaagkbinfgfdmeonpfdjbppcdkgbpadppidncdhoiiaoogbbihpkjpdhjkacioak\"(+(* x 6)52)))")
+;; A personalized generated source has one exact reserved-string branch. All
+;; ordinary inputs here are non-strings, so broadening only that branch is a
+;; real semantic improvement rather than whitespace golf.
+(define %generated-anchor-predicate "(equal? x\"@\")")
+(define %semantic-anchor-predicate "(string? x)")
+
+(define (ordinary-inputs-non-string? spec)
+  (let loop ((pairs (puzzle-spec-examples spec)))
+    (cond
+      ((null? pairs) #f)
+      ((null? (cdr pairs))
+       (let ((anchor (car pairs)))
+         (and (string? (car anchor))
+              (string=? puzzle-anchor-input (car anchor))
+              (puzzle-anchor-output? (cdr anchor)))))
+      ((string? (car (car pairs))) #f)
+      (else (loop (cdr pairs))))))
+
+(define (semantic-share-source spec)
+  (let ((source (puzzle-spec-hidden-source spec)))
+    (and (ordinary-inputs-non-string? spec)
+         (= 1 (string-count source %generated-anchor-predicate))
+         (let* ((candidate
+                  (string-replace source %generated-anchor-predicate
+                                  %semantic-anchor-predicate))
+                (checked
+                  (coin-check-share-solution/spec spec candidate)))
+           (and (< (string-length candidate) (puzzle-spec-par spec))
+                (coin-ok? checked)
+                candidate)))))
 
 ;; Full-workspace harness omits optional native secp256k1; package harness
 ;; binds it and runs this integration suite.
@@ -132,11 +164,21 @@
                     %script-a
                     (+ coin-regtest-genesis-time %spacing)))
 (define %share-context (coin-parent-context %prototype-parent))
+(define (share-source-for secret-byte)
+  (let* ((secret (make-bytevector 32 secret-byte))
+         (pubkey (secp256k1-pubkey-create secret))
+         (source
+           (semantic-share-source
+             (coin-share-puzzle %share-context pubkey))))
+    (unless source
+      (error "test-explorer-e2e: key has no semantic share candidate"))
+    source))
 (define %shares
   (if %native-secp256k1?
       (sort-bytes
-        (list (signed-share 1 %share-source-1 %share-context %hostile-blind)
-              (signed-share 6 %share-source-6 %share-context
+        (list (signed-share 1 (share-source-for 1) %share-context
+                            %hostile-blind)
+              (signed-share 6 (share-source-for 6) %share-context
                             (make-bytevector 32 106)))
         coin-share-pubkey)
       '()))
@@ -224,7 +266,46 @@
                   (node-status-snapshot-validated-block-count
                     (car (cdr (cdr %node-built))))))
 
-  (test "explorer derives valid personalized shares, Q, carrier, and split"
+  (test "summary reports actual solo plus cooperative issuance"
+    (let ((issued (+ (coinbase-total %producer-block)
+                     (coinbase-total %coop-block)))
+          (scheduled (coin-cumulative-supply 2)))
+      (assert-equal (quotient (* 4 (coin-block-reward 1)) 5)
+                    (coinbase-total %producer-block))
+      (assert-equal (coin-block-reward 2) (coinbase-total %coop-block))
+      (with-store
+        (lambda (store)
+          (let ((summary (explorer-chain-summary store)))
+            (assert-equal issued (explorer-summary-supply summary))
+            (assert-equal coin-max-supply
+                          (explorer-summary-max-supply summary))
+            (assert-true (< issued scheduled)))))
+      (assert-equal issued (dict-get (json-of "/api/summary") "supply"))
+      (let ((page (body-of "/")))
+        (assert-true (has? page "issued supply"))
+        (assert-true (has? page "scheduled maximum supply"))
+        (assert-true (has? page "next scheduled subsidy")))))
+
+  (test "list reads leave share programs and payout previews unevaluated"
+    (with-store
+      (lambda (store)
+        (let* ((blocks (explorer-recent-blocks store 2))
+               (b (car blocks)))
+          (assert-equal 2 (explorer-block-height b))
+          (for-each
+            (lambda (share)
+              (assert-equal 'not-evaluated
+                            (explorer-share-problem share))
+              (assert-equal #f (explorer-share-contribution share))
+              (assert-equal #f (explorer-share-steps share))
+              (assert-equal #f (explorer-share-cells share)))
+            (explorer-block-shares b))
+          (for-each
+            (lambda (output)
+              (assert-equal #f (explorer-output-expected output)))
+            (explorer-block-outputs b))))))
+
+  (test "explorer derives valid personalized shares, Q, carrier, and payout"
     (let ((quality (preview-quality %share-context %shares)))
       ;; Explorer uses same pure preview: no share gains verified provenance.
       (for-each (lambda (share)
@@ -284,7 +365,9 @@
       (assert-true (has? page "<h2>Co-op shares</h2>"))
       (assert-true (has? page "aggregate Q"))
       (assert-true (has? page "carrier (the previous producer)"))
-      (assert-true (has? page "<h2>Reward split</h2>"))
+      (assert-true (has? page "<h2>Coinbase payout</h2>"))
+      (assert-true (has? page "actual coinbase total"))
+      (assert-true (has? page "scheduled subsidy"))
       (assert-true (has? page "personal par"))))
 
   (test "address balances come from live-node UTXOs"
@@ -300,6 +383,61 @@
                         (dict-get
                           (json-of (string-append "/api/address/" %miner-a))
                           "balance")))))))
+
+(test-group "active issued supply"
+  (test "issued supply follows the active branch through a reorg"
+    (let* ((dir (fresh-dir))
+           (n (node-open sigilcoin-regtest-chain dir))
+           (parent-header (block-header-field %producer-block))
+           (solution
+             (puzzle-spec-hidden-source
+               (coin-puzzle-for (block-header-hash parent-header)
+                                2
+                                coin-genesis-complexity)))
+           (solo-sibling
+             (coin-build-block
+               parent-header
+               2
+               coin-genesis-complexity
+               solution
+               "/solo-reorg/ shorter"
+               %script-b
+               (block-header-time (block-header-field %coop-block))))
+           (before (+ (coinbase-total %producer-block)
+                      (coinbase-total %coop-block)))
+           (after (+ (coinbase-total %producer-block)
+                     (coinbase-total solo-sibling))))
+      (assert-equal
+        -1
+        (coin-score-compare
+          (block-header-nonce (block-header-field solo-sibling))
+          (block-header-nonce (block-header-field %coop-block))))
+      (assert-equal 1 (submit-block n %producer-block))
+      (assert-equal 1 (submit-block n %coop-block))
+      (let ((store (explorer-open sigilcoin-regtest-chain dir)))
+        (assert-equal before
+                      (explorer-summary-supply
+                        (explorer-chain-summary store)))
+        (explorer-close store))
+      ;; The shorter producer solution replaces the unsettled cooperative
+      ;; sibling; only its solo 80% output remains active at height 2.
+      (assert-equal 1 (submit-block n solo-sibling))
+      (assert-equal (block-header-hash (block-header-field solo-sibling))
+                    (block-header-hash (node-best-header n)))
+      (let ((store (explorer-open sigilcoin-regtest-chain dir)))
+        (let ((summary (explorer-chain-summary store)))
+          (assert-equal after (explorer-summary-supply summary))
+          (assert-true
+            (< (explorer-summary-supply summary)
+               (coin-cumulative-supply 2)))
+          (assert-equal coin-max-supply
+                        (explorer-summary-max-supply summary)))
+        (explorer-close store))
+      (assert-true (< after before))
+      (assert-equal (quotient (* 4 (coin-block-reward 2)) 5)
+                    (coinbase-total solo-sibling))
+      (node-close n)
+      (remove-tree dir))))
 
 (test-group "consensus-valid hostile block stays inert"
   (test "hostile share, program, author, and UTF-8 reached validated block"

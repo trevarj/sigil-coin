@@ -360,6 +360,60 @@
     ;; Repair
     ;; ============================================================
 
+    ;; Remove only lexically redundant whitespace from generated source.
+    ;; The reverse character accumulator makes the scan linear, and string
+    ;; mode keeps data and escapes byte-for-byte unchanged.
+    (define (tighten-source source)
+      (letrec ((whitespace?
+                 (lambda (c)
+                   (or (char=? c #\space) (char=? c #\tab)
+                       (char=? c #\newline) (char=? c #\return))))
+               (delimiter?
+                 (lambda (c)
+                   (or (char=? c #\() (char=? c #\))
+                       (char=? c #\") (char=? c #\'))))
+               (bare-token?
+                 (lambda (c)
+                   (and (not (whitespace? c)) (not (delimiter? c)))))
+               (skip-whitespace
+                 (lambda (i n)
+                   (if (and (< i n)
+                            (whitespace? (string-ref source i)))
+                       (skip-whitespace (+ i 1) n)
+                       i))))
+        (let ((n (string-length source)))
+          (let loop ((i 0) (in-string? #f) (out '()))
+            (cond
+              ((>= i n) (list->string (reverse out)))
+              (in-string?
+                (let ((c (string-ref source i)))
+                  (cond
+                    ((char=? c #\\)
+                     (if (< (+ i 1) n)
+                         (loop (+ i 2) #t
+                               (cons (string-ref source (+ i 1))
+                                     (cons c out)))
+                         (loop (+ i 1) #t (cons c out))))
+                    ((char=? c #\")
+                     (loop (+ i 1) #f (cons c out)))
+                    (else
+                      (loop (+ i 1) #t (cons c out))))))
+              (else
+                (let ((c (string-ref source i)))
+                  (cond
+                    ((char=? c #\")
+                     (loop (+ i 1) #t (cons c out)))
+                    ((whitespace? c)
+                     (let ((next (skip-whitespace (+ i 1) n)))
+                       (loop next #f
+                             (if (and (pair? out) (< next n)
+                                      (bare-token? (car out))
+                                      (bare-token? (string-ref source next)))
+                                 (cons #\space out)
+                                 out))))
+                    (else
+                      (loop (+ i 1) #f (cons c out)))))))))))
+
     ;;; Wrap a one-argument body in the lambda that constraint `ci` demands.
     ;;;
     ;;; This is the repair transform: `letrec-required` and `fold-required`
@@ -374,14 +428,15 @@
     ;;; ```scheme
     ;;; (puzzle-constraint-wrap 0 "(list x x)") ; => "(lambda(x)(list x x))"
     ;;; (puzzle-constraint-wrap 7 "x")
-    ;;; ; => "(lambda(x)(fold(lambda(a b)a)x '()))"
+    ;;; ; => "(lambda(x)(fold(lambda(a b)a)x'()))"
     ;;; ```
     (define (puzzle-constraint-wrap ci body)
       (: integer? string? -> string?)
       (check-constraint ci)
-      (cond
-        ((= ci 3)
-         (string-append "(lambda(x)(letrec((f(lambda(y)y)))(f " body ")))"))
-        ((= ci 7)
-         (string-append "(lambda(x)(fold(lambda(a b)a)" body " '()))"))
-        (else (string-append "(lambda(x)" body ")"))))))
+      (tighten-source
+        (cond
+          ((= ci 3)
+           (string-append "(lambda(x)(letrec((f(lambda(y)y)))(f " body ")))"))
+          ((= ci 7)
+           (string-append "(lambda(x)(fold(lambda(a b)a)" body " '()))"))
+          (else (string-append "(lambda(x)" body ")")))))))

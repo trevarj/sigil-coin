@@ -87,9 +87,11 @@
 
     ;;; Most example pairs a puzzle may carry.
     ;;;
-    ;;; Frozen at 8 by measurement, not taste: see `puzzle-complexity-k`. The
-    ;;; consensus layer re-exports this bound, so the two must agree.
+    ;;; Frozen at 8 as part of the complexity schedule. Tightening generated
+    ;;; witnesses increases its source-cap margin without changing this
+    ;;; consensus-visible example count.
     (define puzzle-max-k 8)
+
 
     ;;; Largest canonical literal, in bytes, an example input may print to.
     (define puzzle-max-input-literal-bytes 8)
@@ -166,18 +168,18 @@
     ;;; Example count `k` for a complexity, in `[3, 8]`.
     ;;;
     ;;; `k` is the slower of the two difficulty knobs on purpose: each extra
-    ;;; pair lengthens the guaranteed table solution by `18 + |i| + |o|`
-    ;;; bytes, and the table is what bounds the whole scheme against
-    ;;; `puzzle-max-source-bytes`. Difficulty is meant to come from `w`.
+    ;;; pair lengthens the tightened guaranteed table solution by
+    ;;; `16 + |i| + |o|` bytes, and the table is what bounds the whole scheme
+    ;;; against `puzzle-max-source-bytes`. Difficulty is meant to come from
+    ;;; `w`.
     ;;;
-    ;;; The ceiling is 8 and not 10 because 10 does not fit. Measured at the
-    ;;; literal caps, the table runs 515 bytes under the `letrec` repair and
-    ;;; 510 under `fold`, against a 512-byte limit: one is already infeasible
-    ;;; and the other leaves two bytes. At `k = 8` the global worst case is
-    ;;; 415 bytes; a personalized table's 66-character full-key anchor raises
-    ;;; its exact bound to 458 bytes, leaving 54 spare. The generator rejects
-    ;;; an oversized table rather than publish an unsolvable puzzle. The
-    ;;; frozen ceiling leaves margin for another bounded repair wrapper.
+    ;;; The ceiling remains frozen at 8 even though tightening creates more
+    ;;; headroom. At the literal caps, a ten-pair table is now 496 bytes under
+    ;;; the widest `letrec` repair and 491 under `fold`. At `k = 8` the
+    ;;; global worst case is 400 bytes; a personalized table's 66-character
+    ;;; full-key anchor raises its exact bound to 443 bytes, leaving 69 spare.
+    ;;; Changing the example ceiling would alter the established complexity
+    ;;; schedule, so the extra margin stays a safety reserve.
     ;;;
     ;;; ```scheme
     ;;; (puzzle-complexity-k 128) ; => 3
@@ -538,7 +540,7 @@
     ;;;
     ;;; ```scheme
     ;;; (puzzle-table-solution 0 '((1 . a) (2 . b)))
-    ;;; ; => "(lambda(x)(if(equal? x '1)'a 'b))"
+    ;;; ; => "(lambda(x)(if(equal? x'1)'a'b))"
     ;;; ```
     (define (puzzle-table-solution ci pairs)
       (: integer? list? -> any?)
@@ -958,7 +960,7 @@
     ;;;
     ;;; ```scheme
     ;;; (puzzle-spec-hidden-source (puzzle-fallback 3 128))
-    ;;; ; => "(lambda(x)(list x (* x x)))"
+    ;;; ; => "(lambda(x)(list x(* x x)))"
     ;;; ```
     (define (puzzle-fallback height complexity)
       (: integer? integer? -> puzzle-spec?)

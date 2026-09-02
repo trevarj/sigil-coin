@@ -12,6 +12,7 @@
         (sigil error)
         (sigil string)
         (sigil math)
+        (sigil time)
         (sigil bitcoin utils)
         (sigil bitcoin encoding)
         (sigil bitcoin tx)
@@ -21,6 +22,8 @@
         (sigil coin puzzle)
         (sigil coin puzzle generator)
         (sigil coin consensus)
+        (only (sigil coin consensus shares)
+              coin-check-share-solution/spec)
         (sigil coin node)
         (sigil coin node rules)
         (sigil coin node body)
@@ -159,42 +162,57 @@
                    blind: (make-bytevector 32 (+ n 100))
                    solution: bytes)))
 
-;; Remove safe spaces adjacent to parentheses, producing a strict under-par
-;; equivalent of each generated personalized source.
-(define (golf-source source)
-  (let loop ((text source) (i 1))
-    (if (>= i (- (string-length text) 1))
-        text
-        (if (and (char=? #\space (string-ref text i))
-                 (or (char=? #\( (string-ref text (+ i 1)))
-                     (char=? #\) (string-ref text (- i 1)))))
-            (loop (string-append (substring text 0 i)
-                                 (substring text (+ i 1)
-                                            (string-length text)))
-                  i)
-            (loop text (+ i 1))))))
+;; A personalized hidden witness contains one exact reserved-string branch.
+;; It can be shortened semantically only when broadening that branch cannot
+;; capture an ordinary example.
+(define %generated-anchor-predicate "(equal? x\"@\")")
+(define %semantic-anchor-predicate "(string? x)")
+
+(define (ordinary-inputs-non-string? spec)
+  (let loop ((pairs (puzzle-spec-examples spec)))
+    (cond
+      ((null? pairs) #f)
+      ((null? (cdr pairs))
+       (let ((anchor (car pairs)))
+         (and (string? (car anchor))
+              (string=? puzzle-anchor-input (car anchor))
+              (puzzle-anchor-output? (cdr anchor)))))
+      ((string? (car (car pairs))) #f)
+      (else (loop (cdr pairs))))))
+
+(define (semantic-share-source spec)
+  (let ((source (puzzle-spec-hidden-source spec)))
+    (and (ordinary-inputs-non-string? spec)
+         (= 1 (string-count source %generated-anchor-predicate))
+         (let* ((candidate
+                  (string-replace source %generated-anchor-predicate
+                                  %semantic-anchor-predicate))
+                (checked
+                  (coin-check-share-solution/spec spec candidate)))
+           (and (< (string-length candidate) (puzzle-spec-par spec))
+                (coin-ok? checked)
+                candidate)))))
 
 (define (generated-share n context)
   (let* ((pubkey (secp256k1-pubkey-create (make-bytevector 32 n)))
          (spec (coin-share-puzzle context pubkey))
-         (source (golf-source (puzzle-spec-hidden-source spec))))
-    (and (< (string-length source) (puzzle-spec-par spec))
-         (coin-ok? (coin-check-solution spec source))
-         (signed-share n source context))))
+         (source (semantic-share-source spec)))
+    (and source (signed-share n source context))))
 
 (define (generated-shares count context)
   (let loop ((n 1) (out '()))
-    (if (= count (length out))
-        (sort-bytes out coin-share-pubkey)
+    (cond
+      ((= count (length out)) (sort-bytes out coin-share-pubkey))
+      ((> n 255)
+       (error "test-node: fewer than eight semantic share candidates"))
+      (else
         (let ((candidate (generated-share n context)))
-          (if (> n 255)
-              (error "test-node: fewer than eight personalized golfs")
-              (loop (+ n 1)
-                    (if (and candidate
-                             (not (member (coin-share-solution candidate)
-                                          (map coin-share-solution out))))
-                        (cons candidate out)
-                        out)))))))
+          (loop (+ n 1)
+                (if (and candidate
+                         (not (member (coin-share-solution candidate)
+                                      (map coin-share-solution out))))
+                    (cons candidate out)
+                    out)))))))
 
 (define (message-of err)
   (let ((message (exception-message err)))
@@ -266,13 +284,27 @@
 ;; ============================================================
 
 (test-group "sigilcoin ranking key"
-  (test "a lower score word is a larger saving"
+  (test "a lower projected producer word is a larger saving"
     (assert-equal #x100000000 (coin-score-saving 0))
     (assert-true (> (coin-score-saving (coin-score-pack 24 0 0 0))
-                    (coin-score-saving (coin-score-pack 25 0 0 0))))
+                    (coin-score-saving (coin-score-pack 25 0 0 15))))
     ;; An illegal word scores the reserved rejected value.
     (assert-equal 0 (coin-score-saving 1))
     (assert-equal 0 (coin-score-saving "24")))
+
+  (test "authenticated Q is erased from saving and chain work"
+    (let* ((q0 (coin-score-pack 40 3 9 0))
+           (q15 (coin-score-pack 40 3 9 15))
+           (header0 (block-header %header1 nonce: q0))
+           (header15 (block-header %header1 nonce: q15)))
+      (assert-true (not (= q0 q15)))
+      (assert-equal 0 (coin-score-quality (coin-score-decode q0)))
+      (assert-equal 15 (coin-score-quality (coin-score-decode q15)))
+      (assert-equal (coin-score-rank-word q0)
+                    (coin-score-rank-word q15))
+      (assert-equal (coin-score-saving q0) (coin-score-saving q15))
+      (assert-equal (coin-chain-work header0 #f 0)
+                    (coin-chain-work header15 #f 0))))
 
   (test "the two digits round-trip"
     (assert-equal (+ #x100000000 1) coin-rank-base)
@@ -306,38 +338,36 @@
                    (candidate-claiming 1 (coin-score-pack 24 0 0 0)
                                        (hash-of 1) #f))))
 
-  (test "at equal height the lower score word wins"
+  (test "at equal height the lower projected producer rank wins"
     (let ((better (candidate-claiming 5 (coin-score-pack 24 0 0 0)
                                       (hash-of 9) #f))
-          (worse (candidate-claiming 5 (coin-score-pack 25 0 0 0)
+          (worse (candidate-claiming 5 (coin-score-pack 25 0 0 15)
                                      (hash-of 1) #f)))
       (assert-true (coin-better-chain? better worse))
       (assert-equal #f (coin-better-chain? worse better))))
 
-  (test "shares break a tie the producer's own solution leaves"
-    ;; Share count occupies strictly lower-order bits than every producer
-    ;; field, so it decides exactly the comparisons the program leaves tied.
-    (let ((with-shares (candidate-claiming 5 (coin-score-pack 40 3 9 2)
+  (test "share quality cannot break a producer-rank tie"
+    (let ((with-shares (candidate-claiming 5 (coin-score-pack 40 3 9 15)
                                            (hash-of 1) #f))
           (without (candidate-claiming 5 (coin-score-pack 40 3 9 0)
                                        (hash-of 2) #f))
           (shorter (candidate-claiming 5 (coin-score-pack 39 3 9 0)
                                        (hash-of 3) #f)))
-      (assert-true (coin-better-chain? with-shares without))
-      ;; And never outranks a genuinely better program.
+      (assert-equal #f (coin-better-chain? with-shares without))
+      (assert-equal #f (coin-better-chain? without with-shares))
+      ;; Producer fields remain strict regardless of Q.
       (assert-true (coin-better-chain? shorter with-shares))
       (assert-equal #f (coin-better-chain? with-shares shorter))))
 
   (test "the block-hash tie-break is gone"
-    ;; A block-hash tie-break would make 400 graffiti bytes grindable. An
-    ;; equal score word therefore never displaces the incumbent, whatever the
-    ;; hashes are.
-    (let ((low (candidate-claiming 5 (coin-score-pack 40 0 0 0)
-                                   (hash-of 1) #f))
-          (high (candidate-claiming 5 (coin-score-pack 40 0 0 0)
-                                    (hash-of 200) #f)))
-      (assert-equal #f (coin-better-chain? low high))
-      (assert-equal #f (coin-better-chain? high low))))
+    ;; Different raw Q words share one projected rank, so neither sibling can
+    ;; displace the incumbent regardless of its hash.
+    (let ((low-hash (candidate-claiming 5 (coin-score-pack 40 0 0 0)
+                                        (hash-of 1) #f))
+          (high-hash (candidate-claiming 5 (coin-score-pack 40 0 0 15)
+                                         (hash-of 200) #f)))
+      (assert-equal #f (coin-better-chain? low-hash high-hash))
+      (assert-equal #f (coin-better-chain? high-hash low-hash))))
 
   (test "a height a taller header outgrew stays settled"
     (assert-equal #f
@@ -579,7 +609,10 @@
     (assert-equal #f (accept? (list %genesis) 42))
     (assert-equal #f (accept? (list %genesis) "soon"))
     (assert-error (coin-header-rules -1))
-    (assert-true (header-rules? (coin-header-rules %spacing)))))
+    (assert-error (coin-header-rules %spacing -1))
+    (assert-error (coin-header-rules %spacing 300 0))
+    (assert-true (header-rules? (coin-header-rules %spacing)))
+    (assert-true (header-rules? (coin-header-rules %spacing 300)))))
 
 ;; ============================================================
 ;; The coinbase payload codec and the co-op seam
@@ -689,10 +722,10 @@
     ;; so reaching this at all is the whole assertion.
     (let ((utxos (connect 1 %block1)))
       (assert-true (not (eq? #f utxos)))
-      ;; One coinbase output, worth exactly the height-1 subsidy.
+      ;; A solo block has one output and leaves one fifth of subsidy unminted.
       (assert-equal 1 (length (transaction-outputs
                                 (car (block-transactions %block1)))))
-      (assert-equal (coin-block-reward 1)
+      (assert-equal (quotient (* 4 (coin-block-reward 1)) 5)
                     (transaction-output-value
                       (car (block-transactions %block1))))))
 
@@ -829,10 +862,31 @@
     (assert-equal coin-regtest-genesis-header-constant
                   (coin-genesis-header-hex coin-regtest-genesis-quote
                                               coin-regtest-genesis-time))
+    (assert-equal coin-testnet-genesis-header-constant
+                  (coin-genesis-header-hex coin-testnet-genesis-quote
+                                           coin-testnet-genesis-time))
     (assert-equal 160 (string-length coin-genesis-header-constant))
+    (assert-equal 160 (string-length coin-testnet-genesis-header-constant))
+    (assert-equal 160 (string-length coin-regtest-genesis-header-constant))
+    (assert-equal coin-genesis-header-constant
+                  (hex-encode
+                    (block-header-serialize
+                      (chain-config-genesis-header sigilcoin-main-chain))))
+    (assert-equal coin-testnet-genesis-header-constant
+                  (hex-encode
+                    (block-header-serialize
+                      (chain-config-genesis-header sigilcoin-testnet-chain))))
+    (assert-equal coin-regtest-genesis-header-constant
+                  (hex-encode
+                    (block-header-serialize
+                      (chain-config-genesis-header sigilcoin-regtest-chain))))
     (assert-equal coin-genesis-id-constant
                   (block-header-id (coin-genesis-header coin-genesis-quote
                                                            coin-genesis-time)))
+    (assert-equal coin-testnet-genesis-id-constant
+                  (block-header-id
+                    (coin-genesis-header coin-testnet-genesis-quote
+                                         coin-testnet-genesis-time)))
     (assert-equal coin-regtest-genesis-id-constant
                   (block-header-id %genesis))
     ;; A different quote is a different genesis, so regenerating after the
@@ -915,18 +969,14 @@
   (guard (err (#t #f))
     (and (secp256k1-seckey-verify? (make-bytevector 32 1)) #t)))
 
-;; Two deterministic pubkeys whose personalized tasks have a shorter golf.
+;; Select the first two deterministic keys with genuine semantic
+;; improvements; string-domain tasks are unavailable rather than golfed.
 (define %share-context0 (coin-parent-context %block1))
-(define %share-source-1
-  "(lambda(x)(if(equal? x \"@\")\"adbliemffghlbcgeeajjfndonfkklkafgfnhbobidegaeibjppjmbhpfojnfnnahip\"(cons x(list x x))))")
-(define %share-source-6
-  "(lambda(x)(if(equal? x \"@\")\"adpaagkbinfgfdmeonpfdjbppcdkgbpadppidncdhoiiaoogbbihpkjpdhjkacioak\"(+(* x 6)52)))")
 (define %coop-shares
   (if %native-secp256k1?
-      (sort-bytes (list (signed-share 1 %share-source-1 %share-context0)
-                        (signed-share 6 %share-source-6 %share-context0))
-                  coin-share-pubkey)
+      (generated-shares 2 %share-context0)
       '()))
+
 (define %coop-commitments
   (sort-bytes
     (map (lambda (share)
@@ -972,6 +1022,17 @@
           ((= i 0) (cons value (cdr ys)))
           (else (cons (car ys) (loop (cdr ys) (- i 1)))))))
 
+(define (block-with-outputs b outputs)
+  (let ((coinbase (car (block-transactions b))))
+    (block-with-coinbase
+      b (transaction coinbase outputs: outputs))))
+
+(define (sum-integers xs)
+  (let loop ((ys xs) (total 0))
+    (if (null? ys)
+        total
+        (loop (cdr ys) (+ total (car ys))))))
+
 (define (submit-block n b)
   (node-ingest-headers n (list (block-header-field b)))
   (node-store-block n b)
@@ -1001,28 +1062,86 @@
       (assert-equal (map coin-share-solution %coop-shares)
                     (map coin-share-solution accepted))))
 
-  (test "commitments at H authorize reveals and exact payouts at H+1"
-    (let* ((parent-utxos (connect/parent 1 %coop-parent %genesis-block '()))
-           (outputs (transaction-outputs
-                      (car (block-transactions %coop-block))))
-           (unit (coin-split-unit (coin-block-reward 2) 2)))
+  (test "commitments authorize reveals and contribution-weighted payouts"
+    (let* ((parent-utxos
+             (connect/parent 1 %coop-parent %genesis-block '()))
+           (coinbase (car (block-transactions %coop-block)))
+           (payload
+             (coin-result-value
+               (coin-block-coinbase-payload %coop-block)))
+           (verified-result (coin-check-coop payload %coop-context))
+           (verified-shares (coin-result-value verified-result))
+           (contributions
+             (map
+               (lambda (share)
+                 (coin-share-quality %coop-context share))
+               verified-shares))
+           (subsidy (coin-block-reward 2))
+           (carrier-value (quotient subsidy 20))
+           (share-pool (quotient subsidy 10))
+           (contribution-total (sum-integers contributions))
+           (share-values
+             (map
+               (lambda (contribution)
+                 (quotient (* share-pool contribution)
+                           contribution-total))
+               contributions))
+           (producer-value
+             (- subsidy carrier-value (sum-integers share-values)))
+           (expected-values
+             (append (list producer-value)
+                     share-values
+                     (list carrier-value)))
+           (outputs (transaction-outputs coinbase)))
+      (assert-true (coin-ok? verified-result))
       (assert-equal 4 (length outputs))
-      ;; Producer weight 2, two share weights, one carrier weight.
-      (assert-equal (* 2 unit) (txout-value (list-ref outputs 0)))
-      (assert-equal unit (txout-value (list-ref outputs 1)))
-      (assert-equal unit (txout-value (list-ref outputs 2)))
-      (assert-equal unit (txout-value (list-ref outputs 3)))
+      (assert-equal expected-values (map txout-value outputs))
       (assert-equal (coin-share-script
                       (coin-share-pubkey (list-ref %coop-shares 0)))
                     (txout-script-pubkey (list-ref outputs 1)))
+      (assert-equal (coin-share-script
+                      (coin-share-pubkey (list-ref %coop-shares 1)))
+                    (txout-script-pubkey (list-ref outputs 2)))
       (assert-equal (coin-carrier-script %coop-parent)
                     (txout-script-pubkey (list-ref outputs 3)))
       (assert-true (not (eq? #f
                              (connect/parent 2 %coop-block %coop-parent
                                              parent-utxos))))
-      ;; One personalized derivation/signature/PBE per accepted pubkey. Q
-      ;; consumes verified reports rather than deriving or evaluating again.
+      ;; One personalized derivation/signature/PBE per accepted pubkey.
+      ;; Exact payouts and Q both reuse those verified reports.
       (assert-equal '(2 2 2) (coin-body-validation-stats))))
+
+  (test "lower coinbase construction keeps contributions aligned and routes residuals"
+    (let* ((subsidy (coin-block-reward 2))
+           (fees 7)
+           (contributions '(1 2))
+           (carrier (coin-carrier-script %coop-parent))
+           (coinbase
+             (coin-mining-coinbase/coop
+               2 #u8(120) %coop-shares contributions '() "weighted"
+               %payout carrier fees))
+           (outputs (transaction-outputs coinbase))
+           (share-pool (quotient subsidy 10))
+           (carrier-value (quotient subsidy 20))
+           (share-a (quotient share-pool 3))
+           (share-b (quotient (* share-pool 2) 3))
+           (residual (- share-pool share-a share-b))
+           (producer-target (- subsidy carrier-value share-pool))
+           (expected
+             (list (+ producer-target fees residual)
+                   share-a share-b carrier-value)))
+      (assert-true (> residual 0))
+      (assert-equal expected (map txout-value outputs))
+      (assert-equal (coin-share-script
+                      (coin-share-pubkey (list-ref %coop-shares 0)))
+                    (txout-script-pubkey (list-ref outputs 1)))
+      (assert-equal (coin-share-script
+                      (coin-share-pubkey (list-ref %coop-shares 1)))
+                    (txout-script-pubkey (list-ref outputs 2)))
+      (assert-equal carrier
+                    (txout-script-pubkey (list-ref outputs 3)))
+      (assert-equal (+ subsidy fees)
+                    (transaction-output-value coinbase))))
 
   (test "bad producer rejects eight valid shares before share examples"
     (let* ((shares (generated-shares 8 %share-context0))
@@ -1099,55 +1218,132 @@
                       commits: %coop-commitments)))
         (assert-true (coin-failed? (coin-check-coop payload wrong))))))
 
-  (test "wrong carrier, split, and Q are rejected"
-    (let* ((parent-utxos (connect/parent 1 %coop-parent %genesis-block '()))
+  (test "cheap payout failures precede all share puzzle work"
+    (let* ((parent-utxos
+             (connect/parent 1 %coop-parent %genesis-block '()))
            (coinbase (car (block-transactions %coop-block)))
            (outputs (transaction-outputs coinbase))
-           (last (list-ref outputs 3))
-           (wrong-carrier
-             (block-with-coinbase
-               %coop-block
-               (transaction coinbase
-                            outputs: (replace-at
-                                       outputs 3
-                                       (txout last script-pubkey: #u8(#x6a))))))
            (producer (list-ref outputs 0))
            (share (list-ref outputs 1))
-           (wrong-values
-             (block-with-coinbase
+           (carrier (list-ref outputs 3))
+           (wrong-count
+             (block-with-outputs %coop-block (cdr outputs)))
+           (wrong-share-script
+             (block-with-outputs
                %coop-block
-               (transaction
-                 coinbase
-                 outputs: (replace-at
-                            (replace-at outputs 0
-                                        (txout producer
-                                               value: (+ 1
-                                                         (txout-value producer))))
-                            1
-                            (txout share value: (- (txout-value share) 1))))))
+               (replace-at
+                 outputs 1 (txout share script-pubkey: %payout))))
+           (wrong-carrier-script
+             (block-with-outputs
+               %coop-block
+               (replace-at
+                 outputs 3 (txout carrier script-pubkey: #u8(#x6a)))))
+           (wrong-carrier-value
+             (block-with-outputs
+               %coop-block
+               (replace-at
+                 (replace-at
+                   outputs 0
+                   (txout producer value: (- (txout-value producer) 1)))
+                 3
+                 (txout carrier value: (+ (txout-value carrier) 1)))))
+           (wrong-total
+             (block-with-outputs
+               %coop-block
+               (replace-at
+                 outputs 0
+                 (txout producer value: (+ (txout-value producer) 1))))))
+      (assert-true
+        (raises-containing?
+          (lambda ()
+            (connect/parent
+              2 wrong-count %coop-parent parent-utxos))
+          "coinbase-output-shape"))
+      (assert-equal '(0 0 0) (coin-body-validation-stats))
+      (assert-true
+        (raises-containing?
+          (lambda ()
+            (connect/parent
+              2 wrong-share-script %coop-parent parent-utxos))
+          "coinbase-output-shape"))
+      (assert-equal '(0 0 0) (coin-body-validation-stats))
+      (assert-true
+        (raises-containing?
+          (lambda ()
+            (connect/parent
+              2 wrong-carrier-script %coop-parent parent-utxos))
+          "coinbase-output-shape"))
+      (assert-equal '(0 0 0) (coin-body-validation-stats))
+      (assert-true
+        (raises-containing?
+          (lambda ()
+            (connect/parent
+              2 wrong-carrier-value %coop-parent parent-utxos))
+          "coinbase-output-value"))
+      (assert-equal '(0 0 0) (coin-body-validation-stats))
+      (assert-true
+        (raises-containing?
+          (lambda ()
+            (connect/parent
+              2 wrong-total %coop-parent parent-utxos))
+          "coinbase-output-value"))
+      (assert-equal '(0 0 0) (coin-body-validation-stats))))
+
+  (test "weighted misallocation rejects only after verified reports exist"
+    (let* ((parent-utxos
+             (connect/parent 1 %coop-parent %genesis-block '()))
+           (coinbase (car (block-transactions %coop-block)))
+           (outputs (transaction-outputs coinbase))
+           (share-a (list-ref outputs 1))
+           (share-b (list-ref outputs 2))
+           (wrong-coinbase
+             (transaction
+               coinbase
+               outputs:
+                 (replace-at
+                   (replace-at
+                     outputs 1
+                     (txout share-a
+                            value: (- (txout-value share-a) 1)))
+                   2
+                   (txout share-b
+                          value: (+ (txout-value share-b) 1)))))
+           (wrong-allocation
+             (block-with-coinbase %coop-block wrong-coinbase))
+           (carrier (coin-carrier-script %coop-parent))
+           (subsidy (coin-block-reward 2)))
+      ;; Count, scripts, carrier value and total remain cheap-valid.
+      (assert-true
+        (coin-ok?
+          (coin-check-payout-cheap
+            wrong-coinbase subsidy 0 %coop-shares carrier)))
+      (assert-true
+        (raises-containing?
+          (lambda ()
+            (connect/parent
+              2 wrong-allocation %coop-parent parent-utxos))
+          "coinbase-output-value"))
+      ;; Exact allocation requires every accepted report, but reads each once.
+      (assert-equal '(2 2 2) (coin-body-validation-stats))))
+
+  (test "aggregate Q mismatch is rejected after verified payouts"
+    (let* ((parent-utxos
+             (connect/parent 1 %coop-parent %genesis-block '()))
            (score (coin-score-decode
                     (coin-header-score (block-header-field %coop-block))))
            (wrong-q
              (with-nonce
                %coop-block
-               (coin-score-pack (coin-score-length score)
-                                   (coin-score-memory score)
-                                   (coin-score-steps score)
-                                   0))))
-      (assert-true (raises-containing?
-                     (lambda () (connect/parent 2 wrong-carrier %coop-parent
-                                                parent-utxos))
-                     "coinbase-output-shape"))
-      ;; Exact carrier/split shape rejects before signature or puzzle work.
-      (assert-equal '(0 0 0) (coin-body-validation-stats))
-      (assert-true (raises-containing?
-                     (lambda () (connect/parent 2 wrong-values %coop-parent
-                                                parent-utxos))
-                     "coinbase-output-value"))
-      (assert-true (raises-containing?
-                     (lambda () (connect/parent 2 wrong-q %coop-parent
-                                                parent-utxos))
-                     "score-mismatch"))))
+               (coin-score-pack
+                 (coin-score-length score)
+                 (coin-score-memory score)
+                 (coin-score-steps score)
+                 0))))
+      (assert-true
+        (raises-containing?
+          (lambda ()
+            (connect/parent 2 wrong-q %coop-parent parent-utxos))
+          "score-mismatch"))))
 
   (test "16 KiB gate runs before hostile body work"
     (let* ((huge-tx
@@ -1180,6 +1376,55 @@
                      "block-oversize")))))
 
 (test-group "sigilcoin canonical live node"
+  (test "Q-neutral rank survives header persistence and restart"
+    (let* ((dir (make-temp-directory))
+           (q0-word (coin-score-pack 40 3 9 0))
+           (q15-word (coin-score-pack 40 3 9 15))
+           (q0-header
+             (block-header
+               version: coin-header-version
+               previous-block: (block-header-hash %header1)
+               merkle-root: (make-bytevector 32 10)
+               time: (+ (block-header-time %header1) %spacing)
+               bits: coin-genesis-bits
+               nonce: q0-word))
+           (q15-header
+             (block-header q0-header
+                           merkle-root: (make-bytevector 32 15)
+                           nonce: q15-word))
+           (saved-work #f)
+           (saved-hash (hex-encode (block-header-hash q0-header)))
+           (n (node-open sigilcoin-regtest-chain dir)))
+      (assert-true (not (= q0-word q15-word)))
+      (assert-equal (coin-score-rank-word q0-word)
+                    (coin-score-rank-word q15-word))
+      (assert-equal (coin-score-saving q0-word)
+                    (coin-score-saving q15-word))
+      (assert-equal 1 (submit-block n %block1))
+      (let ((parent-work
+              (node-status-snapshot-best-work (node-status n))))
+        (assert-equal (coin-chain-work q0-header #f parent-work)
+                      (coin-chain-work q15-header #f parent-work)))
+      (assert-equal 1 (node-ingest-headers n (list q0-header)))
+      (assert-equal 1 (node-ingest-headers n (list q15-header)))
+      ;; First-seen Q0 remains the persisted best header although raw Q15 W
+      ;; would be numerically lower without projection.
+      (assert-equal saved-hash
+                    (node-status-snapshot-best-hash (node-status n)))
+      (set! saved-work
+            (node-status-snapshot-best-work (node-status n)))
+      (assert-equal (coin-score-saving q0-word)
+                    (coin-rank-tip-saving saved-work))
+      (node-close n)
+      (let ((reopened (node-open sigilcoin-regtest-chain dir)))
+        (assert-equal saved-hash
+                      (node-status-snapshot-best-hash
+                        (node-status reopened)))
+        (assert-equal saved-work
+                      (node-status-snapshot-best-work
+                        (node-status reopened)))
+        (node-close reopened))))
+
   (test "configured genesis validates H1 and durable H validates H+1 after restart"
     (let ((dir (make-temp-directory)))
       ;; H1 receives trusted configured genesis because generic node's genesis
@@ -1244,6 +1489,10 @@
 ;; Public testnet chain
 ;; ============================================================
 
+;; Frozen previous public-testnet genesis. The reset must never adopt it.
+(define %previous-public-testnet-genesis-header-hex
+  "050000000000000000000000000000000000000000000000000000000000000000000000c2dae5665d3349784ed7b82fb085c470971e33a3999e26e96d6dbd0dc31ba1198015966a80007f20f0a55516")
+
 (define (chain-extension-ref chain extension key)
   (let ((entry (assq key (chain-config-extension chain extension '()))))
     (and (pair? entry) (cdr entry))))
@@ -1255,9 +1504,9 @@
            (header (block-header-field built))
            (coinbase (car (block-transactions built)))
            (outputs (transaction-outputs coinbase)))
-      (assert-equal "SigilCoin private testnet - 2026-09-01"
+      (assert-equal "SigilCoin public testnet reset - 2026-09-02"
                     coin-testnet-genesis-quote)
-      (assert-equal 1788220800 coin-testnet-genesis-time)
+      (assert-equal 1788307200 coin-testnet-genesis-time)
       (assert-equal coin-testnet-genesis-header-constant
                     (coin-genesis-header-hex coin-testnet-genesis-quote
                                              coin-testnet-genesis-time))
@@ -1270,13 +1519,33 @@
       (assert-equal #u8(#x6a) (txout-script-pubkey (car outputs)))
       (assert-true (block-merkle-root-valid? built))))
 
+  (test "the previous public-testnet genesis is foreign to the reset chain"
+    (let* ((old-header
+             (block-header-parse
+               (hex-decode %previous-public-testnet-genesis-header-hex)))
+           (configured
+             (chain-config-genesis-header sigilcoin-testnet-chain))
+           (dir (make-temp-directory))
+           (n (node-open sigilcoin-testnet-chain dir)))
+      (assert-equal "953c60759643c0701ea19e52d9e97bf57ed4fe1295830545ca7244757a3921a1"
+                    (block-header-id old-header))
+      (assert-false
+        (equal? (block-header-hash old-header)
+                (chain-config-genesis-hash sigilcoin-testnet-chain)))
+      (assert-error (node-ingest-headers n (list old-header)))
+      (assert-equal (block-header-hash configured)
+                    (block-header-hash (node-best-header n)))
+      (node-close n)))
+
   (test "the network config is exact and canonical policy stays intact"
     (assert-equal "sigilcoin-testnet"
                   (chain-config-name sigilcoin-testnet-chain))
     (assert-equal "sigilcoin-test"
                   (chain-config-network-id sigilcoin-testnet-chain))
-    (assert-equal #u8(#xd3 #x7a #x91 #xc4)
+    (assert-equal coin-testnet-network-magic
                   (chain-config-magic sigilcoin-testnet-chain))
+    (assert-equal #u8(#xd3 #x7a #x91 #xc5)
+                  coin-testnet-network-magic)
     (assert-equal 19446
                   (chain-config-default-port sigilcoin-testnet-chain))
     (assert-equal (chain-config-protocol-version sigilcoin-main-chain)
@@ -1292,10 +1561,17 @@
     (assert-equal 3600 coin-testnet-min-block-spacing)
     (assert-equal 3600
                   (coin-chain-min-block-spacing sigilcoin-testnet-chain))
+    (assert-equal 300 coin-testnet-max-future-drift)
+    (assert-equal 300
+                  (coin-chain-max-future-drift sigilcoin-testnet-chain))
+    (assert-equal coin-max-future-drift
+                  (coin-chain-max-future-drift sigilcoin-main-chain))
+    (assert-equal coin-max-future-drift
+                  (coin-chain-max-future-drift sigilcoin-regtest-chain))
     (assert-equal coin-target-block-spacing
                   (chain-extension-ref sigilcoin-testnet-chain
                                        'policy 'target-block-spacing))
-    (assert-equal coin-max-future-drift
+    (assert-equal coin-testnet-max-future-drift
                   (chain-extension-ref sigilcoin-testnet-chain
                                        'policy 'max-future-drift))
     (assert-equal coin-median-time-span
@@ -1356,6 +1632,35 @@
               sigilcoin-main-chain
               sigilcoin-regtest-chain))))
 
+  (test "testnet header rules reject an immediate successor and accept drift boundary"
+    (let* ((now (exact (floor (current-second))))
+           (spacing (coin-chain-min-block-spacing sigilcoin-testnet-chain))
+           (drift (coin-chain-max-future-drift sigilcoin-testnet-chain))
+           (rules (chain-config-header-rules sigilcoin-testnet-chain))
+           (accept-header? (header-rules-accept? rules))
+           (immediate-parent
+             (header-claiming %zero32 now coin-genesis-complexity 24))
+           (immediate
+             (header-claiming (block-header-hash immediate-parent)
+                              (+ now spacing)
+                              coin-genesis-complexity
+                              24))
+           (boundary-parent
+             (header-claiming %zero32 (- now (- spacing drift))
+                              coin-genesis-complexity
+                              24))
+           (boundary
+             (header-claiming (block-header-hash boundary-parent)
+                              (+ (block-header-time boundary-parent) spacing)
+                              coin-genesis-complexity
+                              24)))
+      (assert-false
+        (accept-header? sigilcoin-consensus-params
+                        (list immediate-parent) immediate))
+      (assert-true
+        (accept-header? sigilcoin-consensus-params
+                        (list boundary-parent) boundary))))
+
   (test "the one-hour spacing floor is enforced at the exact boundary"
     (let* ((genesis (coin-genesis-header coin-testnet-genesis-quote
                                          coin-testnet-genesis-time))
@@ -1377,7 +1682,8 @@
                     (list genesis)
                     good
                     (block-header-time good)
-                    (coin-chain-min-block-spacing sigilcoin-testnet-chain))))
+                    (coin-chain-min-block-spacing sigilcoin-testnet-chain)
+                    (coin-chain-max-future-drift sigilcoin-testnet-chain))))
       (assert-equal 'insufficient-spacing
                     (coin-result-reason
                       (coin-validate-header-context
@@ -1385,6 +1691,8 @@
                         early
                         (block-header-time good)
                         (coin-chain-min-block-spacing
+                          sigilcoin-testnet-chain)
+                        (coin-chain-max-future-drift
                           sigilcoin-testnet-chain))))))
 
   (test "producer and co-op blocks use the full canonical body rules"

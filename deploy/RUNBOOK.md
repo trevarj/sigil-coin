@@ -238,20 +238,20 @@ sudo -u sigilcoin sigilcoin status --chain sigilcoin-main --data-dir /var/lib/si
 `sigilcoin-listen` must be `active (running)`. It binds port 19444 itself;
 there is no socket unit and no proxy in front of it.
 
-A node that has done nothing but open its database reports genesis, which is
-verified output from a fresh mainnet data directory:
+A node that has done nothing but open a fresh mainnet database reports the
+current coherent placeholder genesis:
 
 ```
 chain: sigilcoin-main
 best-height: 0
-best-hash: a4db344771ff4af14b854e9cf0ed348c7199268d1f82f2c2782380f425dca5fb
-best-work: 16837369189484508192
+best-hash: edf1ae51f078002fdcb7b30a1a4f9ad7e86ac6cd1a8fceba3e5a459731331516
+best-work: 16909427814348142080
 best-header-time: 1785542400
 headers: 1
 blocks: 0
 validated-blocks: 0
 best-block-height: 0
-best-block-hash: a4db344771ff4af14b854e9cf0ed348c7199268d1f82f2c2782380f425dca5fb
+best-block-hash: edf1ae51f078002fdcb7b30a1a4f9ad7e86ac6cd1a8fceba3e5a459731331516
 mempool: 0
 peers: 0
 peer-successes: 0
@@ -259,18 +259,20 @@ peer-failures: 0
 pending-blocks: 0
 sync-stage: idle
 sync-last-error:
-tip-solution-bytes: 90
+tip-solution-bytes: 86
 next-height: 1
 next-reward: 1.00000000 SGL
 issued-supply: 0.00000000 SGL
+scheduled-supply-cap: 0.00000000 SGL
 max-supply: 143029.99991970 SGL
 ```
 
-`best-hash` is the internal byte order. The display id humans quote is that
-string reversed: `fba5dc25f4802378c2f2821f8d2699718c34edf09c4e854bf14aff714734dba4`.
-Both are current coherent placeholders, derived from genesis quote
+`best-hash` is the internal byte order. The display id humans quote is
+`1615333197455a3ebace8f1acdc66ae8d79a4f1a0ab3b7dc2f0078f051aef1ed`.
+Both are current coherent placeholders derived from genesis quote
 `Sigil - Practical Symbolic Power`; mainnet timestamp remains non-final until
-launch day. See `../LAUNCH.md`.
+launch day. Generated-witness tightening changed this genesis, so an older
+database is not compatible with the current placeholder. See `../LAUNCH.md`.
 
 Creating the node's own address writes the wallet key:
 
@@ -327,7 +329,7 @@ peer in the table is enough to leave `sync-stage: failed` and a populated
 | `best-height` vs `best-block-height` | within a few blocks | headers far ahead of validated bodies: block download or validation is behind |
 | `pending-blocks` | 0, or briefly non-zero | persistently non-zero means validation is stuck |
 | `peers` | at least 1 | 0 means nothing was ever configured |
-| `issued-supply` | rises, never exceeds `max-supply` | anything above 143029.99991970 SGL is a consensus bug |
+| supply | `issued-supply <= scheduled-supply-cap <= max-supply`; issued may trail the height cap after solo blocks | issued above the scheduled cap, or inconsistent with another node on the same active branch |
 
 Verified contrast, both from this build. A sync that reached its peer:
 
@@ -365,9 +367,13 @@ traffic, not errors. `p2p-read-envelope: payload too large` on the same line
 is a malformed peer being rejected — also normal, and also not a fault of the
 seed.
 
-`tip-solution-bytes` is the winning program length at the tip, and
-`next-reward` is what the next block pays. Neither is a health signal; they
-are the game.
+`tip-solution-bytes` comes from the persisted projected rank word.
+Authenticated share quality was erased from persisted rank and cannot be
+reconstructed by status. `next-reward` is the next **scheduled subsidy**, not
+an exact coinbase payout: a solo block mints `floor(4*S/5)+F`, while a
+cooperative block mints `S+F`, targets 10% for verified shares and 5% for the
+parent carrier, and sends fees and integer residuals to the producer. These
+fields are chain state, not health signals.
 
 **Is the seed actually reachable?** The only real answer comes from off-host:
 
@@ -513,12 +519,13 @@ Work through it in this order:
 
 ### Reorgs
 
-A reorg here is routine, not an incident. Fork choice is: greater height
-wins; at equal height the lower composite score wins. Equal-height,
-equal-score blocks are incomparable, so the incumbent remains the tip and
-first-seen wins locally. There is no block-hash tie-break. Nodes can briefly
-keep different siblings, then converge when a child gives one branch greater
-height.
+A reorg here is routine, not an incident. Fork choice is: greater height wins;
+at equal height, lower projected rank `(L, MB, SB)` wins. Equal-height,
+equal-rank blocks are incomparable, so the incumbent remains the tip and
+first-seen wins locally. Authenticated `Q`, raw score-word differences, and
+block hash do not break that tie. Nodes can briefly retain different siblings;
+a child must link the selected incumbent and explicitly settles its height
+against later siblings.
 
 What that means operationally:
 

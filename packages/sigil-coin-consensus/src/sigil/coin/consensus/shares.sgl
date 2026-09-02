@@ -1,11 +1,11 @@
-;;; (sigil coin consensus shares) — co-op shares, commit-reveal, the split
+;;; (sigil coin consensus shares) — co-op shares, commit-reveal, and payouts
 ;;;
 ;;; A block's producer solves puzzle `H` alone, but he is not the only
 ;;; miner who solved it. §6 lets up to eight other miners publish their own
 ;;; solutions to the PREVIOUS puzzle as signed "shares" inside his coinbase,
-;;; and pays them for it. A losing solver is paid instead of discarding work,
-;;; while aggregate quality `Q` from verified personalized tasks breaks
-;;; fork-choice ties that the producer's own solution leaves (§5.3).
+;;; and pays them for it. A losing solver is paid instead of discarding work.
+;;; Aggregate quality `Q` from verified personalized tasks remains authenticated
+;;; and reportable, but fork choice projects it out of the score word (§5.3).
 ;;;
 ;;; THE PIPELINE (§7.2). Puzzle `H` is not knowable until block `H-1`
 ;;; exists, so a share cannot be committed and revealed in the same block:
@@ -19,11 +19,11 @@
 ;;; checking and its parent: at most sixteen 32-byte hashes.
 ;;;
 ;;; WHY A PRODUCER CARRIES ANYONE ELSE'S COMMITMENTS (§7.4). He is paid.
-;;; The block at `H` pays weight 1 to the CARRIER — the producer of `H-1` —
-;;; whenever it contains a reveal, and a reveal is only valid if its
-;;; commitment was in the carrier's block. He cannot fabricate it: a
-;;; commitment nobody can open earns nothing, because the opening needs a
-;;; signature only the sharer can produce.
+;;; The block at `H` reserves `floor(S/20)` from its scheduled subsidy for
+;;; the CARRIER — the producer of `H-1` — whenever it contains a reveal, and
+;;; a reveal is only valid if its commitment was in the carrier's block. He
+;;; cannot fabricate it: a commitment nobody can open earns nothing, because
+;;; the opening needs a signature only the sharer can produce.
 ;;;
 ;;; WHY THE BLIND RIDES IN THE REVEAL.
 ;;;
@@ -128,12 +128,10 @@
     coin-check-shares-expensive
     coin-check-shares
 
-    ;; The reward split
-    coin-producer-weight
-    coin-split-weight-total
-    coin-split-unit
-    coin-split-plan
-    coin-check-split)
+    ;; Payouts
+    coin-payout-plan
+    coin-check-payout-cheap
+    coin-check-payout)
 
   (begin
 
@@ -1254,140 +1252,280 @@
             (coin-check-shares-expensive context shares))))
 
     ;; ============================================================
-    ;; The reward split
+    ;; Payouts
     ;; ============================================================
 
-    ;;; The producer's weight in the split: 2. Each share and the carrier
-    ;;; are worth 1 (§6.5).
-    (define coin-producer-weight 2)
+    (define (nonnegative-exact-integer? value)
+      (and (number? value) (exact? value) (integer? value) (>= value 0)))
 
-    (define (require-value who value)
-      (if (not (and (number? value) (exact? value) (integer? value)
-                    (>= value 0)))
-          (error (string-append who ": value must be a non-negative integer")))
+    (define (require-nonnegative-integer who field value)
+      (if (not (nonnegative-exact-integer? value))
+          (error
+            (string-append
+              who ": " field " must be a non-negative exact integer")))
       value)
 
-    (define (require-share-count who count)
-      (if (not (and (number? count) (exact? count) (integer? count)
-                    (<= 0 count coin-max-shares)))
-          (error (string-append who ": share count out of range")))
-      count)
+    (define (require-payout-share-count who shares)
+      (if (not (list? shares))
+          (error (string-append who ": shares must be a list")))
+      (let ((count (length shares)))
+        (if (> count coin-max-shares)
+            (error (string-append who ": share count out of range")))
+        count))
 
-    ;;; Total weight the block's reward is divided into: `2 + R + carrier`,
-    ;;; where the carrier exists exactly when `R >= 1`.
-    ;;;
-    ;;; ```scheme
-    ;;; (coin-split-weight-total 0) ; => 2
-    ;;; (coin-split-weight-total 8) ; => 11
-    ;;; ```
-    (define (coin-split-weight-total share-count)
-      (: integer? -> integer?)
-      (require-share-count "coin-split-weight-total" share-count)
-      (+ coin-producer-weight
-         share-count
-         (if (> share-count 0) 1 0)))
+    (define (require-contribution-total who shares contributions)
+      (if (not (list? contributions))
+          (error (string-append who ": contributions must be a list")))
+      (let loop ((ss shares) (cs contributions) (total 0))
+        (cond
+          ((null? ss)
+           (if (null? cs)
+               total
+               (error
+                 (string-append
+                   who ": contributions must align with shares"))))
+          ((null? cs)
+           (error
+             (string-append who ": contributions must align with shares")))
+          ((not (and (number? (car cs))
+                     (exact? (car cs))
+                     (integer? (car cs))
+                     (<= 1 (car cs) 4)))
+           (error
+             (string-append
+               who ": each contribution must be an exact integer from 1 to 4")))
+          (else
+            (loop (cdr ss) (cdr cs) (+ total (car cs)))))))
 
-    ;;; One weight-unit of the reward: `u = floor(V / Wtot)`.
-    ;;;
-    ;;; ```scheme
-    ;;; (coin-split-unit 5000000000 8) ; => 454545454
-    ;;; ```
-    (define (coin-split-unit value share-count)
-      (: integer? integer? -> integer?)
-      (require-value "coin-split-unit" value)
-      (quotient value (coin-split-weight-total share-count)))
+    (define (solo-producer-value subsidy fees)
+      (+ (quotient (* 4 subsidy) 5) fees))
 
-    ;;; The exact coinbase outputs a block owes (§6.5).
+    ;;; Compute the exact coinbase outputs owed by a block.
     ;;;
-    ;;; Returns `1 + R + carrier` entries as `(value . script)` pairs, in
-    ;;; consensus order:
+    ;;; Entries are `(value . script)` pairs in consensus order: the
+    ;;; unconstrained producer output, one P2WPKH output per share in canonical
+    ;;; share order, then the carrier output when shares exist. Zero-valued
+    ;;; required outputs are retained.
     ;;;
-    ;;;   0        producer, `V - R*u - carrier*u`, script `#f` because
-    ;;;            consensus does not constrain where a producer pays himself
-    ;;;   1 .. R   share `i`, `u`, P2WPKH of share `i`'s signed pubkey, in
-    ;;;            the shares' own ascending-pubkey order
-    ;;;   R+1      carrier, `u`, `carrier-script` — the scriptPubKey of
-    ;;;            output 0 of block `H-1`'s coinbase, present only when
-    ;;;            `R >= 1`
-    ;;;
-    ;;; The remainder `V mod Wtot`, at most ten daviwils, goes to the
-    ;;; producer, so the outputs sum to `V` EXACTLY. Nothing burns, nothing
-    ;;; leaks to fees, and Bitcoin's value-conservation check passes
-    ;;; unchanged.
-    ;;;
-    ;;; ```scheme
-    ;;; (car (car (coin-split-plan 100 '() #f))) ; => 100
-    ;;; ```
-    (define (coin-split-plan value shares carrier-script)
-      (: integer? list? any? -> list?)
-      (require-value "coin-split-plan" value)
-      (let* ((count (require-share-count "coin-split-plan" (length shares)))
-             (carrier (if (> count 0) 1 0))
-             (unit (coin-split-unit value count))
-             (producer (- value (* count unit) (* carrier unit))))
-        (if (and (= 1 carrier) (not (bytevector? carrier-script)))
-            (error "coin-split-plan: a block with shares needs a carrier script"))
-        (cons (cons producer #f)
-              (let loop ((xs shares) (acc '()))
-                (if (null? xs)
-                    (reverse (if (= 1 carrier)
-                                 (cons (cons unit carrier-script) acc)
-                                 acc))
-                    (loop (cdr xs)
-                          (cons (cons unit
-                                      (coin-share-script
-                                        (coin-share-pubkey (car xs))))
-                                acc)))))))
+    ;;; A solo block mints `floor(4*S/5) + F`; the remaining scheduled subsidy
+    ;;; is unminted. A cooperative block reserves `floor(S/20)` for the carrier
+    ;;; and divides `floor(S/10)` among shares in proportion to their verified
+    ;;; contributions. Fees and every rounding remainder go to the producer,
+    ;;; and the cooperative outputs sum to `S + F` exactly.
+    (define (coin-payout-plan subsidy fees shares contributions carrier-script)
+      (: integer? integer? list? list? any? -> list?)
+      (require-nonnegative-integer
+        "coin-payout-plan" "subsidy" subsidy)
+      (require-nonnegative-integer "coin-payout-plan" "fees" fees)
+      (let ((count (require-payout-share-count "coin-payout-plan" shares)))
+        (if (and (> count 0) (not (bytevector? carrier-script)))
+            (error
+              "coin-payout-plan: a block with shares needs a carrier script"))
+        (let ((contribution-total
+                (require-contribution-total
+                  "coin-payout-plan" shares contributions)))
+          (if (= count 0)
+              (list (cons (solo-producer-value subsidy fees) #f))
+              (let ((carrier-value (quotient subsidy 20))
+                    (share-pool (quotient subsidy 10)))
+                (let loop ((ss shares)
+                           (cs contributions)
+                           (share-total 0)
+                           (reversed '()))
+                  (if (null? ss)
+                      (cons
+                        (cons (- (+ subsidy fees)
+                                 carrier-value
+                                 share-total)
+                              #f)
+                        (reverse
+                          (cons (cons carrier-value carrier-script)
+                                reversed)))
+                      (let ((value
+                              (quotient
+                                (* share-pool (car cs))
+                                contribution-total)))
+                        (loop
+                          (cdr ss)
+                          (cdr cs)
+                          (+ share-total value)
+                          (cons
+                            (cons
+                              value
+                              (coin-share-script
+                                (coin-share-pubkey (car ss))))
+                            reversed))))))))))
 
     (define (outputs-of tx)
       (guard (e (#t #f))
         (and (transaction? tx) (transaction-outputs tx))))
 
-    ;;; Check a coinbase transaction's outputs against the split (§6.5).
+    (define (output-values-total outputs)
+      (let loop ((os outputs) (total 0))
+        (if (null? os)
+            total
+            (let ((value (txout-value (car os))))
+              (and (nonnegative-exact-integer? value)
+                   (loop (cdr os) (+ total value)))))))
+
+    (define (share-output-scripts-match? outputs shares)
+      (let loop ((os (cdr outputs)) (ss shares))
+        (or (null? ss)
+            (and
+              (equal?
+                (txout-script-pubkey (car os))
+                (coin-share-script (coin-share-pubkey (car ss))))
+              (loop (cdr os) (cdr ss))))))
+
+    ;;; Perform the payout checks that do not depend on verified contribution.
     ;;;
-    ;;; `value` is `V = subsidy(H) + total_fees(H)`, which the caller
-    ;;; computes; this rule only decides how `V` is divided.
+    ;;; Solo blocks are fully determined here. Cooperative blocks must have the
+    ;;; right output count and share/carrier scripts, the exact carrier value,
+    ;;; and total `S + F`; proportional share and producer values are deferred
+    ;;; until the share programs have been verified.
+    (define (coin-check-payout-cheap
+              tx subsidy fees shares carrier-script)
+      (: any? integer? integer? list? any? -> coin-result?)
+      (guard (e (#t (coin-error
+                      'internal-error "the cheap payout check raised")))
+        (cond
+          ((not (nonnegative-exact-integer? subsidy))
+           (coin-error
+             'internal-error
+             "subsidy must be a non-negative exact integer"))
+          ((not (nonnegative-exact-integer? fees))
+           (coin-error
+             'internal-error
+             "fees must be a non-negative exact integer"))
+          ((not (list? shares))
+           (coin-error 'internal-error "expected a list of shares"))
+          (else
+            (let ((count (length shares)))
+              (cond
+                ((> count coin-max-shares)
+                 (coin-error 'shares-oversize "more than eight shares"))
+                ((and (> count 0) (not (bytevector? carrier-script)))
+                 (coin-error
+                   'internal-error
+                   "a block with shares needs a carrier script"))
+                (else
+                  (let* ((outputs (outputs-of tx))
+                         (output-total
+                           (and outputs (output-values-total outputs)))
+                         (expected-count (if (= count 0) 1 (+ count 2))))
+                    (cond
+                      ((not outputs)
+                       (coin-error 'internal-error "expected a transaction"))
+                      ((not (= (length outputs) expected-count))
+                       (coin-error
+                         'coinbase-output-shape
+                         "coinbase output count does not match the payout"))
+                      ((not output-total)
+                       (coin-error
+                         'coinbase-output-value
+                         "coinbase output value is not a non-negative exact integer"))
+                      ((= count 0)
+                       (if (= (txout-value (car outputs))
+                              (solo-producer-value subsidy fees))
+                           (coin-ok outputs)
+                           (coin-error
+                             'coinbase-output-value
+                             "coinbase output pays the wrong value")))
+                      ((not (share-output-scripts-match? outputs shares))
+                       (coin-error
+                         'coinbase-output-shape
+                         "coinbase output pays a share to the wrong script"))
+                      ((not
+                         (equal?
+                           (txout-script-pubkey
+                             (list-ref outputs (+ count 1)))
+                           carrier-script))
+                       (coin-error
+                         'coinbase-output-shape
+                         "coinbase output pays the carrier to the wrong script"))
+                      ((not
+                         (= (txout-value (list-ref outputs (+ count 1)))
+                            (quotient subsidy 20)))
+                       (coin-error
+                         'coinbase-output-value
+                         "coinbase output pays the carrier the wrong value"))
+                      ((not (= output-total (+ subsidy fees)))
+                       (coin-error
+                         'coinbase-output-value
+                         "coinbase outputs do not sum to subsidy plus fees"))
+                      (else
+                        (coin-ok outputs)))))))))))
+
+    ;;; Check every payout after contributions have been fully verified.
     ;;;
-    ;;; Total. Rejection reasons are `coinbase-output-shape` — wrong output
-    ;;; count, or a share or carrier paid to the wrong script — and
-    ;;; `coinbase-output-value`. On success the value is the split plan.
-    ;;;
-    ;;; ```scheme
-    ;;; (coin-ok? (coin-check-split coinbase 5000000000 '() #f)) ; => #t
-    ;;; ```
-    (define (coin-check-split tx value shares carrier-script)
-      (: any? integer? list? any? -> coin-result?)
-      (guard (e (#t (coin-error 'internal-error "the split check raised")))
-        (let ((outputs (outputs-of tx)))
-          (cond
-            ((not outputs)
-             (coin-error 'internal-error "expected a transaction"))
-            ((not (and (number? value) (exact? value) (integer? value)
-                       (>= value 0)))
-             (coin-error 'coinbase-output-value
-                         "block value is not a non-negative integer"))
-            ((> (length shares) coin-max-shares)
-             (coin-error 'shares-oversize "more than eight shares"))
-            ((and (pair? shares) (not (bytevector? carrier-script)))
-             (coin-error 'internal-error
-                         "a block with shares needs a carrier script"))
-            (else
-              (let ((plan (coin-split-plan value shares carrier-script)))
-                (if (not (= (length outputs) (length plan)))
-                    (coin-error 'coinbase-output-shape
-                                "coinbase output count does not match the split")
-                    (let loop ((os outputs) (ps plan))
-                      (cond
-                        ((null? ps) (coin-ok plan))
-                        ((not (= (txout-value (car os)) (car (car ps))))
-                         (coin-error 'coinbase-output-value
-                                     "coinbase output pays the wrong value"))
-                        ;; Output 0's script is the producer's business.
-                        ;; Every other script is derived, so a mismatch is a
-                        ;; producer trying to keep a payout he owes.
-                        ((and (cdr (car ps))
-                              (not (equal? (txout-script-pubkey (car os))
-                                           (cdr (car ps)))))
-                         (coin-error 'coinbase-output-shape
-                                     "coinbase output pays the wrong script"))
-                        (else (loop (cdr os) (cdr ps))))))))))))))
+    ;;; Malformed trusted arguments are `internal-error`. Output count and
+    ;;; derived script mismatches are `coinbase-output-shape`; any incorrect
+    ;;; output value or total is `coinbase-output-value`.
+    (define (coin-check-payout
+              tx subsidy fees shares contributions carrier-script)
+      (: any? integer? integer? list? list? any? -> coin-result?)
+      (guard (e (#t (coin-error
+                      'internal-error "the exact payout check raised")))
+        (cond
+          ((not (nonnegative-exact-integer? subsidy))
+           (coin-error
+             'internal-error
+             "subsidy must be a non-negative exact integer"))
+          ((not (nonnegative-exact-integer? fees))
+           (coin-error
+             'internal-error
+             "fees must be a non-negative exact integer"))
+          ((not (list? shares))
+           (coin-error 'internal-error "expected a list of shares"))
+          ((not (list? contributions))
+           (coin-error 'internal-error "expected a list of contributions"))
+          (else
+            (let ((count (length shares)))
+              (cond
+                ((> count coin-max-shares)
+                 (coin-error 'shares-oversize "more than eight shares"))
+                ((and (> count 0) (not (bytevector? carrier-script)))
+                 (coin-error
+                   'internal-error
+                   "a block with shares needs a carrier script"))
+                (else
+                  (let* ((plan
+                           (coin-payout-plan
+                             subsidy fees
+                             shares contributions carrier-script))
+                         (outputs (outputs-of tx)))
+                    (cond
+                      ((not outputs)
+                       (coin-error 'internal-error "expected a transaction"))
+                      ((not (= (length outputs) (length plan)))
+                       (coin-error
+                         'coinbase-output-shape
+                         "coinbase output count does not match the payout"))
+                      (else
+                        (let loop ((os outputs) (ps plan))
+                          (cond
+                            ((null? ps) (coin-ok plan))
+                            ((not
+                               (nonnegative-exact-integer?
+                                 (txout-value (car os))))
+                             (coin-error
+                               'coinbase-output-value
+                               "coinbase output value is not a non-negative exact integer"))
+                            ((not
+                               (= (txout-value (car os))
+                                  (car (car ps))))
+                             (coin-error
+                               'coinbase-output-value
+                               "coinbase output pays the wrong value"))
+                            ((and
+                               (cdr (car ps))
+                               (not
+                                 (equal?
+                                   (txout-script-pubkey (car os))
+                                   (cdr (car ps)))))
+                             (coin-error
+                               'coinbase-output-shape
+                               "coinbase output pays the wrong script"))
+                            (else
+                              (loop (cdr os) (cdr ps)))))))))))))))
+))
