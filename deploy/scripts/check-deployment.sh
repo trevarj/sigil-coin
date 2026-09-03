@@ -31,12 +31,26 @@ expect_not_exit() {
   [[ $actual != "$forbidden" ]] || fail "unexpected exit $forbidden: $*"
 }
 
-bash -n deploy/scripts/deploy-remote.sh deploy/scripts/run-local.sh \
-  deploy/scripts/stop-local.sh deploy/scripts/check-deployment.sh
+bash -n deploy/scripts/deploy-remote.sh deploy/scripts/deploy-site-remote.sh \
+  deploy/scripts/run-local.sh deploy/scripts/stop-local.sh \
+  deploy/scripts/check-deployment.sh
 sh -n deploy/docker/entrypoint.sh
-for script in deploy/scripts/deploy-remote.sh deploy/scripts/run-local.sh deploy/scripts/stop-local.sh; do
+for script in deploy/scripts/deploy-remote.sh \
+  deploy/scripts/deploy-site-remote.sh deploy/scripts/run-local.sh \
+  deploy/scripts/stop-local.sh
+do
   bash "$script" --help >/dev/null
 done
+expect_exit 64 bash deploy/scripts/deploy-site-remote.sh
+
+assert_fixed 'root * /srv/sigilcoin/site' deploy/Caddyfile
+assert_fixed '@site_assets path /assets/sigilcoin-symbol.png /assets/plus-jakarta.woff2 /assets/jetbrains-mono.woff2' deploy/Caddyfile
+assert_fixed 'reverse_proxy 127.0.0.1:8080' deploy/Caddyfile
+if command -v caddy >/dev/null; then
+  caddy validate --config deploy/Caddyfile >/dev/null
+else
+  printf 'SKIP: Caddy unavailable\n'
+fi
 
 for pattern in '/.sigilcoin/' '**/.sigilcoin/' '/.sigilcoin-testnet/' '**/.sigilcoin-testnet/'; do
   assert_fixed "$pattern" .gitignore

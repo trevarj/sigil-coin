@@ -60,12 +60,13 @@ Create operator-owned DNS records with TTL 300 during initial rollout:
 
 | Name | Type | Value |
 | --- | --- | --- |
+| `sigilcoin.lol` | A | seed host public IPv4 address (host static site) |
 | `seed.testnet.sigilcoin.lol` | A | seed host public IPv4 address |
 | `explorer.testnet.sigilcoin.lol` | A | seed host public IPv4 address (host reverse proxy) |
 
-Both records resolve to the RackNerd seed host. The seed record must be DNS-only: do
-not place a web CDN or HTTP proxy in front of P2P. No SRV record is needed,
-because the node's canonical seed includes TCP port `19446`.
+All three A records resolve to the RackNerd seed host. The seed record must be
+DNS-only: do not place a web CDN or HTTP proxy in front of P2P. No SRV record
+is needed, because the node's canonical seed includes TCP port `19446`.
 
 Add corresponding AAAA records only after validating the IPv6 node listener,
 reverse proxy, provider firewall, host firewall, routing, and off-host probes.
@@ -75,9 +76,8 @@ versa.
 Apply separate provider and host firewall policy:
 
 - public TCP/19446 to the testnet seed;
-- public TCP/443 to the explorer's host reverse proxy;
-- public TCP/80 only when the operator intentionally enables an HTTPS redirect
-  or an ACME HTTP challenge;
+- public TCP/443 to the static site and explorer host reverse proxy;
+- public TCP/80 for Caddy's HTTPS redirect and ACME HTTP challenge;
 - no public TCP/8080; Docker binds it to `127.0.0.1` only;
 - SSH on its chosen port restricted independently to approved operator sources
   or a VPN.
@@ -85,11 +85,13 @@ Apply separate provider and host firewall policy:
 Verify from outside the host network:
 
 ```sh
+getent ahostsv4 sigilcoin.lol
 dig +short A seed.testnet.sigilcoin.lol
 dig +short A explorer.testnet.sigilcoin.lol
 nc -vz seed.testnet.sigilcoin.lol 19446
 curl -fsS https://explorer.testnet.sigilcoin.lol/api/summary \
   | jq -e '.chain == "sigilcoin-testnet"'
+curl -fsS https://sigilcoin.lol/ >/dev/null
 ```
 
 When AAAA exists, repeat with IPv6 forced. Confirm an off-host connection to
@@ -191,45 +193,42 @@ solo block mints only `floor(4*S/5)` of scheduled subsidy; cooperative blocks
 mint full scheduled subsidy and route fees and integer residuals to the
 producer.
 
-## Explorer reverse proxy and TLS
+## Static site, explorer assets, and TLS
 
-`compose.testnet.yml` hardcodes the host mapping to
-`127.0.0.1:${EXPLORER_PORT:-8080}:8080`; there is no public bind override. Only
-an operator-managed host reverse proxy should serve
-`explorer.testnet.sigilcoin.lol` over TLS.
+`compose.testnet.yml` hardcodes the explorer host mapping to
+`127.0.0.1:${EXPLORER_PORT:-8080}:8080`; there is no public bind override.
+Caddy serves the generated site itself and remains the only public HTTP
+service. The image installs that site at
+`/opt/sigilcoin/share/sigilcoin-site`.
 
-A Caddy site using certificate files already provisioned by the operator:
+After deploying an image, run the site helper with the SSH hostname or alias:
 
-```caddyfile
-explorer.testnet.sigilcoin.lol {
-    tls /path/to/operator-managed/fullchain.pem /path/to/operator-managed/privkey.pem
-    reverse_proxy 127.0.0.1:8080
-}
+```sh
+bash deploy/scripts/deploy-site-remote.sh racknerd-chi
 ```
 
-A generic nginx site after the operator provisions certificate files:
+The helper copies the immutable generated site tree from the running explorer
+image, stages the repository Caddyfile and a rollback copy, validates the
+configuration, prompts for remote `sudo`, reloads Caddy, and checks both public
+HTTPS endpoints. It forces SSH agent identities so aliases with a missing
+configured key still work.
 
-```nginx
-server {
-    listen 443 ssl;
-    server_name explorer.testnet.sigilcoin.lol;
+`deploy/Caddyfile` serves the apex from that tree. On the explorer origin it
+serves only the three exact shared branding paths
+`/assets/sigilcoin-symbol.png`, `/assets/plus-jakarta.woff2`, and
+`/assets/jetbrains-mono.woff2`; every other request, including
+`/assets/explorer.js`, stays on the loopback explorer proxy.
 
-    ssl_certificate     /path/to/operator-managed/fullchain.pem;
-    ssl_certificate_key /path/to/operator-managed/privkey.pem;
+Rollback uses the preserved pre-change config:
 
-    location / {
-        proxy_pass http://127.0.0.1:8080;
-        proxy_set_header Host $host;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto https;
-    }
-}
+```sh
+sudo sh -c 'caddy validate --config /srv/sigilcoin/Caddyfile.rollback && install -o root -g root -m 0644 /srv/sigilcoin/Caddyfile.rollback /etc/caddy/Caddyfile && systemctl reload caddy'
 ```
 
-These examples do not install, issue, or renew certificates. TLS policy and
-proxy lifecycle remain operator-owned. Smoke-test `/`, `/blocks`,
-`/difficulty`, `/api/summary`, `/api/blocks`, and `/api/difficulty` over HTTPS,
-and verify direct off-host TCP/8080 remains closed.
+Smoke-test `/`, `/blocks`, `/difficulty`, `/api/summary`, `/api/blocks`, and
+`/api/difficulty` on the explorer over HTTPS, fetch all three shared asset
+paths from the explorer origin, fetch `https://sigilcoin.lol/`, and verify
+direct off-host TCP/8080 remains closed.
 
 ## Local Nix loopback stack
 

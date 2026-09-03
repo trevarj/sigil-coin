@@ -1652,20 +1652,24 @@
   )
 
 (test-group "branded shared shell"
-  (test "HTML shell carries the apex wordmark and resilient asset fallbacks"
+  (test "HTML shell keeps every branding asset same-origin"
     (let ((page (explorer-page "Test" "<p>body</p>")))
       (assert-true (has? page "class=\"wordmark\""))
       (assert-true (has? page "href=\"https://sigilcoin.lol\""))
-      (assert-true
-        (has? page
-              "https://sigilcoin.lol/assets/sigilcoin-symbol.png"))
-      (assert-true
-        (has? page
-              "https://sigilcoin.lol/assets/plus-jakarta.woff2"))
+      (for-each
+        (lambda (name)
+          (assert-true
+            (has? page (string-append "url(/assets/" name ")"))))
+        '("plus-jakarta.woff2"
+          "jetbrains-mono.woff2"))
+      (assert-true (not (has? page "https://sigilcoin.lol/assets/")))
       (assert-true (not (has? page "-v1")))
       (assert-true
         (has? page
-              "<span class=\"wordmark-symbol\" aria-hidden=\"true\">S</span>"))
+              "<img class=\"wordmark-symbol\" src=\"/assets/sigilcoin-symbol.png\" width=\"32\" height=\"32\" alt=\"\">"))
+      (assert-true
+        (not (has? page
+                   "<span class=\"wordmark-symbol\" aria-hidden=\"true\">S</span>")))
       (assert-true (has? page "SigilCoin <small>Explorer</small>"))
       (assert-true (has? page "class=\"badge badge-live status-badge\""))
       (assert-true (has? page "<main class=\"shell\"><p>body</p></main>"))
@@ -1694,15 +1698,16 @@
       (assert-true (not (has? javascript "eval(")))
       (assert-true (not (has? javascript "new Function")))))
 
-  (test "CSP allows only the same-origin client and polling connection"
+  (test "CSP allows only same-origin scripts, polling, images, and fonts"
     (let ((response (explorer-http-response
                       (list 200 "text/html; charset=utf-8"
                             (explorer-page "Test" "ok")))))
       (assert-true
         (has? response
-              "Content-Security-Policy: default-src 'none'; script-src 'self'; connect-src 'self'; style-src 'unsafe-inline'; img-src https://sigilcoin.lol; font-src https://sigilcoin.lol; base-uri 'none'; frame-ancestors 'none'"))
+              "Content-Security-Policy: default-src 'none'; script-src 'self'; connect-src 'self'; style-src 'unsafe-inline'; img-src 'self'; font-src 'self'; base-uri 'none'; frame-ancestors 'none'"))
       (assert-true (not (has? response "unsafe-eval")))
       (assert-true (not (has? response "script-src 'unsafe-inline'")))
+      (assert-true (not (has? response "https://sigilcoin.lol/assets/")))
       (assert-true (not (has? response "https://cdn"))))))
 
 (run-tests)

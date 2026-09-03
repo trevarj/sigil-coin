@@ -371,9 +371,8 @@
           ;; live view; nothing here may be cached as if it were final.
           "Cache-Control: no-store\r\n"
           "X-Content-Type-Options: nosniff\r\n"
-          ;; Scripts and polling stay same-origin. Only the apex site's symbol
-          ;; and optional webfonts are otherwise allowed.
-          "Content-Security-Policy: default-src 'none'; script-src 'self'; connect-src 'self'; style-src 'unsafe-inline'; img-src https://sigilcoin.lol; font-src https://sigilcoin.lol; base-uri 'none'; frame-ancestors 'none'\r\n"
+          ;; Every executable or fetched page asset stays same-origin.
+          "Content-Security-Policy: default-src 'none'; script-src 'self'; connect-src 'self'; style-src 'unsafe-inline'; img-src 'self'; font-src 'self'; base-uri 'none'; frame-ancestors 'none'\r\n"
           "Connection: close\r\n"
           "\r\n"
           (if body text ""))))
