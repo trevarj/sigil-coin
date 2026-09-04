@@ -529,15 +529,20 @@ against later siblings.
 
 What that means operationally:
 
-- A `best-block-hash` that changes at the same height is a reorg. The node
-  rolls back UTXOs and restores the affected mempool entries by itself.
-- **A coinbase created in block H may first be spent in H+1.** A fresh reward
-  is spendable for the following block but remains reorg-sensitive until that
-  child settles its height.
+- A `best-block-hash` change is a reorg. Rollback and reconnect commit as one
+  SQLite transaction: the node removes orphan-created UTXOs, reactivates
+  orphan-spent outputs, restores affected mempool rows, then revalidates them
+  against the fully connected winning branch. A spend whose orphaned coinbase
+  no longer exists becomes `rejected` with `missing-input` instead of remaining
+  a permanent available entry.
+- **Consensus permits a coinbase created in H to be spent in H+1.** That spend
+  remains vulnerable to a later taller fork even after H has a child. The
+  bundled mainnet wallet therefore waits for six confirmations before selecting
+  coinbase inputs; testnet and regtest deliberately select at one.
 - A reorg deeper than a few blocks, or one that repeats at the same height,
   is worth reporting in `#systemcrafters` with the two competing block ids
   and the output of `sigilcoin status` from both sides.
-- No action is required from the operator. There is no `invalidateblock`.
+- No action is required for a routine reorg. There is no `invalidateblock`.
 
 ## Known rough edges
 

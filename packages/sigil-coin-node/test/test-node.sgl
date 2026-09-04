@@ -859,7 +859,17 @@
             (chain-config-block-rules chain))))
       (list sigilcoin-main-chain
             sigilcoin-testnet-chain
-            sigilcoin-regtest-chain)))
+            sigilcoin-regtest-chain))
+    (assert-equal coin-main-wallet-coinbase-maturity
+                  (coin-chain-wallet-coinbase-maturity
+                    sigilcoin-main-chain))
+    (assert-equal 6 coin-main-wallet-coinbase-maturity)
+    (assert-equal 1
+                  (coin-chain-wallet-coinbase-maturity
+                    sigilcoin-testnet-chain))
+    (assert-equal 1
+                  (coin-chain-wallet-coinbase-maturity
+                    sigilcoin-regtest-chain)))
 
   (test "the connector rejects a coinbase at age zero"
     (let* ((funding (car (block-transactions %block1)))

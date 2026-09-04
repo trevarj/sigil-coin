@@ -520,8 +520,8 @@
 
     ;;; Whether a UTXO row can be spent in the block after `tip-height`.
     ;;;
-    ;;; Coinbase maturity comes from the selected node's block rules, so the
-    ;;; wallet cannot drift from the connector.
+    ;;; Coinbase selection depth comes from wallet policy on the selected
+    ;;; chain. It may be stricter than consensus, but never weakens validation.
     ;;;
     ;;; ```scheme
     ;;; (wallet-utxo-mature? n row 1) ; => #t
@@ -530,8 +530,7 @@
       (: node? list? integer? -> boolean?)
       (or (not (= 1 (row-ref row "coinbase")))
           (>= (- (+ tip-height 1) (row-ref row "height"))
-              (block-rules-coinbase-maturity
-                (chain-config-block-rules (node-config n))))))
+              (coin-chain-wallet-coinbase-maturity (node-config n)))))
 
     ;;; Total and spendable balance for a scriptPubKey, in daviwils.
     ;;;
@@ -645,8 +644,7 @@
              (rows (wallet-utxos n script-pubkey))
              (pinned (wallet-mempool-spent-outpoints n))
              (maturity
-               (block-rules-coinbase-maturity
-                 (chain-config-block-rules (node-config n)))))
+               (coin-chain-wallet-coinbase-maturity (node-config n))))
         (let loop ((xs rows) (chosen '()) (value 0) (held 0))
           (cond
             ((>= value needed)

@@ -59,9 +59,11 @@
     coin-testnet-min-block-spacing
     coin-regtest-min-block-spacing
     coin-testnet-max-future-drift
+    coin-main-wallet-coinbase-maturity
     coin-chain-min-block-spacing
     coin-chain-max-future-drift
     coin-chain-address-hrp
+    coin-chain-wallet-coinbase-maturity
     coin-irc-channel
     coin-genesis-quote
     coin-genesis-time

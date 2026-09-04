@@ -766,6 +766,11 @@ maturity. The relay has no payout balance or private key and cannot redirect
 that valid signed output. These are non-normative public-testnet operations; no
 mainnet pool is offered or defined.
 
+Consensus validity and wallet caution are separate. Mainnet nodes accept a
+coinbase spend in the following block, but the bundled mainnet wallet does not
+select that reward until it has six confirmations. Testnet and regtest keep
+one-block selection for deliberate reorg and transaction testing.
+
 ---
 
 ## 10. Scheduled subsidy and actual issuance

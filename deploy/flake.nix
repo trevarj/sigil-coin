@@ -23,8 +23,8 @@
   # to revision-pinned clones below /workspace. The local and Docker helpers
   # override these inputs from their detected sibling layout. The dependency
   # set is currently ahead of what is pushed: local sigil-bitcoin HEAD
-  # 8b8f380 configures coinbase maturity per chain while retaining Bitcoin's
-  # canonical 100-block rule.
+  # 4ecc1f1 adds atomic fork reconnect, fixed-point mempool recovery, and
+  # selected-chain locator matching.
   # Pinning by rev also means an uncommitted change in a sibling checkout can never leak into a
   # deployment build, and that the flake still locks while a sibling working
   # tree is dirty.
@@ -47,7 +47,7 @@
       flake = false;
     };
     sigil-bitcoin = {
-      url = "git+file:///workspace/sigil-bitcoin?rev=8b8f380d0fb63177b0949c9e0697cef3d8604fdc";
+      url = "git+file:///workspace/sigil-bitcoin?rev=4ecc1f188c51887450eb448b991dae28ba36dfa0";
       flake = false;
     };
 

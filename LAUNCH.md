@@ -176,6 +176,8 @@ should be in the same place the code is.
       bytes, blocks at most 16384 bytes, at most 8 example pairs per puzzle,
       block spacing floor 72000 seconds, future drift allowance 7200 seconds,
       SigilCoin coinbase maturity 1 block (Bitcoin's default remains 100).
+      The bundled mainnet wallet waits for six confirmations before selecting
+      a coinbase; consensus-valid external spends remain accepted after one.
 - [ ] Fork choice, stated plainly: greater height wins; at equal height the
       shorter producer source wins, then lower producer allocation bucket,
       then lower producer step bucket. Raw `W` authenticates `Q` for reporting

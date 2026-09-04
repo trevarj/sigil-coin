@@ -1002,7 +1002,7 @@
                       (node-ingest-headers
                         server (list (block-header-field bad))))
         (node-store-block server bad)
-        (assert-peer-rejects server bad peer-dir 1 "shares-malformed")
+        (assert-peer-rejects server bad peer-dir 0 "shares-malformed")
         (node-close server)))
 
     (test "wrong aggregate Q is rejected by peer"
@@ -1026,7 +1026,7 @@
                       (node-ingest-headers
                         server (list (block-header-field bad))))
         (node-store-block server bad)
-        (assert-peer-rejects server bad peer-dir 1 "score-mismatch")
+        (assert-peer-rejects server bad peer-dir 0 "score-mismatch")
         (node-close server)))
 
     (test "replayed committed share is rejected by peer"
@@ -1054,7 +1054,7 @@
                       (node-ingest-headers
                         server (list (block-header-field bad))))
         (node-store-block server bad)
-        (assert-peer-rejects server bad peer-dir 2 "share")
+        (assert-peer-rejects server bad peer-dir 0 "share")
         (node-close server)))))
 
 (test-group "sigilcoin Q-neutral header fork choice"
@@ -1275,20 +1275,88 @@
         (remove-tree dir-b)))))
 
 ;; ============================================================
+;; Maturity-one reorg recovery
+;; ============================================================
+
+(test-group "sigilcoin maturity-one reorg recovery"
+  (test "orphaning H1 and its H2 spend rejects the restored transaction"
+    (let* ((active-dir (fresh-dir))
+           (fork-dir (fresh-dir))
+           (n (open-node active-dir))
+           (original-h1 (car (mine-blocks n 1 %anyone)))
+           (funding (car (block-transactions original-h1)))
+           (funding-value (solo-coinbase-value 1))
+           (transfer
+             (transaction
+               version: 2
+               inputs: (list
+                         (txin
+                           previous-output:
+                             (outpoint txid: (transaction-txid funding)
+                                       index: 0)
+                           script-sig: #u8()
+                           sequence: #xffffffff
+                           witness: '()))
+               outputs: (list
+                          (txout value: funding-value
+                                 script-pubkey: %anyone))
+               lock-time: 0))
+           (history (validated-headers n))
+           (original-h2
+             (coin-build-block
+               (block-header-field original-h1)
+               2
+               (coin-required-complexity history 2)
+               #f
+               "maturity-one spend"
+               %anyone
+               (coin-next-block-time
+                 (block-header-field original-h1)
+                 coin-regtest-min-block-spacing)
+               (list transfer)
+               0)))
+      (assert-equal 1
+                    (block-rules-coinbase-maturity
+                      (chain-config-block-rules (node-config n))))
+      (assert-equal
+        "available"
+        (node-mempool-entry-status
+          (node-store-transaction n transfer "wallet")))
+      (assert-equal 1 (submit n original-h2))
+      (let* ((fork-node (open-node fork-dir))
+             (fork (mine-blocks fork-node 3 %elsewhere)))
+        (node-close fork-node)
+        (assert-equal
+          3
+          (node-ingest-headers
+            n (map block-header-field fork)))
+        (for-each (lambda (b) (node-store-block n b)) fork)
+        (assert-equal 3 (node-validate-blocks n))
+        (assert-true (tip-is? n (list-ref fork 2)))
+        (assert-equal 0 (length (utxos-paying n %anyone)))
+        (let ((row
+                (car
+                  (sqlite-query
+                    (node-db n)
+                    "SELECT status, last_error FROM mempool WHERE txid = ?"
+                    (hex-encode (transaction-txid transfer))))))
+          (assert-equal "rejected" (row-value row "status"))
+          (assert-equal "missing-input" (row-value row "last_error")))
+        (assert-equal (solo-issued-supply 3) (utxo-total n)))
+      (node-close n)
+      (remove-tree active-dir)
+      (remove-tree fork-dir))))
+
+;; ============================================================
 ;; Reorganising onto a shorter solution
 ;; ============================================================
 
 (test-group "sigilcoin reorganisation between nodes"
   (test "a shorter solution takes the tip on both nodes, and a late one does not"
-    ;; WHERE THE SIBLING HAS TO COME FROM. A node answers `getheaders` by
-    ;; looking up the height of the first locator hash it has SEEN, on any
-    ;; branch, and then sending its own best chain above that height
-    ;; (`db-best-chain-header-rows-after`). A node that saw the loser
-    ;; therefore tells a peer sitting on the loser that it has nothing —
-    ;; same height, nothing above it — and if it later extends, the child
-    ;; does not connect for that peer. So the better sibling is offered by a
-    ;; node that never saw the worse one, which is also the honest picture:
-    ;; two miners solved the same puzzle, and neither has the other's block.
+    ;; The competing sibling comes from an independent miner, matching a real
+    ;; partition. Shared-node coverage additionally pins the locator rule: a
+    ;; losing sibling known to the responder is not a common ancestor merely
+    ;; because it has the same height as one on the selected chain.
     (let* ((dir-a (fresh-dir))
            (dir-b (fresh-dir))
            (dir-c (fresh-dir))

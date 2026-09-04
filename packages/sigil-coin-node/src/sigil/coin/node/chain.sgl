@@ -17,9 +17,11 @@
     coin-testnet-min-block-spacing
     coin-regtest-min-block-spacing
     coin-testnet-max-future-drift
+    coin-main-wallet-coinbase-maturity
     coin-chain-min-block-spacing
     coin-chain-max-future-drift
     coin-chain-address-hrp
+    coin-chain-wallet-coinbase-maturity
     coin-irc-channel
     coin-genesis-quote
     coin-genesis-time
@@ -50,6 +52,10 @@
 
     ;;; Public testnet future-drift allowance: five minutes.
     (define coin-testnet-max-future-drift 300)
+
+    ;;; Mainnet wallet policy waits six confirmations before selecting a
+    ;;; coinbase, while consensus still permits spending it in the next block.
+    (define coin-main-wallet-coinbase-maturity 6)
 
     ;;; Miner community channel.
     (define coin-irc-channel "#systemcrafters")
@@ -107,6 +113,19 @@
             (error "coin-chain-max-future-drift: chain publishes no drift allowance"))
         (cdr entry)))
 
+    ;;; Read the wallet's coinbase selection depth from chain policy.
+    (define (coin-chain-wallet-coinbase-maturity chain)
+      (: chain-config? -> integer?)
+      (let ((entry (assq 'wallet-coinbase-maturity
+                         (chain-config-extension chain 'policy '()))))
+        (if (not (and (pair? entry)
+                      (number? (cdr entry))
+                      (integer? (cdr entry))
+                      (> (cdr entry) 0)))
+            (error
+              "coin-chain-wallet-coinbase-maturity: chain publishes no valid depth"))
+        (cdr entry)))
+
     ;;; Read the SegWit address human-readable prefix from a chain config.
     ;;;
     ;;; ```scheme
@@ -120,7 +139,8 @@
             (error "coin-chain-address-hrp: chain publishes no address HRP"))
         (cdr entry)))
 
-    (define (extensions min-spacing max-future-drift genesis hrp)
+    (define (extensions min-spacing max-future-drift genesis hrp
+                        wallet-coinbase-maturity)
       (list
         (cons 'address (list (cons 'hrp hrp)))
         (cons 'consensus
@@ -137,6 +157,8 @@
               (list (cons 'min-block-spacing min-spacing)
                     (cons 'target-block-spacing coin-target-block-spacing)
                     (cons 'max-future-drift max-future-drift)
+                    (cons 'wallet-coinbase-maturity
+                          wallet-coinbase-maturity)
                     (cons 'median-time-span coin-median-time-span)
                     (cons 'max-block-bytes coin-max-block-bytes)
                     (cons 'max-solution-bytes coin-max-solution-bytes)
@@ -146,7 +168,7 @@
                           coin-max-coinbase-script-bytes)))))
 
     (define (config name network-id magic port seeds min-spacing
-                    max-future-drift genesis hrp)
+                    max-future-drift genesis hrp wallet-coinbase-maturity)
       (let ((header (block-header-field genesis)))
         (chain-config name: name
                       network-id: network-id
@@ -159,8 +181,9 @@
                       genesis-header: header
                       genesis-hash: (block-header-hash header)
                       consensus-params: sigilcoin-consensus-params
-                      extensions: (extensions min-spacing max-future-drift
-                                              genesis hrp))))
+                      extensions: (extensions
+                                    min-spacing max-future-drift genesis hrp
+                                    wallet-coinbase-maturity))))
 
     (define %main-genesis
       (coin-genesis-block coin-genesis-quote coin-genesis-time))
@@ -183,7 +206,8 @@
               coin-min-block-spacing
               coin-max-future-drift
               %main-genesis
-              "sgl"))
+              "sgl"
+              coin-main-wallet-coinbase-maturity))
 
     ;;; Public test network with canonical validation.
     (define sigilcoin-testnet-chain
@@ -195,7 +219,8 @@
               coin-testnet-min-block-spacing
               coin-testnet-max-future-drift
               %testnet-genesis
-              "tsgl"))
+              "tsgl"
+              1))
 
     ;;; Local development chain.
     (define sigilcoin-regtest-chain
@@ -207,7 +232,8 @@
               coin-regtest-min-block-spacing
               coin-max-future-drift
               %regtest-genesis
-              "sgl"))
+              "sgl"
+              1))
 
     ;;; Return a SigilCoin chain config by canonical or short name.
     ;;;

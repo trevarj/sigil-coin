@@ -70,6 +70,12 @@ The block-subsidy schedule, scheduled maximum, and coinbase maturity are
 consensus rules. SigilCoin sets maturity to 1 block, so an output created in
 block `H` may first be spent in `H+1`; Bitcoin's block-rules default remains 100.
 
+Wallet coin selection is deliberately stricter on mainnet without changing
+consensus: the bundled mainnet wallet waits for six confirmations before it
+selects a coinbase input. Testnet and regtest select at the consensus boundary
+so transaction and reorg drills remain fast. Nodes still accept externally
+created transactions that satisfy the one-block consensus rule.
+
 ### 2.3 Scheduled subsidy and issued supply
 
 `coin-block-reward`, `coin-cumulative-supply`, and `coin-max-supply` describe

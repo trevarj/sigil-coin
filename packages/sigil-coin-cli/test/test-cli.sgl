@@ -364,6 +364,28 @@
                   (cli-data-dir
                     '("--testnet" "--data-dir" "/tmp/n")))))
 
+(test-group "sigilcoin wallet coinbase policy"
+  (test "mainnet waits six confirmations while test chains select at one"
+    (let* ((main-dir (make-temp-directory))
+           (test-dir (make-temp-directory))
+           (main (node-open sigilcoin-main-chain main-dir))
+           (testnet (node-open sigilcoin-testnet-chain test-dir))
+           (coinbase-row
+             (list (cons "coinbase" 1)
+                   (cons "height" 1))))
+      (assert-false (wallet-utxo-mature? main coinbase-row 5))
+      (assert-true (wallet-utxo-mature? main coinbase-row 6))
+      (assert-true (wallet-utxo-mature? testnet coinbase-row 1))
+      (assert-true
+        (wallet-utxo-mature?
+          main
+          (list (cons "coinbase" 0) (cons "height" 6))
+          5))
+      (node-close main)
+      (node-close testnet)
+      (process-run "rm" "-rf" main-dir)
+      (process-run "rm" "-rf" test-dir))))
+
 ;; ============================================================
 ;; Amounts
 ;; ============================================================

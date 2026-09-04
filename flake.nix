@@ -9,7 +9,7 @@
       flake = false;
     };
     sigil-bitcoin = {
-      url = "git+file:///home/trev/Workspace/sigil/sigil-bitcoin?rev=8b8f380d0fb63177b0949c9e0697cef3d8604fdc";
+      url = "git+file:///home/trev/Workspace/sigil/sigil-bitcoin?rev=4ecc1f188c51887450eb448b991dae28ba36dfa0";
       flake = false;
     };
 

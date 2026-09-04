@@ -76,16 +76,16 @@
     "sigil-bitcoin": {
       "flake": false,
       "locked": {
-        "lastModified": 1788505884,
-        "narHash": "sha256-FdNgBewM2ywjAF6Vq8V/ImQhgrOR7966fj+TupVX1To=",
+        "lastModified": 1788534654,
+        "narHash": "sha256-lrhFv1dqyEtg3CnlSuEoUrzf9UjXoByehalbD3xRmPs=",
         "ref": "refs/heads/master",
-        "rev": "8b8f380d0fb63177b0949c9e0697cef3d8604fdc",
-        "revCount": 110,
+        "rev": "4ecc1f188c51887450eb448b991dae28ba36dfa0",
+        "revCount": 111,
         "type": "git",
         "url": "file:///workspace/sigil-bitcoin"
       },
       "original": {
-        "rev": "8b8f380d0fb63177b0949c9e0697cef3d8604fdc",
+        "rev": "4ecc1f188c51887450eb448b991dae28ba36dfa0",
         "type": "git",
         "url": "file:///workspace/sigil-bitcoin"
       }
