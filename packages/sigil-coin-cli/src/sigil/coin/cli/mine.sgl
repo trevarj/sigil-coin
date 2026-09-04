@@ -27,6 +27,7 @@
           (sigil coin cli history)
           (sigil coin cli args)
           (sigil coin cli wallet)
+          (sigil coin cli relay)
           (sigil coin cli support))
   (export
     coin-validated-tip-height
@@ -41,6 +42,7 @@
     coin-select-verified-share-candidates
     run-puzzle
     run-mine
+    run-contribute
     run-commit
     run-reveal)
 
@@ -193,9 +195,11 @@
 
     ;; The connector's coinbase maturity rule, read at the height the block
     ;; would occupy rather than the height the transaction arrived at.
-    (define (utxo-row-spendable-at? row height)
+    (define (utxo-row-spendable-at? n row height)
       (or (not (= 1 (row-ref row "coinbase")))
-          (>= (- height (row-ref row "height")) coin-coinbase-maturity)))
+          (>= (- height (row-ref row "height"))
+              (block-rules-coinbase-maturity
+                (chain-config-block-rules (node-config n))))))
 
     ;; Whether an input opts into BIP68 relative timelocks, which SigilCoin
     ;; activates at height 0 and which this selection does not evaluate.
@@ -251,7 +255,7 @@
                                   (not (relative-timelock? tx input))
                                   (active-utxo-row n op))))
                    (and row
-                        (utxo-row-spendable-at? row height)
+                        (utxo-row-spendable-at? n row height)
                         (loop (cdr inputs)
                               (cons op seen)
                               (cons (utxo-row->txout row) prevouts)
@@ -861,17 +865,121 @@
         (println "unminted: ~a SGL"
                  (cli-daviwils->sgl (- (+ subsidy fees) minted)))))
 
+    (define (relay-field response key)
+      (let ((field (and (list? response) (assq key response))))
+        (unless field
+          (error "relay: malformed response"))
+        (cdr field)))
+
+    (define (canonical-hex text)
+      (and (string? text)
+           (guard (e (#t #f))
+             (let ((bytes (hex-decode text)))
+               (and (string=? text (hex bytes)) bytes)))))
+
+    (define (require-relay-producer response chain context)
+      (let* ((height (report-ref context 'height))
+             (parent-id (hex (reverse-bytevector
+                               (report-ref context 'parent-hash))))
+             (complexity (report-ref context 'complexity))
+             (version (relay-field response 'version))
+             (response-chain (relay-field response 'chain))
+             (response-height (relay-field response 'height))
+             (response-parent (relay-field response 'parent_id))
+             (response-complexity (relay-field response 'complexity))
+             (commitment-texts (relay-field response 'commitments))
+             (reveal-texts (relay-field response 'reveals)))
+        (unless (and (number? version) (exact? version) (integer? version)
+                     (= version 1)
+                     (string? response-chain)
+                     (string=? response-chain (chain-config-name chain))
+                     (number? response-height) (exact? response-height)
+                     (integer? response-height) (= response-height height)
+                     (string? response-parent)
+                     (string=? response-parent parent-id)
+                     (number? response-complexity)
+                     (exact? response-complexity)
+                     (integer? response-complexity)
+                     (= response-complexity complexity)
+                     (list? commitment-texts)
+                     (<= (length commitment-texts) coin-max-commitments)
+                     (list? reveal-texts)
+                     (<= (length reveal-texts) coin-max-commitments))
+          (error "mine: relay producer context does not match the current puzzle"))
+        (let ((commitments
+                (map
+                  (lambda (text)
+                    (let ((bytes (canonical-hex text)))
+                      (unless (and bytes
+                                   (= (bytevector-length bytes)
+                                      coin-commitment-bytes))
+                        (error "mine: relay returned a malformed commitment"))
+                      bytes))
+                  commitment-texts))
+              (shares
+                (map
+                  (lambda (text)
+                    (let ((bytes (canonical-hex text)))
+                      (unless (and bytes
+                                   (<= (bytevector-length bytes)
+                                       coin-max-share-bytes))
+                        (error "mine: relay returned a malformed reveal"))
+                      (let ((decoded (coin-shares-decode
+                                      (bytevector-append #u8(1) bytes))))
+                        (unless (and (coin-ok? decoded)
+                                     (= 1 (length
+                                            (coin-result-value decoded)))
+                                     (equal?
+                                       bytes
+                                       (coin-share-encode
+                                         (car (coin-result-value decoded)))))
+                          (error "mine: relay returned a malformed reveal"))
+                        (car (coin-result-value decoded)))))
+                  reveal-texts)))
+          ;; The consensus encoder checks both K16 and strict digest order.
+          (guard (e (#t
+                     (error
+                       "mine: relay returned noncanonical commitments")))
+            (coin-commits-encode commitments))
+          (list commitments shares))))
+
+    (define (require-relay-shares context shares)
+      (for-each
+        (lambda (share)
+          (let ((checked
+                  (and context
+                       (coin-check-shares context #u8() (list share)))))
+            (unless (and checked (coin-ok? checked))
+              (error
+                (string-append
+                  "mine: relay returned an invalid reveal: "
+                  (if checked
+                      (result-reason checked)
+                      "no eligible parent commitments"))))))
+        shares)
+      shares)
+
     ;;; Check a candidate, then submit canonical producer work.
     ;;; `--share` checks personalized work without publishing its source.
     (define (run-mine args)
       (: list? -> any?)
       (let* ((share? (cli-flag? args "--share"))
              (data-dir (cli-data-dir args))
+             (chain (cli-chain args))
+             (origin (relay-url args chain))
              (pubkey (and share?
                           (wallet-public-key (wallet-key data-dir)))))
+        (when (and origin (not share?))
+          (relay-require-curl "mine"))
         (cli-with-node args
           (lambda (n)
             (let* ((context (coin-puzzle-context n args))
+                   (relay-values
+                     (and origin
+                          (not share?)
+                          (require-relay-producer
+                            (relay-producer origin chain)
+                            chain context)))
                    (height (report-ref context 'height))
                    (coop (and share? (share-context context '())))
                    (spec (if share?
@@ -943,6 +1051,9 @@
                          (commit-selection
                            (select-commitments
                              (append (context-commitments data-dir context)
+                                     (if relay-values
+                                         (list-ref relay-values 0)
+                                         '())
                                      (car decoded-commits))
                              (cdr decoded-commits)))
                          (commitments (car commit-selection))
@@ -950,16 +1061,28 @@
                            (decode-inputs
                              (cli-arg-list args "--reveal")
                              "reveal" decode-share-input))
+                         (relay-share-values
+                           (if relay-values
+                               (list-ref relay-values 1)
+                               '()))
                          (parent-block
-                           (and (pair? (car decoded-shares))
+                           (and (or (pair? relay-share-values)
+                                    (pair? (car decoded-shares)))
                                 (validated-parent-block n parent)))
                          (parent-context
                            (and parent-block
                                 (coin-parent-context parent-block)))
+                         (relay-shares
+                           (if relay-values
+                               (require-relay-shares
+                                 parent-context relay-share-values)
+                               relay-share-values))
+                         (candidate-shares
+                           (append relay-shares (car decoded-shares)))
                          (share-validation
                            (validate-shares
                              parent-context solution
-                             (car decoded-shares) (cdr decoded-shares)))
+                             candidate-shares (cdr decoded-shares)))
                          (shares (list-ref share-validation 0))
                          (contributions (list-ref share-validation 1))
                          (share-rejected (list-ref share-validation 2))
@@ -992,6 +1115,12 @@
                                    (cdr (assq 'word score))
                                    (cdr (assq 'word baseline)))
                                  "yes" "no"))
+                    (when origin
+                      (println "relay: ~a" origin)
+                      (println "relay-commitments: ~a"
+                               (length (list-ref relay-values 0)))
+                      (println "relay-reveals: ~a"
+                               (length (list-ref relay-values 1))))
                     (print-contributions
                       commitments (cdr commit-selection)
                       shares contributions share-rejected quality)
@@ -1247,6 +1376,417 @@
                           candidate
                           best)
                       (or invalid? (not candidate))))))))
+
+    (define (exact-integer? value)
+      (and (number? value) (exact? value) (integer? value)))
+
+    (define (relay-puzzle-context response chain)
+      (let* ((version (relay-field response 'version))
+             (response-chain (relay-field response 'chain))
+             (height (relay-field response 'height))
+             (parent-id (relay-field response 'parent_id))
+             (complexity (relay-field response 'complexity))
+             (capacity (relay-field response 'capacity))
+             (accepted (relay-field response 'accepted))
+             (display-parent (canonical-hex parent-id)))
+        (unless (and (exact-integer? version) (= version 1)
+                     (string? response-chain)
+                     (string=? response-chain (chain-config-name chain))
+                     (exact-integer? height) (>= height 1)
+                     display-parent
+                     (= (bytevector-length display-parent) 32)
+                     (exact-integer? complexity)
+                     (<= coin-complexity-min complexity)
+                     (<= complexity coin-complexity-max)
+                     (exact-integer? capacity)
+                     (<= 0 capacity)
+                     (<= capacity coin-max-commitments)
+                     (exact-integer? accepted)
+                     (<= 0 accepted)
+                     (<= accepted coin-max-commitments)
+                     (= (+ capacity accepted) coin-max-commitments))
+          (error "contribute: relay returned an invalid puzzle context"))
+        (let ((parent-hash (reverse-bytevector display-parent)))
+          (list (cons 'height height)
+                (cons 'parent-hash parent-hash)
+                (cons 'complexity complexity)
+                (cons 'spec
+                      (coin-puzzle-for parent-hash height complexity))))))
+
+    (define (local-puzzle-context parent-hash height complexity)
+      (unless (and (= 32 (bytevector-length parent-hash))
+                   (exact-integer? height) (>= height 1)
+                   (exact-integer? complexity)
+                   (<= coin-complexity-min complexity)
+                   (<= complexity coin-complexity-max))
+        (error "contribute: stored commitment has an invalid puzzle context"))
+      (list (cons 'height height)
+            (cons 'parent-hash parent-hash)
+            (cons 'complexity complexity)
+            (cons 'spec (coin-puzzle-for parent-hash height complexity))))
+
+    (define (parse-contribution-commitment text)
+      (and text
+           (let ((bytes (guard (e (#t #f)) (hex-decode text))))
+             (unless (and bytes
+                          (= coin-commitment-bytes
+                             (bytevector-length bytes)))
+               (error "contribute: --commitment must be exactly 32 bytes of hexadecimal"))
+             bytes)))
+
+    (define (stored-contribution-record data-dir commitment)
+      (let ((matches
+              (filter
+                (lambda (record)
+                  (equal? commitment
+                          (cli-commit-record-commitment record)))
+                (cli-commit-records data-dir))))
+        (cond
+          ((null? matches)
+           (error "contribute: requested commitment is not stored locally"))
+          ((not (null? (cdr matches)))
+           (error "contribute: requested commitment has duplicate local records"))
+          (else (car matches)))))
+
+    ;; Return `(context checked)` only after the private record has been
+    ;; reconstructed and its personalized solution has been checked locally.
+    (define (prepare-stored-contribution record pubkey)
+      (unless (equal? pubkey (cli-commit-record-pubkey record))
+        (error "contribute: stored commitment belongs to another wallet key"))
+      (let* ((height (cli-commit-record-height record))
+             (complexity (cli-commit-record-complexity record))
+             (parent-hash (cli-commit-record-parent record))
+             (blind (cli-commit-record-blind record))
+             (commitment (cli-commit-record-commitment record))
+             (solution (cli-commit-record-solution record))
+             (expected
+               (coin-commitment
+                 (coin-share-preimage
+                   parent-hash height complexity solution pubkey)
+                 blind)))
+        (unless (equal? commitment expected)
+          (error "contribute: stored commitment does not match its private record"))
+        (let* ((context
+                 (local-puzzle-context parent-hash height complexity))
+               (coop (share-context context '()))
+               (spec (coin-share-puzzle coop pubkey))
+               (checked
+                 (require-share-solution
+                   "contribute" coop pubkey blind solution spec)))
+          (list context checked))))
+
+    (define (prompt-contribution-solution context pubkey spec)
+      (coin-print-puzzle
+        (cons
+          (cons 'personalized-pubkey (hex pubkey))
+          (coin-puzzle-report/spec
+            (report-ref context 'parent-hash)
+            (report-ref context 'height)
+            (report-ref context 'complexity)
+            spec)))
+      (display "solution> ")
+      (flush-output-port (current-output-port))
+      (let ((line (read-line (current-input-port))))
+        (and (not (eof-object? line))
+             (not (string=? line ""))
+             line)))
+
+    (define (contribution-status? status)
+      (and (string? status)
+           (or (string=? status "waiting")
+               (string=? status "stale")
+               (string=? status "queued")
+               (string=? status "commit-missed")
+               (string=? status "revealable")
+               (string=? status "reveal-queued")
+               (string=? status "included")
+               (string=? status "reveal-missed"))))
+
+    (define (relay-null? value)
+      (eq? value 'null))
+
+    (define (canonical-block-id? value)
+      (let ((bytes (canonical-hex value)))
+        (and bytes (= 32 (bytevector-length bytes)))))
+
+    (define (require-contribution-status
+              response chain record expected-contribution)
+      (let* ((height (cli-commit-record-height record))
+             (parent-id
+               (hex (reverse-bytevector
+                      (cli-commit-record-parent record))))
+             (commitment (hex (cli-commit-record-commitment record)))
+             (pubkey (hex (cli-commit-record-pubkey record)))
+             (version (relay-field response 'version))
+             (response-chain (relay-field response 'chain))
+             (response-height (relay-field response 'height))
+             (response-parent (relay-field response 'parent_id))
+             (response-complexity (relay-field response 'complexity))
+             (response-commitment (relay-field response 'commitment))
+             (response-pubkey (relay-field response 'pubkey))
+             (status (relay-field response 'status))
+             (tip-height (relay-field response 'tip_height))
+             (commit-block (relay-field response 'commit_block_id))
+             (reveal-block (relay-field response 'reveal_block_id))
+             (contribution (relay-field response 'contribution))
+             (payout (relay-field response 'payout_daviwils))
+             (matures-at (relay-field response 'matures_at_height)))
+        (unless
+          (and (exact-integer? version) (= version 1)
+               (string? response-chain)
+               (string=? response-chain (chain-config-name chain))
+               (exact-integer? response-height) (= response-height height)
+               (string? response-parent)
+               (string=? response-parent parent-id)
+               (exact-integer? response-complexity)
+               (= response-complexity
+                  (cli-commit-record-complexity record))
+               (string? response-commitment)
+               (string=? response-commitment commitment)
+               (string? response-pubkey)
+               (string=? response-pubkey pubkey)
+               (contribution-status? status)
+               (exact-integer? tip-height) (>= tip-height 0)
+               (or (relay-null? commit-block)
+                   (canonical-block-id? commit-block))
+               (or (relay-null? reveal-block)
+                   (canonical-block-id? reveal-block))
+               (or (relay-null? contribution)
+                   (and (exact-integer? contribution)
+                        (<= 1 contribution) (<= contribution 4)
+                        (= contribution expected-contribution)))
+               (or (relay-null? payout)
+                   (and (exact-integer? payout) (>= payout 0)))
+               (or (relay-null? matures-at)
+                   (and (exact-integer? matures-at)
+                        (>= matures-at 1))))
+          (error "contribute: relay returned a contradictory contribution status"))
+        (when (string=? status "revealable")
+          (unless (and (= tip-height height)
+                       (not (relay-null? commit-block)))
+            (error "contribute: relay returned an unsafe revealable status")))
+        (when (string=? status "included")
+          (unless (and (not (relay-null? commit-block))
+                       (not (relay-null? reveal-block))
+                       (not (relay-null? contribution))
+                       (not (relay-null? payout))
+                       (not (relay-null? matures-at)))
+            (error "contribute: relay returned an incomplete inclusion status")))
+        response))
+
+    (define (print-contribution-status response previous)
+      (let ((status (relay-field response 'status)))
+        (unless (and previous (string=? previous status))
+          (println "status: ~a" status)
+          (let ((commit-block (relay-field response 'commit_block_id))
+                (reveal-block (relay-field response 'reveal_block_id))
+                (payout (relay-field response 'payout_daviwils))
+                (matures-at (relay-field response 'matures_at_height)))
+            (unless (relay-null? commit-block)
+              (println "commit-block: ~a" commit-block))
+            (unless (relay-null? reveal-block)
+              (println "reveal-block: ~a" reveal-block))
+            (unless (relay-null? payout)
+              (println "payout: ~a daviwils" payout))
+            (unless (relay-null? matures-at)
+              (println "matures-at-height: ~a" matures-at)))
+          (flush-output-port (current-output-port)))))
+
+    (define (signed-contribution key record context contribution)
+      (let* ((pubkey (cli-commit-record-pubkey record))
+             (solution (string->utf8
+                         (cli-commit-record-solution record)))
+             (preimage
+               (coin-share-preimage
+                 (cli-commit-record-parent record)
+                 (cli-commit-record-height record)
+                 (cli-commit-record-complexity record)
+                 solution pubkey))
+             (share
+               (coin-share
+                 pubkey: pubkey
+                 signature: (secp256k1-ecdsa-sign key preimage)
+                 blind: (cli-commit-record-blind record)
+                 solution: solution))
+             (share-bytes (coin-share-encode share))
+             (push (coin-shares-encode (list share)))
+             (decoded (coin-shares-decode push)))
+        (unless (and (coin-ok? decoded)
+                     (= 1 (length (coin-result-value decoded)))
+                     (equal? share-bytes
+                             (coin-share-encode
+                               (car (coin-result-value decoded)))))
+          (error "contribute: consensus rejected the canonical share encoding"))
+        (let* ((back (car (coin-result-value decoded)))
+               (verified-context
+                 (share-context
+                   context
+                   (list (cli-commit-record-commitment record))))
+               (verified
+                 (coin-check-shares verified-context #u8() (list back))))
+          (unless (coin-ok? verified)
+            (error "contribute: consensus rejected the signed share"))
+          (unless (= contribution
+                     (coin-share-quality verified-context back))
+            (error "contribute: signed share contribution changed"))
+          share-bytes)))
+
+    (define (terminal-contribution-status? status)
+      (or (string=? status "commit-missed")
+          (string=? status "reveal-missed")
+          (string=? status "stale")))
+
+    (define (watch-contribution
+              origin chain key data-dir record context contribution initial)
+      (let loop ((response initial) (previous #f))
+        (let* ((checked
+                 (require-contribution-status
+                   response chain record contribution))
+               (status (relay-field checked 'status)))
+          (print-contribution-status checked previous)
+          (cond
+            ((string=? status "included")
+             (cli-commit-remove
+               data-dir (cli-commit-record-commitment record))
+             checked)
+            ((terminal-contribution-status? status)
+             checked)
+            ((string=? status "revealable")
+             (loop
+               (relay-submit-reveal
+                 origin chain
+                 (cli-commit-record-commitment record)
+                 (signed-contribution key record context contribution))
+               status))
+            (else
+              (sleep 10)
+              (loop
+                (relay-contribution-status
+                  origin chain
+                  (cli-commit-record-commitment record))
+                status))))))
+
+    ;;; Submit and watch one non-custodial relay contribution.
+    (define (run-contribute args)
+      (: list? -> any?)
+      (let ((solution-option (cli-arg args "--solution" #f))
+            (commitment-option (cli-arg args "--commitment" #f)))
+        (when (and solution-option commitment-option)
+          (error "contribute: --solution and --commitment are mutually exclusive"))
+        (let* ((requested
+                 (parse-contribution-commitment commitment-option))
+               (chain (cli-chain args))
+               (origin
+                 (or (relay-url args chain)
+                     (error
+                       "contribute: missing --relay. Pass --relay with the pool URL."))))
+          (relay-require-curl "contribute")
+          ;; Fetch and validate public context before the wallet can be read
+          ;; or created.
+          (let* ((current-context
+                   (relay-puzzle-context
+                     (relay-context origin chain) chain))
+                 (data-dir
+                   (cli-arg args
+                            "--data-dir"
+                            cli-testnet-default-data-dir))
+                 (key (wallet-key data-dir))
+                 (pubkey (wallet-public-key key)))
+            (println "relay: ~a" origin)
+            (let ((prepared
+                    (if requested
+                        (let* ((record
+                                 (stored-contribution-record
+                                   data-dir requested))
+                               (parts
+                                 (prepare-stored-contribution
+                                   record pubkey)))
+                          (list record
+                                (list-ref parts 0)
+                                (list-ref parts 1)))
+                        (let* ((context current-context)
+                               (coop (share-context context '()))
+                               (spec (coin-share-puzzle coop pubkey))
+                               (solution
+                                 (or solution-option
+                                     (prompt-contribution-solution
+                                       context pubkey spec))))
+                          (and solution
+                               (let* ((checked
+                                        (require-share-solution
+                                          "contribute" coop pubkey
+                                          (make-bytevector
+                                            coin-share-blind-bytes 0)
+                                          solution spec))
+                                      (blind
+                                        (wallet-entropy
+                                          coin-share-blind-bytes))
+                                      (commitment
+                                        (coin-commitment
+                                          (coin-share-preimage
+                                            (report-ref context 'parent-hash)
+                                            (report-ref context 'height)
+                                            (report-ref context 'complexity)
+                                            solution pubkey)
+                                          blind))
+                                      ;; Persist every secret before the
+                                      ;; relay receives the commitment.
+                                      (record
+                                        (cli-commit-save
+                                          data-dir
+                                          (cli-commit-record
+                                            height:
+                                              (report-ref context 'height)
+                                            complexity:
+                                              (report-ref context 'complexity)
+                                            parent:
+                                              (report-ref context 'parent-hash)
+                                            pubkey: pubkey
+                                            blind: blind
+                                            commitment: commitment
+                                            solution: solution))))
+                                 (list record context checked)))))))
+              (if (not prepared)
+                  #f
+                  (let* ((record (list-ref prepared 0))
+                         (context (list-ref prepared 1))
+                         (checked (list-ref prepared 2))
+                         (height (cli-commit-record-height record))
+                         (parent-hash
+                           (cli-commit-record-parent record))
+                         (complexity
+                           (cli-commit-record-complexity record))
+                         (commitment
+                           (cli-commit-record-commitment record))
+                         (contribution (list-ref checked 3)))
+                    (println "height: ~a" height)
+                    (println "parent: ~a"
+                             (hex (reverse-bytevector parent-hash)))
+                    (println "pubkey: ~a" (hex pubkey))
+                    (println "personalized-par: ~a"
+                             (puzzle-spec-par (list-ref checked 2)))
+                    (println "solution-length: ~a"
+                             (bytevector-length
+                               (string->utf8
+                                 (cli-commit-record-solution record))))
+                    (println "contribution: ~a" contribution)
+                    (println "commitment: ~a" (hex commitment))
+                    (flush-output-port (current-output-port))
+                    (let* ((authorization
+                             (relay-commit-authorization
+                               key chain parent-hash height complexity
+                               pubkey commitment))
+                           (initial
+                             (relay-submit-commitment
+                               origin chain height parent-hash complexity
+                               pubkey commitment authorization)))
+                      (require-contribution-status
+                        initial chain record contribution)
+                      (println "receipt: accepted")
+                      (flush-output-port (current-output-port))
+                      (watch-contribution
+                        origin chain key data-dir record context
+                        contribution initial)))))))))
 
     ;;; Open one commitment using consensus' reveal type and codec.
     (define (run-reveal args)

@@ -64,8 +64,8 @@ validation, and payouts all use canonical CLI operations.
 6. Runs A listener, B sync, and explorer over loopback. Stops A, reopens its
    database, mines H102 on durable H101, restarts A, and re-syncs B.
 7. Requires both nodes to agree on H102 tip hash, next C, block count, and 102
-   validated bodies. B must have the `0.50000000 SGL` spendable transfer plus
-   the immature `10.00000000 SGL` share payout.
+   validated bodies. B must have both the `0.50000000 SGL` transfer and the
+   `10.00000000 SGL` share payout spendable under the one-block maturity rule.
 8. Validates `/api/summary`, `/api/block/100`, `/api/block/101`,
    `/api/difficulty`, and `/api/address/<B>`, including authenticated `Q`,
    verified contribution, expected/actual 85%/10%/5% payout roles,
@@ -170,9 +170,9 @@ and H101 reports one verified contribution with authenticated non-zero `Q`.
 For the frozen one-share transaction, require producer `85.00001000 SGL`,
 share `10.00000000 SGL`, carrier `5.00000000 SGL`, minted
 `100.00001000 SGL`, and unminted `0.00000000 SGL`. B must hold the
-`0.50000000 SGL` transfer plus its immature share payout, and explorer
-endpoints must return HTTP 200 JSON. Node status must keep branch-aware issued
-supply separate from the current scheduled cap; explorer summary must keep it
+`0.50000000 SGL` transfer plus its share payout, both spendable by H102, and
+explorer endpoints must return HTTP 200 JSON. Node status must keep branch-aware
+issued supply separate from the current scheduled cap; explorer summary must keep it
 separate from the scheduled lifetime maximum.
 
 ## Current payout and supply expectations
@@ -190,7 +190,7 @@ carrier:                  5.00000000 SGL
 coinbase total:         100.00001000 SGL
 unminted subsidy:         0.00000000 SGL
 B balance:               10.50000000 SGL
-                          (0.50000000 spendable, 10.00000000 immature)
+                          (10.50000000 spendable, 0.00000000 immature)
 ```
 
 The producer's nominal 85% is a target: fees and any proportional rounding

@@ -737,6 +737,35 @@ block: validating a block requires only the parent's commitment set, at most
 513 bytes per block. A miner may commit to several candidates and reveal the
 best one, which is a feature.
 
+### 9.5 A node-free public-testnet relay
+
+The reference implementation adds an optional public-testnet rendezvous at
+`https://pool.testnet.sigilcoin.lol`. A contributor can run:
+
+```sh
+sigilcoin contribute --relay https://pool.testnet.sigilcoin.lol --testnet
+```
+
+The local watcher derives the personalized puzzle itself. It sends a
+commitment and context-bound admission signature first, while the wallet key,
+blind, and source remain local. Only after the commitment appears in canonical
+block `H` does it sign and send the reveal for possible inclusion in `H+1`.
+The watcher must stay running through that block or be resumed from its saved
+commitment.
+
+This relay is coordination, not protocol. Its first 16 authenticated distinct
+pubkeys per context get relay slots, while the producer independently
+revalidates work and chooses at most eight reveals by contribution before
+serialization. Authentication does not stop one actor creating many keys, so
+Sybil slot filling remains possible. A relay or producer may delay, omit, or
+censor work, and a receipt is never an inclusion promise.
+
+An included share creates a direct coinbase output for the signed payout
+pubkey and becomes spendable in the following block under SigilCoin's one-block
+maturity. The relay has no payout balance or private key and cannot redirect
+that valid signed output. These are non-normative public-testnet operations; no
+mainnet pool is offered or defined.
+
 ---
 
 ## 10. Scheduled subsidy and actual issuance
@@ -766,8 +795,10 @@ supply. The node prints that as `issued-supply` beside the current-height
 supply beside the scheduled lifetime maximum.
 
 There is no premine or founder's reward. Genesis pays zero to an unspendable
-`OP_RETURN`, and coinbase outputs mature after 100 blocks. The warmup limits
-the scheduled subsidy while the first month of a new chain is debugged.
+`OP_RETURN`. SigilCoin coinbase outputs first become spendable in the following
+block; Bitcoin's block-rules default remains 100, and the chain config selects
+SigilCoin's one-block override. The warmup limits the scheduled subsidy while
+the first month of a new chain is debugged.
 
 There is no fee market. Fees remain because Bitcoin transactions have them and
 the wallet pays a token amount by default; every fee reaches the producer
@@ -1039,7 +1070,7 @@ explicit genesis reset; old testnet state is not migrated.
 | block size cap | 16384 bytes |
 | block spacing floor | 72000 seconds; target 86400 |
 | future drift / median time span | 7200 seconds / 11 blocks |
-| coinbase maturity | 100 blocks |
+| coinbase maturity | 1 block |
 | daviwils per SGL | 100000000 |
 | warmup | heights 1..30 at 1 SGL |
 | reward / halving | 100 SGL, halving every 730 blocks |

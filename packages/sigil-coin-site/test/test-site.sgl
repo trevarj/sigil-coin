@@ -33,7 +33,8 @@
     (assert-true
       (has? %html
             "Puzzle. Program. Block. Each block publishes a puzzle. Shortest valid program wins."))
-    (assert-true (has? %html "https://explorer.sigilcoin.lol"))
+    (assert-true (has? %html "https://explorer.testnet.sigilcoin.lol"))
+    (assert-true (not (has? %html "https://explorer.sigilcoin.lol")))
     (assert-true
       (has? %html
             "https://github.com/trevarj/sigil-coin/blob/HEAD/docs/whitepaper.md")))
@@ -60,7 +61,7 @@
       '("Program synthesis" "~1 block/day" "512 bytes" "Zero" "premine"
         "143029.99991970 SGL" "maximum co-op shares")))
 
-  (test "consensus layers and ecosystem URLs are explicit"
+  (test "consensus layers and public URLs are explicit"
     (for-each
       (lambda (text) (assert-true (has? %html text)))
       '("Bitcoin foundation" "Frozen puzzle machine" "Composite score"
@@ -68,9 +69,10 @@
         "https://usesigil.org"
         "https://github.com/trevarj/sigil-coin"
         "https://github.com/trevarj/sigil-coin/blob/HEAD/docs/consensus.md"
+        "https://pool.testnet.sigilcoin.lol/v1/context"
         "https://web.libera.chat/#systemcrafters")))
 
-  (test "start path has warning, commands and compact LLM prompt"
+  (test "start path and contributor card have exact commands and trust copy"
     (assert-true
       (has? %html
             "Warning: back up .sigilcoin/wallet/wallet.key before receiving SGL."))
@@ -81,12 +83,31 @@
       '("sigilcoin address"
         "sigilcoin sync"
         "sigilcoin puzzle"
-        "sigilcoin mine --solution"))
+        "sigilcoin mine --solution"
+        "sigilcoin contribute --relay https://pool.testnet.sigilcoin.lol --testnet"))
+    (for-each
+      (lambda (text) (assert-true (has? %html text)))
+      '("Contribute without a node"
+        "wallet key local"
+        "blind and source remain local until your commitment appears in a canonical block"
+        "only then does the watcher submit the signed reveal"
+        "Keep the watcher running through the following block"
+        "resume it from the saved commitment"
+        "direct coinbase payout to your wallet"
+        "becomes spendable in the block after it is paid"
+        "Inclusion is not guaranteed"
+        "relay or producer can delay, omit or censor work"
+        "cannot redirect a valid signed payout"))
     (assert-true
       (has? %html
             "Write the shortest valid SigilCoin puzzle-language one-argument function that reproduces every given input/output pair, obeys the stated syntactic constraint, and fits in 512 source bytes. Return source only."))
     (assert-true (has? %html "id=\"fundamentals\""))
     (assert-true (has? %html "<details>"))
+    (for-each
+      (lambda (number)
+        (assert-true
+          (has? %html (string-append "step-number\">" number "<"))))
+      '("1" "2" "3" "4"))
     (assert-true (not (has? %html "step-number\">5<")))
     (assert-true (has? %html "aria-label=\"Copy"))
     (assert-true (has? %js "navigator.clipboard")))

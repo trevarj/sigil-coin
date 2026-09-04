@@ -1,4 +1,4 @@
-;;; Test-solution fixture for the local regtest drill.
+;;; Fixtures for the four-role local regtest pool drill.
 
 (package
   name: "sigil-coin-local-testnet"
@@ -12,10 +12,19 @@
 
   dependencies: (list
     (from-git url: "codeberg:sigil/sigil-crypto" version: "^0.16.1")
+    (from-git url: "codeberg:sigil/sigil-json" version: "^0.16.0")
+    (from-git url: "codeberg:sigil/sigil-http" version: "^0.18.5")
     (from-path dir: "../.." package: "sigil-coin-cli")
+    (from-path dir: "../.." package: "sigil-coin-explorer")
     (from-path dir: "../.." package: "sigil-coin-node")
     (from-path dir: "../.." package: "sigil-coin-consensus")
     (from-path dir: "../.." package: "sigil-coin-puzzle")
+    (from-path dir: "../../../sigil-bitcoin" package: "sigil-bitcoin-utils")
+    (from-path dir: "../../../sigil-bitcoin" package: "sigil-bitcoin-encoding")
+    (from-path dir: "../../../sigil-bitcoin" package: "sigil-bitcoin-primitives")
+    (from-path dir: "../../../sigil-bitcoin" package: "sigil-bitcoin-tx")
+    (from-path dir: "../../../sigil-bitcoin" package: "sigil-bitcoin-consensus")
+    (from-path dir: "../../../sigil-bitcoin" package: "sigil-bitcoin-p2p")
     (from-path dir: "../../../sigil-bitcoin" package: "sigil-bitcoin-node")
     (from-git url: "codeberg:sigil/sigil-sqlite" version: "^0.16.0"))
 

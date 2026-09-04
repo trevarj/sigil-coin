@@ -842,13 +842,65 @@
     (assert-true (block-rules? coin-block-rules))
     (assert-true (eq? coin-connect-block
                       (block-rules-connect coin-block-rules)))
+    (assert-equal 1
+                  (block-rules-coinbase-maturity coin-block-rules))
     ;; The block rules use the chain's emission schedule directly.
     (assert-true (eq? coin-block-reward
                       (block-rules-subsidy coin-block-rules)))
     (assert-equal coin-coinbase-script-bounds
                   (block-rules-coinbase-script-bounds coin-block-rules))
     (assert-true (not (equal? bitcoin-coinbase-script-bounds
-                              coin-coinbase-script-bounds)))))
+                              coin-coinbase-script-bounds)))
+    (for-each
+      (lambda (chain)
+        (assert-equal
+          (block-rules-coinbase-maturity coin-block-rules)
+          (block-rules-coinbase-maturity
+            (chain-config-block-rules chain))))
+      (list sigilcoin-main-chain
+            sigilcoin-testnet-chain
+            sigilcoin-regtest-chain)))
+
+  (test "the connector rejects a coinbase at age zero"
+    (let* ((funding (car (block-transactions %block1)))
+           (funding-output (car (transaction-outputs funding)))
+           (funding-outpoint
+             (outpoint txid: (transaction-txid funding) index: 0))
+           (spend
+             (transaction
+               version: 2
+               inputs: (list
+                         (txin previous-output: funding-outpoint
+                               script-sig: #u8()
+                               sequence: #xffffffff
+                               witness: '()))
+               outputs: (list
+                          (txout value: (txout-value funding-output)
+                                 script-pubkey: %payout))
+               lock-time: 0))
+           (child
+             (coin-build-block
+               %header1 2 coin-genesis-complexity #f "age zero" %payout
+               (+ (block-header-time %header1) %spacing)
+               (list spend) 0))
+           (age-zero-utxos
+             (list
+               (cons funding-outpoint
+                     (utxo-entry output: funding-output
+                                 coinbase?: #t
+                                 height: 2
+                                 time: (block-header-time %header1))))))
+      (assert-true
+        (raises-containing?
+          (lambda ()
+            (coin-connect-block coin-block-rules
+                                sigilcoin-consensus-params
+                                2
+                                age-zero-utxos
+                                child
+                                #t
+                                %block1))
+          "immature coinbase spend")))))
 
 ;; ============================================================
 ;; Genesis

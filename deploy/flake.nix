@@ -22,9 +22,9 @@
   # copy of this flake rather than the working tree. Direct flake use defaults
   # to revision-pinned clones below /workspace. The local and Docker helpers
   # override these inputs from their detected sibling layout. The dependency
-  # set is currently ahead of what is pushed: at the time of
-  # writing, local sigil-bitcoin HEAD is 7547072 and includes both the durable
-  # parent-block validation seam and strict per-chain P2P magic enforcement.
+  # set is currently ahead of what is pushed: local sigil-bitcoin HEAD
+  # 8b8f380 configures coinbase maturity per chain while retaining Bitcoin's
+  # canonical 100-block rule.
   # Pinning by rev also means an uncommitted change in a sibling checkout can never leak into a
   # deployment build, and that the flake still locks while a sibling working
   # tree is dirty.
@@ -47,7 +47,7 @@
       flake = false;
     };
     sigil-bitcoin = {
-      url = "git+file:///workspace/sigil-bitcoin?rev=7547072e87636423ab57f0dbeb538c2c8c6b440d";
+      url = "git+file:///workspace/sigil-bitcoin?rev=8b8f380d0fb63177b0949c9e0697cef3d8604fdc";
       flake = false;
     };
 
@@ -80,7 +80,7 @@
       flake = false;
     };
     sigil-http = {
-      url = "git+https://codeberg.org/sigil/sigil-http?ref=master&rev=c24a14cabdb5ceed6273d7a6c1004baee07d69a0";
+      url = "git+https://codeberg.org/sigil/sigil-http?ref=master&rev=0b4617ac000d6f3ed9f3d0906e6b746ad995ea03";
       flake = false;
     };
     sigil-json = {

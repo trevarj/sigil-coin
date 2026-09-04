@@ -58,8 +58,8 @@
 
 ;; Longest wait for a message from a connected peer. Generous on purpose: a
 ;; peer goes quiet for as long as it takes to ingest the headers it was just
-;; sent, which is seconds for a hundred of them, and hanging up on it would
-;; cost it the whole block-download half of the pass.
+;; sent, which is seconds for a retarget window. Hanging up would cost it the
+;; whole block-download half of the pass.
 (define %read-timeout 60000)
 
 ;; Envelopes the serving node handles on one connection. A whole sync round
@@ -521,38 +521,45 @@
     (let* ((dir-a (fresh-dir))
            (dir-b (fresh-dir))
            (a (open-node dir-a))
-           (blocks (mine-blocks a 4 %elsewhere))
+           (blocks (mine-blocks a 16 %elsewhere))
+           (at-16 (list-ref blocks 15))
+           (complexity-16
+             (coin-result-value
+               (coin-bits-decode
+                 (block-header-bits (block-header-field at-16)))))
            (endpoint (open-endpoint))
            (port (car endpoint))
            (listener (cdr endpoint)))
-      (assert-equal 4 (height-of a))
-      (assert-equal 4 (validated-count a))
+      (assert-equal 16 (height-of a))
+      (assert-equal 16 (validated-count a))
+      (assert-true (not (= coin-genesis-complexity complexity-16)))
       ;; The peer starts with nothing but the address of this node.
       (let ((lines (sync-peer-ok a listener port dir-b 2)))
         ;; What the peer itself reported, before anything is read back out
         ;; of its database.
-        (assert-equal "4" (peer-field lines "best-height"))
-        (assert-equal "4" (peer-field lines "validated-blocks"))
-        (assert-equal (hex-encode (block-hash (list-ref blocks 3)))
+        (assert-equal "16" (peer-field lines "best-height"))
+        (assert-equal "16" (peer-field lines "validated-blocks"))
+        (assert-equal (hex-encode (block-hash at-16))
                       (peer-field lines "best-block-hash"))
         (assert-equal "" (peer-field lines "sync-last-error")))
       (socket-close listener)
       (node-close a)
       ;; And the same chain read out of the peer's own database.
       (let ((b (open-node dir-b)))
-        (assert-equal 4 (height-of b))
-        (assert-equal 4 (best-block-height b))
-        (assert-equal (hex-encode (block-hash (list-ref blocks 3)))
+        (assert-equal 16 (height-of b))
+        (assert-equal 16 (best-block-height b))
+        (assert-equal (hex-encode (block-hash at-16))
                       (best-block-hash b))
-        ;; Bodies, not just headers: four blocks validated, and four solo
-        ;; coinbase outputs in the peer's own UTXO set. Each leaves one fifth
-        ;; of its scheduled subsidy unminted.
-        (assert-equal 4 (validated-count b))
-        (assert-equal 4 (length (active-utxos b)))
-        (assert-equal (solo-issued-supply 4) (utxo-total b))
-        (assert-equal '(1 1 1 1)
-                      (map (lambda (r) (row-value r "coinbase"))
-                           (active-utxos b)))
+        ;; Bodies, not just headers: a full retarget window validated, and
+        ;; every solo coinbase is present in the peer's own UTXO set.
+        (assert-equal 16 (validated-count b))
+        (assert-equal 16 (length (active-utxos b)))
+        (assert-equal (solo-issued-supply 16) (utxo-total b))
+        (assert-equal complexity-16
+                      (coin-result-value
+                        (coin-bits-decode
+                          (block-header-bits
+                            (list-ref (validated-headers b) 16)))))
         (assert-equal "" (last-error b))
         (node-close b))
       (remove-tree dir-a)
@@ -1117,14 +1124,13 @@
 ;; Spending across nodes
 ;; ============================================================
 ;;
-;; A coinbase has to age `coinbase-maturity` blocks before anything can
-;; spend it, so this is the one expensive test in the file: the chain really
-;; is mined to height 101 on one node and really is validated block by block
-;; on the other.
+;; A SigilCoin coinbase matures after one block: H1 cannot be spent at age
+;; zero, and its reward is eligible in H2. The full retarget-window sync is
+;; exercised independently above.
 
 (when %native-secp256k1?
   (test-group "sigilcoin wallet spend across nodes"
-    (test "wallet transaction confirms in co-op builder block after retarget"
+    (test "wallet transaction spends the H1 reward in an H2 co-op block"
       (let* ((dir-a (fresh-dir))
              (dir-b (fresh-dir))
              (wallet-script (address->script %peer-address))
@@ -1132,14 +1138,8 @@
         (plant-wallet-key dir-a)
         (assert-address-matches-key)
         (let* ((a (open-node dir-a))
-               (blocks (mine-blocks a 100 wallet-script))
-               (at-16 (list-ref blocks 15))
-               (complexity-16
-                 (coin-result-value
-                   (coin-bits-decode
-                     (block-header-bits (block-header-field at-16))))))
-          (assert-equal 100 (height-of a))
-          (assert-true (not (= coin-genesis-complexity complexity-16)))
+               (blocks (mine-blocks a 1 wallet-script)))
+          (assert-equal 1 (height-of a))
           (let* ((funding (car (block-transactions (car blocks))))
                  (funding-value (solo-coinbase-value 1))
                  (secret (make-bytevector 32 1))
@@ -1165,12 +1165,12 @@
                  (transfer (transaction-sign-p2wpkh-input
                              unsigned 0 funding-value secret))
                  (history (validated-headers a))
-                 (complexity (coin-required-complexity history 101))
-                 (parent (list-ref blocks 99))
+                 (complexity (coin-required-complexity history 2))
+                 (parent (car blocks))
                  ;; Empty share set still exercises canonical co-op builder
                  ;; path and transaction/fee accounting.
                  (payment (coin-build-coop-block
-                            parent 101 complexity #f '() "wallet payment"
+                            parent 2 complexity #f '() "wallet payment"
                             wallet-script
                             (coin-next-block-time
                               (block-header-field parent)
@@ -1187,50 +1187,45 @@
                    (port (car endpoint))
                    (listener (cdr endpoint))
                    (lines (sync-peer-ok a listener port dir-b 2)))
-              (assert-equal "101" (peer-field lines "best-block-height"))
-              (assert-equal "101" (peer-field lines "validated-blocks"))
+              (assert-equal "2" (peer-field lines "best-block-height"))
+              (assert-equal "2" (peer-field lines "validated-blocks"))
               (socket-close listener))
             (node-close a)
             (let* ((b (open-node dir-b))
-                   (received-16 (list-ref (validated-headers b) 16))
                    (paid (utxos-paying b recipient-script)))
               (assert-true (tip-is? b payment))
-              (assert-equal complexity-16
-                            (coin-result-value
-                              (coin-bits-decode
-                                (block-header-bits received-16))))
               (assert-equal 1 (length paid))
               (assert-equal 25000000 (row-value (car paid) "value"))
               (assert-equal 0 (row-value (car paid) "coinbase"))
-              (assert-equal 101 (row-value (car paid) "height"))
+              (assert-equal 2 (row-value (car paid) "height"))
               (let* ((block-row (car (sqlite-query
                                        (node-db b)
-                                       "SELECT block_hex FROM blocks WHERE height = 101 AND validated = 1")))
+                                       "SELECT block_hex FROM blocks WHERE height = 2 AND validated = 1")))
                      (received (block-parse
                                  (hex-decode
                                    (row-value block-row "block_hex")))))
                 (assert-equal (transaction-txid transfer)
                               (transaction-txid
                                 (list-ref (block-transactions received) 1))))
-              ;; Spent H1 leaves, recipient and change enter, and the fee
-              ;; returns through H101 coinbase. Transactions conserve the
-              ;; lower actual supply minted by the 101 solo blocks.
-              (assert-equal 102 (length (active-utxos b)))
-              (assert-equal (solo-issued-supply 101) (utxo-total b))
+              ;; Spent H1 leaves; recipient, change, and H2 coinbase enter.
+              ;; The fee returns through the H2 coinbase without changing
+              ;; issued supply.
+              (assert-equal 3 (length (active-utxos b)))
+              (assert-equal (solo-issued-supply 2) (utxo-total b))
               (assert-equal "" (last-error b))
               (node-close b))))
         (remove-tree dir-a)
         (remove-tree dir-b)))))
 
-;; Keep keyless workspace coverage: native harness above upgrades this same
-;; maturity/sync path to a signed wallet transaction instead of duplicating it.
+;; Keep the same H1-to-H2 boundary covered when the generic test runtime lacks
+;; secp256k1; the bundled operator path above upgrades it to a signed transfer.
 (when (not %native-secp256k1?)
   (test-group "sigilcoin spend across nodes"
-    (test "coins mined by one node land in the other node's own UTXO set"
+    (test "the H1 reward spent in H2 reaches the peer's UTXO set"
       (let* ((dir-a (fresh-dir))
              (dir-b (fresh-dir))
              (a (open-node dir-a))
-             (blocks (mine-blocks a 100 %anyone))
+             (blocks (mine-blocks a 1 %anyone))
              (funding (car (block-transactions (car blocks))))
              (to-script (address->script %peer-address))
              (parent (node-best-header a))
@@ -1249,21 +1244,21 @@
                                    script-pubkey: to-script))
                  lock-time: 0))
              (history (validated-headers a))
-             (complexity (coin-required-complexity history 101))
+             (complexity (coin-required-complexity history 2))
              (payment (coin-build-block
-                        parent 101 complexity #f "payment" %anyone
+                        parent 2 complexity #f "payment" %anyone
                         (coin-next-block-time
                           parent coin-regtest-min-block-spacing)
                         (list transfer) 0)))
-        (assert-equal 100 (height-of a))
+        (assert-equal 1 (height-of a))
         (assert-equal 1 (submit a payment))
         (assert-equal 2 (length (block-transactions payment)))
         (let* ((endpoint (open-endpoint))
                (port (car endpoint))
                (listener (cdr endpoint))
                (lines (sync-peer-ok a listener port dir-b 2)))
-          (assert-equal "101" (peer-field lines "best-block-height"))
-          (assert-equal "101" (peer-field lines "validated-blocks"))
+          (assert-equal "2" (peer-field lines "best-block-height"))
+          (assert-equal "2" (peer-field lines "validated-blocks"))
           (socket-close listener))
         (node-close a)
         (let* ((b (open-node dir-b))
@@ -1272,8 +1267,9 @@
           (assert-equal 1 (length paid))
           (assert-equal (solo-coinbase-value 1)
                         (row-value (car paid) "value"))
-          (assert-equal 101 (length (active-utxos b)))
-          (assert-equal (solo-issued-supply 101) (utxo-total b))
+          (assert-equal 2 (row-value (car paid) "height"))
+          (assert-equal 2 (length (active-utxos b)))
+          (assert-equal (solo-issued-supply 2) (utxo-total b))
           (node-close b))
         (remove-tree dir-a)
         (remove-tree dir-b)))))

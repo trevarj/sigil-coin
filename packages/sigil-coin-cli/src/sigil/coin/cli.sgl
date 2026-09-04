@@ -7,6 +7,7 @@
           (sigil coin cli wallet)
           (sigil coin cli support)
           (sigil coin cli mine)
+          (sigil coin cli relay)
           (sigil coin cli operate)
   )
   (export
@@ -29,7 +30,6 @@
     cli-sgl->daviwils
     cli-error-message
     coin-address-hrp
-    coin-coinbase-maturity
     coin-address
     coin-address->script-pubkey
     wallet-key-file
@@ -78,6 +78,7 @@
     cli-commit-records-for
     cli-commit-save
     cli-commit-prune
+    cli-commit-remove
     cli-bytes<?
     cli-sort-bytes
     coin-validated-tip-height
@@ -93,6 +94,17 @@
     run-mine
     run-commit
     run-reveal
+    run-contribute
+    relay-url
+    relay-require-curl
+    relay-context
+    relay-producer
+    relay-submit-commitment
+    relay-contribution-status
+    relay-submit-reveal
+    relay-commit-authorization
+    relay-authorization-hash
+    run-relay
     coin-parse-peer
     coin-print-status
     coin-peer-connector
@@ -127,9 +139,12 @@
       (println "")
       (println "mining:")
       (println "  sigilcoin puzzle [--height N] [--share] [--complexity C] [CHAIN] [--data-dir DIR]")
-      (println "  sigilcoin mine [--solution EXPR] [--commit HEX]... [--reveal HEX]... [--graffiti TEXT] [--address ADDR] [--share] [--complexity C] [CHAIN] [--data-dir DIR]")
+      (println "  sigilcoin mine [--solution EXPR] [--commit HEX]... [--reveal HEX]... [--relay URL] [--graffiti TEXT] [--address ADDR] [--share] [--complexity C] [CHAIN] [--data-dir DIR]")
       (println "  sigilcoin commit --solution EXPR [--height N] [--complexity C] [CHAIN] [--data-dir DIR]")
       (println "  sigilcoin reveal [--height N] [--commitment HEX] [CHAIN] [--data-dir DIR]")
+      (println "  sigilcoin contribute --relay URL [--solution EXPR | --commitment HEX] [--data-dir DIR] [--testnet]")
+      (println "  sigilcoin relay serve --testnet [--state-dir DIR] [--data-dir DIR] [--host HOST] [--port N]")
+      (println "  sigilcoin relay health --relay URL --testnet")
       (println "")
       (println "how mining works:")
       (println "  A puzzle is k input/output pairs plus one syntactic constraint, both")
@@ -204,6 +219,8 @@
                   ((string=? command "mine") (run-mine rest))
                   ((string=? command "commit") (run-commit rest))
                   ((string=? command "reveal") (run-reveal rest))
+                  ((string=? command "contribute") (run-contribute rest))
+                  ((string=? command "relay") (run-relay rest))
                   ((string=? command "address") (run-address rest))
                   ((string=? command "balance") (run-balance rest))
                   ((string=? command "send") (run-send rest))

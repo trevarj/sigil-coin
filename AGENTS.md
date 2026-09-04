@@ -19,14 +19,12 @@ These instructions apply to the whole repository unless a more specific
 
 - The host runs NixOS. Do not use apt, dnf, pacman, brew, global npm, or global
   pip, and do not install into user or system profiles.
-- Build tools (gcc, make, pkg-config, secp256k1) come from the shared devshell
-  one level up. Run project commands as:
-  `nix develop /home/trev/Workspace/sigil -c <command>`.
-- Use the development toolchain binary at
-  `/home/trev/Workspace/sigil/sigil/build/dev/bin/sigil`; put its directory on
-  `PATH` before running commands.
-- There is no `flake.nix` in this repo on purpose; the workspace flake at
-  `/home/trev/Workspace/sigil/flake.nix` covers it.
+- Build tools (gcc, make, pkg-config, secp256k1) come from this repository's
+  pinned `flake.nix`. Run project commands as `nix develop -c <command>`;
+  `.envrc` loads the same shell through direnv.
+- The dev shell puts pinned `sigil`, `sigil-run`, `sigilcoin`, and
+  `sigilcoin-explorer` binaries on `PATH`, plus locally built testnet and
+  simulator tool directories when present.
 - Sibling checkouts `../sigil` (language monorepo) and `../sigil-bitcoin` are
   resolved through `dev-redirects.sgl`.
 - Prefer `rg` for content search and `fd` for file search.
@@ -56,15 +54,13 @@ Key rules for this repo:
 Every meaningful behavior change needs tests.
 
 ```sh
-nix develop /home/trev/Workspace/sigil -c sigil test \
-  --redirects ./dev-redirects.sgl --no-color
+nix develop -c sigil test --redirects ./dev-redirects.sgl --no-color
 ```
 
 Install or refresh dependencies with:
 
 ```sh
-nix develop /home/trev/Workspace/sigil -c sigil deps install \
-  --redirects ./dev-redirects.sgl
+nix develop -c sigil deps install --redirects ./dev-redirects.sgl
 ```
 
 Run a single package harness from its directory, pointing at the root
@@ -72,7 +68,7 @@ redirects file:
 
 ```sh
 cd packages/sigil-coin-puzzle
-nix develop /home/trev/Workspace/sigil -c sigil test test/test-puzzle.sgl \
+nix develop -c sigil test test/test-puzzle.sgl \
   --redirects ../../dev-redirects.sgl --no-color
 ```
 

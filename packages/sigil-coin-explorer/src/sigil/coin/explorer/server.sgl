@@ -2,16 +2,9 @@
 ;;;
 ;;; A read-only site with a compiled first-party dashboard asset needs one
 ;;; thing from a web server: parse a request line, hand back a response, close.
-;;; That is what this is. It is built on `(sigil socket)`, which ships in
-;;; `sigil-stdlib`, rather than on `sigil-http`: the published `sigil-http`
-;;; is part of the 0.9 `sigil` workspace and pulls that workspace's
-;;; `sigil-stdlib`, `sigil-socket`, `sigil-tls` and `sigil-crypto` in behind
-;;; it. Installing it here re-pointed the shared `sigil-crypto` from 0.16.5
-;;; to 0.9.2 for EVERY package in this workspace, which is a change to
-;;; `sigil-bitcoin`'s hashing, made silently, from a package that only wants
-;;; to print a table. That is reported rather than worked around; when a
-;;; 0.20-compatible `sigil-http` is published, `explorer-serve-connection`
-;;; is the only procedure that has to change.
+;;; That is what this is. A compatible `sigil-http` now exists, but the
+;;; explorer deliberately remains on its small GET-only implementation built
+;;; directly on `(sigil socket)`, which ships in `sigil-stdlib`.
 ;;;
 ;;; ## Routes
 ;;;

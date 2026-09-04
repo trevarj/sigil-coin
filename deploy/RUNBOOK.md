@@ -453,10 +453,10 @@ sudo -u sigilcoin sigilcoin balance --chain sigilcoin-main --data-dir /var/lib/s
 ```
 
 `balance` prints the address, `outputs`, `balance`, `spendable` and
-`immature`. Coinbase outputs are immature for 100 blocks, which on a
-one-block-a-day chain is about 100 days: a freshly restored node that mined
-recently will show its reward under `immature`, not `spendable`. That is
-correct, not a restore failure.
+`immature`. SigilCoin uses one-block coinbase maturity: an output created in
+block `H` may first be spent in `H+1`. Because `balance` evaluates spending in
+the candidate after the current tip, a fresh reward at tip `H` is already
+reported as `spendable`. Bitcoin's block-rules default remains 100 blocks.
 
 Losing only the database: delete it and let the node re-sync from peers. The
 wallet key is independent of it, and the balance reappears once the chain is
@@ -531,9 +531,9 @@ What that means operationally:
 
 - A `best-block-hash` that changes at the same height is a reorg. The node
   rolls back UTXOs and restores the affected mempool entries by itself.
-- **A mined block is not money until it is 100 blocks deep**, which is the
-  coinbase maturity and roughly 100 days. Treat a fresh reward as
-  provisional; `balance` already does, under `immature`.
+- **A coinbase created in block H may first be spent in H+1.** A fresh reward
+  is spendable for the following block but remains reorg-sensitive until that
+  child settles its height.
 - A reorg deeper than a few blocks, or one that repeats at the same height,
   is worth reporting in `#systemcrafters` with the two competing block ids
   and the output of `sigilcoin status` from both sides.

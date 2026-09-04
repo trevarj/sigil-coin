@@ -24,7 +24,8 @@
       "https://github.com/trevarj/sigil-coin/blob/HEAD/docs/whitepaper.md")
     (define %consensus
       "https://github.com/trevarj/sigil-coin/blob/HEAD/docs/consensus.md")
-    (define %explorer "https://explorer.sigilcoin.lol")
+    (define %explorer "https://explorer.testnet.sigilcoin.lol")
+    (define %pool "https://pool.testnet.sigilcoin.lol")
     (define %release "https://github.com/trevarj/sigil-coin/releases")
 
     ;;; Versioned files copied into the generated `assets` directory.
@@ -268,8 +269,8 @@
               'section (attrs '(id "start") '(class "section-shell section-block start"))
               (list 'div (attrs '(class "section-heading reveal"))
                     (list 'p (attrs '(class "eyebrow")) "Get started")
-                    (list 'h2 "Download. Wallet. Sync. Solve.")
-                    (list 'p "The CLI is the node, wallet and miner. Read each command before running it."))
+                    (list 'h2 "Download. Run a node or contribute.")
+                    (list 'p "Use the CLI as a full node, wallet and miner, or contribute to the public testnet pool without running a node. Read each command before running it."))
               (list 'div (attrs '(class "path"))
                     (step "1" "Download"
                           "Published builds appear on Releases. If none matches your system, build the source with the repository's pinned Nix environment."
@@ -287,6 +288,13 @@
                           "Print today's examples and constraint, ask a model or synthesizer for a candidate, then submit the shortest source you found."
                           '("sigilcoin puzzle"
                             "sigilcoin mine --solution '(lambda(x)...)'"))
+                    (list 'article (attrs '(class "prompt-card reveal"))
+                          (list 'h3 "Contribute without a node")
+                          (list 'p "On public testnet, the contributor watcher derives your personalized puzzle and keeps your wallet key local. Your blind and source remain local until your commitment appears in a canonical block; only then does the watcher submit the signed reveal.")
+                          (command-row "sigilcoin contribute --relay https://pool.testnet.sigilcoin.lol --testnet")
+                          (list 'p "Keep the watcher running through the following block, or resume it from the saved commitment. If included, the reward is a direct coinbase payout to your wallet and becomes spendable in the block after it is paid. Inclusion is not guaranteed: the relay or producer can delay, omit or censor work, but cannot redirect a valid signed payout.")
+                          (list 'p (link (string-append %pool "/v1/context")
+                                         "View current pool context ↗")))
                     (list 'article (attrs '(class "prompt-card reveal"))
                           (list 'div (attrs '(class "prompt-heading"))
                                 (list 'h3 "Compact LLM prompt")

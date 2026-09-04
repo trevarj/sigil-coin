@@ -68,6 +68,7 @@
           (sigil sqlite)
           (sigil secp256k1)
           (sigil bitcoin utils)
+          (sigil bitcoin consensus)
           (sigil bitcoin primitives)
           (sigil bitcoin encoding)
           (sigil bitcoin keys)
@@ -78,7 +79,6 @@
           (sigil coin cli args))
   (export
     coin-address-hrp
-    coin-coinbase-maturity
     coin-address
     coin-address->script-pubkey
     wallet-key-file
@@ -124,15 +124,6 @@
     ;;; Smallest change output the wallet will create, in daviwils.
     (define coin-dust-threshold 294)
 
-    ;; `sigil-bitcoin` keeps its maturity window private, so it is restated
-    ;; here and pinned by a test that spends at exactly the boundary. A
-    ;; wallet that disagreed would build transactions the node refuses.
-    ;;; Blocks a coinbase output must age before the wallet will spend it.
-    ;;;
-    ;;; ```scheme
-    ;;; coin-coinbase-maturity ; => 100
-    ;;; ```
-    (define coin-coinbase-maturity 100)
 
     ;;; Fee `send` pays when `--fee` is not given, in daviwils.
     ;;;
@@ -529,18 +520,18 @@
 
     ;;; Whether a UTXO row can be spent in the block after `tip-height`.
     ;;;
-    ;;; Only coinbase outputs are ever held back, and the maturity window is
-    ;;; the node's own: a wallet that disagreed would build transactions the
-    ;;; node then refuses.
+    ;;; Coinbase maturity comes from the selected node's block rules, so the
+    ;;; wallet cannot drift from the connector.
     ;;;
     ;;; ```scheme
-    ;;; (wallet-utxo-mature? row 101) ; => #t
+    ;;; (wallet-utxo-mature? n row 1) ; => #t
     ;;; ```
-    (define (wallet-utxo-mature? row tip-height)
-      (: list? integer? -> boolean?)
+    (define (wallet-utxo-mature? n row tip-height)
+      (: node? list? integer? -> boolean?)
       (or (not (= 1 (row-ref row "coinbase")))
           (>= (- (+ tip-height 1) (row-ref row "height"))
-              coin-coinbase-maturity)))
+              (block-rules-coinbase-maturity
+                (chain-config-block-rules (node-config n))))))
 
     ;;; Total and spendable balance for a scriptPubKey, in daviwils.
     ;;;
@@ -561,7 +552,7 @@
               (let ((value (wallet-utxo-value (car rows))))
                 (loop (cdr rows)
                       (+ total value)
-                      (if (wallet-utxo-mature? (car rows) tip)
+                      (if (wallet-utxo-mature? n (car rows) tip)
                           (+ spendable value)
                           spendable)))))))
 
@@ -652,7 +643,10 @@
       (: node? bytevector? integer? -> pair?)
       (let* ((tip (node-status-snapshot-best-block-height (node-status n)))
              (rows (wallet-utxos n script-pubkey))
-             (pinned (wallet-mempool-spent-outpoints n)))
+             (pinned (wallet-mempool-spent-outpoints n))
+             (maturity
+               (block-rules-coinbase-maturity
+                 (chain-config-block-rules (node-config n)))))
         (let loop ((xs rows) (chosen '()) (value 0) (held 0))
           (cond
             ((>= value needed)
@@ -672,8 +666,10 @@
                                                     (cdr balance)))
                               " SGL still maturing; a mined reward is"
                               " spendable "
-                              (number->string coin-coinbase-maturity)
-                              " blocks later)")
+                              (number->string maturity)
+                              (if (= maturity 1)
+                                  " block later)"
+                                  " blocks later)"))
                             "")
                         (if (> held 0)
                             (string-append
@@ -689,7 +685,7 @@
                    chosen
                    value
                    (+ held (wallet-utxo-value (car xs)))))
-            ((wallet-utxo-mature? (car xs) tip)
+            ((wallet-utxo-mature? n (car xs) tip)
              (loop (cdr xs)
                    (cons (car xs) chosen)
                    (+ value (wallet-utxo-value (car xs)))

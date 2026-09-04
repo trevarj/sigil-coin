@@ -113,3 +113,34 @@ services:
         read_only: true
         bind:
           create_host_path: false
+
+  pool:
+    <<: *sigilcoin-service
+    user: "${POOL_UID:-1002}:${SIGIL_GID:-1000}"
+    command: ["relay"]
+    pids_limit: 64
+    mem_limit: 256m
+    cpus: "0.5"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/sigilcoin-entrypoint", "health-relay"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    ports:
+      - "127.0.0.1:${POOL_PORT:-8082}:8082/tcp"
+    depends_on:
+      sync:
+        condition: service_healthy
+    volumes:
+      - type: bind
+        source: ${SIGIL_TESTNET_STATE_DIR:-./state/testnet}
+        target: /var/lib/sigilcoin
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${SIGIL_TESTNET_POOL_STATE_DIR:-./state/testnet-pool}
+        target: /var/lib/sigilcoin-pool
+        bind:
+          create_host_path: false

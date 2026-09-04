@@ -1,0 +1,1085 @@
+;;; Focused contracts for the co-op relay boundary.
+
+(import (sigil test)
+        (sigil fs)
+        (sigil io)
+        (sigil string)
+        (sigil json)
+        (sigil path)
+        (sigil error)
+        (sigil sqlite)
+        (sigil http request)
+        (sigil http response)
+        (sigil secp256k1)
+        (sigil bitcoin utils)
+        (sigil bitcoin encoding)
+        (sigil bitcoin primitives)
+        (sigil bitcoin consensus)
+        (sigil bitcoin node)
+        (sigil coin puzzle)
+        (sigil coin puzzle generator)
+        (sigil coin consensus)
+        (only (sigil coin consensus shares)
+              coin-check-share-solution/spec)
+        (sigil coin node)
+        (only (sigil coin explorer store) explorer-db-path)
+        (sigil coin cli relay))
+
+(define (raises? thunk)
+  (guard (err (else #t))
+    (thunk)
+    #f))
+
+(define (field object key)
+  (let ((entry (assq key object)))
+    (and entry (cdr entry))))
+
+(define %native-secp256k1?
+  (guard (err (else #f))
+    (let ((key (make-bytevector 32 1)))
+      (and (secp256k1-seckey-verify? key)
+           (= 33 (bytevector-length (secp256k1-pubkey-create key)))))))
+
+(test-group "strict relay JSON"
+  (test "accepts only declared flat scalars and declared string arrays"
+    (let ((decoded
+            (relay-json-decode
+              "{\"version\":1,\"name\":\"pool\",\"none\":null,\"items\":[\"a\",\"b\"]}"
+              '("version" "name" "none" "items")
+              '("items"))))
+      (assert-equal 1 (field decoded 'version))
+      (assert-equal "pool" (field decoded 'name))
+      (assert-equal 'null (field decoded 'none))
+      (assert-equal '("a" "b") (field decoded 'items))))
+
+  (test "rejects duplicate and unknown fields"
+    (assert-true
+      (raises? (lambda ()
+                 (relay-json-decode "{\"x\":1,\"x\":2}" '("x") '()))))
+    (assert-true
+      (raises? (lambda ()
+                 (relay-json-decode "{\"x\":1,\"y\":2}" '("x") '())))))
+
+  (test "rejects nested values, booleans, loose separators, and trailing data"
+    (for-each
+      (lambda (text)
+        (assert-true
+          (raises? (lambda () (relay-json-decode text '("x") '())))))
+      '("{\"x\":{}}"
+        "{\"x\":true}"
+        "{,\"x\":1}"
+        "{\"x\":1,}"
+        "{\"x\":1 \"y\":2}"
+        "{\"x\":1}{}")))
+
+  (test "rejects noncanonical numbers and strings"
+    (for-each
+      (lambda (text)
+        (assert-true
+          (raises? (lambda () (relay-json-decode text '("x") '())))))
+      '("{\"x\":01}"
+        "{\"x\":+1}"
+        "{\"x\":1.0}"
+        "{\"x\":1e0}"
+        "{\"x\":-0}"
+        "{\"x\":\"\\q\"}")))
+
+  (test "array exception remains string-only and canonical"
+    (for-each
+      (lambda (text)
+        (assert-true
+          (raises? (lambda ()
+                     (relay-json-decode text '("items") '("items"))))))
+      '("{\"items\":[1]}"
+        "{\"items\":[\"a\",]}"
+        "{\"items\":[[\"a\"]]}"))))
+
+(test-group "relay encoding and authorization"
+  (test "hex must be lowercase and exactly sized"
+    (assert-equal #u8(0 255) (relay-canonical-hex "00ff" 2))
+    (assert-false (relay-canonical-hex "00FF" 2))
+    (assert-false (relay-canonical-hex "00" 2))
+    (assert-false (relay-canonical-hex "0g" 1)))
+
+  (test "authorization hash is the exact version-one domain"
+    (let* ((parent (make-bytevector 32 2))
+           (pubkey (if %native-secp256k1?
+                       (secp256k1-pubkey-create (make-bytevector 32 1))
+                       (make-bytevector 33 3)))
+           (commitment (make-bytevector 32 4))
+           (height 42)
+           (complexity 128)
+           (expected
+             (hash256
+               (bytevector-append
+                 (string->utf8 "SigilCoin/relay-commit/1")
+                 (string->utf8 "sigilcoin-regtest")
+                 parent (u64-le height) (u32-le complexity)
+                 pubkey commitment))))
+      (assert-equal expected
+        (relay-authorization-hash sigilcoin-regtest-chain parent height
+                                  complexity pubkey commitment))
+      (assert-true
+        (not (equal? expected
+                     (relay-authorization-hash
+                       sigilcoin-regtest-chain parent (+ height 1)
+                       complexity pubkey commitment))))))
+
+  (test "compact authorization verifies when native secp256k1 is present"
+    (when %native-secp256k1?
+      (let* ((key (make-bytevector 32 1))
+             (pubkey (secp256k1-pubkey-create key))
+             (parent (make-bytevector 32 2))
+             (commitment (make-bytevector 32 4))
+             (digest (relay-authorization-hash
+                       sigilcoin-regtest-chain parent 1 128
+                       pubkey commitment))
+             (signature (relay-commit-authorization
+                          key sigilcoin-regtest-chain parent 1 128
+                          pubkey commitment)))
+        (assert-equal 64 (bytevector-length signature))
+        (assert-true (secp256k1-ecdsa-verify signature digest pubkey))))))
+
+(test-group "relay origin policy"
+  (test "mine can omit a relay"
+    (assert-false (relay-url '() sigilcoin-testnet-chain)))
+
+  (test "testnet requires TLS and regtest permits only literal loopback HTTP"
+    (assert-equal "https://pool.test"
+                  (relay-url '("--relay" "https://pool.test")
+                             sigilcoin-testnet-chain))
+    (assert-equal "http://127.0.0.1:8082"
+                  (relay-url '("--relay" "http://127.0.0.1:8082")
+                             sigilcoin-regtest-chain))
+    (assert-true
+      (raises? (lambda ()
+                 (relay-url '("--relay" "http://pool.test")
+                            sigilcoin-testnet-chain))))
+    (assert-true
+      (raises? (lambda ()
+                 (relay-url '("--relay" "http://localhost:8082")
+                            sigilcoin-regtest-chain))))
+    (assert-true
+      (raises? (lambda ()
+                 (relay-url '("--relay" "https://pool.test/path")
+                            sigilcoin-testnet-chain)))))
+
+  (test "curl cannot expand one relay into multiple transfers"
+    (assert-true
+      (raises? (lambda ()
+                 (relay-url '("--relay" "https://pool{1,2}.test")
+                            sigilcoin-testnet-chain))))
+    (assert-true
+      (raises? (lambda ()
+                 (relay-url '("--relay" "https://pool[12].test")
+                            sigilcoin-testnet-chain))))
+    (let ((args (relay-curl-arguments
+                  "PUT" "https://pool.test" "/v1/x" "{}" "/tmp/response")))
+      (assert-equal "--disable" (car args))
+      (assert-equal "--globoff" (cadr args))
+      (assert-false (member "--insecure" args))
+      (assert-false (member "--location" args))
+      (assert-equal 1
+        (length (filter (lambda (arg) (string=? arg "--url")) args)))))
+
+  (test "peer errors cannot reflect secrets or controls"
+    (assert-equal "relay: HTTP 400 bad-share"
+                  (relay-protocol-error-message 400 "bad-share"))
+    (assert-equal "relay: HTTP 400 protocol-error"
+                  (relay-protocol-error-message
+                    400 "deadbeef\nsecret-source")))
+
+  (test "mainnet relay use is rejected"
+    (assert-true
+      (raises? (lambda ()
+                 (relay-url '("--relay" "https://pool.test")
+                            sigilcoin-main-chain))))))
+
+(define (request method path headers body)
+  (http-request method: method path: path query: #f version: "HTTP/1.1"
+                headers: headers body: body))
+
+(test-group "direct relay HTTP boundary"
+  (test "routes, media type, body cap, and malformed schemas fail closed"
+    (let* ((data-dir (make-temp-directory))
+           (state-dir (path-join data-dir "pool"))
+           (service (relay-service-open
+                      sigilcoin-regtest-chain data-dir state-dir))
+           (commitment (make-string 64 #\0))
+           (path (string-append "/v1/contributions/" commitment)))
+      (assert-equal 404
+        (http-response-status
+          (relay-handle-request
+            service (request 'GET "/not-a-route" #{} #f))))
+      (assert-equal 405
+        (http-response-status
+          (relay-handle-request
+            service (request 'POST "/v1/context" #{} #f))))
+      (assert-equal 415
+        (http-response-status
+          (relay-handle-request
+            service (request 'PUT path #{} "{}"))))
+      (assert-equal 413
+        (http-response-status
+          (relay-handle-request
+            service
+            (request 'PUT path #{ content-type: "application/json" }
+                     (make-string 2050 #\x)))))
+      (assert-equal 400
+        (http-response-status
+          (relay-handle-request
+            service
+            (request 'PUT path #{ content-type: "application/json" }
+                     "{\"version\":1,\"unknown\":1}"))))
+      (assert-equal 400
+        (http-response-status
+          (relay-handle-request
+            service
+            (request
+              'PUT path #{ content-type: "application/json" }
+              (string-append
+                "{\"version\":\"1\",\"chain\":\"sigilcoin-regtest\","
+                "\"height\":1,\"parent_id\":\"" (make-string 64 #\0)
+                "\",\"complexity\":1,\"pubkey\":\"" (make-string 66 #\0)
+                "\",\"authorization\":\"" (make-string 128 #\0) "\"}")))))
+      ;; Every rejected request above precedes persistence.
+      (let* ((db-path (path-join state-dir "sigilcoin-pool.sqlite"))
+             (db (sqlite-open db-path))
+             (row (sqlite-query-row db
+                    "SELECT COUNT(*) AS count FROM contributions")))
+        (assert-equal 0 (cdr (assq 'count row)))
+        (sqlite-close db))
+      (relay-service-close service)))
+
+  (test "missing chain data is a bounded service response"
+    (let* ((data-dir (make-temp-directory))
+           (state-dir (path-join data-dir "pool"))
+           (service (relay-service-open
+                      sigilcoin-regtest-chain data-dir state-dir)))
+      (assert-equal 503
+        (http-response-status
+          (relay-handle-request
+            service (request 'GET "/healthz" #{} #f))))
+      (assert-equal 503
+        (http-response-status
+          (relay-handle-request
+            service (request 'GET "/v1/context" #{} #f))))
+      (relay-service-close service))))
+
+
+;;; Real regtest fixtures for admission, reveal, producer, and reorg behavior.
+
+(define %pool-context-json-fields
+  '("version" "chain" "height" "parent_id" "complexity" "capacity" "accepted"))
+(define %pool-status-json-fields
+  '("version" "chain" "height" "parent_id" "complexity" "commitment" "pubkey"
+    "status" "tip_height" "commit_block_id" "reveal_block_id" "contribution"
+    "payout_daviwils" "matures_at_height" "detail"))
+(define %pool-producer-json-fields
+  '("version" "chain" "height" "parent_id" "complexity"
+    "commitments" "reveals"))
+(define %pool-error-json-fields '("error" "detail"))
+(define %pool-script #u8(#x6a #x02 #x70 #x6c))
+
+(define (pool-response-object response fields . maybe-arrays)
+  (relay-json-decode
+    (http-response-body response)
+    fields
+    (if (null? maybe-arrays) '() (car maybe-arrays))))
+
+(define (pool-error-code response)
+  (field
+    (pool-response-object response %pool-error-json-fields)
+    'error))
+
+(define (pool-context service)
+  (let ((response
+          (relay-handle-request
+            service (request 'GET "/v1/context" #{} #f))))
+    (unless (= 200 (http-response-status response))
+      (error "test-pool: relay context was unavailable"))
+    (pool-response-object response %pool-context-json-fields)))
+
+(define (pool-status service commitment)
+  (let ((response
+          (relay-handle-request
+            service
+            (request
+              'GET
+              (string-append
+                "/v1/contributions/" (hex-encode commitment))
+              #{} #f))))
+    (unless (= 200 (http-response-status response))
+      (error "test-pool: stored contribution status was unavailable"))
+    (pool-response-object response %pool-status-json-fields)))
+
+(define (pool-producer service)
+  (let ((response
+          (relay-handle-request
+            service (request 'GET "/v1/producer" #{} #f))))
+    (unless (= 200 (http-response-status response))
+      (error "test-pool: producer view was unavailable"))
+    (pool-response-object
+      response %pool-producer-json-fields '("commitments" "reveals"))))
+
+(define (pool-put-commitment service commitment body)
+  (relay-handle-request
+    service
+    (request
+      'PUT
+      (string-append "/v1/contributions/" (hex-encode commitment))
+      #{ content-type: "application/json" }
+      body)))
+
+(define (pool-put-reveal-text service commitment share-text)
+  (relay-handle-request
+    service
+    (request
+      'PUT
+      (string-append
+        "/v1/contributions/" (hex-encode commitment) "/reveal")
+      #{ content-type: "application/json" }
+      (json-encode
+        (list (cons 'version 1)
+              (cons 'share share-text))))))
+
+(define (pool-commit-body chain context key commitment . maybe-authorization)
+  (let* ((parent-id (field context 'parent_id))
+         (parent-hash (reverse-bytevector (hex-decode parent-id)))
+         (height (field context 'height))
+         (complexity (field context 'complexity))
+         (pubkey (secp256k1-pubkey-create key))
+         (authorization
+           (if (null? maybe-authorization)
+               (relay-commit-authorization
+                 key chain parent-hash height complexity pubkey commitment)
+               (car maybe-authorization))))
+    (json-encode
+      (list
+        (cons 'version 1)
+        (cons 'chain (chain-config-name chain))
+        (cons 'height height)
+        (cons 'parent_id parent-id)
+        (cons 'complexity complexity)
+        (cons 'pubkey (hex-encode pubkey))
+        (cons 'authorization (hex-encode authorization))))))
+
+
+(define (pool-indexes first last)
+  (if (> first last)
+      '()
+      (cons first (pool-indexes (+ first 1) last))))
+
+(define (pool-bytes<? a b)
+  (let ((alen (bytevector-length a))
+        (blen (bytevector-length b)))
+    (let loop ((i 0))
+      (cond ((= i alen) (< alen blen))
+            ((= i blen) #f)
+            ((< (bytevector-u8-ref a i) (bytevector-u8-ref b i)) #t)
+            ((> (bytevector-u8-ref a i) (bytevector-u8-ref b i)) #f)
+            (else (loop (+ i 1)))))))
+
+(define (pool-sort values less?)
+  (let loop ((rest values) (out '()))
+    (if (null? rest)
+        out
+        (loop
+          (cdr rest)
+          (let insert ((ordered out))
+            (cond ((null? ordered) (list (car rest)))
+                  ((less? (car rest) (car ordered))
+                   (cons (car rest) ordered))
+                  (else
+                    (cons (car ordered) (insert (cdr ordered))))))))))
+
+(define %pool-generated-anchor-predicate "(equal? x\"@\")")
+(define %pool-semantic-anchor-predicate "(string? x)")
+
+(define (pool-ordinary-inputs-non-string? spec)
+  (let loop ((pairs (puzzle-spec-examples spec)))
+    (cond
+      ((null? pairs) #f)
+      ((null? (cdr pairs))
+       (let ((anchor (car pairs)))
+         (and (string? (car anchor))
+              (string=? puzzle-anchor-input (car anchor))
+              (puzzle-anchor-output? (cdr anchor)))))
+      ((string? (car (car pairs))) #f)
+      (else (loop (cdr pairs))))))
+
+(define (pool-semantic-share-source spec)
+  (let ((source (puzzle-spec-hidden-source spec)))
+    (and (pool-ordinary-inputs-non-string? spec)
+         (= 1 (string-count source %pool-generated-anchor-predicate))
+         (let* ((candidate
+                  (string-replace
+                    source
+                    %pool-generated-anchor-predicate
+                    %pool-semantic-anchor-predicate))
+                (checked
+                  (coin-check-share-solution/spec spec candidate)))
+           (and (< (string-length candidate) (puzzle-spec-par spec))
+                (coin-ok? checked)
+                candidate)))))
+
+(define (pool-signed-share key source context)
+  (let* ((pubkey (secp256k1-pubkey-create key))
+         (solution (string->utf8 source))
+         (preimage
+           (coin-share-preimage
+             (coin-coop-context-parent-prev-hash context)
+             (coin-coop-context-puzzle-height context)
+             (coin-coop-context-complexity context)
+             solution
+             pubkey)))
+    (coin-share
+      pubkey: pubkey
+      signature: (secp256k1-ecdsa-sign key preimage)
+      blind: (hash256 (bytevector-append key #u8(1)))
+      solution: solution)))
+
+(define (pool-generated-share secret-byte context)
+  (let* ((key (make-bytevector 32 secret-byte))
+         (pubkey (secp256k1-pubkey-create key))
+         (source
+           (pool-semantic-share-source
+             (coin-share-puzzle context pubkey))))
+    (and source (list key (pool-signed-share key source context)))))
+
+(define (pool-share-fixtures count context)
+  (let loop ((secret-byte 1) (out '()))
+    (cond
+      ((= count (length out))
+       (pool-sort
+         out
+         (lambda (a b)
+           (pool-bytes<?
+             (coin-share-pubkey (cadr a))
+             (coin-share-pubkey (cadr b))))))
+      ((> secret-byte 199)
+       (error "test-pool: fewer than three semantic share fixtures"))
+      (else
+        (let ((candidate (pool-generated-share secret-byte context)))
+          (loop
+            (+ secret-byte 1)
+            (if (and
+                  candidate
+                  (not
+                    (member
+                      (coin-share-solution (cadr candidate))
+                      (map
+                        (lambda (fixture)
+                          (coin-share-solution (cadr fixture)))
+                        out))))
+                (cons candidate out)
+                out)))))))
+
+(define (pool-share-quality context share)
+  (let ((checked (coin-check-shares context #u8() (list share))))
+    (unless (coin-ok? checked)
+      (error "test-pool: generated share failed full validation"))
+    (coin-share-quality context share)))
+
+(define (pool-producer-candidate<? a b)
+  (let ((aq (cadr a))
+        (bq (cadr b))
+        (ap (coin-share-pubkey (car a)))
+        (bp (coin-share-pubkey (car b))))
+    (or (> aq bq)
+        (and (= aq bq) (pool-bytes<? ap bp)))))
+
+(define (pool-expected-reveals context shares)
+  (map
+    (lambda (candidate)
+      (hex-encode (coin-share-encode (car candidate))))
+    (pool-sort
+      (map
+        (lambda (share)
+          (list share (pool-share-quality context share)))
+        shares)
+      pool-producer-candidate<?)))
+
+(define (pool-padded-solution parent height complexity)
+  (string-append
+    "(if #f \"padding\" "
+    (puzzle-spec-hidden-source
+      (coin-puzzle-for (block-header-hash parent) height complexity))
+    ")"))
+
+(define (pool-submit-block! n block)
+  (node-ingest-headers n (list (block-header-field block)))
+  (node-store-block n block)
+  (unless (= 1 (node-validate-blocks n))
+    (let ((status (node-status n)))
+      (error (string-append
+               "test-pool: canonical fixture block did not validate "
+               (block-header-id (block-header-field block))
+               " "
+               (node-status-snapshot-sync-last-error status)))))
+  block)
+
+(define (pool-activate-tip! chain data-dir header height)
+  (let ((db (sqlite-open (explorer-db-path chain data-dir))))
+    (unless db (error "test-pool: could not open the node database"))
+    (unless
+      (sqlite-run
+        db
+        "UPDATE metadata SET value = ? WHERE key = ?"
+        (hex-encode (block-header-hash header))
+        "active-chain-tip-hash")
+      (sqlite-close db)
+      (error "test-pool: could not switch the active tip hash"))
+    (unless
+      (sqlite-run
+        db
+        "UPDATE metadata SET value = ? WHERE key = ?"
+        (number->string height)
+        "active-chain-tip-height")
+      (sqlite-close db)
+      (error "test-pool: could not switch the active tip height"))
+    (sqlite-close db)
+    #t))
+
+(define (pool-db-row state-dir sql . params)
+  (let* ((db (sqlite-open (path-join state-dir "sigilcoin-pool.sqlite")))
+         (row (apply sqlite-query-row db sql params)))
+    (sqlite-close db)
+    row))
+
+(define (pool-db-update! state-dir sql . params)
+  (let* ((db (sqlite-open (path-join state-dir "sigilcoin-pool.sqlite")))
+         (ok (apply sqlite-run db sql params)))
+    (sqlite-close db)
+    (unless ok (error "test-pool: could not mutate the corruption fixture"))
+    #t))
+
+(test-group "relay durable admission"
+  (test "the first sixteen keys fill durable slots and producer digests are canonical"
+    (when %native-secp256k1?
+      (let* ((chain sigilcoin-regtest-chain)
+             (data-dir (make-temp-directory))
+             (state-dir (path-join data-dir "pool"))
+             (n (node-open chain data-dir))
+             (service (relay-service-open chain data-dir state-dir))
+             (context (pool-context service)))
+        ;; Insert in descending digest order so the producer response cannot
+        ;; accidentally inherit SQLite sequence order.
+        (for-each
+          (lambda (i)
+            (let* ((key (make-bytevector 32 i))
+                   (commitment (make-bytevector 32 (- 17 i)))
+                   (body
+                     (pool-commit-body chain context key commitment)))
+              (assert-equal
+                201
+                (http-response-status
+                  (pool-put-commitment service commitment body)))))
+          (pool-indexes 1 8))
+        ;; A second commitment from the first key conflicts with its durable
+        ;; context identity rather than consuming another slot.
+        (let* ((key (make-bytevector 32 1))
+               (commitment (make-bytevector 32 250))
+               (response
+                 (pool-put-commitment
+                   service commitment
+                   (pool-commit-body chain context key commitment))))
+          (assert-equal 409 (http-response-status response))
+          (assert-equal "uniqueness-conflict" (pool-error-code response)))
+        ;; The source limiter is deliberately in-memory. Reopening the relay
+        ;; leaves the durable context count intact and lets distinct clients
+        ;; fill the remaining authenticated slots.
+        (relay-service-close service)
+        (set! service (relay-service-open chain data-dir state-dir))
+        (for-each
+          (lambda (i)
+            (let* ((key (make-bytevector 32 i))
+                   (commitment (make-bytevector 32 (- 17 i)))
+                   (body
+                     (pool-commit-body chain context key commitment)))
+              (assert-equal
+                201
+                (http-response-status
+                  (pool-put-commitment service commitment body)))))
+          (pool-indexes 9 16))
+        (relay-service-close service)
+        (set! service (relay-service-open chain data-dir state-dir))
+        (let* ((key (make-bytevector 32 17))
+               (commitment (make-bytevector 32 0))
+               (response
+                 (pool-put-commitment
+                   service commitment
+                   (pool-commit-body chain context key commitment))))
+          (assert-equal 409 (http-response-status response))
+          (assert-equal "pool-full" (pool-error-code response)))
+        (let ((current (pool-context service))
+              (producer (pool-producer service)))
+          (assert-equal 16 (field current 'accepted))
+          (assert-equal 0 (field current 'capacity))
+          (assert-equal
+            (map
+              (lambda (i)
+                (hex-encode (make-bytevector 32 i)))
+              (pool-indexes 1 16))
+            (field producer 'commitments)))
+        (relay-service-close service)
+        (node-close n))))
+
+  (test "eight new attempts are allowed while an exact replay bypasses the full bucket"
+    (when %native-secp256k1?
+      (let* ((chain sigilcoin-regtest-chain)
+             (data-dir (make-temp-directory))
+             (state-dir (path-join data-dir "pool"))
+             (n (node-open chain data-dir))
+             (service (relay-service-open chain data-dir state-dir))
+             (context (pool-context service))
+             (key (make-bytevector 32 1))
+             (commitment (make-bytevector 32 1))
+             (body (pool-commit-body chain context key commitment)))
+        (assert-equal
+          201
+          (http-response-status
+            (pool-put-commitment service commitment body)))
+        ;; Seven failed cryptographic attempts plus the accepted mutation fill
+        ;; the fixed eight-attempt source window.
+        (for-each
+          (lambda (i)
+            (let* ((candidate (make-bytevector 32 i))
+                   (response
+                     (pool-put-commitment
+                       service candidate
+                       (pool-commit-body
+                         chain context
+                         (make-bytevector 32 i)
+                         candidate
+                         (make-bytevector 64 0)))))
+              (assert-equal 403 (http-response-status response))
+              (assert-equal "bad-authorization" (pool-error-code response))))
+          (pool-indexes 2 8))
+        (let* ((candidate (make-bytevector 32 9))
+               (response
+                 (pool-put-commitment
+                   service candidate
+                   (pool-commit-body
+                     chain context
+                     (make-bytevector 32 9)
+                     candidate
+                     (make-bytevector 64 0)))))
+          (assert-equal 429 (http-response-status response))
+          (assert-equal "rate-limited" (pool-error-code response)))
+        (let ((replay
+                (pool-put-commitment service commitment body)))
+          (assert-equal 200 (http-response-status replay))
+          (assert-equal
+            "queued"
+            (field
+              (pool-response-object replay %pool-status-json-fields)
+              'status)))
+        (assert-equal 1 (field (pool-context service) 'accepted))
+        (relay-service-close service)
+        (node-close n)))))
+
+(test-group "relay stale-write compensation"
+  (test "a tip change after commit persistence removes the new row"
+    (when %native-secp256k1?
+      (let* ((chain sigilcoin-regtest-chain)
+             (data-dir (make-temp-directory))
+             (state-dir (path-join data-dir "pool"))
+             (n (node-open chain data-dir))
+             (service (relay-service-open chain data-dir state-dir))
+             (context (pool-context service))
+             (height (field context 'height))
+             (complexity (field context 'complexity))
+             (genesis (chain-config-genesis-header chain))
+             (block
+               (coin-build-block
+                 genesis height complexity #f
+                 "post-persist race" %pool-script
+                 (+ (block-header-time genesis)
+                    (coin-chain-min-block-spacing (node-config n)))))
+             (key (make-bytevector 32 42))
+             (commitment (hash256 (string->utf8 "stale-write")))
+             (body (pool-commit-body chain context key commitment)))
+        (pool-submit-block! n block)
+        (pool-activate-tip! chain data-dir genesis 0)
+        (relay-service-test-hook!
+          service
+          (lambda (phase)
+            (when (eq? phase 'commit-after-persist)
+              (pool-activate-tip!
+                chain data-dir (block-header-field block) height))))
+        (let ((response
+                (pool-put-commitment service commitment body)))
+          (assert-equal 409 (http-response-status response))
+          (assert-equal "stale-context" (pool-error-code response)))
+        (assert-false
+          (pool-db-row
+            state-dir
+            "SELECT commitment FROM contributions WHERE commitment = ?"
+            (hex-encode commitment)))
+        (relay-service-close service)
+        (node-close n)))))
+
+(test-group "relay canonical lifecycle"
+  (test "body membership drives reveal admission, producer output, and every reorg projection"
+    (when %native-secp256k1?
+      (let* ((chain sigilcoin-regtest-chain)
+             (data-dir (make-temp-directory))
+             (state-dir (path-join data-dir "pool"))
+             (n (node-open chain data-dir))
+             (service (relay-service-open chain data-dir state-dir))
+             (admission-context (pool-context service))
+             (height (field admission-context 'height))
+             (complexity (field admission-context 'complexity))
+             (genesis (chain-config-genesis-header chain))
+             (spacing (coin-chain-min-block-spacing (node-config n)))
+             (time-one (+ (block-header-time genesis) spacing))
+             (prototype
+               (coin-build-block
+                 genesis height complexity #f
+                 "prototype" %pool-script time-one))
+             (share-context (coin-parent-context prototype))
+             (fixtures (pool-share-fixtures 3 share-context))
+             (shares (map cadr fixtures))
+             (commitments
+               (map
+                 (lambda (share)
+                   (coin-share-commitment share-context share))
+                 shares))
+             (dummy-key (make-bytevector 32 200))
+             (dummy-commitment
+               (hash256 (string->utf8 "invalid producer row")))
+             (all-commitments
+               (pool-sort
+                 (cons dummy-commitment commitments)
+                 pool-bytes<?))
+             (primary (car fixtures))
+             (primary-key (car primary))
+             (primary-share (cadr primary))
+             (primary-commitment
+               (coin-share-commitment share-context primary-share))
+             (primary-body
+               (pool-commit-body
+                 chain admission-context primary-key primary-commitment))
+             (dummy-body
+               (pool-commit-body
+                 chain admission-context dummy-key dummy-commitment)))
+        (assert-equal
+          201
+          (http-response-status
+            (pool-put-commitment
+              service primary-commitment primary-body)))
+        (for-each
+          (lambda (fixture)
+            (let* ((key (car fixture))
+                   (share (cadr fixture))
+                   (commitment
+                     (coin-share-commitment share-context share)))
+              (assert-equal
+                201
+                (http-response-status
+                  (pool-put-commitment
+                    service commitment
+                    (pool-commit-body
+                      chain admission-context key commitment))))))
+          (cdr fixtures))
+        (assert-equal
+          201
+          (http-response-status
+            (pool-put-commitment
+              service dummy-commitment dummy-body)))
+        (assert-equal
+          "queued"
+          (field (pool-status service primary-commitment) 'status))
+        ;; Phase one persists only the public receipt. No reveal material is
+        ;; manufactured while the commitment block is still absent.
+        (let ((row
+                (pool-db-row
+                  state-dir
+                  (string-append
+                    "SELECT share_hex, contribution, revealed_at, "
+                    "reveal_attempts FROM contributions WHERE commitment = ?")
+                  (hex-encode primary-commitment))))
+          (assert-false (field row 'share_hex))
+          (assert-false (field row 'contribution))
+          (assert-false (field row 'revealed_at))
+          (assert-equal 0 (field row 'reveal_attempts)))
+
+        ;; Reset only the deliberately in-memory source bucket. Durable rows
+        ;; and all subsequent assertions continue through the same pool DB.
+        (relay-service-close service)
+        (set! service (relay-service-open chain data-dir state-dir))
+        (let* ((missed-one
+                 (coin-build-block
+                   genesis height complexity
+                   (pool-padded-solution genesis height complexity)
+                   "commitment omitted" %pool-script time-one))
+               (committed-one
+                 (coin-build-block
+                   genesis height complexity
+                   (puzzle-spec-hidden-source
+                     (coin-puzzle-for
+                       (block-header-hash genesis) height complexity))
+                   "commitment included" %pool-script time-one
+                   '() 0 all-commitments)))
+          (pool-submit-block! n missed-one)
+          (let ((status (pool-status service primary-commitment)))
+            (assert-equal "commit-missed" (field status 'status))
+            (assert-equal
+              (block-header-id (block-header-field missed-one))
+              (field status 'commit_block_id)))
+          ;; The shorter canonical producer solution wins this unsettled
+          ;; sibling reorg; status follows its exact COMMITS body.
+          (pool-submit-block! n committed-one)
+          (assert-equal
+            (block-header-hash (block-header-field committed-one))
+            (block-header-hash (node-best-header n)))
+          (let ((status (pool-status service primary-commitment)))
+            (assert-equal "revealable" (field status 'status))
+            (assert-equal
+              (block-header-id (block-header-field committed-one))
+              (field status 'commit_block_id)))
+
+          ;; Keep one next-height receipt to prove that changing H's canonical
+          ;; parent projects stale/waiting independently of stored labels.
+          (let* ((next-context (pool-context service))
+                 (next-key (make-bytevector 32 201))
+                 (next-commitment
+                   (hash256 (string->utf8 "next-height receipt")))
+                 (next-body
+                   (pool-commit-body
+                     chain next-context next-key next-commitment)))
+            (assert-equal
+              201
+              (http-response-status
+                (pool-put-commitment
+                  service next-commitment next-body)))
+
+            ;; Exact invalid retries are cached, so the repeated "00" does
+            ;; not consume one of the three distinct-body attempts.
+            (let ((response
+                    (pool-put-reveal-text
+                      service dummy-commitment "00")))
+              (assert-equal 400 (http-response-status response))
+              (assert-equal "bad-share" (pool-error-code response)))
+            (let ((response
+                    (pool-put-reveal-text
+                      service dummy-commitment "00")))
+              (assert-equal 400 (http-response-status response))
+              (assert-equal "bad-share" (pool-error-code response)))
+            (for-each
+              (lambda (text)
+                (let ((response
+                        (pool-put-reveal-text
+                          service dummy-commitment text)))
+                  (assert-equal 400 (http-response-status response))
+                  (assert-equal "bad-share" (pool-error-code response))))
+              '("01" "02"))
+            (let ((response
+                    (pool-put-reveal-text
+                      service dummy-commitment "03")))
+              (assert-equal 429 (http-response-status response))
+              (assert-equal
+                "reveal-attempt-limit" (pool-error-code response)))
+
+            (let ((primary-share-text
+                    (hex-encode (coin-share-encode primary-share))))
+              (assert-equal
+                201
+                (http-response-status
+                  (pool-put-reveal-text
+                    service primary-commitment primary-share-text)))
+              (for-each
+                (lambda (fixture)
+                  (let* ((share (cadr fixture))
+                         (commitment
+                           (coin-share-commitment share-context share)))
+                    (assert-equal
+                      201
+                      (http-response-status
+                        (pool-put-reveal-text
+                          service commitment
+                          (hex-encode (coin-share-encode share)))))))
+                (cdr fixtures))
+              (assert-equal
+                "reveal-queued"
+                (field
+                  (pool-status service primary-commitment)
+                  'status))
+
+              (let* ((canonical-context
+                       (coin-parent-context committed-one))
+                     (expected-reveals
+                       (pool-expected-reveals canonical-context shares))
+                     (producer (pool-producer service))
+                     (primary-quality
+                       (pool-share-quality canonical-context primary-share)))
+                (assert-equal
+                  (list (hex-encode next-commitment))
+                  (field producer 'commitments))
+                (assert-equal
+                  expected-reveals
+                  (field producer 'reveals))
+
+                ;; Simulate one corrupted durable row with a valid canonical
+                ;; share belonging to another receipt. Producer retrieval must
+                ;; revalidate identity, commitment, signature, and work instead
+                ;; of trusting either the row or its forged contribution.
+                (pool-db-update!
+                  state-dir
+                  (string-append
+                    "UPDATE contributions SET share_hex = ?, contribution = ? "
+                    "WHERE commitment = ?")
+                  primary-share-text
+                  999
+                  (hex-encode dummy-commitment))
+                (assert-equal
+                  expected-reveals
+                  (field (pool-producer service) 'reveals))
+
+                (let* ((next-height (field next-context 'height))
+                       (next-complexity
+                         (field next-context 'complexity))
+                       (time-two
+                         (+ (block-header-time
+                              (block-header-field committed-one))
+                            spacing))
+                       (missed-two
+                         (coin-build-block
+                           (block-header-field committed-one)
+                           next-height
+                           next-complexity
+                           (pool-padded-solution
+                             (block-header-field committed-one)
+                             next-height
+                             next-complexity)
+                           "reveal omitted" %pool-script time-two))
+                       (included-two
+                         (coin-build-coop-block
+                           committed-one
+                           next-height
+                           next-complexity
+                           (puzzle-spec-hidden-source
+                             (coin-puzzle-for
+                               (block-header-hash
+                                 (block-header-field committed-one))
+                               next-height
+                               next-complexity))
+                           shares
+                           "reveal included"
+                           %pool-script
+                           time-two)))
+                  (pool-submit-block! n missed-two)
+                  (assert-equal
+                    "reveal-missed"
+                    (field
+                      (pool-status service primary-commitment)
+                      'status))
+                  ;; The shorter producer solution replaces the unsettled
+                  ;; omitted sibling, and exact share/payout membership makes
+                  ;; the receipt included.
+                  (pool-submit-block! n included-two)
+                  (assert-equal
+                    (block-header-hash (block-header-field included-two))
+                    (block-header-hash (node-best-header n)))
+                  (let ((status
+                          (pool-status service primary-commitment)))
+                    (assert-equal "included" (field status 'status))
+                    (assert-equal
+                      (block-header-id (block-header-field included-two))
+                      (field status 'reveal_block_id))
+                    (assert-equal
+                      primary-quality (field status 'contribution))
+                    (assert-true
+                      (> (field status 'payout_daviwils) 0))
+                    (assert-equal
+                      (+ next-height
+                         (block-rules-coinbase-maturity
+                           (chain-config-block-rules
+                             sigilcoin-regtest-chain)))
+                      (field status 'matures_at_height)))
+
+                  ;; Both exact resources stay idempotent after H and H+1
+                  ;; have closed their live mutation windows.
+                  (let ((replay
+                          (pool-put-commitment
+                            service primary-commitment primary-body)))
+                    (assert-equal 200 (http-response-status replay))
+                    (assert-equal
+                      "included"
+                      (field
+                        (pool-response-object
+                          replay %pool-status-json-fields)
+                        'status)))
+                  (let ((replay
+                          (pool-put-reveal-text
+                            service
+                            primary-commitment
+                            primary-share-text)))
+                    (assert-equal 200 (http-response-status replay))
+                    (assert-equal
+                      "included"
+                      (field
+                        (pool-response-object
+                          replay %pool-status-json-fields)
+                        'status)))
+
+                  ;; Re-point only the node's published active validated tip.
+                  ;; Every body below was consensus-validated above, so this
+                  ;; deterministically exercises backward and sibling reorg
+                  ;; projection without fabricating relay state.
+                  (pool-activate-tip!
+                    chain data-dir
+                    (block-header-field missed-two)
+                    next-height)
+                  (assert-equal
+                    "reveal-missed"
+                    (field
+                      (pool-status service primary-commitment)
+                      'status))
+                  (pool-activate-tip!
+                    chain data-dir
+                    (block-header-field committed-one)
+                    height)
+                  (assert-equal
+                    "reveal-queued"
+                    (field
+                      (pool-status service primary-commitment)
+                      'status))
+                  (pool-activate-tip!
+                    chain data-dir
+                    (block-header-field missed-one)
+                    height)
+                  (assert-equal
+                    "commit-missed"
+                    (field
+                      (pool-status service primary-commitment)
+                      'status))
+                  (assert-equal
+                    "stale"
+                    (field
+                      (pool-status service next-commitment)
+                      'status))
+                  (pool-activate-tip! chain data-dir genesis 0)
+                  (assert-equal
+                    "queued"
+                    (field
+                      (pool-status service primary-commitment)
+                      'status))
+                  (assert-equal
+                    "waiting"
+                    (field
+                      (pool-status service next-commitment)
+                      'status))
+                  (pool-activate-tip!
+                    chain data-dir
+                    (block-header-field included-two)
+                    next-height)
+                  (assert-equal
+                    "included"
+                    (field
+                      (pool-status service primary-commitment)
+                      'status)))))))
+        (relay-service-close service)
+        (node-close n)))))
+(run-tests)

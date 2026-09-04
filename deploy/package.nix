@@ -22,6 +22,9 @@
   gnumake,
   pkg-config,
   git,
+  makeWrapper,
+  curl,
+  cacert,
   secp256k1,
   mbedtls,
 
@@ -175,6 +178,7 @@ let
       gcc
       gnumake
       pkg-config
+      makeWrapper
     ];
     buildInputs = [
       # sigil-secp256k1 links libsecp256k1; sigil-sqlite and sigil-crypto
@@ -230,6 +234,10 @@ let
       install -Dm755 build/dev/bin/sigilcoin $out/bin/sigilcoin
       install -Dm755 build/dev/bin/sigilcoin-explorer $out/bin/sigilcoin-explorer
       cp -r build/site/. $out/share/sigilcoin-site/
+      wrapProgram $out/bin/sigilcoin \
+        --prefix PATH : ${lib.makeBinPath [ curl ]} \
+        --set CURL_CA_BUNDLE ${cacert}/etc/ssl/certs/ca-bundle.crt \
+        --set SSL_CERT_FILE ${cacert}/etc/ssl/certs/ca-bundle.crt
       runHook postInstall
     '';
 

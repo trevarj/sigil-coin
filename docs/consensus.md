@@ -66,8 +66,9 @@
 | score quality `Q` | 0..15 |
 | coinbase scriptSig bytes | 8..6588 |
 
-The block-subsidy schedule, scheduled maximum, and 100-block coinbase maturity
-are consensus rules.
+The block-subsidy schedule, scheduled maximum, and coinbase maturity are
+consensus rules. SigilCoin sets maturity to 1 block, so an output created in
+block `H` may first be spent in `H+1`; Bitcoin's block-rules default remains 100.
 
 ### 2.3 Scheduled subsidy and issued supply
 
@@ -805,6 +806,33 @@ commitments does not multiply the carrier output.
 - *See, at reveal time, the full program of every sharer.* Programs are public
   once revealed, and reusing one at a later height is worthless because the
   puzzle changed.
+
+### 7.6 Non-normative public-testnet relay
+
+The reference public testnet operates
+`https://pool.testnet.sigilcoin.lol` as an optional coordination relay. This
+service, its HTTP routes, authorization signature, first-16 admission order,
+source-address limits, receipt database, and status names are operational
+policy only. They are not serialized into blocks, consulted by validators, or
+part of fork choice. Nodes continue to enforce only the commitment and share
+rules above.
+
+`sigilcoin contribute --relay https://pool.testnet.sigilcoin.lol --testnet`
+derives the personalized puzzle and signs locally without opening a node
+database. The wallet key never leaves the contributor. The blind, source, and
+consensus share signature stay local until the exact commitment appears in
+canonical block `H`; only then is the reveal submitted for possible inclusion
+in `H+1`. A producer opts in with `sigilcoin mine --relay ... --testnet`,
+revalidates relay material, and retains the consensus-defined choice of at most
+eight reveals.
+
+Admission does not prove hidden work or resist Sybil keys. The relay or either
+producer can delay, omit, or censor a commitment or reveal, so no receipt
+guarantees inclusion or payment. They cannot redirect a valid included share's
+payout because §6 binds its pubkey and required output; that direct coinbase
+output follows SigilCoin's one-block maturity and is spendable in the following
+block. The relay holds no balance or private key and is not a custodian. This
+implementation exposes no mainnet pool.
 
 ---
 

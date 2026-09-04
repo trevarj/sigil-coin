@@ -14,6 +14,7 @@
           (sigil io)
           (sigil math)
           (sigil path)
+          (sigil process)
           (sigil string)
           (sigil struct)
           (sigil bitcoin node)
@@ -52,6 +53,7 @@
     cli-commit-records-for
     cli-commit-save
     cli-commit-prune
+    cli-commit-remove
     cli-bytes<?
     cli-sort-bytes)
 
@@ -472,43 +474,122 @@
              (loop (cdr xs) (cons (car xs) out)))
             (else (loop (cdr xs) out))))))
 
+    (define (commit-lock-owner-alive? owner)
+      (and (file-exists? owner)
+           (guard (e (#t #f))
+             (let ((pid (string-trim (read-file-string owner))))
+               (= 0 (process-run "kill" "-0" pid))))))
+
+    (define (release-commit-lock lock)
+      (when (and lock (directory-exists? lock))
+        (let ((owner (path-join lock "owner")))
+          (when (file-exists? owner)
+            (guard (e (#t #t)) (delete-file owner))))
+        (guard (e (#t #t)) (delete-directory lock))))
+
+    (define (acquire-commit-lock data-dir)
+      (let* ((path (cli-commit-file data-dir))
+             (dir (path-dirname path))
+             (lock (string-append path ".lock"))
+             (owner (path-join lock "owner")))
+        (ensure-directory dir)
+        (unless (= 0 (process-run "chmod" "0700" dir))
+          (error (string-append
+                   "commit: could not restrict permissions on " dir)))
+        (let loop ((owner-missing-polls 0))
+          (if (= 0 (process-run
+                     "sh" "-c" "mkdir -- \"$1\" 2>/dev/null" "sh" lock))
+              (guard (err
+                       (else
+                         (release-commit-lock lock)
+                         (raise err)))
+                (write-file-string owner (number->string (process-id)))
+                lock)
+              (begin
+                (cond
+                  ((commit-lock-owner-alive? owner) #t)
+                  ((file-exists? owner)
+                   (guard (e (#t #t)) (delete-file owner))
+                   (guard (e (#t #t)) (delete-directory lock)))
+                  ((>= owner-missing-polls 40)
+                   (guard (e (#t #t)) (delete-directory lock))))
+                (run! "sleep" "0.05")
+                (loop (if (file-exists? owner)
+                          0
+                          (+ owner-missing-polls 1))))))))
+
+    (define (with-commit-lock data-dir thunk)
+      (let ((lock #f))
+        (dynamic-wind
+          (lambda () (set! lock (acquire-commit-lock data-dir)))
+          thunk
+          (lambda ()
+            (release-commit-lock lock)))))
+
     ;;; Save one candidate without replacing another still-live candidate.
     ;;; Re-saving an identical commitment is idempotent.
     (define (cli-commit-save data-dir record)
       (: string? cli-commit-record? -> cli-commit-record?)
-      (let* ((records (cli-commit-records data-dir))
-             (same (let loop ((xs records))
-                     (cond
-                       ((null? xs) #f)
-                       ((and (same-slot? (car xs) record)
-                             (equal? (cli-commit-record-commitment (car xs))
-                                     (cli-commit-record-commitment record)))
-                        (car xs))
-                       (else (loop (cdr xs)))))))
-        (if same
-            same
-            (begin
-              (when (>= (length (cli-commit-records-for
-                                  data-dir
-                                  (cli-commit-record-height record)
-                                  (cli-commit-record-parent record)
-                                  (cli-commit-record-complexity record)
-                                  (cli-commit-record-pubkey record)))
-                         coin-max-commitments)
-                (error "commit: all sixteen canonical commitment slots are already stored for this puzzle and key"))
-              (write-records data-dir (append records (list record)))
-              record))))
+      (with-commit-lock
+        data-dir
+        (lambda ()
+          (let* ((records (cli-commit-records data-dir))
+                 (same (let loop ((xs records))
+                         (cond
+                           ((null? xs) #f)
+                           ((and
+                              (same-slot? (car xs) record)
+                              (equal?
+                                (cli-commit-record-commitment (car xs))
+                                (cli-commit-record-commitment record)))
+                            (car xs))
+                           (else (loop (cdr xs)))))))
+            (if same
+                same
+                (begin
+                  (when
+                    (>= (length (filter
+                                  (lambda (stored)
+                                    (same-slot? stored record))
+                                  records))
+                        coin-max-commitments)
+                    (error "commit: all sixteen canonical commitment slots are already stored for this puzzle and key"))
+                  (write-records data-dir (append records (list record)))
+                  record))))))
+
+    ;;; Atomically remove every stored record with this exact commitment.
+    ;;; Returns the number removed.
+    (define (cli-commit-remove data-dir commitment)
+      (: string? bytevector? -> integer?)
+      (with-commit-lock
+        data-dir
+        (lambda ()
+          (let* ((records (cli-commit-records data-dir))
+                 (kept (filter
+                         (lambda (record)
+                           (not (equal?
+                                  commitment
+                                  (cli-commit-record-commitment record))))
+                         records))
+                 (removed (- (length records) (length kept))))
+            (when (> removed 0)
+              (write-records data-dir kept))
+            removed))))
 
     ;;; Drop commitments whose one-block reveal window has closed.
     (define (cli-commit-prune data-dir tip-height)
       (: string? integer? -> list?)
-      (let* ((records (cli-commit-records data-dir))
-             (kept (let loop ((xs records) (out '()))
-                     (cond
-                       ((null? xs) (reverse out))
-                       ((< (cli-commit-record-height (car xs)) tip-height)
-                        (loop (cdr xs) out))
-                       (else (loop (cdr xs) (cons (car xs) out)))))))
-        (when (not (= (length records) (length kept)))
-          (write-records data-dir kept))
-        kept))))
+      (with-commit-lock
+        data-dir
+        (lambda ()
+          (let* ((records (cli-commit-records data-dir))
+                 (kept (let loop ((xs records) (out '()))
+                         (cond
+                           ((null? xs) (reverse out))
+                           ((< (cli-commit-record-height (car xs)) tip-height)
+                            (loop (cdr xs) out))
+                           (else
+                             (loop (cdr xs) (cons (car xs) out)))))))
+            (when (not (= (length records) (length kept)))
+              (write-records data-dir kept))
+            kept))))))

@@ -396,6 +396,7 @@
     (define coin-block-rules
       (block-rules connect: coin-connect-block
                    subsidy: coin-block-reward
+                   coinbase-maturity: 1
                    coinbase-script-bounds: coin-coinbase-script-bounds))
 
     ;;; Build rules that provide trusted configured genesis to block one.
@@ -410,4 +411,6 @@
                          genesis
                          parent-block)))
         subsidy: coin-block-reward
+        coinbase-maturity:
+          (block-rules-coinbase-maturity coin-block-rules)
         coinbase-script-bounds: coin-coinbase-script-bounds))))

@@ -1,0 +1,1967 @@
+;;; (sigil coin cli relay) — bounded co-op relay transport and service
+;;;
+;;; The public endpoint is deliberately small: Caddy owns TLS and framing,
+;;; this module owns strict JSON, durable admission, canonical-chain status,
+;;; and the fail-closed curl client used by contributors and producers.
+
+(define-library (sigil coin cli relay)
+  (import (sigil fs)
+          (sigil io)
+          (sigil math)
+          (sigil path)
+          (sigil process)
+          (sigil string)
+          (sigil struct)
+          (sigil time)
+          (sigil sqlite)
+          (sigil json)
+          (sigil http)
+          (sigil secp256k1)
+          (sigil bitcoin utils)
+          (sigil bitcoin encoding)
+          (sigil bitcoin primitives)
+          (sigil bitcoin tx)
+          (sigil bitcoin consensus)
+          (sigil bitcoin node)
+          (sigil coin consensus)
+          (sigil coin node)
+          (sigil coin explorer store)
+          (sigil coin cli args))
+  (export
+    relay-url
+    relay-require-curl
+    relay-context
+    relay-producer
+    relay-submit-commitment
+    relay-contribution-status
+    relay-submit-reveal
+    relay-commit-authorization
+    relay-authorization-hash
+    run-relay
+
+    ;; Narrow seams used by the focused package tests.
+    relay-json-decode
+    relay-canonical-hex
+    relay-curl-arguments
+    relay-protocol-error-message
+    relay-service-open
+    relay-service-close
+    relay-service-test-hook!
+    relay-handle-request)
+
+  (begin
+
+    (define %relay-version 1)
+    (define %relay-request-cap 2048)
+    (define %relay-response-cap 65536)
+    (define %relay-rate-window 60)
+    (define %relay-rate-attempts 8)
+    (define %relay-rate-buckets 1024)
+    (define %relay-retain-heights 256)
+    (define %relay-reveal-attempts 3)
+    (define %relay-auth-tag "SigilCoin/relay-commit/1")
+    (define %json-null 'null)
+
+    (define (alist-ref values key . default)
+      (let ((entry (and (list? values) (assq key values))))
+        (if entry
+            (cdr entry)
+            (if (null? default) #f (car default)))))
+
+    (define (row-ref row key)
+      (alist-ref row key #f))
+
+    (define (exact-integer? value)
+      (and (number? value) (exact? value) (integer? value)))
+
+    (define (bounded-uint? value maximum)
+      (and (exact-integer? value) (<= 0 value) (<= value maximum)))
+
+    (define (string-list-member? value values)
+      (cond ((null? values) #f)
+            ((string=? value (car values)) #t)
+            (else (string-list-member? value (cdr values)))))
+
+    (define (symbol-list-member? value values)
+      (cond ((null? values) #f)
+            ((eq? value (car values)) #t)
+            (else (symbol-list-member? value (cdr values)))))
+
+    (define (bytes-member? value values)
+      (cond ((null? values) #f)
+            ((equal? value (car values)) #t)
+            (else (bytes-member? value (cdr values)))))
+
+    (define (relay-canonical-hex text bytes)
+      (: any? integer? -> any?)
+      (guard (err (else #f))
+        (and (string? text)
+             (= (string-length text) (* 2 bytes))
+             (let loop ((i 0))
+               (if (= i (string-length text))
+                   (let ((decoded (hex-decode text)))
+                     (and (= (bytevector-length decoded) bytes)
+                          (string=? text (hex-encode decoded))
+                          decoded))
+                   (let ((c (string-ref text i)))
+                     (and (or (and (char>=? c #\0) (char<=? c #\9))
+                              (and (char>=? c #\a) (char<=? c #\f)))
+                          (loop (+ i 1)))))))))
+
+    ;; ============================================================
+    ;; Strict JSON
+    ;; ============================================================
+
+    (define (json-space? c)
+      (and (not (eof-object? c))
+           (or (char=? c #\space)
+               (char=? c #\tab)
+               (char=? c #\newline)
+               (char=? c #\return))))
+
+    (define (json-skip-space port)
+      (let loop ()
+        (when (json-space? (peek-char port))
+          (read-char port)
+          (loop))))
+
+    (define (json-escape-hex? c)
+      (or (and (char>=? c #\0) (char<=? c #\9))
+          (and (char>=? c #\a) (char<=? c #\f))
+          (and (char>=? c #\A) (char<=? c #\F))))
+
+    ;; Validate the quoted token before handing it to `json-read`. Its stock
+    ;; string reader deliberately accepts unknown escapes and raw controls;
+    ;; an API boundary may not erase those noncanonical spellings.
+    (define (json-read-string/strict port)
+      (unless (char=? (read-char port) #\")
+        (error "relay JSON: expected a string"))
+      (let loop ((raw (list #\")))
+        (let ((c (read-char port)))
+          (cond
+            ((eof-object? c)
+             (error "relay JSON: unterminated string"))
+            ((char=? c #\")
+             (let ((value
+                     (call-with-input-string
+                       (list->string (reverse (cons c raw)))
+                       json-read)))
+               (unless (string? value)
+                 (error "relay JSON: expected a string"))
+               value))
+            ((< (char->integer c) 32)
+             (error "relay JSON: raw control character in string"))
+            ((char=? c #\\)
+             (let ((escaped (read-char port)))
+               (unless (and (not (eof-object? escaped))
+                            (or (char=? escaped #\")
+                                (char=? escaped #\\)
+                                (char=? escaped #\/)
+                                (char=? escaped #\b)
+                                (char=? escaped #\f)
+                                (char=? escaped #\n)
+                                (char=? escaped #\r)
+                                (char=? escaped #\t)
+                                (char=? escaped #\u)))
+                 (error "relay JSON: invalid string escape"))
+               (if (char=? escaped #\u)
+                   (let hex-loop ((i 0)
+                                  (token (cons escaped (cons c raw))))
+                     (if (= i 4)
+                         (loop token)
+                         (let ((h (read-char port)))
+                           (unless (and (not (eof-object? h))
+                                        (json-escape-hex? h))
+                             (error "relay JSON: invalid unicode escape"))
+                           (hex-loop (+ i 1) (cons h token)))))
+                   (loop (cons escaped (cons c raw))))))
+            (else (loop (cons c raw)))))))
+
+    (define (canonical-integer-text? text)
+      (let ((len (string-length text)))
+        (cond ((= len 0) #f)
+              ((string=? text "0") #t)
+              ((char=? (string-ref text 0) #\-)
+               (and (> len 1)
+                    (not (char=? (string-ref text 1) #\0))
+                    (let loop ((i 1))
+                      (or (= i len)
+                          (and (char-numeric? (string-ref text i))
+                               (loop (+ i 1)))))))
+              ((char=? (string-ref text 0) #\0) #f)
+              (else
+               (let loop ((i 0))
+                 (or (= i len)
+                     (and (char-numeric? (string-ref text i))
+                          (loop (+ i 1)))))))))
+
+    (define (json-value-delimiter? c)
+      (or (eof-object? c)
+          (json-space? c)
+          (char=? c #\,)
+          (char=? c #\})
+          (char=? c #\])))
+
+    (define (json-read-integer/strict port)
+      (let loop ((chars '()))
+        (let ((c (peek-char port)))
+          (if (json-value-delimiter? c)
+              (let ((text (list->string (reverse chars))))
+                (unless (canonical-integer-text? text)
+                  (error "relay JSON: noncanonical integer"))
+                (let ((value (string->number text)))
+                  (unless (exact-integer? value)
+                    (error "relay JSON: integer is not exact"))
+                  value))
+              (begin
+                (read-char port)
+                (loop (cons c chars)))))))
+
+    (define (json-read-string-array port)
+      (unless (char=? (read-char port) #\[)
+        (error "relay JSON: expected an array"))
+      (json-skip-space port)
+      (if (char=? (peek-char port) #\])
+          (begin (read-char port) '())
+          (let loop ((out '()))
+            (json-skip-space port)
+            (let ((value (json-read-string/strict port)))
+              (json-skip-space port)
+              (let ((next (read-char port)))
+                (cond ((char=? next #\]) (reverse (cons value out)))
+                      ((char=? next #\,)
+                       (json-skip-space port)
+                       (when (char=? (peek-char port) #\])
+                         (error "relay JSON: trailing array comma"))
+                       (loop (cons value out)))
+                      (else (error "relay JSON: expected ',' or ']'"))))))))
+
+    (define (json-read-scalar port array?)
+      (let ((c (peek-char port)))
+        (cond ((char=? c #\") (json-read-string/strict port))
+              ((or (char=? c #\-) (char-numeric? c))
+               (json-read-integer/strict port))
+              ((char=? c #\n)
+               (let ((value (json-read port)))
+                 (unless (eq? value %json-null)
+                   (error "relay JSON: expected null"))
+                 value))
+              ((and array? (char=? c #\[))
+               (json-read-string-array port))
+              (else
+               (error "relay JSON: only strings, exact integers, null, and declared string arrays are allowed")))))
+
+    ;;; Decode one exact, flat JSON object.
+    ;;;
+    ;;; `allowed` and `array-keys` contain field-name strings. Duplicate and
+    ;;; unknown keys, booleans, nested values, noncanonical integers, malformed
+    ;;; separators and trailing bytes are all rejected before a dict can erase
+    ;;; evidence of them.
+    (define (relay-json-decode text allowed array-keys)
+      (: string? list? list? -> list?)
+      (call-with-input-string text
+        (lambda (port)
+          (json-skip-space port)
+          (unless (char=? (read-char port) #\{)
+            (error "relay JSON: expected an object"))
+          (json-skip-space port)
+          (let ((result
+                  (if (char=? (peek-char port) #\})
+                      (begin (read-char port) '())
+                      (let loop ((out '()) (seen '()))
+                        (json-skip-space port)
+                        (let ((key (json-read-string/strict port)))
+                          (unless (string-list-member? key allowed)
+                            (error (string-append "relay JSON: unknown field " key)))
+                          (when (string-list-member? key seen)
+                            (error (string-append "relay JSON: duplicate field " key)))
+                          (json-skip-space port)
+                          (unless (char=? (read-char port) #\:)
+                            (error "relay JSON: expected ':'"))
+                          (json-skip-space port)
+                          (let ((value (json-read-scalar
+                                        port
+                                        (string-list-member? key array-keys))))
+                            (json-skip-space port)
+                            (let ((next (read-char port)))
+                              (cond
+                                ((char=? next #\})
+                                 (reverse
+                                   (cons (cons (string->symbol key) value) out)))
+                                ((char=? next #\,)
+                                 (json-skip-space port)
+                                 (when (char=? (peek-char port) #\})
+                                   (error "relay JSON: trailing object comma"))
+                                 (loop (cons (cons (string->symbol key) value) out)
+                                       (cons key seen)))
+                                (else
+                                 (error "relay JSON: expected ',' or '}'"))))))))))
+            (json-skip-space port)
+            (unless (eof-object? (peek-char port))
+              (error "relay JSON: trailing data"))
+            result))))
+
+    (define (require-fields object fields)
+      (for-each
+        (lambda (field)
+          (unless (assq field object)
+            (error (string-append "relay JSON: missing field "
+                                  (symbol->string field)))))
+        fields)
+      object)
+
+    (define (json-response status object)
+      (http-response/json status (json-encode object)))
+
+    (define (json-error status code detail)
+      (json-response status
+        (list (cons 'error code)
+              (cons 'detail
+                    (if (> (string-length detail) 160)
+                        (substring detail 0 160)
+                        detail)))))
+
+    ;; ============================================================
+    ;; Authorization and URL policy
+    ;; ============================================================
+
+    (define (relay-authorization-hash chain parent-hash height complexity
+                                      pubkey commitment)
+      (: chain-config? bytevector? integer? integer? bytevector? bytevector? -> bytevector?)
+      (hash256
+        (bytevector-append
+          (string->utf8 %relay-auth-tag)
+          (string->utf8 (chain-config-name chain))
+          parent-hash
+          (u64-le height)
+          (u32-le complexity)
+          pubkey
+          commitment)))
+
+    (define (relay-commit-authorization key chain parent-hash height complexity
+                                         pubkey commitment)
+      (: bytevector? chain-config? bytevector? integer? integer? bytevector? bytevector? -> bytevector?)
+      (secp256k1-ecdsa-sign
+        key
+        (relay-authorization-hash chain parent-hash height complexity
+                                  pubkey commitment)))
+
+    (define (clean-origin-text? text)
+      (and (string? text)
+           (> (string-length text) 0)
+           (let loop ((i 0))
+             (or (= i (string-length text))
+                 (let ((c (string-ref text i)))
+                   (and (char>=? c #\!)
+                        (char<=? c #\~)
+                        (not (char=? c #\@))
+                        (not (char=? c #\#))
+                        (not (char=? c #\?))
+                        (not (char=? c #\{))
+                        (not (char=? c #\}))
+                        (not (char=? c #\[))
+                        (not (char=? c #\]))
+                        (loop (+ i 1))))))))
+
+    (define (decimal-port? text)
+      (and (> (string-length text) 0)
+           (let loop ((i 0))
+             (or (= i (string-length text))
+                 (and (char-numeric? (string-ref text i))
+                      (loop (+ i 1)))))
+           (let ((port (string->number text)))
+             (and (exact-integer? port) (<= 1 port) (<= port 65535)))))
+
+    (define (loopback-http-origin? origin)
+      (let ((prefix "http://127.0.0.1:"))
+        (and (string-starts-with? origin prefix)
+             (decimal-port?
+               (substring origin (string-length prefix)
+                          (string-length origin))))))
+
+    (define (https-origin? origin)
+      (let ((prefix "https://"))
+        (and (string-starts-with? origin prefix)
+             (> (string-length origin) (string-length prefix))
+             (not (string-contains?
+                    (substring origin (string-length prefix)
+                               (string-length origin))
+                    "/")))))
+
+    (define (validate-origin who origin chain health?)
+      (unless (clean-origin-text? origin)
+        (error (string-append who ": invalid relay URL")))
+      (let ((name (chain-config-name chain)))
+        (cond
+          ((string=? name "sigilcoin-main")
+           (error (string-append who ": the co-op relay is not available on mainnet")))
+          ((https-origin? origin) origin)
+          ((and (loopback-http-origin? origin)
+                (or health? (string=? name "sigilcoin-regtest")))
+           origin)
+          (else
+           (error (string-append
+                    who
+                    ": relay URL must be an https:// origin"
+                    (if (string=? name "sigilcoin-regtest")
+                        " or literal http://127.0.0.1:<port> on regtest"
+                        "")))))))
+
+    ;;; Validate optional `--relay`. Absence remains `#f` for solo mining.
+    (define (relay-url args chain)
+      (: list? chain-config? -> any?)
+      (let ((origin (cli-arg args "--relay" #f)))
+        (and origin (validate-origin "relay" origin chain #f))))
+
+    (define (relay-require-curl who)
+      (: string? -> boolean?)
+      (unless (command-exists? "curl")
+        (error (string-append who ": curl is required")))
+      #t)
+
+    ;; ============================================================
+    ;; Bounded curl client
+    ;; ============================================================
+
+    (define (relay-curl-arguments method origin path body output)
+      (: string? string? string? any? string? -> list?)
+      (append
+        ;; These must stay first and second: no curlrc may add another URL,
+        ;; redirects, tracing, or insecure TLS, and URL globbing stays off
+        ;; even if a future caller misses origin validation.
+        (list "--disable"
+              "--globoff"
+              "--silent"
+              "--connect-timeout" "5"
+              "--max-time" "10"
+              "--max-filesize" (number->string %relay-response-cap)
+              "--output" output
+              "--write-out" "%{response_code}"
+              "--request" method
+              "--header" "Accept: application/json"
+              "--proto"
+              (if (string-starts-with? origin "https://")
+                  "=https" "=http"))
+        (if body
+            (list "--header" "Content-Type: application/json"
+                  "--data-binary" "@-")
+            '())
+        (list "--url" (string-append origin path))))
+
+    ;; `(exit-code http-status body)`. A non-zero curl exit deliberately
+    ;; remains data so PUT callers can resolve unknown acknowledgement with a
+    ;; status GET instead of generating another blind.
+    (define (curl-request method origin path body)
+      (relay-require-curl "relay")
+      (when (and body
+                 (> (bytevector-length (string->utf8 body)) %relay-request-cap))
+        (error "relay: encoded request exceeds 2048 bytes"))
+      (let ((tmp (make-temp-file)))
+        (unless tmp (error "relay: could not create response file"))
+        (let ((result #f) (failure #f))
+          (guard (err (else (set! failure err) #f))
+            (let* ((argv (relay-curl-arguments method origin path body tmp))
+                   (child (apply process-spawn "curl" argv)))
+              (unless child (error "relay: could not start curl"))
+              (let ((input (process-stdin child))
+                    (output (process-stdout child))
+                    (errors (process-stderr child)))
+                (when body (display body input))
+                (close-output-port input)
+                (let ((status-text (read-line output)))
+                  ;; Close captured ports before `process-wait`; reaping the
+                  ;; child invalidates its port accessors.
+                  (close-input-port output)
+                  (close-input-port errors)
+                  (let* ((exit-code (process-wait child))
+                         (size (file-size tmp))
+                         (response (if (<= size %relay-response-cap)
+                                       (read-file-string tmp)
+                                       #f))
+                         (status (and (string? status-text)
+                                      (= (string-length status-text) 3)
+                                      (string->number status-text))))
+                    (when (> size %relay-response-cap)
+                      (error "relay: response exceeds 65536 bytes"))
+                    (set! result (list exit-code status response)))))))
+          (when (file-exists? tmp) (delete-file tmp))
+          (when failure
+            (error (cli-error-message failure "relay: curl request failed")))
+          result)))
+
+    (define %protocol-error-codes
+      '("bad-authorization" "bad-commitment" "bad-json" "bad-path"
+        "bad-pubkey" "bad-request" "bad-share" "client-ip-required"
+        "internal-error" "method-not-allowed" "no-chain-data"
+        "not-found" "not-revealable" "payload-too-large" "pool-full"
+        "rate-limited" "reveal-attempt-limit" "reveal-window-closed"
+        "stale-context" "storage-error" "uniqueness-conflict"
+        "unknown-commitment" "unsupported-media-type"))
+
+    (define (relay-protocol-error-message status code)
+      (: integer? any? -> string?)
+      (string-append
+        "relay: HTTP " (number->string status) " "
+        (if (and (string? code)
+                 (string-list-member? code %protocol-error-codes))
+            code
+            "protocol-error")))
+
+    (define %error-fields '(error detail))
+
+    (define (decode-error-body status body)
+      (let ((object
+              (guard (err (else #f))
+                (require-fields
+                  (relay-json-decode body '("error" "detail") '())
+                  %error-fields))))
+        (unless (and object
+                     (string? (alist-ref object 'error))
+                     (string? (alist-ref object 'detail)))
+          (error (string-append
+                   "relay: HTTP " (number->string status)
+                   " returned malformed JSON")))
+        ;; Neither the peer's detail nor an unrecognized peer-chosen code may
+        ;; cross into contributor/miner output.
+        (error
+          (relay-protocol-error-message status (alist-ref object 'error)))))
+
+    (define (client-object method origin path body ok-statuses allowed required arrays)
+      (let* ((raw (curl-request method origin path body))
+             (exit-code (list-ref raw 0))
+             (status (list-ref raw 1))
+             (text (list-ref raw 2)))
+        (if (not (= exit-code 0))
+            (list 'transport-failed status text)
+            (begin
+              (unless (and status (symbol-list-member? status ok-statuses))
+                (if (and status text)
+                    (decode-error-body status text)
+                    (error "relay: request failed without an HTTP response")))
+              (guard (err (else
+                            (error "relay: response contains malformed JSON")))
+                (require-fields (relay-json-decode text allowed arrays) required))))))
+
+    (define %context-field-strings
+      '("version" "chain" "height" "parent_id" "complexity" "capacity" "accepted"))
+    (define %context-fields
+      '(version chain height parent_id complexity capacity accepted))
+    (define %producer-field-strings
+      '("version" "chain" "height" "parent_id" "complexity" "commitments" "reveals"))
+    (define %producer-fields
+      '(version chain height parent_id complexity commitments reveals))
+    (define %status-field-strings
+      '("version" "chain" "height" "parent_id" "complexity" "commitment" "pubkey"
+        "status" "tip_height" "commit_block_id" "reveal_block_id" "contribution"
+        "payout_daviwils" "matures_at_height" "detail"))
+    (define %status-fields
+      '(version chain height parent_id complexity commitment pubkey status tip_height
+        commit_block_id reveal_block_id contribution payout_daviwils matures_at_height detail))
+
+    (define (valid-common-context? object chain)
+      (let ((version (alist-ref object 'version))
+            (height (alist-ref object 'height))
+            (complexity (alist-ref object 'complexity)))
+        (and (exact-integer? version)
+             (= version %relay-version)
+             (string? (alist-ref object 'chain))
+             (string=? (alist-ref object 'chain) (chain-config-name chain))
+             (bounded-uint? height #xffffffffffffffff)
+             (> height 0)
+             (relay-canonical-hex (alist-ref object 'parent_id) 32)
+             (bounded-uint? complexity #xffffffff)
+             (<= coin-complexity-min complexity)
+             (<= complexity coin-complexity-max))))
+
+    (define (relay-context origin chain)
+      (: string? chain-config? -> list?)
+      (validate-origin "relay" origin chain #f)
+      (let ((object (client-object
+                      "GET" origin "/v1/context" #f '(200)
+                      %context-field-strings %context-fields '())))
+        (when (eq? (car object) 'transport-failed)
+          (error "relay: context request failed"))
+        (unless (and (valid-common-context? object chain)
+                     (bounded-uint? (alist-ref object 'capacity) coin-max-commitments)
+                     (bounded-uint? (alist-ref object 'accepted) coin-max-commitments)
+                     (= (+ (alist-ref object 'capacity)
+                           (alist-ref object 'accepted))
+                        coin-max-commitments))
+          (error "relay: invalid context response"))
+        object))
+
+    (define (canonical-share-text? text)
+      (let ((bytes (and (string? text)
+                        (even? (string-length text))
+                        (relay-canonical-hex text (quotient (string-length text) 2)))))
+        (and bytes
+             (<= (bytevector-length bytes) coin-max-share-bytes)
+             (let ((decoded (coin-shares-decode
+                              (bytevector-append #u8(1) bytes))))
+               (and (coin-ok? decoded)
+                    (= (length (coin-result-value decoded)) 1)
+                    (equal? bytes
+                            (coin-share-encode
+                              (car (coin-result-value decoded)))))))))
+
+    (define (relay-producer origin chain)
+      (: string? chain-config? -> list?)
+      (validate-origin "relay" origin chain #f)
+      (let ((object (client-object
+                      "GET" origin "/v1/producer" #f '(200)
+                      %producer-field-strings %producer-fields
+                      '("commitments" "reveals"))))
+        (when (eq? (car object) 'transport-failed)
+          (error "relay: producer request failed"))
+        (unless (and (valid-common-context? object chain)
+                     (list? (alist-ref object 'commitments))
+                     (<= (length (alist-ref object 'commitments)) coin-max-commitments)
+                     (let loop ((xs (alist-ref object 'commitments)))
+                       (or (null? xs)
+                           (and (relay-canonical-hex (car xs) coin-commitment-bytes)
+                                (loop (cdr xs)))))
+                     (list? (alist-ref object 'reveals))
+                     (<= (length (alist-ref object 'reveals)) coin-max-commitments)
+                     (let loop ((xs (alist-ref object 'reveals)))
+                       (or (null? xs)
+                           (and (canonical-share-text? (car xs))
+                                (loop (cdr xs))))))
+          (error "relay: invalid producer response"))
+        object))
+
+    (define %status-names
+      '("waiting" "stale" "queued" "commit-missed" "revealable"
+        "reveal-queued" "included" "reveal-missed"))
+
+    (define (nullable? value predicate)
+      (or (eq? value %json-null) (predicate value)))
+
+    (define (valid-status-object? object chain commitment)
+      (and (valid-common-context? object chain)
+           (string? (alist-ref object 'commitment))
+           (string=? (alist-ref object 'commitment) (hex-encode commitment))
+           (relay-canonical-hex (alist-ref object 'pubkey) coin-share-pubkey-bytes)
+           (string? (alist-ref object 'status))
+           (string-list-member? (alist-ref object 'status) %status-names)
+           (bounded-uint? (alist-ref object 'tip_height) #xffffffffffffffff)
+           (nullable? (alist-ref object 'commit_block_id)
+                      (lambda (x) (and (string? x) (relay-canonical-hex x 32))))
+           (nullable? (alist-ref object 'reveal_block_id)
+                      (lambda (x) (and (string? x) (relay-canonical-hex x 32))))
+           (nullable? (alist-ref object 'contribution)
+                      (lambda (x) (bounded-uint? x #xffffffffffffffff)))
+           (nullable? (alist-ref object 'payout_daviwils)
+                      (lambda (x) (bounded-uint? x #xffffffffffffffff)))
+           (nullable? (alist-ref object 'matures_at_height)
+                      (lambda (x) (bounded-uint? x #xffffffffffffffff)))
+           (nullable? (alist-ref object 'detail) string?)))
+
+    (define (decode-status-response raw chain commitment)
+      (when (eq? (car raw) 'transport-failed)
+        (error "relay: status request failed"))
+      (unless (valid-status-object? raw chain commitment)
+        (error "relay: invalid contribution status response"))
+      ;; Status detail is presentation-only and peer-controlled. Replace it
+      ;; with the local protocol wording before any caller can print it.
+      (map (lambda (entry)
+             (if (eq? (car entry) 'detail)
+                 (cons 'detail
+                       (status-detail (alist-ref raw 'status)))
+                 entry))
+           raw))
+
+    (define (relay-contribution-status origin chain commitment)
+      (: string? chain-config? bytevector? -> list?)
+      (validate-origin "relay" origin chain #f)
+      (decode-status-response
+        (client-object
+          "GET" origin
+          (string-append "/v1/contributions/" (hex-encode commitment))
+          #f '(200) %status-field-strings %status-fields '())
+        chain commitment))
+
+    (define (confirmation-status? object)
+      (and (list? object)
+           (let ((status (alist-ref object 'status "")))
+             (or (string=? status "queued")
+                 (string=? status "revealable")
+                 (string=? status "reveal-queued")
+                 (string=? status "included")
+                 (string=? status "commit-missed")
+                 (string=? status "reveal-missed")))))
+
+    (define (relay-submit-commitment origin chain height parent-hash complexity
+                                      pubkey commitment authorization)
+      (: string? chain-config? integer? bytevector? integer? bytevector? bytevector? bytevector? -> list?)
+      (validate-origin "relay" origin chain #f)
+      (let* ((body (json-encode
+                     (list
+                       (cons 'version %relay-version)
+                       (cons 'chain (chain-config-name chain))
+                       (cons 'height height)
+                       (cons 'parent_id
+                             (hex-encode (reverse-bytevector parent-hash)))
+                       (cons 'complexity complexity)
+                       (cons 'pubkey (hex-encode pubkey))
+                       (cons 'authorization (hex-encode authorization)))))
+             (path (string-append "/v1/contributions/"
+                                  (hex-encode commitment)))
+             (raw (client-object "PUT" origin path body '(200 201)
+                                 %status-field-strings %status-fields '())))
+        (if (eq? (car raw) 'transport-failed)
+            (let ((status (relay-contribution-status origin chain commitment)))
+              (if (and (confirmation-status? status)
+                       (= (alist-ref status 'height) height)
+                       (= (alist-ref status 'complexity) complexity)
+                       (string=? (alist-ref status 'parent_id)
+                                 (hex-encode (reverse-bytevector parent-hash)))
+                       (string=? (alist-ref status 'pubkey) (hex-encode pubkey)))
+                  status
+                  (error "relay: commitment acknowledgement is unknown; resume with the same commitment")))
+            (decode-status-response raw chain commitment))))
+
+    (define (relay-submit-reveal origin chain commitment share-bytes)
+      (: string? chain-config? bytevector? bytevector? -> list?)
+      (validate-origin "relay" origin chain #f)
+      (let* ((body (json-encode
+                     (list (cons 'version %relay-version)
+                           (cons 'share (hex-encode share-bytes)))))
+             (path (string-append "/v1/contributions/"
+                                  (hex-encode commitment) "/reveal"))
+             (raw (client-object "PUT" origin path body '(200 201)
+                                 %status-field-strings %status-fields '())))
+        (if (eq? (car raw) 'transport-failed)
+            (let ((status (relay-contribution-status origin chain commitment)))
+              (if (let ((name (alist-ref status 'status "")))
+                    (or (string=? name "reveal-queued")
+                        (string=? name "included")))
+                  status
+                  (error "relay: reveal acknowledgement is unknown; resume with the same commitment")))
+            (decode-status-response raw chain commitment))))
+
+    ;; ============================================================
+    ;; Durable pool state
+    ;; ============================================================
+
+    (define-struct relay-service
+      (config)
+      (data-dir)
+      (state-dir)
+      (db)
+      (public?)
+      (rates)
+      (test-hooks)
+      (faulted?))
+
+    (define %contributions-schema
+      (string-append
+        "CREATE TABLE IF NOT EXISTS contributions ("
+        "sequence INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "commitment TEXT NOT NULL UNIQUE,"
+        "height INTEGER NOT NULL,"
+        "parent_hash TEXT NOT NULL,"
+        "complexity INTEGER NOT NULL,"
+        "pubkey TEXT NOT NULL,"
+        "authorization TEXT NOT NULL,"
+        "source_ip TEXT NOT NULL,"
+        "received_at INTEGER NOT NULL,"
+        "share_hex TEXT,"
+        "contribution INTEGER,"
+        "revealed_at INTEGER,"
+        "reveal_attempt_hash TEXT,"
+        "reveal_attempt_error TEXT,"
+        "reveal_attempts INTEGER NOT NULL DEFAULT 0,"
+        "UNIQUE(height, parent_hash, complexity, pubkey)"
+        ")"))
+    ;; Sigil exposes no in-process umask primitive. Create owned state at
+    ;; 0027; a deployment bind root may instead be operator-owned and
+    ;; group-writable, while files created inside it remain pool-owned 0640.
+    (define %prepare-state-script
+      (string-append
+        "umask 0027 || exit 1; "
+        "mkdir -p -- \"$1\" || exit 1; "
+        "chmod 0750 -- \"$1\" 2>/dev/null || { [ -d \"$1\" ] && [ -w \"$1\" ] && [ -x \"$1\" ]; } || exit 1; "
+        "for f in \"$2\" \"$2-journal\"; do "
+        "if [ ! -e \"$f\" ]; then "
+        "(set -C; : > \"$f\") 2>/dev/null || [ -e \"$f\" ] || exit 1; "
+        "fi; chmod 0640 -- \"$f\" || exit 1; done; "
+        "for f in \"$2-wal\" \"$2-shm\"; do "
+        "if [ -e \"$f\" ]; then chmod 0640 -- \"$f\" || exit 1; fi; done"))
+
+    (define (pool-db-path state-dir)
+      (path-join state-dir "sigilcoin-pool.sqlite"))
+
+    (define (prepare-pool-state! state-dir)
+      (let ((path (pool-db-path state-dir)))
+        (unless (= 0
+                   (process-run "sh" "-c" %prepare-state-script
+                                "sigilcoin-relay-state" state-dir path))
+          (error "relay: could not create private pool state"))
+        path))
+
+    (define (mark-storage-failure! service)
+      (vector-set! (relay-service-faulted? service) 0 #t)
+      #f)
+
+    (define (pool-permissions-ok? service)
+      (guard (err (else (mark-storage-failure! service)))
+        (prepare-pool-state! (relay-service-state-dir service))
+        #t))
+
+    (define (pool-rollback! service)
+      (let ((ok (sqlite-exec (relay-service-db service) "ROLLBACK")))
+        (if (and ok (pool-permissions-ok? service))
+            #t
+            (mark-storage-failure! service))))
+
+    (define (pool-commit! service)
+      (if (sqlite-exec (relay-service-db service) "COMMIT")
+          (pool-permissions-ok? service)
+          (begin
+            ;; A failed COMMIT may leave the transaction active. Always try to
+            ;; unwind it, then poison the service: no uncertain row is served.
+            (sqlite-exec (relay-service-db service) "ROLLBACK")
+            (mark-storage-failure! service))))
+
+    (define (checked-pool-update! service sql . params)
+      (let ((db (relay-service-db service)))
+        (if (not (sqlite-exec db "BEGIN IMMEDIATE"))
+            (mark-storage-failure! service)
+            (let ((changed
+                    (and (apply sqlite-run db sql params)
+                         (= (sqlite-changes db) 1))))
+              (if changed
+                  (pool-commit! service)
+                  (begin
+                    (pool-rollback! service)
+                    (mark-storage-failure! service)))))))
+
+
+    (define (sql-required db sql)
+      (unless (sqlite-exec db sql)
+        (error (string-append "relay: SQLite failed: " (sqlite-errmsg db)))))
+
+    (define (relay-service-open chain data-dir state-dir)
+      (: chain-config? string? string? -> relay-service?)
+      (when (string=? (chain-config-name chain) "sigilcoin-main")
+        (error "relay: mainnet is not supported"))
+      (let* ((path (prepare-pool-state! state-dir))
+             (db (sqlite-open path)))
+        (unless db (error "relay: could not open pool state"))
+        (sql-required db "PRAGMA busy_timeout = 5000")
+        (sql-required db "PRAGMA journal_mode = PERSIST")
+        (sql-required db "PRAGMA synchronous = FULL")
+        (sql-required db "CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        (let ((row (sqlite-query-row db
+                     "SELECT value FROM metadata WHERE key = ?" "schema-version")))
+          (if row
+              (unless (and (string? (row-ref row 'value))
+                           (string=? (row-ref row 'value) "1"))
+                (sqlite-close db)
+                (error "relay: unsupported pool schema version"))
+              (unless (sqlite-run db
+                        "INSERT INTO metadata(key, value) VALUES(?, ?)"
+                        "schema-version" "1")
+                (sqlite-close db)
+                (error "relay: could not initialize pool schema"))))
+        (sql-required db %contributions-schema)
+        (sql-required db
+          "CREATE INDEX IF NOT EXISTS contributions_context ON contributions(height, parent_hash, complexity, sequence)")
+        (prepare-pool-state! state-dir)
+        (relay-service config: chain
+                       data-dir: data-dir
+                       state-dir: state-dir
+                       db: db
+                       public?: (string=? (chain-config-name chain)
+                                          "sigilcoin-testnet")
+                       rates: (vector '())
+                       test-hooks: (vector #f)
+                       faulted?: (vector #f))))
+
+    (define (relay-service-close service)
+      (: relay-service? -> boolean?)
+      (unless (sqlite-close (relay-service-db service))
+        (error "relay: could not close pool state"))
+      (prepare-pool-state! (relay-service-state-dir service))
+      #t)
+
+    (define (relay-service-test-hook! service thunk)
+      (: relay-service? any? -> boolean?)
+      (unless (or (not thunk) (procedure? thunk))
+        (error "relay-service-test-hook!: expected a procedure or #f"))
+      (vector-set! (relay-service-test-hooks service) 0 thunk)
+      #t)
+
+    (define (run-service-hook service phase)
+      (let ((hook (vector-ref (relay-service-test-hooks service) 0)))
+        (when hook (hook phase))))
+
+    (define (with-chain-snapshot service proc)
+      (let ((store (explorer-open (relay-service-config service)
+                                  (relay-service-data-dir service))))
+        (if (not store)
+            #f
+            (let ((db (explorer-store-db store))
+                  (result #f)
+                  (failure #f))
+              (unless (sqlite-exec db "BEGIN")
+                (explorer-close store)
+                (error "relay: could not begin chain snapshot"))
+              (guard (err (else (set! failure err) #f))
+                (set! result (proc store)))
+              (if failure
+                  (sqlite-exec db "ROLLBACK")
+                  (unless (sqlite-exec db "COMMIT")
+                    (sqlite-exec db "ROLLBACK")
+                    (set! failure "relay: could not commit chain snapshot")))
+              (explorer-close store)
+              (when failure
+                (error (if (string? failure)
+                           failure
+                           (cli-error-message failure
+                             "relay: chain snapshot failed"))))
+              result))))
+
+    (define (active-block store height)
+      (explorer-block-by-height store height))
+
+    (define (active-raw-block store block-record)
+      (and block-record
+           (let ((row (sqlite-query-row
+                        (explorer-store-db store)
+                        "SELECT block_hex FROM blocks WHERE hash = ? AND validated = 1 AND block_hex IS NOT NULL LIMIT 1"
+                        (explorer-block-hash-text block-record))))
+             (and row
+                  (string? (row-ref row 'block_hex))
+                  (guard (err (else #f))
+                    (block-parse (hex-decode (row-ref row 'block_hex))))))))
+
+    (define (raw-payload raw)
+      (and raw
+           (let ((decoded (coin-block-coinbase-payload raw)))
+             (and (coin-ok? decoded) (coin-result-value decoded)))))
+
+    (define (raw-commitments raw)
+      (let* ((payload (raw-payload raw))
+             (decoded (and payload
+                           (coin-commits-decode
+                             (coin-coinbase-payload-commits payload)))))
+        (and decoded (coin-ok? decoded) (coin-result-value decoded))))
+
+    (define (raw-shares raw)
+      (let* ((payload (raw-payload raw))
+             (decoded (and payload
+                           (coin-shares-decode
+                             (coin-coinbase-payload-shares payload)))))
+        (and decoded (coin-ok? decoded) (coin-result-value decoded))))
+
+    ;; Current validated tip and the context for its successor.
+    (define (chain-current service)
+      (with-chain-snapshot service
+        (lambda (store)
+          (let* ((summary (explorer-chain-summary store))
+                 (hooked (run-service-hook service 'snapshot-after-summary))
+                 (height (explorer-summary-tip-height summary))
+                 (tip (active-block store height))
+                 (complexity (explorer-summary-next-complexity summary)))
+            (and (not (explorer-summary-empty summary))
+                 tip
+                 (exact-integer? complexity)
+                 (list (cons 'tip_height height)
+                       (cons 'tip_hash (explorer-block-hash-text tip))
+                       (cons 'height (+ height 1))
+                       (cons 'parent_id (explorer-block-id tip))
+                       (cons 'parent_hash
+                             (hex-decode (explorer-block-hash-text tip)))
+                       (cons 'complexity complexity)))))))
+
+    (define (same-chain-token? a b)
+      (and a b
+           (= (alist-ref a 'tip_height) (alist-ref b 'tip_height))
+           (string=? (alist-ref a 'tip_hash) (alist-ref b 'tip_hash))))
+
+    (define (context-matches? view height parent-hash complexity)
+      (and view
+           (= height (alist-ref view 'height))
+           (= complexity (alist-ref view 'complexity))
+           (equal? parent-hash (alist-ref view 'parent_hash))))
+
+    (define (prune-contributions service tip-height)
+      (let ((before (- tip-height %relay-retain-heights)))
+        (or (<= before 0)
+            (and (sqlite-run (relay-service-db service)
+                             "DELETE FROM contributions WHERE height < ?"
+                             before)
+                 (pool-permissions-ok? service))
+            (mark-storage-failure! service))))
+
+    (define (contribution-by-commitment service commitment-text)
+      (sqlite-query-row
+        (relay-service-db service)
+        "SELECT * FROM contributions WHERE commitment = ? LIMIT 1"
+        commitment-text))
+
+    (define (contribution-by-identity service height parent-hash complexity pubkey)
+      (sqlite-query-row
+        (relay-service-db service)
+        "SELECT * FROM contributions WHERE height = ? AND parent_hash = ? AND complexity = ? AND pubkey = ? LIMIT 1"
+        height parent-hash complexity pubkey))
+
+    (define (context-count service height parent-hash complexity)
+      (let ((row (sqlite-query-row
+                   (relay-service-db service)
+                   "SELECT COUNT(*) AS count FROM contributions WHERE height = ? AND parent_hash = ? AND complexity = ?"
+                   height parent-hash complexity)))
+        (if row (row-ref row 'count) 0)))
+
+    ;; ============================================================
+    ;; Canonical status projection
+    ;; ============================================================
+
+    (define (status-detail status)
+      (cond ((string=? status "waiting") "the commitment context is ahead of the validated chain")
+            ((string=? status "stale") "the commitment context is not on the active validated branch")
+            ((string=? status "queued") "waiting for the commitment block")
+            ((string=? status "commit-missed") "the canonical commitment block omitted this commitment")
+            ((string=? status "revealable") "the canonical commitment block contains this commitment")
+            ((string=? status "reveal-queued") "the reveal is queued for the next block")
+            ((string=? status "included") "the canonical reveal block contains the share and direct payout")
+            (else "the canonical reveal block omitted this reveal")))
+
+    (define (find-share-index share-hex shares)
+      (let loop ((xs shares) (index 0))
+        (cond ((null? xs) #f)
+              ((string=? share-hex (hex-encode (coin-share-encode (car xs)))) index)
+              (else (loop (cdr xs) (+ index 1))))))
+
+    (define (included-payout raw index pubkey)
+      (guard (err (else #f))
+        (let* ((coinbase (coin-block-coinbase raw))
+               (outputs (and coinbase (transaction-outputs coinbase)))
+               (output-index (+ index 1)))
+          (and outputs
+               (< output-index (length outputs))
+               (let ((output (list-ref outputs output-index)))
+                 (and (equal? (txout-script-pubkey output)
+                              (coin-share-script pubkey))
+                      (txout-value output)))))))
+
+    (define (project-row/store service store row)
+      (let* ((height (row-ref row 'height))
+             (tip-summary (explorer-chain-summary store))
+             (hooked (run-service-hook service 'snapshot-after-summary))
+             (tip-height (explorer-summary-tip-height tip-summary))
+             (parent-text (row-ref row 'parent_hash))
+             (parent (and (>= tip-height (- height 1))
+                          (active-block store (- height 1))))
+             (block-h (and (>= tip-height height)
+                           (active-block store height)))
+             (block-next (and (>= tip-height (+ height 1))
+                              (active-block store (+ height 1))))
+             (raw-h (and block-h (active-raw-block store block-h)))
+             (raw-next (and block-next (active-raw-block store block-next)))
+             (commitment-text (row-ref row 'commitment))
+             (commitment (hex-decode commitment-text))
+             (pubkey (hex-decode (row-ref row 'pubkey)))
+             (share-text (row-ref row 'share_hex))
+             (expected-complexity
+               (cond (block-h (explorer-block-complexity block-h))
+                     ((= tip-height (- height 1))
+                      (explorer-summary-next-complexity tip-summary))
+                     (else #f)))
+             (parent-ok?
+               (and parent
+                    (string=? parent-text
+                              (explorer-block-hash-text parent))))
+             (complexity-ok?
+               (and (exact-integer? expected-complexity)
+                    (= expected-complexity (row-ref row 'complexity))))
+             (commits (and raw-h (raw-commitments raw-h)))
+             (commit-included? (and commits
+                                    (bytes-member? commitment commits)))
+             (shares (and raw-next (raw-shares raw-next)))
+             (share-index (and share-text shares
+                               (find-share-index share-text shares)))
+             (payout (and (exact-integer? share-index)
+                          (included-payout raw-next share-index pubkey)))
+             (status
+               (cond ((< tip-height (- height 1)) "waiting")
+                     ((or (not parent-ok?) (not complexity-ok?)) "stale")
+                     ((not block-h) "queued")
+                     ((not commit-included?) "commit-missed")
+                     ((not block-next)
+                      (if share-text "reveal-queued" "revealable"))
+                     ((and share-text (exact-integer? share-index) payout)
+                      "included")
+                     (else "reveal-missed"))))
+        (list
+          (cons 'version %relay-version)
+          (cons 'chain (chain-config-name (relay-service-config service)))
+          (cons 'height height)
+          (cons 'parent_id
+                (hex-encode (reverse-bytevector (hex-decode parent-text))))
+          (cons 'complexity (row-ref row 'complexity))
+          (cons 'commitment commitment-text)
+          (cons 'pubkey (row-ref row 'pubkey))
+          (cons 'status status)
+          (cons 'tip_height tip-height)
+          (cons 'commit_block_id
+                (if block-h (explorer-block-id block-h) %json-null))
+          (cons 'reveal_block_id
+                (if block-next (explorer-block-id block-next) %json-null))
+          (cons 'contribution
+                (if (exact-integer? (row-ref row 'contribution))
+                    (row-ref row 'contribution)
+                    %json-null))
+          (cons 'payout_daviwils (if payout payout %json-null))
+          (cons 'matures_at_height
+                (if payout
+                    (+ height 1
+                       (block-rules-coinbase-maturity
+                         (chain-config-block-rules
+                           (relay-service-config service))))
+                    %json-null))
+          (cons 'detail (status-detail status)))))
+
+    (define (project-row service row)
+      (with-chain-snapshot service
+        (lambda (store) (project-row/store service store row))))
+
+    (define (status-response service row status-code)
+      (if (not row)
+          (begin
+            (mark-storage-failure! service)
+            (json-error 500 "storage-error"
+                        "pool state disappeared before projection"))
+          (let ((status (project-row service row)))
+            (if status
+                (json-response status-code status)
+                (json-error 503 "no-chain-data"
+                            "no coherent validated chain is available")))))
+
+    ;; ============================================================
+    ;; Admission limits
+    ;; ============================================================
+
+    (define (source-address request service)
+      (if (relay-service-public? service)
+          (let ((value (http-request-header request "X-Sigilcoin-Client-IP")))
+            (and (string? value)
+                 (<= 1 (string-length value))
+                 (<= (string-length value) 64)
+                 (let loop ((i 0))
+                   (or (= i (string-length value))
+                       (let ((c (string-ref value i)))
+                         (and (or (char-alphabetic? c)
+                                  (char-numeric? c)
+                                  (char=? c #\.)
+                                  (char=? c #\:))
+                              (loop (+ i 1))))))
+                 value))
+          "127.0.0.1"))
+
+    (define (rate-entry-before? a b)
+      (< (list-ref a 1) (list-ref b 1)))
+
+    (define (drop-oldest-rate entries)
+      (if (null? entries)
+          '()
+          (let ((oldest
+                  (let loop ((xs (cdr entries)) (best (car entries)))
+                    (if (null? xs)
+                        best
+                        (loop (cdr xs)
+                              (if (rate-entry-before? (car xs) best)
+                                  (car xs) best))))))
+            (filter (lambda (entry) (not (eq? entry oldest))) entries))))
+
+    (define (rate-admit? service address)
+      (let* ((now (exact (floor (current-second))))
+             (box (relay-service-rates service))
+             (fresh (filter (lambda (entry)
+                              (< (- now (list-ref entry 1))
+                                 %relay-rate-window))
+                            (vector-ref box 0)))
+             (entry (let loop ((xs fresh))
+                      (cond ((null? xs) #f)
+                            ((string=? address (car (car xs))) (car xs))
+                            (else (loop (cdr xs)))))))
+        (cond
+          (entry
+           (if (>= (list-ref entry 2) %relay-rate-attempts)
+               #f
+               (begin
+                 (vector-set! box 0
+                   (cons (list address (list-ref entry 1)
+                               (+ 1 (list-ref entry 2)))
+                         (filter (lambda (item) (not (eq? item entry))) fresh)))
+                 #t)))
+          (else
+           (let ((bounded (if (>= (length fresh) %relay-rate-buckets)
+                              (drop-oldest-rate fresh)
+                              fresh)))
+             (vector-set! box 0 (cons (list address now 1) bounded))
+             #t)))))
+
+    ;; ============================================================
+    ;; Server routes
+    ;; ============================================================
+
+    (define (request-json request allowed required)
+      (let ((body (http-request-body request)))
+        (unless (and (string? body)
+                     (<= (bytevector-length (string->utf8 body))
+                         %relay-request-cap))
+          (error "request body is missing or too large"))
+        (require-fields (relay-json-decode body allowed '()) required)))
+
+    (define (mutation-media-ok? request)
+      (let ((content-type (http-request-content-type request)))
+        (and (string? content-type)
+             (string=? content-type "application/json"))))
+
+    (define (commit-request-values object service commitment-text)
+      (let* ((chain (relay-service-config service))
+             (version (alist-ref object 'version))
+             (height (alist-ref object 'height))
+             (parent-id (alist-ref object 'parent_id))
+             (complexity (alist-ref object 'complexity))
+             (pubkey-text (alist-ref object 'pubkey))
+             (authorization-text (alist-ref object 'authorization))
+             (parent-display (relay-canonical-hex parent-id 32))
+             (pubkey (relay-canonical-hex pubkey-text coin-share-pubkey-bytes))
+             (authorization (relay-canonical-hex authorization-text
+                                                 coin-share-signature-bytes)))
+        (and (exact-integer? version)
+             (= version %relay-version)
+             (string? (alist-ref object 'chain))
+             (string=? (alist-ref object 'chain) (chain-config-name chain))
+             (bounded-uint? height #xffffffffffffffff)
+             (> height 0)
+             parent-display
+             (bounded-uint? complexity #xffffffff)
+             (<= coin-complexity-min complexity)
+             (<= complexity coin-complexity-max)
+             pubkey
+             authorization
+             (list height
+                   (reverse-bytevector parent-display)
+                   complexity pubkey authorization
+                   commitment-text pubkey-text authorization-text))))
+
+    (define (same-commit-request? row values)
+      (and (= (row-ref row 'height) (list-ref values 0))
+           (string=? (row-ref row 'parent_hash)
+                     (hex-encode (list-ref values 1)))
+           (= (row-ref row 'complexity) (list-ref values 2))
+           (string=? (row-ref row 'pubkey) (list-ref values 6))
+           (string=? (row-ref row 'authorization) (list-ref values 7))))
+
+    (define (compensate-commit! service commitment-text)
+      (checked-pool-update!
+        service
+        "DELETE FROM contributions WHERE commitment = ? AND share_hex IS NULL"
+        commitment-text))
+
+    (define (persist-commitment! service initial values source commitment-text)
+      (let ((db (relay-service-db service))
+            (outcome "storage"))
+        (if (not (sqlite-exec db "BEGIN IMMEDIATE"))
+            (mark-storage-failure! service)
+            (begin
+              (let ((fresh (chain-current service)))
+                (cond
+                  ((not (and fresh
+                             (same-chain-token? initial fresh)
+                             (context-matches?
+                               fresh (list-ref values 0)
+                               (list-ref values 1)
+                               (list-ref values 2))))
+                   (set! outcome "stale"))
+                  ((>= (context-count
+                         service (list-ref values 0)
+                         (hex-encode (list-ref values 1))
+                         (list-ref values 2))
+                       coin-max-commitments)
+                   (set! outcome "full"))
+                  ((and
+                     (sqlite-run db
+                       (string-append
+                         "INSERT INTO contributions("
+                         "commitment,height,parent_hash,complexity,pubkey,authorization,source_ip,received_at"
+                         ") VALUES(?,?,?,?,?,?,?,?)")
+                       commitment-text
+                       (list-ref values 0)
+                       (hex-encode (list-ref values 1))
+                       (list-ref values 2)
+                       (list-ref values 6)
+                       (list-ref values 7)
+                       source
+                       (exact (floor (current-second))))
+                     (= (sqlite-changes db) 1))
+                   (set! outcome "ok"))
+                  (else (set! outcome "conflict"))))
+              (if (string=? outcome "ok")
+                  (unless (pool-commit! service)
+                    (set! outcome "storage"))
+                  (unless (pool-rollback! service)
+                    (set! outcome "storage")))))
+        outcome))
+
+    (define (put-commitment service request commitment-text object)
+      (let ((values (commit-request-values object service commitment-text)))
+        (if (not values)
+            (json-error 400 "bad-request" "commitment request fields are invalid")
+            (let* ((existing (contribution-by-commitment service commitment-text))
+                   (identity (contribution-by-identity
+                               service
+                               (list-ref values 0)
+                               (hex-encode (list-ref values 1))
+                               (list-ref values 2)
+                               (list-ref values 6))))
+              (cond
+                (existing
+                 (if (same-commit-request? existing values)
+                     (status-response service existing 200)
+                     (json-error 409 "uniqueness-conflict"
+                                 "the commitment already has a different identity")))
+                (identity
+                 (json-error 409 "uniqueness-conflict"
+                             "this public key already has a commitment in the context"))
+                (else
+                 (let ((source (source-address request service))
+                       (view (chain-current service)))
+                   (cond
+                     ((not source)
+                      (json-error 403 "client-ip-required"
+                                  "the trusted client address header is required"))
+                     ((not view)
+                      (json-error 503 "no-chain-data"
+                                  "no coherent validated chain is available"))
+                     ((not (context-matches?
+                             view (list-ref values 0)
+                             (list-ref values 1)
+                             (list-ref values 2)))
+                      (json-error 409 "stale-context"
+                                  "the commitment context is not the current validated tip"))
+                     ((not (rate-admit? service source))
+                      (json-error 429 "rate-limited"
+                                  "too many new mutations from this source"))
+                     ((not (guard (err (else #f))
+                             (secp256k1-pubkey-parse
+                               (list-ref values 3))))
+                      (json-error 400 "bad-pubkey"
+                                  "the contributor public key is invalid"))
+                     ((not (secp256k1-ecdsa-verify
+                             (list-ref values 4)
+                             (relay-authorization-hash
+                               (relay-service-config service)
+                               (list-ref values 1)
+                               (list-ref values 0)
+                               (list-ref values 2)
+                               (list-ref values 3)
+                               (hex-decode commitment-text))
+                             (list-ref values 3)))
+                      (json-error 403 "bad-authorization"
+                                  "the relay commitment authorization is invalid"))
+                     (else
+                      (let* ((initial (chain-current service))
+                             (outcome
+                               (and initial
+                                    (context-matches?
+                                      initial (list-ref values 0)
+                                      (list-ref values 1)
+                                      (list-ref values 2))
+                                    (persist-commitment!
+                                      service initial values source
+                                      commitment-text))))
+                        (cond
+                          ((not outcome)
+                           (json-error 409 "stale-context"
+                                       "the validated tip changed before admission"))
+                          ((string=? outcome "stale")
+                           (json-error 409 "stale-context"
+                                       "the validated tip changed during admission"))
+                          ((string=? outcome "full")
+                           (json-error 409 "pool-full"
+                                       "the first 16 authenticated slots are full"))
+                          ((string=? outcome "conflict")
+                           (json-error 409 "uniqueness-conflict"
+                                       "the contribution conflicts with durable state"))
+                          ((string=? outcome "storage")
+                           (json-error 500 "storage-error"
+                                       "pool state could not be committed"))
+                          (else
+                           (let* ((hooked
+                                    (run-service-hook
+                                      service 'commit-after-persist))
+                                  (after (chain-current service)))
+                             (if (not (same-chain-token? initial after))
+                                 (if (compensate-commit!
+                                       service commitment-text)
+                                     (json-error
+                                       409 "stale-context"
+                                       "the validated tip changed after admission")
+                                     (json-error
+                                       500 "storage-error"
+                                       "stale pool state could not be removed"))
+                                 (status-response
+                                   service
+                                   (contribution-by-commitment
+                                     service commitment-text)
+                                   201)))))))))))))))
+
+    (define (decode-one-share text)
+      (let ((bytes (and (string? text)
+                        (even? (string-length text))
+                        (relay-canonical-hex
+                          text (quotient (string-length text) 2)))))
+        (and bytes
+             (<= (bytevector-length bytes) coin-max-share-bytes)
+             (let ((decoded (coin-shares-decode
+                              (bytevector-append #u8(1) bytes))))
+               (and (coin-ok? decoded)
+                    (= (length (coin-result-value decoded)) 1)
+                    (let ((share (car (coin-result-value decoded))))
+                      (and (equal? bytes (coin-share-encode share))
+                           share)))))))
+
+    (define (reveal-gate service row)
+      (with-chain-snapshot service
+        (lambda (store)
+          (let* ((height (row-ref row 'height))
+                 (summary (explorer-chain-summary store))
+                 (hooked (run-service-hook service 'snapshot-after-summary))
+                 (tip-height (explorer-summary-tip-height summary))
+                 (block-h (and (= tip-height height)
+                               (active-block store height)))
+                 (raw-h (and block-h (active-raw-block store block-h)))
+                 (status (project-row/store service store row)))
+            (and raw-h
+                 (string=? (alist-ref status 'status) "revealable")
+                 (list (cons 'tip_height tip-height)
+                       (cons 'tip_hash (explorer-block-hash-text block-h))
+                       (cons 'raw raw-h)))))))
+
+    (define (cache-invalid-reveal! service row body-hash status code)
+      (checked-pool-update!
+        service
+        (string-append
+          "UPDATE contributions SET reveal_attempt_hash = ?, "
+          "reveal_attempt_error = ?, reveal_attempts = reveal_attempts + 1 "
+          "WHERE commitment = ? AND share_hex IS NULL AND "
+          "(reveal_attempt_hash IS NULL OR reveal_attempt_hash <> ?)")
+        body-hash
+        (string-append (number->string status) " " code)
+        (row-ref row 'commitment)
+        body-hash))
+
+    (define (cached-reveal-error row)
+      (let ((text (row-ref row 'reveal_attempt_error)))
+        (and (string? text)
+             (>= (string-length text) 5)
+             (let ((status (string->number (substring text 0 3)))
+                   (code (substring text 4 (string-length text))))
+               (and (exact-integer? status) (cons status code))))))
+
+    (define (compensate-reveal! service commitment-text share-text)
+      (checked-pool-update!
+        service
+        (string-append
+          "UPDATE contributions SET share_hex = NULL, contribution = NULL, "
+          "revealed_at = NULL WHERE commitment = ? AND share_hex = ?")
+        commitment-text share-text))
+
+    (define (persist-reveal! service initial commitment-text share-text
+                             contribution)
+      (let ((db (relay-service-db service))
+            (outcome "storage"))
+        (if (not (sqlite-exec db "BEGIN IMMEDIATE"))
+            (mark-storage-failure! service)
+            (begin
+              (let ((fresh-row
+                      (contribution-by-commitment service commitment-text)))
+                (cond
+                  ((not fresh-row) (set! outcome "conflict"))
+                  ((string? (row-ref fresh-row 'share_hex))
+                   (set! outcome
+                     (if (string=? share-text
+                                   (row-ref fresh-row 'share_hex))
+                         "replay" "conflict")))
+                  (else
+                   (let ((fresh-gate (reveal-gate service fresh-row)))
+                     (cond
+                       ((not (and fresh-gate
+                                  (same-chain-token? initial fresh-gate)))
+                        (set! outcome "stale"))
+                       ((and
+                          (sqlite-run db
+                            (string-append
+                              "UPDATE contributions SET share_hex = ?, "
+                              "contribution = ?, revealed_at = ? "
+                              "WHERE commitment = ? AND share_hex IS NULL")
+                            share-text contribution
+                            (exact (floor (current-second)))
+                            commitment-text)
+                          (= (sqlite-changes db) 1))
+                        (set! outcome "ok"))
+                       (else (set! outcome "storage")))))))
+              (if (string=? outcome "ok")
+                  (unless (pool-commit! service)
+                    (set! outcome "storage"))
+                  (unless (pool-rollback! service)
+                    (set! outcome "storage")))))
+        outcome))
+
+    (define (put-reveal service request commitment-text object)
+      (if (not (and (exact-integer? (alist-ref object 'version))
+                    (= (alist-ref object 'version) %relay-version)))
+          (json-error 400 "bad-request" "reveal version must be 1")
+          (let ((share-text (alist-ref object 'share)))
+            (if (not (string? share-text))
+                (json-error 400 "bad-request" "share must be a hexadecimal string")
+                (let* ((row (contribution-by-commitment service commitment-text))
+                       (body-hash (hex-encode
+                                    (hash256 (string->utf8 share-text)))))
+                  (cond
+                    ((not row)
+                     (json-error 404 "unknown-commitment"
+                                 "the commitment is not stored"))
+                    ((string? (row-ref row 'share_hex))
+                     (if (string=? share-text (row-ref row 'share_hex))
+                         (status-response service row 200)
+                         (json-error 409 "uniqueness-conflict"
+                                     "a different reveal is already stored")))
+                    ((and (string? (row-ref row 'reveal_attempt_hash))
+                          (string=? body-hash
+                                    (row-ref row 'reveal_attempt_hash)))
+                     (let ((cached (cached-reveal-error row)))
+                       (if cached
+                           (json-error (car cached) (cdr cached)
+                                       "this invalid reveal body was already checked")
+                           (json-error 400 "bad-share"
+                                       "this invalid reveal body was already checked"))))
+                    ((>= (row-ref row 'reveal_attempts) %relay-reveal-attempts)
+                     (json-error 429 "reveal-attempt-limit"
+                                 "three distinct invalid reveal bodies were already checked"))
+                    (else
+                     (let ((gate (reveal-gate service row))
+                           (source (source-address request service)))
+                       (cond
+                         ((not source)
+                          (json-error 403 "client-ip-required"
+                                      "the trusted client address header is required"))
+                         ((not gate)
+                          (let ((status (project-row service row)))
+                            (cond
+                              ((not status)
+                               (json-error 503 "no-chain-data"
+                                           "no coherent validated chain is available"))
+                              ((or (string=? (alist-ref status 'status) "commit-missed")
+                                   (string=? (alist-ref status 'status) "reveal-missed"))
+                               (json-error 410 "reveal-window-closed"
+                                           "the commitment-bearing window is closed"))
+                              (else
+                               (json-error 409 "not-revealable"
+                                           "the commitment-bearing block is not the active validated tip")))))
+                         ((not (rate-admit? service source))
+                          (json-error 429 "rate-limited"
+                                      "too many new mutations from this source"))
+                         (else
+                          (let* ((share (decode-one-share share-text))
+                                 (pubkey (and share (coin-share-pubkey share)))
+                                 (context (and share
+                                               (guard (err (else #f))
+                                                 (coin-parent-context
+                                                   (alist-ref gate 'raw)))))
+                                 (commitment (hex-decode commitment-text))
+                                 (checked
+                                   (and context pubkey
+                                        (string=? (hex-encode pubkey)
+                                                  (row-ref row 'pubkey))
+                                        (equal? commitment
+                                                (coin-share-commitment
+                                                  context share))
+                                        (coin-check-shares
+                                          context #u8() (list share)))))
+                            (if (not (and checked (coin-ok? checked)))
+                                (if (cache-invalid-reveal!
+                                      service row body-hash 400 "bad-share")
+                                    (json-error
+                                      400 "bad-share"
+                                      "the canonical share failed full validation")
+                                    (json-error
+                                      500 "storage-error"
+                                      "the invalid reveal could not be recorded"))
+                                (let* ((contribution
+                                         (coin-share-quality context share))
+                                       (initial gate)
+                                       (outcome
+                                         (persist-reveal!
+                                           service initial commitment-text
+                                           share-text contribution)))
+                                  (cond
+                                    ((string=? outcome "replay")
+                                     (status-response
+                                       service
+                                       (contribution-by-commitment
+                                         service commitment-text)
+                                       200))
+                                    ((string=? outcome "stale")
+                                     (json-error
+                                       409 "stale-context"
+                                       "the validated tip changed during reveal admission"))
+                                    ((string=? outcome "conflict")
+                                     (json-error
+                                       409 "uniqueness-conflict"
+                                       "the reveal conflicts with durable state"))
+                                    ((string=? outcome "storage")
+                                     (json-error
+                                       500 "storage-error"
+                                       "the reveal could not be committed"))
+                                    (else
+                                     (let* ((hooked
+                                              (run-service-hook
+                                                service 'reveal-after-persist))
+                                            (after (chain-current service)))
+                                       (if (not (same-chain-token?
+                                                  initial after))
+                                           (if (compensate-reveal!
+                                                 service commitment-text
+                                                 share-text)
+                                               (json-error
+                                                 409 "stale-context"
+                                                 "the validated tip changed after reveal admission")
+                                               (json-error
+                                                 500 "storage-error"
+                                                 "stale reveal state could not be removed"))
+                                           (status-response
+                                             service
+                                             (contribution-by-commitment
+                                               service commitment-text)
+                                             201))))))))))))))))))
+
+    (define (context-route service)
+      (let ((view (chain-current service)))
+        (cond
+          ((not view)
+           (json-error 503 "no-chain-data"
+                       "no coherent validated chain is available"))
+          ((not (prune-contributions
+                  service (alist-ref view 'tip_height)))
+           (json-error 500 "storage-error"
+                       "expired pool state could not be pruned"))
+          (else
+           (let* ((count (context-count
+                           service
+                           (alist-ref view 'height)
+                           (hex-encode (alist-ref view 'parent_hash))
+                           (alist-ref view 'complexity)))
+                  (body
+                    (list (cons 'version %relay-version)
+                          (cons 'chain
+                                (chain-config-name
+                                  (relay-service-config service)))
+                          (cons 'height (alist-ref view 'height))
+                          (cons 'parent_id (alist-ref view 'parent_id))
+                          (cons 'complexity (alist-ref view 'complexity))
+                          (cons 'capacity (- coin-max-commitments count))
+                          (cons 'accepted count))))
+             (json-response 200 body))))))
+
+    (define (bytes<? a b)
+      (let ((alen (bytevector-length a)) (blen (bytevector-length b)))
+        (let loop ((i 0))
+          (cond ((= i alen) (< alen blen))
+                ((= i blen) #f)
+                ((< (bytevector-u8-ref a i) (bytevector-u8-ref b i)) #t)
+                ((> (bytevector-u8-ref a i) (bytevector-u8-ref b i)) #f)
+                (else (loop (+ i 1)))))))
+
+    (define (insert-sorted value values less?)
+      (cond ((null? values) (list value))
+            ((less? value (car values)) (cons value values))
+            (else (cons (car values)
+                        (insert-sorted value (cdr values) less?)))))
+
+    (define (sort-values values less?)
+      (let loop ((xs values) (out '()))
+        (if (null? xs) out
+            (loop (cdr xs) (insert-sorted (car xs) out less?)))))
+
+    (define (producer-share<? a b)
+      (let ((aq (list-ref a 1)) (bq (list-ref b 1))
+            (ap (coin-share-pubkey (car a)))
+            (bp (coin-share-pubkey (car b))))
+        (or (> aq bq)
+            (and (= aq bq) (bytes<? ap bp)))))
+
+    (define (producer-route service)
+      (let ((result
+              (with-chain-snapshot service
+                (lambda (store)
+                  (let* ((summary (explorer-chain-summary store))
+                         (hooked (run-service-hook service 'snapshot-after-summary))
+                         (tip-height (explorer-summary-tip-height summary))
+                         (tip (active-block store tip-height))
+                         (height (+ tip-height 1))
+                         (complexity (explorer-summary-next-complexity summary)))
+                    (and (not (explorer-summary-empty summary))
+                         tip
+                         (exact-integer? complexity)
+                         (let* ((parent-text
+                                  (explorer-block-hash-text tip))
+                                (commit-rows
+                                  (sqlite-query
+                                    (relay-service-db service)
+                                    (string-append
+                                      "SELECT commitment FROM contributions "
+                                      "WHERE height = ? AND parent_hash = ? AND complexity = ? "
+                                      "ORDER BY sequence ASC")
+                                    height parent-text complexity))
+                                (commitments
+                                  (sort-values
+                                    (map (lambda (row)
+                                           (hex-decode
+                                             (row-ref row 'commitment)))
+                                         commit-rows)
+                                    bytes<?))
+                                (raw-tip (and (> tip-height 0)
+                                              (active-raw-block store tip)))
+                                (context (and raw-tip
+                                              (guard (err (else #f))
+                                                (coin-parent-context raw-tip))))
+                                (share-rows
+                                  (if context
+                                      (sqlite-query
+                                        (relay-service-db service)
+                                        (string-append
+                                          "SELECT * FROM contributions "
+                                          "WHERE height = ? AND share_hex IS NOT NULL "
+                                          "ORDER BY sequence ASC")
+                                        tip-height)
+                                      '()))
+                                (valid
+                                  (let loop ((rows share-rows) (out '()))
+                                    (if (null? rows)
+                                        (reverse out)
+                                        (let* ((row (car rows))
+                                               (share (decode-one-share
+                                                        (row-ref row 'share_hex)))
+                                               (checked
+                                                 (and share
+                                                      (string=?
+                                                        (hex-encode
+                                                          (coin-share-pubkey share))
+                                                        (row-ref row 'pubkey))
+                                                      (equal?
+                                                        (coin-share-commitment
+                                                          context share)
+                                                        (hex-decode
+                                                          (row-ref row 'commitment)))
+                                                      (coin-check-shares
+                                                        context #u8() (list share)))))
+                                          (if (and checked (coin-ok? checked))
+                                              (loop
+                                                (cdr rows)
+                                                (cons
+                                                  (list share
+                                                        (coin-share-quality
+                                                          context share))
+                                                  out))
+                                              (loop (cdr rows) out))))))
+                                (ordered (sort-values valid producer-share<?)))
+                           (list
+                             (cons 'version %relay-version)
+                             (cons 'chain
+                                   (chain-config-name
+                                     (relay-service-config service)))
+                             (cons 'height height)
+                             (cons 'parent_id (explorer-block-id tip))
+                             (cons 'complexity complexity)
+                             (cons 'commitments (map hex-encode commitments))
+                             (cons 'reveals
+                                   (map (lambda (candidate)
+                                          (hex-encode
+                                            (coin-share-encode
+                                              (car candidate))))
+                                        ordered))))))))))
+        (if result
+            (json-response 200 result)
+            (json-error 503 "no-chain-data"
+                        "no coherent validated chain is available"))))
+
+    (define (health-route service)
+      (let ((view (chain-current service))
+            (pool-ok (sqlite-query-row
+                       (relay-service-db service) "SELECT 1 AS ok")))
+        (if (and view pool-ok)
+            (json-response 200
+              (list (cons 'version %relay-version)
+                    (cons 'chain
+                          (chain-config-name (relay-service-config service)))
+                    (cons 'status "ok")))
+            (json-error 503 "no-chain-data"
+                        "chain and pool stores are not coherently available"))))
+
+    (define %commit-request-strings
+      '("version" "chain" "height" "parent_id" "complexity" "pubkey" "authorization"))
+    (define %commit-request-fields
+      '(version chain height parent_id complexity pubkey authorization))
+    (define %reveal-request-strings '("version" "share"))
+    (define %reveal-request-fields '(version share))
+    (define %contribution-prefix "/v1/contributions/")
+
+    (define (contribution-path path)
+      (and (string-starts-with? path %contribution-prefix)
+           (let* ((rest (substring path (string-length %contribution-prefix)
+                                   (string-length path)))
+                  (len (string-length rest)))
+             (cond ((= len 64) (list rest #f))
+                   ((and (= len 71)
+                         (string=? (substring rest 64 71) "/reveal"))
+                    (list (substring rest 0 64) #t))
+                   (else (list rest 'bad))))))
+
+    (define (relay-route service request)
+      (let* ((method (http-request-method request))
+             (path (http-request-path request))
+             (query (http-request-query request))
+             (contribution (and (not query) (contribution-path path))))
+        (cond
+          (query (json-error 404 "not-found" "unknown route"))
+          ((and (eq? method 'GET) (string=? path "/healthz"))
+           (health-route service))
+          ((and (eq? method 'GET) (string=? path "/v1/context"))
+           (context-route service))
+          ((and (eq? method 'GET) (string=? path "/v1/producer"))
+           (producer-route service))
+          ((and contribution (eq? (list-ref contribution 1) 'bad))
+           (json-error 400 "bad-path" "contribution path is malformed"))
+          ((and contribution
+                (not (relay-canonical-hex
+                       (car contribution) coin-commitment-bytes)))
+           (json-error 400 "bad-commitment"
+                       "commitment path must be 64 lowercase hexadecimal characters"))
+          ((and contribution
+                (not (list-ref contribution 1))
+                (eq? method 'GET))
+           (let ((row (contribution-by-commitment service (car contribution))))
+             (if row
+                 (status-response service row 200)
+                 (json-error 404 "unknown-commitment"
+                             "the commitment is not stored"))))
+          ((and contribution (eq? method 'PUT))
+           (if (not (mutation-media-ok? request))
+               (json-error 415 "unsupported-media-type"
+                           "mutations require application/json")
+               (let ((body (http-request-body request)))
+                 (if (and (string? body)
+                          (> (bytevector-length (string->utf8 body))
+                             %relay-request-cap))
+                     (json-error 413 "payload-too-large"
+                                 "request body exceeds 2048 bytes")
+                     (let ((object
+                             (guard (err (else #f))
+                               (if (list-ref contribution 1)
+                                   (request-json request
+                                     %reveal-request-strings
+                                     %reveal-request-fields)
+                                   (request-json request
+                                     %commit-request-strings
+                                     %commit-request-fields)))))
+                       (if (not object)
+                           (json-error 400 "bad-json"
+                                       "request JSON or schema is invalid")
+                           (if (list-ref contribution 1)
+                               (put-reveal service request
+                                           (car contribution) object)
+                               (put-commitment service request
+                                               (car contribution) object))))))))
+          ((or (string=? path "/healthz")
+               (string=? path "/v1/context")
+               (string=? path "/v1/producer")
+               contribution)
+           (json-error 405 "method-not-allowed"
+                       "the method is not allowed for this route"))
+          (else (json-error 404 "not-found" "unknown route")))))
+
+    (define (relay-handle-request service request)
+      (: relay-service? http-request? -> http-response?)
+      (if (vector-ref (relay-service-faulted? service) 0)
+          (json-error 500 "storage-error"
+                      "pool state is unavailable after a storage failure")
+          (guard (err (else
+                        (json-error 500 "internal-error"
+                                    "the relay could not complete the request")))
+            (relay-route service request))))
+
+    ;; ============================================================
+    ;; Command entry point
+    ;; ============================================================
+
+    (define (relay-chain args who)
+      (let ((chain (cli-chain args)))
+        (when (string=? (chain-config-name chain) "sigilcoin-main")
+          (error (string-append who ": mainnet is not supported")))
+        chain))
+
+    (define (run-relay args)
+      (: list? -> any?)
+      (when (null? args)
+        (error "relay: expected `serve` or `health`"))
+      (let ((command (car args)) (rest (cdr args)))
+        (cond
+          ((string=? command "serve")
+           (let* ((chain (relay-chain rest "relay serve"))
+                  (host (cli-arg rest "--host" "127.0.0.1"))
+                  (port (cli-number rest "--port" "8082"))
+                  (data-dir (cli-data-dir rest))
+                  (state-dir (cli-arg rest "--state-dir"
+                                      ".sigilcoin-pool")))
+             (unless (and (<= 1 port) (<= port 65535))
+               (error "relay serve: --port must be in [1, 65535]"))
+             (when (and (string=? (chain-config-name chain)
+                                  "sigilcoin-regtest")
+                        (not (string=? host "127.0.0.1")))
+               (error "relay serve: regtest may bind only literal 127.0.0.1"))
+             (let ((service (relay-service-open chain data-dir state-dir)))
+               (println "chain: ~a" (chain-config-name chain))
+               (println "state: ~a" state-dir)
+               (println "listen: ~a:~a" host port)
+               (let ((result #f) (failure #f))
+                 (guard (err (else (set! failure err) #f))
+                   (set! result
+                     (http-serve
+                       (lambda (request)
+                         (relay-handle-request service request))
+                       host: host
+                       port: port
+                       timeout: 5000
+                       max-request-size: %relay-request-cap)))
+                 (relay-service-close service)
+                 (when failure
+                   (error (cli-error-message failure
+                            "relay serve: server failed")))
+                 result))))
+          ((string=? command "health")
+           (let* ((chain (relay-chain rest "relay health"))
+                  (origin-text (cli-required
+                                 rest "--relay" "relay health"
+                                 "the relay origin"))
+                  (origin (validate-origin
+                            "relay health" origin-text chain #t)))
+             (relay-require-curl "relay health")
+             (let ((raw (curl-request "GET" origin "/healthz" #f)))
+               (unless (and (exact-integer? (list-ref raw 0))
+                            (= (list-ref raw 0) 0)
+                            (exact-integer? (list-ref raw 1))
+                            (= (list-ref raw 1) 200))
+                 (error "relay health: relay is unhealthy"))
+               (println "relay: ~a" origin)
+               (println "status: ok")
+               #t)))
+          (else
+           (error "relay: expected `serve` or `health`")))))
+
+    ))

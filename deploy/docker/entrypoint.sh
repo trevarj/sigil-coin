@@ -199,6 +199,20 @@ case "$service_mode" in
     exec "$@" --data-dir "$data_dir"
     ;;
 
+  relay)
+    [ "$chain" = testnet ] || {
+      echo "relay is testnet-only" >&2
+      exit 64
+    }
+    umask 0027
+    exec "$coin" relay serve \
+      --testnet \
+      --data-dir /var/lib/sigilcoin \
+      --state-dir /var/lib/sigilcoin-pool \
+      --host 0.0.0.0 \
+      --port 8082
+    ;;
+
   health-node)
     secure_node_state
     set -- "$coin" status
@@ -209,6 +223,13 @@ case "$service_mode" in
   health-explorer)
     db_path=$data_dir/$db_name
     [ -f "$db_path" ] && [ ! -h "$db_path" ] && [ -r "$db_path" ]
+    ;;
+
+  health-relay)
+    [ "$chain" = testnet ] || exit 64
+    exec "$coin" relay health \
+      --relay http://127.0.0.1:8082 \
+      --testnet
     ;;
 
   cli)
@@ -223,7 +244,7 @@ case "$service_mode" in
     ;;
 
   *)
-    echo "unknown mode '$service_mode' (listener, sync-loop, explorer, health-node, health-explorer, cli, site-path)" >&2
+    echo "unknown mode '$service_mode' (listener, sync-loop, explorer, relay, health-node, health-explorer, health-relay, cli, site-path)" >&2
     exit 64
     ;;
 esac

@@ -1,20 +1,33 @@
-;;; (sigil coin local-testnet) — test-solution fixture for the local drill
+;;; (sigil coin local-testnet) — fixtures for the real local pool drill
 
 (define-library (sigil coin local-testnet)
   (import (sigil io)
+          (sigil math)
           (sigil process)
           (sigil string)
+          (sigil sqlite)
+          (sigil bitcoin utils)
+          (sigil bitcoin encoding)
+          (sigil bitcoin primitives)
+          (sigil bitcoin tx)
+          (sigil bitcoin consensus)
+          (sigil bitcoin p2p)
           (sigil bitcoin node)
           (sigil coin puzzle generator)
           (sigil coin consensus)
           (only (sigil coin consensus shares)
                 coin-check-share-solution/spec)
           (sigil coin node)
-          (sigil coin cli mine)
+          (sigil coin cli operate)
+          (sigil coin cli relay)
           (sigil coin cli wallet))
   (export main)
 
   (begin
+    (define %ipv6-loopback
+      #u8(#x00 #x00 #x00 #x00 #x00 #x00 #x00 #x00
+          #x00 #x00 #x00 #x00 #x00 #x00 #x00 #x01))
+
     (define (application-args raw)
       (let loop ((xs raw))
         (cond ((null? xs) raw)
@@ -24,65 +37,185 @@
     (define (field alist key)
       (cdr (assq key alist)))
 
-    (define %generated-anchor-predicate "(equal? x\"@\")")
-    (define %semantic-anchor-predicate "(string? x)")
+    (define (row-field row key)
+      (let ((entry (or (assoc key row)
+                       (assq (string->symbol key) row))))
+        (and entry (cdr entry))))
 
-    ;; The final personalized pair is the reserved string anchor. Broadening
-    ;; its predicate is safe only when every ordinary input is non-string.
-    (define (ordinary-inputs-non-string? spec)
-      (let loop ((pairs (puzzle-spec-examples spec)))
-        (cond
-          ((null? pairs) #f)
-          ((null? (cdr pairs))
-           (let ((anchor (car pairs)))
-             (and (string? (car anchor))
-                  (string=? puzzle-anchor-input (car anchor))
-                  (puzzle-anchor-output? (cdr anchor)))))
-          ((string? (car (car pairs))) #f)
-          (else (loop (cdr pairs))))))
+    (define %generated-anchor-predicate "(equal? x\"@\")")
 
     (define (semantic-share-source spec)
       (let ((source (puzzle-spec-hidden-source spec)))
-        (and (ordinary-inputs-non-string? spec)
-             (= 1 (string-count source %generated-anchor-predicate))
-             (let* ((candidate
-                      (string-replace source %generated-anchor-predicate
-                                      %semantic-anchor-predicate))
-                    (checked
-                      (coin-check-share-solution/spec spec candidate)))
-               (and (< (string-length candidate) (puzzle-spec-par spec))
-                    (coin-ok? checked)
-                    candidate)))))
+        (and (= 1 (string-count source %generated-anchor-predicate))
+             (let loop ((predicates
+                          '("(eq? x\"@\")"
+                            "(eqv? x\"@\")"
+                            "(string? x)")))
+               (and (pair? predicates)
+                    (let* ((candidate
+                             (string-replace
+                               source %generated-anchor-predicate
+                               (car predicates)))
+                           (checked
+                             (coin-check-share-solution/spec spec candidate)))
+                      (if (and (< (string-length candidate)
+                                  (puzzle-spec-par spec))
+                               (coin-ok? checked))
+                          candidate
+                          (loop (cdr predicates)))))))))
 
-    ;; This fixture only supplies a test solution because the CLI has no
-    ;; solver. Commit aggregation, reveal aggregation, mining and submission
-    ;; remain canonical CLI operations.
-    (define (solve-share data-dir)
-      (let* ((key (wallet-key data-dir))
-             (pubkey (wallet-public-key key))
-             (n (node-open sigilcoin-regtest-chain data-dir))
-             (context (coin-puzzle-context
-                        n (list "--regtest" "--data-dir" data-dir)))
+    ;; Derive D's personalized puzzle only from the relay's public context.
+    ;; Opening a node here would invalidate the light-contributor drill.
+    (define (solve-relay-share relay-url wallet-dir)
+      (let* ((context
+               (relay-context relay-url sigilcoin-regtest-chain))
+             (parent-hash
+               (reverse-bytevector
+                 (hex-decode (field context 'parent_id))))
+             (height (field context 'height))
+             (complexity (field context 'complexity))
+             (global (coin-puzzle-for parent-hash height complexity))
              (coop (coin-coop-context
-                     parent-prev-hash: (field context 'parent-hash)
-                     puzzle-height: (field context 'height)
-                     complexity: (field context 'complexity)
-                     spec: (field context 'spec)
+                     parent-prev-hash: parent-hash
+                     puzzle-height: height
+                     complexity: complexity
+                     spec: global
                      commits: '()))
-             (spec (coin-share-puzzle coop pubkey))
-             (solution (semantic-share-source spec)))
-        (node-close n)
-        (when (not solution)
-          (error (string-append
-                   "local-testnet: personalized task has no verified "
-                   "non-string semantic share candidate; hidden="
-                   (puzzle-spec-hidden-source spec)
-                   " par=" (number->string (puzzle-spec-par spec)))))
+             (selected
+               (let loop ((attempt 0))
+                 (when (= attempt 256)
+                   (error
+                     "local-testnet: no deterministic-golfable contributor puzzle found"))
+                 (let* ((key (wallet-entropy 32))
+                        (pubkey
+                          (guard (err (else #f))
+                            (wallet-public-key key)))
+                        (spec (and pubkey
+                                   (coin-share-puzzle coop pubkey)))
+                        (solution (and spec
+                                       (semantic-share-source spec))))
+                   (if solution
+                       (list key solution)
+                       (loop (+ attempt 1))))))
+             (key (car selected))
+             (solution (cadr selected)))
+        (wallet-write-private-file
+          (wallet-key-file wallet-dir)
+          (string-append (hex-encode key) "\n"))
         (println "~a" solution)))
+
+    ;; Send B's sole signed wallet transaction over the same P2P handshake and
+    ;; canonical `tx` envelope an ordinary remote peer uses.
+    (define (relay-wallet-transaction source-dir host port-text)
+      (let ((port (string->number port-text)))
+        (unless (and (number? port) (exact? port) (integer? port)
+                     (<= 1 port) (<= port 65535))
+          (error "local-testnet: relay port must be in 1..65535"))
+        (let ((n (node-open sigilcoin-regtest-chain source-dir))
+              (transport #f))
+          (dynamic-wind
+            (lambda () #t)
+            (lambda ()
+              (let ((transactions (wallet-mempool-transactions n)))
+                (unless (= 1 (length transactions))
+                  (error
+                    "local-testnet: source node must have one available signed transaction"))
+                (let* ((tx (car transactions))
+                       (chain (node-config n))
+                       (peer (node-add-peer n host port))
+                       (recv (network-address
+                               services: (chain-config-services chain)
+                               ip: %ipv6-loopback
+                               port: port))
+                       (from (network-address
+                               services: (chain-config-services chain)
+                               ip: %ipv6-loopback
+                               port: (chain-config-default-port chain))))
+                  (set! transport
+                    ((coin-peer-connector
+                       '("--resolve-timeout" "1000"
+                         "--connect-timeout" "3000"
+                         "--read-timeout" "10000"))
+                     peer))
+                  (p2p-session-handshake
+                    (car transport)
+                    (cadr transport)
+                    (p2p-session-create
+                      (chain-config-magic chain)
+                      (chain-config-protocol-version chain)
+                      (chain-config-services chain)
+                      recv
+                      from
+                      1
+                      (chain-config-user-agent chain)
+                      (node-status-snapshot-best-height (node-status n))
+                      #t)
+                    16)
+                  ((cadr transport)
+                   (p2p-envelope magic: (chain-config-magic chain)
+                                 command: "tx"
+                                 payload: (tx-message tx)))
+                  (println "txid: ~a"
+                           (hex-encode
+                             (reverse-bytevector (transaction-txid tx)))))))
+            (lambda ()
+              (when transport
+                (guard (err (else #f)) ((caddr transport))))
+              (node-close n))))))
+
+    ;; The explorer reports counts, so inspect the canonical body for the
+    ;; stronger assertion that the exact signed transaction was included.
+    (define (assert-block-transaction data-dir height-text txid)
+      (let ((height (string->number height-text)))
+        (unless (and (number? height) (exact? height) (integer? height)
+                     (>= height 0))
+          (error "local-testnet: block height must be a nonnegative integer"))
+        (let ((n (node-open sigilcoin-regtest-chain data-dir)))
+          (dynamic-wind
+            (lambda () #t)
+            (lambda ()
+              (let ((rows
+                      (sqlite-query
+                        (node-db n)
+                        "SELECT block_hex FROM blocks WHERE height = ? AND validated = 1 AND block_hex IS NOT NULL"
+                        height)))
+                (unless (= 1 (length rows))
+                  (error
+                    "local-testnet: canonical validated block body is unavailable"))
+                (let loop
+                  ((transactions
+                     (block-transactions
+                       (block-parse
+                         (hex-decode
+                           (row-field (car rows) "block_hex"))))))
+                  (cond
+                    ((null? transactions)
+                     (error
+                       "local-testnet: expected transaction is absent from canonical block"))
+                    ((string=?
+                       txid
+                       (hex-encode
+                         (reverse-bytevector
+                           (transaction-txid (car transactions)))))
+                     (println "block-transaction: height=~a txid=~a"
+                              height txid))
+                    (else (loop (cdr transactions)))))))
+            (lambda () (node-close n))))))
 
     (define (main)
       (let ((args (application-args (cdr (command-line)))))
-        (if (and (= 2 (length args))
-                 (string=? (car args) "solve-share"))
-            (solve-share (cadr args))
-            (error "usage: sigil-coin-local-testnet solve-share DATA_DIR"))))))
+        (cond
+          ((and (= 3 (length args))
+                (string=? (car args) "solve-relay-share"))
+           (solve-relay-share (cadr args) (caddr args)))
+          ((and (= 4 (length args))
+                (string=? (car args) "relay-wallet-transaction"))
+           (relay-wallet-transaction
+             (cadr args) (caddr args) (cadddr args)))
+          ((and (= 4 (length args))
+                (string=? (car args) "assert-block-transaction"))
+           (assert-block-transaction
+             (cadr args) (caddr args) (cadddr args)))
+          (else
+           (error
+             "usage: sigil-coin-local-testnet solve-relay-share RELAY_URL WALLET_DIR | relay-wallet-transaction SOURCE_DIR HOST PORT | assert-block-transaction DATA_DIR HEIGHT TXID")))))))

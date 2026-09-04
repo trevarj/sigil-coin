@@ -9,10 +9,9 @@ invalidates the chain. Mainnet operational detail lives in
 
 Current state: **nothing here has ever run on a public network.** Genesis quote
 is chosen, but mainnet timestamp and derived constants are provisional until
-operator chooses launch day. Seed hostname, repository URL and explorer
-hostname are in tree. See
-[Decisions still owed](#decisions-still-owed-by-the-operator) for what is
-left.
+the operator chooses launch day. Seed, explorer, and public-testnet pool
+hostnames are in tree; the pool is not a mainnet service. See
+[Decisions still owed](#decisions-still-owed-by-the-operator) for what is left.
 
 ---
 
@@ -26,16 +25,39 @@ until the public testnet has completed its full 30-day run.
       `15447f3226699f537969cbea4b493bbbe25a4d856832bf28bce3e7df579e6ddc`
       without a hand-entered IP.
 - [ ] `explorer.testnet.sigilcoin.lol` serves through TLS while the explorer
-      container remains host-loopback-only.
+      container remains host-loopback-only on 8080.
+- [ ] `pool.testnet.sigilcoin.lol` has an A record to `104.223.122.157`, serves
+      `/healthz` and coherent `sigilcoin-testnet` `/v1/context` through TLS, and
+      its container remains host-loopback-only on 8082 with read-only chain
+      state and a separate writable receipt store.
+- [ ] Once DNS and the reviewed local checks pass, the public testnet and site
+      are deployed only by the explicit operator handoff
+      `./deploy/scripts/deploy-testnet-remote.sh racknerd-chi`; implementation
+      work does not run this command.
+- [ ] The four-role local drill proves a node-free contributor's commitment in
+      H100; its reveal plus A-to-B transaction in H101; B's signed B-to-C
+      transaction crossing real P2P into H102; restart durability at H103; and
+      three-node/explorer agreement. D's directory contains only private
+      wallet/commitment state and no node database; before H100, relay
+      phase-one state contains no private key, blind, solution source,
+      consensus share signature, or encoded share.
+- [ ] Relay evidence covers all branch-projected statuses, exact replay,
+      first-16 admission and seventeenth rejection, one pubkey per context,
+      miner-owned contribution-first R8 selection, one-block payout maturity,
+      reorgs, backups, incidents, and bounded resources without claiming Sybil
+      resistance, custody, or guaranteed inclusion.
 - [ ] The day-7 gate in [`docs/testnet.md`](docs/testnet.md) passes with
-      independent-node, consensus, recovery, explorer, abuse, log, and resource
-      evidence.
+      independent-node, consensus, recovery, explorer/pool, abuse, log, and
+      resource evidence.
 - [ ] The day-30 gate passes with no unresolved consensus divergence, database
-      corruption, secret disclosure, or resource-growth trend.
+      corruption, premature contributor-secret disclosure, unexplained
+      censorship, resource-growth trend, or other incident.
 - [ ] Testnet coins and keys remain worthless and disposable; no production key
-      or mainnet state was used, and no testnet state is promoted to mainnet.
-- [ ] Every prior public-testnet database was archived or moved aside and no
-      reset binary opened it. The reset starts at height 0 with marker
+      or mainnet state was used, and no chain or pool testnet state is promoted
+      to mainnet.
+- [ ] Every prior public-testnet chain or relay database was archived or moved
+      aside and no reset binary opened it. The reset starts at height 0 with
+      marker
       `SigilCoin public testnet reset - 2026-09-02` and timestamp
       `1788307200`; retained `d3 7a 91 c5` magic is not evidence of state
       compatibility.
@@ -153,7 +175,7 @@ should be in the same place the code is.
 - [ ] Rules a miner hits: solutions at most 512 bytes, graffiti at most 400
       bytes, blocks at most 16384 bytes, at most 8 example pairs per puzzle,
       block spacing floor 72000 seconds, future drift allowance 7200 seconds,
-      coinbase maturity 100 blocks.
+      SigilCoin coinbase maturity 1 block (Bitcoin's default remains 100).
 - [ ] Fork choice, stated plainly: greater height wins; at equal height the
       shorter producer source wins, then lower producer allocation bucket,
       then lower producer step bucket. Raw `W` authenticates `Q` for reporting

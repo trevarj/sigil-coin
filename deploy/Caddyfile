@@ -22,6 +22,28 @@ explorer.testnet.sigilcoin.lol {
 	log
 }
 
+pool.testnet.sigilcoin.lol {
+	encode zstd gzip
+
+	request_body {
+		max_size 2KB
+	}
+	reverse_proxy 127.0.0.1:8082 {
+		header_up X-Sigilcoin-Client-IP {remote_host}
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Permissions-Policy "camera=(), geolocation=(), microphone=()"
+		-Server
+	}
+
+	log
+}
+
 sigilcoin.lol {
 	encode zstd gzip
 	root * /srv/sigilcoin/site

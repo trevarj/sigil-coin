@@ -15,9 +15,12 @@
     (from-workspace name: "sigil-coin-puzzle")
     (from-workspace name: "sigil-coin-consensus")
     (from-workspace name: "sigil-coin-node")
+    (from-workspace name: "sigil-coin-explorer")
     ;; The wallet reads the node's own UTXO table rather than keeping a
     ;; second copy of it.
     (from-git url: "codeberg:sigil/sigil-sqlite" version: "^0.16.0")
+    (from-git url: "codeberg:sigil/sigil-http" version: "^0.18.5")
+    (from-git url: "codeberg:sigil/sigil-json" version: "^0.16.0")
     (from-git url: "github:trevarj/sigil-bitcoin"
               package: "sigil-secp256k1" version: "^0.1")
     (from-git url: "github:trevarj/sigil-bitcoin"

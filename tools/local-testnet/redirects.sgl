@@ -24,6 +24,12 @@
     (bitcoin "sigil-bitcoin-consensus")
     (bitcoin "sigil-bitcoin-p2p")
     (bitcoin "sigil-bitcoin-node")
+    (for-package name: "sigil-coin-explorer"
+      use: (from-path dir: "../../packages/sigil-coin-explorer"))
+    (for-package name: "sigil-http"
+      use: (from-path dir: "../../.sigil/deps/sigil-http"))
+    (for-package name: "sigil-json"
+      use: (from-path dir: "../../.sigil/deps/sigil-json"))
     (for-package name: "sigil-crypto"
       use: (from-path dir: "../../.sigil/deps/sigil-crypto"))
     (for-package name: "sigil-sqlite"

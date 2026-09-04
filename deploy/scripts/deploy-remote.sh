@@ -16,6 +16,10 @@ Options:
   --env-file FILE   Upload FILE as sigil-coin/deploy/docker/.env (env: ENV_FILE)
   -h, --help        Show this help
 
+Environment:
+  SSH_IDENTITIES_ONLY=yes|no  Override OpenSSH identity selection. Unset keeps
+                              the caller's SSH configuration unchanged.
+
 Mainnet additionally requires ALLOW_MAINNET=yes. Non-loopback testnet P2P
 requires either peer-ip-allowlisted with REMOTE_PEER_IP, or the exact explicit
 public-testnet-approved acknowledgement.
@@ -26,6 +30,7 @@ REMOTE_HOST=${REMOTE_HOST:-}
 REMOTE_DIR=${REMOTE_DIR:-/srv/sigilcoin}
 MODE=${MODE:-testnet}
 ENV_FILE=${ENV_FILE:-}
+ssh_identities_only=${SSH_IDENTITIES_ONLY-}
 
 require_option_value() {
   if (($# < 2)); then
@@ -50,6 +55,13 @@ allow_mainnet=${ALLOW_MAINNET:-no}
   printf 'ALLOW_MAINNET must be exactly yes or no\n' >&2
   exit 64
 }
+if [[ -v SSH_IDENTITIES_ONLY ]]; then
+  case $ssh_identities_only in
+    yes|no) ;;
+    *) printf 'SSH_IDENTITIES_ONLY must be exactly yes or no\n' >&2; exit 64 ;;
+  esac
+fi
+
 case $MODE in
   testnet) ;;
   mainnet)
@@ -83,7 +95,7 @@ esac
 while [[ $REMOTE_DIR == */ ]]; do REMOTE_DIR=${REMOTE_DIR%/}; done
 [[ $REMOTE_DIR != / ]] || { printf 'REMOTE_DIR must not resolve to /\n' >&2; exit 64; }
 
-for variable_name in SIGIL_UID SIGIL_GID EXPLORER_UID; do
+for variable_name in SIGIL_UID SIGIL_GID EXPLORER_UID POOL_UID; do
   variable_value=${!variable_name:-}
   if [[ -n $variable_value && ! $variable_value =~ ^[0-9]+$ ]]; then
     printf '%s must be numeric\n' "$variable_name" >&2
@@ -92,6 +104,14 @@ for variable_name in SIGIL_UID SIGIL_GID EXPLORER_UID; do
 done
 if [[ -n ${SIGIL_UID:-} && -n ${EXPLORER_UID:-} && $SIGIL_UID == "$EXPLORER_UID" ]]; then
   printf 'EXPLORER_UID must differ from SIGIL_UID\n' >&2
+  exit 64
+fi
+if [[ -n ${POOL_UID:-} && -n ${SIGIL_UID:-} && $POOL_UID == "$SIGIL_UID" ]]; then
+  printf 'POOL_UID must differ from SIGIL_UID\n' >&2
+  exit 64
+fi
+if [[ -n ${POOL_UID:-} && -n ${EXPLORER_UID:-} && $POOL_UID == "$EXPLORER_UID" ]]; then
+  printf 'POOL_UID must differ from EXPLORER_UID\n' >&2
   exit 64
 fi
 if [[ -n $ENV_FILE && ! -f $ENV_FILE ]]; then
@@ -113,10 +133,17 @@ for repo in sigil sigil-bitcoin sigil-coin; do
   [[ -d $workspace/$repo ]] || { printf 'missing sibling checkout: %s\n' "$workspace/$repo" >&2; exit 66; }
 done
 
+ssh_options=()
+rsync_transport=()
+if [[ -n $ssh_identities_only ]]; then
+  ssh_options=(-o "IdentitiesOnly=$ssh_identities_only")
+  rsync_transport=(-e "ssh -o IdentitiesOnly=$ssh_identities_only")
+fi
+
 # REMOTE_HOST and REMOTE_DIR are restricted above, so neither can become an
 # SSH option or remote-shell expression on clients without `ssh --` support.
 printf 'Preparing remote workspace %s:%s\n' "$REMOTE_HOST" "$REMOTE_DIR"
-ssh "$REMOTE_HOST" bash -s -- "$REMOTE_DIR" <<'PREPARE_REMOTE'
+ssh "${ssh_options[@]}" "$REMOTE_HOST" bash -s -- "$REMOTE_DIR" <<'PREPARE_REMOTE'
 set -euo pipefail
 remote_dir=$1
 mkdir -p -- "$remote_dir/sigil" "$remote_dir/sigil-bitcoin" "$remote_dir/sigil-coin"
@@ -147,41 +174,35 @@ rsync_args=(
 
 for repo in sigil sigil-bitcoin sigil-coin; do
   printf 'Synchronizing %s\n' "$repo"
-  rsync "${rsync_args[@]}" -- "$workspace/$repo/" "$REMOTE_HOST:$REMOTE_DIR/$repo/"
+  rsync "${rsync_transport[@]}" "${rsync_args[@]}" -- "$workspace/$repo/" "$REMOTE_HOST:$REMOTE_DIR/$repo/"
 done
 
 has_env=no
 if [[ -n $ENV_FILE ]]; then
   printf 'Uploading Compose environment file\n'
-  rsync --archive --protect-args --chmod=F600 -- "$ENV_FILE" \
-    "$REMOTE_HOST:$REMOTE_DIR/sigil-coin/deploy/docker/.env"
+  rsync "${rsync_transport[@]}" --archive --protect-args --chmod=F600 -- \
+    "$ENV_FILE" "$REMOTE_HOST:$REMOTE_DIR/sigil-coin/deploy/docker/.env"
   has_env=yes
 fi
 
-ssh "$REMOTE_HOST" bash -s -- \
+ssh "${ssh_options[@]}" "$REMOTE_HOST" bash -s -- \
   "$REMOTE_DIR" "$MODE" "${SIGIL_UID:--}" "${SIGIL_GID:--}" \
-  "${EXPLORER_UID:--}" "$allow_mainnet" "$has_env" <<'REMOTE_SCRIPT'
+  "${EXPLORER_UID:--}" "${POOL_UID:--}" "$allow_mainnet" "$has_env" <<'REMOTE_SCRIPT'
 set -euo pipefail
 remote_dir=$1
 mode=$2
 sigil_uid=$3
 sigil_gid=$4
 explorer_uid=$5
-allow_mainnet=$6
-has_env=$7
+pool_uid=$6
+allow_mainnet=$7
+has_env=$8
 
 [[ $allow_mainnet == yes || $allow_mainnet == no ]] || { echo 'invalid ALLOW_MAINNET' >&2; exit 64; }
 [[ $mode == testnet || $mode == mainnet ]] || { echo 'invalid mode' >&2; exit 64; }
 [[ $mode != mainnet || $allow_mainnet == yes ]] || { echo 'mainnet is not acknowledged' >&2; exit 64; }
 
 cd "$remote_dir/sigil-coin/deploy/docker"
-if [[ $sigil_uid == - ]]; then sigil_uid=$(id -u); fi
-if [[ $sigil_gid == - ]]; then sigil_gid=$(id -g); fi
-if [[ $explorer_uid == - ]]; then explorer_uid=$((sigil_uid + 1)); fi
-for identity in "$sigil_uid" "$sigil_gid" "$explorer_uid"; do
-  [[ $identity =~ ^[0-9]+$ ]] || { echo 'container UID/GID values must be numeric' >&2; exit 64; }
-done
-[[ $sigil_uid != "$explorer_uid" ]] || { echo 'EXPLORER_UID must differ from SIGIL_UID' >&2; exit 64; }
 
 read_env_value() {
   local wanted=$1 line value=
@@ -200,6 +221,22 @@ env_or_file() {
   local name=$1 current=${!1:-}
   if [[ -n $current ]]; then printf '%s' "$current"; else read_env_value "$name"; fi
 }
+
+if [[ $sigil_uid == - ]]; then sigil_uid=$(read_env_value SIGIL_UID); fi
+if [[ $sigil_gid == - ]]; then sigil_gid=$(read_env_value SIGIL_GID); fi
+if [[ $explorer_uid == - ]]; then explorer_uid=$(read_env_value EXPLORER_UID); fi
+if [[ $pool_uid == - ]]; then pool_uid=$(read_env_value POOL_UID); fi
+sigil_uid=${sigil_uid:-$(id -u)}
+sigil_gid=${sigil_gid:-$(id -g)}
+explorer_uid=${explorer_uid:-$((sigil_uid + 1))}
+pool_uid=${pool_uid:-$((sigil_uid + 2))}
+for identity in "$sigil_uid" "$sigil_gid" "$explorer_uid" "$pool_uid"; do
+  [[ $identity =~ ^[0-9]+$ ]] || { echo 'container UID/GID values must be numeric' >&2; exit 64; }
+done
+[[ $sigil_uid != "$explorer_uid" ]] || { echo 'EXPLORER_UID must differ from SIGIL_UID' >&2; exit 64; }
+[[ $pool_uid != "$sigil_uid" ]] || { echo 'POOL_UID must differ from SIGIL_UID' >&2; exit 64; }
+[[ $pool_uid != "$explorer_uid" ]] || { echo 'POOL_UID must differ from EXPLORER_UID' >&2; exit 64; }
+operator_uid=$(id -u)
 
 is_ipv4() {
   local address=$1 octet
@@ -226,9 +263,24 @@ validate_state_spec() {
   [[ -n $value && ! $value =~ (^|/)\.\.?(/|$) ]]
 }
 
+canonical_state_path() {
+  local spec=$1 path
+  while [[ $spec == */ ]]; do spec=${spec%/}; done
+  spec=${spec#./}
+  if [[ $spec == /* ]]; then path=$spec; else path=$(pwd -P)/$spec; fi
+  [[ $(realpath -m -- "$path") == "$path" ]] || return 1
+  printf '%s' "$path"
+}
+
+paths_overlap() {
+  [[ $1 == "$2" || $1 == "$2/"* || $2 == "$1/"* ]]
+}
+
 if [[ $mode == testnet ]]; then
   state_spec=$(env_or_file SIGIL_TESTNET_STATE_DIR)
   state_spec=${state_spec:-./state/testnet}
+  pool_state_spec=$(env_or_file SIGIL_TESTNET_POOL_STATE_DIR)
+  pool_state_spec=${pool_state_spec:-./state/testnet-pool}
   p2p_bind=$(env_or_file P2P_BIND)
   p2p_bind=${p2p_bind:-127.0.0.1}
   exposure_ack=$(env_or_file TESTNET_EXPOSURE_ACK)
@@ -266,10 +318,23 @@ else
   state_spec=$(env_or_file SIGIL_MAINNET_STATE_DIR)
   state_spec=${state_spec:-./state/mainnet}
 fi
-validate_state_spec "$state_spec" || { echo 'unsafe state directory path' >&2; exit 64; }
-state_spec=${state_spec#./}
-if [[ $state_spec == /* ]]; then state_dir=$state_spec; else state_dir=$PWD/$state_spec; fi
-[[ $state_dir != / && ! -L $state_dir ]] || { echo 'refusing unsafe state directory' >&2; exit 73; }
+validate_state_spec "$state_spec" || { echo 'unsafe chain state directory path' >&2; exit 64; }
+state_dir=$(canonical_state_path "$state_spec") || {
+  echo 'refusing chain state directory with a symlink component' >&2
+  exit 73
+}
+if [[ $mode == testnet ]]; then
+  validate_state_spec "$pool_state_spec" || { echo 'unsafe pool state directory path' >&2; exit 64; }
+  pool_state_dir=$(canonical_state_path "$pool_state_spec") || {
+    echo 'refusing pool state directory with a symlink component' >&2
+    exit 73
+  }
+  ! paths_overlap "$state_dir" "$pool_state_dir" || {
+    echo 'chain and pool state directories must be distinct and non-nested' >&2
+    exit 64
+  }
+fi
+[[ $state_dir != / && ! -L $state_dir ]] || { echo 'refusing unsafe chain state directory' >&2; exit 73; }
 
 install -d -m 0750 -- "$state_dir"
 chmod 0750 -- "$state_dir"
@@ -304,20 +369,36 @@ do
 done
 shopt -u nullglob
 
+if [[ $mode == testnet ]]; then
+  [[ $pool_state_dir != / && ! -L $pool_state_dir ]] || { echo 'refusing unsafe pool state directory' >&2; exit 73; }
+  install -d -m 0770 -- "$pool_state_dir"
+  chmod 0770 -- "$pool_state_dir"
+  chgrp "$sigil_gid" -- "$pool_state_dir" || {
+    echo "cannot set pool state group to SIGIL_GID=$sigil_gid" >&2
+    exit 73
+  }
+  [[ $(stat -c %u -- "$pool_state_dir") == "$operator_uid" &&
+     $(stat -c %g -- "$pool_state_dir") == "$sigil_gid" ]] || {
+    echo "pool state directory must be owned by remote operator $operator_uid:$sigil_gid" >&2
+    exit 73
+  }
+fi
+
 compose_args=(-f "compose.$mode.yml")
 if [[ $has_env == yes ]]; then compose_args=(--env-file .env "${compose_args[@]}"); fi
 
 export SIGIL_UID="$sigil_uid" SIGIL_GID="$sigil_gid" EXPLORER_UID="$explorer_uid"
 export ALLOW_MAINNET="$allow_mainnet" DOCKER_BUILDKIT=1
 if [[ $mode == testnet ]]; then
+  export POOL_UID="$pool_uid"
   export P2P_BIND="$p2p_bind" TESTNET_EXPOSURE_ACK="$exposure_ack" REMOTE_PEER_IP="$remote_peer_ip"
-  export SIGIL_TESTNET_STATE_DIR="$state_dir"
+  export SIGIL_TESTNET_STATE_DIR="$state_dir" SIGIL_TESTNET_POOL_STATE_DIR="$pool_state_dir"
 else
   export SIGIL_MAINNET_STATE_DIR="$state_dir"
 fi
 
 docker compose "${compose_args[@]}" config --quiet
 docker compose "${compose_args[@]}" build
-docker compose "${compose_args[@]}" up -d --remove-orphans
+docker compose "${compose_args[@]}" up -d --remove-orphans --wait --wait-timeout 180
 docker compose "${compose_args[@]}" ps
 REMOTE_SCRIPT
