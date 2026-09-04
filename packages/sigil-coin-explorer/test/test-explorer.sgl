@@ -226,6 +226,69 @@
           nonce: (block-header-nonce header))
       transactions: transactions)))
 
+(define (with-extra-transactions b extra)
+  (let* ((header (block-header-field b))
+         (transactions (append (block-transactions b) extra)))
+    (block
+      header-field:
+        (block-header
+          version: (block-header-version header)
+          previous-block: (block-header-previous-block header)
+          merkle-root: (merkle-root (map transaction-txid transactions))
+          time: (block-header-time header)
+          bits: (block-header-bits header)
+          nonce: (block-header-nonce header))
+      transactions: transactions)))
+
+(define (fixture-transfer funding)
+  (let* ((value (txout-value (car (transaction-outputs funding))))
+         (sent 10000000))
+    (transaction
+      version: 2
+      inputs: (list
+                (txin
+                  previous-output:
+                    (outpoint txid: (transaction-txid funding) index: 0)
+                  script-sig: #u8()
+                  sequence: %sequence-final
+                  witness: '()))
+      outputs: (list
+                 (txout value: sent script-pubkey: %script-b)
+                 (txout value: (- value sent) script-pubkey: %script-a))
+      lock-time: 0)))
+
+(define (store-transaction-outputs! db tx height time hash coinbase?)
+  (let ((txid (hex-encode (transaction-txid tx))))
+    (let loop ((outputs (transaction-outputs tx)) (index 0))
+      (unless (null? outputs)
+        (sqlite-run
+          db
+          "INSERT OR REPLACE INTO utxos(txid, output_index, value, script_pubkey, coinbase, height, time, created_by, spent_by, spent_height, active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 1)"
+          txid
+          index
+          (txout-value (car outputs))
+          (hex-encode (txout-script-pubkey (car outputs)))
+          (if coinbase? 1 0)
+          height
+          time
+          hash)
+        (loop (cdr outputs) (+ index 1))))))
+
+(define (store-transaction-spends! db tx height hash)
+  (for-each
+    (lambda (input)
+      (let* ((op (txin-previous-output input))
+             (txid (outpoint-txid op)))
+        (sqlite-run
+          db
+          "UPDATE utxos SET active = 0, spent_by = ?, spent_height = ? WHERE (txid = ? OR txid = ?) AND output_index = ? AND active = 1"
+          hash
+          height
+          (hex-encode txid)
+          (hex-encode (reverse-bytevector txid))
+          (outpoint-index op))))
+    (transaction-inputs tx)))
+
 ;; Write a block into the node's own tables, the way a synced node would.
 (define (store-block! db b height)
   (let* ((header (block-header-field b))
@@ -246,25 +309,16 @@
                   "(hash, height, status, block_hex, validated, updated_at)"
                   " VALUES (?,?,'valid',?,1,0)")
                 hash height (hex-encode (block-serialize b)))
-    ;; Mirror the connector's active UTXO rows so summary supply is the
-    ;; branch-aware sum of actual coinbase outputs, not a height formula.
-    (let* ((coinbase (car (block-transactions b)))
-           (txid (hex-encode (transaction-txid coinbase)))
-           (time (block-header-time header)))
-      (let loop ((outputs (transaction-outputs coinbase)) (index 0))
-        (unless (null? outputs)
-          (sqlite-run
-            db
-            "INSERT OR REPLACE INTO utxos(txid, output_index, value, script_pubkey, coinbase, height, time, created_by, spent_by, spent_height, active) VALUES (?, ?, ?, ?, 1, ?, ?, ?, NULL, NULL, 1)"
-            txid
-            index
-            (txout-value (car outputs))
-            (hex-encode (txout-script-pubkey (car outputs)))
-            height
-            time
-            hash)
-          (loop (cdr outputs) (+ index 1)))))
-    hash))
+    ;; Mirror the connector's UTXO transition for address balance/history.
+    (let ((time (block-header-time header)))
+      (let loop ((transactions (block-transactions b)) (index 0))
+        (unless (null? transactions)
+          (let ((tx (car transactions)))
+            (unless (= index 0)
+              (store-transaction-spends! db tx height hash))
+            (store-transaction-outputs! db tx height time hash (= index 0))
+            (loop (cdr transactions) (+ index 1)))))
+    hash)))
 
 (define (store-header-only! db header height)
   (sqlite-run db
@@ -347,9 +401,13 @@
 (define %blocks '())
 (define %coop-shares '())
 (define %coop-commits '())
+(define %transfer #f)
 
 (define (block-at height)
   (cdr (assv height %blocks)))
+
+(define (transfer-id)
+  (hex-encode (reverse-bytevector (transaction-txid %transfer))))
 
 ;; The header a block at `height` was built on: the regtest genesis at
 ;; height 1, and the previous block's header after that. This is the parent
@@ -411,10 +469,20 @@
                                                    complexity)
                                    (hidden-solution parent-hash height
                                                     complexity)))
-                     (b (build-block parent height complexity solution
-                                        shares commits graffiti
-                                        (if (even? height) %script-b %script-a)
-                                        %script-a)))
+                     (base (build-block
+                             parent height complexity solution
+                             shares commits graffiti
+                             (if (even? height) %script-b %script-a)
+                             %script-a))
+                     (transfer
+                       (and (= height %tip-height)
+                            (fixture-transfer
+                              (car (block-transactions (block-at 29))))))
+                     (remember-transfer
+                       (when transfer (set! %transfer transfer)))
+                     (b (if transfer
+                            (with-extra-transactions base (list transfer))
+                            base)))
                 (set! %blocks (cons (cons height b) %blocks))
                 (loop (+ height 1)
                       (block-header-field b)
@@ -453,10 +521,12 @@
   (list "/" "/blocks" "/difficulty" "/assets/explorer.js"
         (string-append "/block/" (number->string %coop-height))
         "/block/1" "/block/31" "/block/nope"
+        (string-append "/tx/" (transfer-id)) "/tx/nope"
         (string-append "/address/" %miner-a)
         "/api/summary" "/api/blocks" "/api/difficulty"
         (string-append "/api/block/" (number->string %coop-height))
         "/api/block/nope"
+        (string-append "/api/tx/" (transfer-id)) "/api/tx/nope"
         (string-append "/api/address/" %miner-a)))
 
 ;; ============================================================
@@ -1282,6 +1352,130 @@
                                         "/api/blocks"))))))
 
 ;; ============================================================
+;; Transaction activity
+;; ============================================================
+
+(test-group "transaction activity"
+  (test "a block detail lists every transaction"
+    (let* ((id (hex-encode
+                 (reverse-bytevector (transaction-txid %transfer))))
+           (page (body-of (string-append
+                            "/block/" (number->string %tip-height))))
+           (value (json-of (string-append
+                             "/api/block/" (number->string %tip-height))))
+           (rows (json-list (dict-get value "transaction_details"))))
+      (assert-true (has? page "<h2>Transactions</h2>"))
+      (assert-true (has? page id))
+      (assert-true (has? page "transfer"))
+      (assert-equal 2 (length rows))
+      (assert-equal id (dict-get (list-ref rows 1) "id"))
+      (assert-equal 1 (dict-get (list-ref rows 1) "inputs"))
+      (assert-equal 2 (dict-get (list-ref rows 1) "outputs"))
+      (assert-equal 80000000
+                    (dict-get (list-ref rows 1) "total_output"))))
+
+  (test "an address lists received and spent transactions"
+    (let ((id (hex-encode
+                (reverse-bytevector (transaction-txid %transfer)))))
+      (with-store
+        (lambda (store)
+          (let find ((rows (explorer-address-transactions
+                             store %script-a
+                             explorer-default-page-size)))
+            (cond
+              ((null? rows)
+               (error "transfer missing from address activity"))
+              ((string=? id (explorer-address-transaction-id (car rows)))
+               (assert-equal %tip-height
+                             (explorer-address-transaction-height (car rows)))
+               (assert-equal 70000000
+                             (explorer-address-transaction-received (car rows)))
+               (assert-equal 80000000
+                             (explorer-address-transaction-spent (car rows))))
+              (else (find (cdr rows)))))))
+      (let* ((page (body-of (string-append "/address/" %miner-a)))
+             (value (json-of (string-append "/api/address/" %miner-a)))
+             (rows (json-list (dict-get value "transactions"))))
+        (assert-true (has? page "<h2>Recent transactions</h2>"))
+        (assert-true (has? page id))
+        (assert-true (has? page "-0.10000000"))
+        (let find ((xs rows))
+          (cond
+            ((null? xs) (error "transfer missing from address JSON"))
+            ((string=? id (dict-get (car xs) "id"))
+             (assert-equal 70000000 (dict-get (car xs) "received"))
+             (assert-equal 80000000 (dict-get (car xs) "spent"))
+             (assert-equal -10000000 (dict-get (car xs) "net")))
+            (else (find (cdr xs)))))))))
+
+(test-group "transaction navigation"
+  (test "confirmed lookup resolves block, prevout, fee, and outputs"
+    (with-store
+      (lambda (store)
+        (let* ((tx (explorer-transaction-by-id store (transfer-id)))
+               (inputs (explorer-transaction-inputs tx))
+               (outputs (explorer-transaction-outputs tx))
+               (funding-id
+                 (hex-encode
+                   (reverse-bytevector
+                     (transaction-txid
+                       (car (block-transactions (block-at 29))))))))
+          (assert-equal %tip-height (explorer-transaction-height tx))
+          (assert-equal 0 (explorer-transaction-fee tx))
+          (assert-equal funding-id
+                        (explorer-transaction-input-previous-id
+                          (car inputs)))
+          (assert-equal %miner-a
+                        (explorer-transaction-input-address (car inputs)))
+          (assert-equal 80000000
+                        (explorer-transaction-input-value (car inputs)))
+          (assert-equal %miner-b
+                        (explorer-transaction-output-address (car outputs)))
+          (assert-equal 10000000
+                        (explorer-transaction-output-value (car outputs)))
+          (assert-equal %miner-a
+                        (explorer-transaction-output-address
+                          (list-ref outputs 1)))))))
+
+  (test "transaction, block, address, and JSON routes cross-link"
+    (let* ((id (transfer-id))
+           (funding-id
+             (hex-encode
+               (reverse-bytevector
+                 (transaction-txid
+                   (car (block-transactions (block-at 29)))))))
+           (tx-page (body-of (string-append "/tx/" id)))
+           (block-page (body-of (string-append
+                                  "/block/" (number->string %tip-height))))
+           (address-page (body-of (string-append "/address/" %miner-a)))
+           (value (json-of (string-append "/api/tx/" id)))
+           (inputs (json-list (dict-get value "inputs")))
+           (outputs (json-list (dict-get value "outputs"))))
+      (assert-equal 200 (status-of (string-append "/tx/" id)))
+      (assert-equal 404 (status-of "/tx/nope"))
+      (assert-equal 404 (status-of "/api/tx/nope"))
+      (assert-true (has? tx-page "<h1>Transaction</h1>"))
+      (assert-true
+        (has? tx-page
+              (string-append "href=\"/block/"
+                             (number->string %tip-height) "\"")))
+      (assert-true
+        (has? tx-page (string-append "href=\"/tx/" funding-id "\"")))
+      (assert-true
+        (has? tx-page (string-append "href=\"/address/" %miner-a "\"")))
+      (assert-true
+        (has? block-page (string-append "href=\"/tx/" id "\"")))
+      (assert-true
+        (has? address-page (string-append "href=\"/tx/" id "\"")))
+      (assert-equal id (dict-get value "id"))
+      (assert-equal %tip-height (dict-get value "height"))
+      (assert-equal 1 (dict-get value "input_count"))
+      (assert-equal 2 (dict-get value "output_count"))
+      (assert-equal funding-id (dict-get (car inputs) "previous_id"))
+      (assert-equal %miner-b (dict-get (car outputs) "address")))))
+
+
+;; ============================================================
 ;; JSON parity
 ;; ============================================================
 
@@ -1655,7 +1849,7 @@
   (test "HTML shell keeps every branding asset same-origin"
     (let ((page (explorer-page "Test" "<p>body</p>")))
       (assert-true (has? page "class=\"wordmark\""))
-      (assert-true (has? page "href=\"https://sigilcoin.lol\""))
+      (assert-true (has? page "href=\"/\""))
       (for-each
         (lambda (name)
           (assert-true

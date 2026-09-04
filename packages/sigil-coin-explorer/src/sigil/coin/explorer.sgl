@@ -75,6 +75,7 @@
     explorer-block-payout-script
     explorer-block-payout-address
     explorer-block-transaction-count
+    explorer-block-transactions
     explorer-block-size
     explorer-block-problem
     explorer-block-under-par
@@ -97,6 +98,49 @@
     explorer-block-total-output
     explorer-block-author
     explorer-block-margin
+
+    ;; Store: block transactions
+    explorer-transaction
+    explorer-transaction?
+    explorer-transaction-index
+    explorer-transaction-id
+    explorer-transaction-coinbase?
+    explorer-transaction-input-count
+    explorer-transaction-output-count
+    explorer-transaction-total-output
+    explorer-transaction-height
+    explorer-transaction-block-id
+    explorer-transaction-time
+    explorer-transaction-inputs
+    explorer-transaction-outputs
+    explorer-transaction-fee
+
+    ;; Store: transaction inputs
+    explorer-transaction-input
+    explorer-transaction-input?
+    explorer-transaction-input-index
+    explorer-transaction-input-coinbase?
+    explorer-transaction-input-previous-id
+    explorer-transaction-input-previous-index
+    explorer-transaction-input-address
+    explorer-transaction-input-value
+
+    ;; Store: transaction outputs
+    explorer-transaction-output
+    explorer-transaction-output?
+    explorer-transaction-output-index
+    explorer-transaction-output-address
+    explorer-transaction-output-value
+
+    ;; Store: address transactions
+    explorer-address-transaction
+    explorer-address-transaction?
+    explorer-address-transaction-height
+    explorer-address-transaction-block-id
+    explorer-address-transaction-time
+    explorer-address-transaction-id
+    explorer-address-transaction-received
+    explorer-address-transaction-spent
 
     ;; Store: co-op shares
     explorer-share
@@ -161,8 +205,10 @@
     explorer-chain-summary
     explorer-recent-blocks
     explorer-block-by-height
+    explorer-transaction-by-id
     explorer-block-by-id
     explorer-address-blocks
+    explorer-address-transactions
     explorer-address-balance
     explorer-next-halving-height
 
@@ -185,6 +231,7 @@
     explorer-summary-page
     explorer-blocks-page
     explorer-block-page
+    explorer-transaction-page
     explorer-difficulty-page
     explorer-address-page
     explorer-missing-page
@@ -194,6 +241,7 @@
     explorer-summary-json
     explorer-blocks-json
     explorer-block-json
+    explorer-transaction-json
     explorer-difficulty-json
     explorer-address-json
     explorer-error-json

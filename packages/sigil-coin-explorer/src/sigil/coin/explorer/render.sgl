@@ -67,6 +67,7 @@
     explorer-summary-page
     explorer-blocks-page
     explorer-block-page
+    explorer-transaction-page
     explorer-difficulty-page
     explorer-address-page
     explorer-missing-page
@@ -76,6 +77,7 @@
     explorer-summary-json
     explorer-blocks-json
     explorer-block-json
+    explorer-transaction-json
     explorer-difficulty-json
     explorer-address-json
     explorer-error-json)
@@ -441,7 +443,7 @@
               "<script src=\"/assets/explorer.js\" defer></script>"
               "</head><body>"
               "<header class=\"topbar\">"
-              "<a class=\"wordmark\" href=\"https://sigilcoin.lol\">"
+              "<a class=\"wordmark\" href=\"/\">"
               "<img class=\"wordmark-symbol\" src=\"/assets/sigilcoin-symbol.png\" width=\"32\" height=\"32\" alt=\"\">"
               "<span>SigilCoin <small>Explorer</small></span></a>"
               "<span class=\"badge badge-live status-badge\">read only</span>"
@@ -565,6 +567,17 @@
       (if (number? value)
           (explorer-escape (explorer-sigil-amount value))
           "&mdash;"))
+
+    (define (signed-amount-cell value)
+      (if (not (number? value))
+          "&mdash;"
+          (let ((prefix (cond ((< value 0) "-")
+                              ((> value 0) "+")
+                              (else ""))))
+            (explorer-escape
+              (string-append prefix
+                             (explorer-sigil-amount
+                               (if (< value 0) (- value) value)))))))
 
     ;; The k input/output pairs, canonically printed and escaped. They come
     ;; from the generator rather than from a miner, and they still go
@@ -802,6 +815,158 @@
                                   (expected-output-total outputs))
                                 "<span class=\"q\">minted</span>"))
                     "</tr></tbody></table></div></section>")))))
+
+    (define (transaction-link id)
+      (if (string? id)
+          (let ((text (explorer-escape id)))
+            (string-append
+              "<a class=\"hash-cell mono\" href=\"/tx/" text "\">"
+              text "</a>"))
+          "<span class=\"q\">&mdash;</span>"))
+
+    (define (transaction-address-cell address)
+      (if (string? address)
+          (let ((text (explorer-escape address)))
+            (string-append
+              "<a href=\"/address/" text "\">" text "</a>"))
+          "<span class=\"q\">unrecognised script</span>"))
+
+    (define (transaction-row tx)
+      (string-append
+        "<tr>"
+        (rows
+          (list
+            (number->string (explorer-transaction-index tx))
+            (if (explorer-transaction-coinbase? tx)
+                (badge "badge-violet" "coinbase")
+                (badge "badge-good" "transfer"))
+            (transaction-link (explorer-transaction-id tx))
+            (number->string (explorer-transaction-input-count tx))
+            (number->string (explorer-transaction-output-count tx))
+            (amount-cell (explorer-transaction-total-output tx))))
+        "</tr>"))
+
+    (define (transactions-section b)
+      (let ((transactions (explorer-block-transactions b)))
+        (join
+          (list
+            "<section class=\"panel content-panel\"><h2>Transactions</h2>"
+            (if (null? transactions)
+                "<div class=\"empty-state\">Transaction bodies are unavailable.</div>"
+                (string-append
+                  "<div class=\"table-scroll\"><table><thead><tr>"
+                  (headings '("#" "type" "transaction id" "inputs" "outputs"
+                              "total output"))
+                  "</tr></thead><tbody>"
+                  (join (map transaction-row transactions))
+                  "</tbody></table></div>"))
+            "</section>"))))
+    (define (transaction-input-row input)
+      (let ((coinbase? (explorer-transaction-input-coinbase? input)))
+        (string-append
+          "<tr>"
+          (rows
+            (list
+              (number->string (explorer-transaction-input-index input))
+              (if coinbase?
+                  (badge "badge-violet" "coinbase input")
+                  (badge "badge-good" "spend"))
+              (if coinbase?
+                  "<span class=\"q\">new coin issuance</span>"
+                  (transaction-link
+                    (explorer-transaction-input-previous-id input)))
+              (if coinbase?
+                  "&mdash;"
+                  (optional-number
+                    (explorer-transaction-input-previous-index input)))
+              (if coinbase?
+                  "<span class=\"q\">not applicable</span>"
+                  (transaction-address-cell
+                    (explorer-transaction-input-address input)))
+              (amount-cell (explorer-transaction-input-value input))))
+          "</tr>")))
+
+    (define (transaction-inputs-section tx)
+      (let ((inputs (explorer-transaction-inputs tx)))
+        (join
+          (list
+            "<section class=\"panel\"><h2>Inputs</h2>"
+            (if (null? inputs)
+                "<div class=\"empty-state\">No decoded inputs are available.</div>"
+                (table-wrap
+                  (string-append
+                    "<table><thead><tr>"
+                    (headings
+                      '("#" "type" "previous transaction" "output"
+                        "address" "value"))
+                    "</tr></thead><tbody>"
+                    (join (map transaction-input-row inputs))
+                    "</tbody></table>")))
+            "</section>"))))
+
+    (define (transaction-output-row output)
+      (string-append
+        "<tr>"
+        (rows
+          (list
+            (number->string (explorer-transaction-output-index output))
+            (transaction-address-cell
+              (explorer-transaction-output-address output))
+            (amount-cell (explorer-transaction-output-value output))))
+        "</tr>"))
+
+    (define (transaction-outputs-section tx)
+      (let ((outputs (explorer-transaction-outputs tx)))
+        (join
+          (list
+            "<section class=\"panel\"><h2>Outputs</h2>"
+            (if (null? outputs)
+                "<div class=\"empty-state\">No decoded outputs are available.</div>"
+                (table-wrap
+                  (string-append
+                    "<table><thead><tr>"
+                    (headings '("#" "address" "value"))
+                    "</tr></thead><tbody>"
+                    (join (map transaction-output-row outputs))
+                    "</tbody></table>")))
+            "</section>"))))
+
+    (define (address-transaction-row tx)
+      (let ((received (explorer-address-transaction-received tx))
+            (spent (explorer-address-transaction-spent tx)))
+        (string-append
+          "<tr>"
+          (rows
+            (list
+              (string-append
+                "<a href=\"/block/"
+                (explorer-escape
+                  (number->string (explorer-address-transaction-height tx)))
+                "\">"
+                (number->string (explorer-address-transaction-height tx))
+                "</a>")
+              (explorer-escape
+                (explorer-format-time (explorer-address-transaction-time tx)))
+              (transaction-link (explorer-address-transaction-id tx))
+              (amount-cell received)
+              (amount-cell spent)
+              (signed-amount-cell (- received spent))))
+          "</tr>")))
+
+    (define (address-transactions-section transactions)
+      (join
+        (list
+          "<section class=\"panel\"><h2>Recent transactions</h2>"
+          (if (null? transactions)
+              "<div class=\"empty-state\">No transactions found on the active chain.</div>"
+              (string-append
+                "<div class=\"table-scroll\"><table><thead><tr>"
+                (headings '("block" "time" "transaction id" "received" "spent"
+                            "net"))
+                "</tr></thead><tbody>"
+                (join (map address-transaction-row transactions))
+                "</tbody></table></div>"))
+          "</section>")))
 
     (define %difficulty-headings
       '("height" "C" "par" "bytes" "margin" ""))
@@ -1184,6 +1349,7 @@
                 "<section class=\"panel content-panel\"><h2>Solution</h2><pre>"
                 (solution-text b) "</pre></section>"
                 (score-section b)
+                (transactions-section b)
                 (shares-section b)
                 (payout-section b)
                 "<section class=\"panel content-panel\"><h2>Quote</h2><pre>"
@@ -1194,21 +1360,101 @@
                       "&mdash;"))
                 "</pre></section>"))))
 
+    ;;; One confirmed transaction, including its prevouts and destinations.
+    (define (explorer-transaction-page tx)
+      (: explorer-transaction? -> string?)
+      (let ((id (explorer-transaction-id tx))
+            (height (explorer-transaction-height tx))
+            (block-id (explorer-transaction-block-id tx))
+            (time (explorer-transaction-time tx))
+            (fee (explorer-transaction-fee tx)))
+        (explorer-page
+          (string-append "Transaction " id)
+          (join
+            (list
+              "<section class=\"page-head\"><div><p class=\"eyebrow\">"
+              "Confirmed transaction</p><h1>Transaction</h1></div>"
+              (if (explorer-transaction-coinbase? tx)
+                  (badge "badge-violet" "coinbase")
+                  (badge "badge-good" "transfer"))
+              "</section><section class=\"panel\">"
+              "<h2 class=\"sr-only\">Transaction data</h2>"
+              (table-wrap
+                (join
+                  (list
+                    "<table><tbody>"
+                    (field
+                      "id"
+                      (string-append
+                        "<span class=\"hash-cell mono\">"
+                        (explorer-escape id) "</span>"))
+                    (field
+                      "confirmation block"
+                      (cond
+                        ((and (number? height) (string? block-id))
+                         (let ((height-text (number->string height))
+                               (id-text (explorer-escape block-id)))
+                           (string-append
+                             "<a class=\"hash-cell mono\" href=\"/block/"
+                             height-text "\">" id-text "</a>")))
+                        ((string? block-id)
+                         (string-append
+                           "<span class=\"hash-cell mono\">"
+                           (explorer-escape block-id) "</span>"))
+                        (else "&mdash;")))
+                    (field
+                      "height"
+                      (if (number? height)
+                          (let ((text (number->string height)))
+                            (string-append
+                              "<a href=\"/block/" text "\">" text "</a>"))
+                          "&mdash;"))
+                    (field
+                      "time"
+                      (if (number? time)
+                          (explorer-escape (explorer-format-time time))
+                          "&mdash;"))
+                    (field
+                      "inputs"
+                      (optional-number
+                        (explorer-transaction-input-count tx)))
+                    (field
+                      "outputs"
+                      (optional-number
+                        (explorer-transaction-output-count tx)))
+                    (field
+                      "total output"
+                      (if (number? (explorer-transaction-total-output tx))
+                          (string-append
+                            (amount-cell
+                              (explorer-transaction-total-output tx))
+                            " SGL")
+                          "&mdash;"))
+                    (if (number? fee)
+                        (field
+                          "fee"
+                          (string-append (amount-cell fee) " SGL"))
+                        "")
+                    "</tbody></table>")))
+              "</section>"
+              (transaction-inputs-section tx)
+              (transaction-outputs-section tx))))))
+
     ;;; The address page: what it mined and what it currently holds.
     ;;;
     ;;; ```scheme
-    ;;; (explorer-address-page "sgl1..." 10000000000 blocks)
+    ;;; (explorer-address-page "sgl1..." 10000000000 '() '())
     ;;; ```
-    (define (explorer-address-page address balance blocks)
-      (: string? integer? list? -> string?)
+    (define (explorer-address-page address balance blocks transactions)
+      (: string? integer? list? list? -> string?)
       (explorer-page
         (string-append "Address " address)
         (join (list
                 "<section class=\"page-head\"><div><p class=\"eyebrow\">"
-                "Mining activity</p><h1>Address</h1></div>"
+                "Address activity</p><h1>Address</h1></div>"
                 (badge "badge-violet"
-                       (string-append (number->string (length blocks))
-                                      " blocks"))
+                       (string-append (number->string (length transactions))
+                                      " recent transactions"))
                 "</section><section class=\"metric-grid\">"
                 (metric-card "balance"
                              (string-append
@@ -1222,7 +1468,9 @@
                   (string-append "<table><tbody>"
                                  (field "address" (explorer-text address))
                                  "</tbody></table>"))
-                "</section><section class=\"panel\"><h2>Blocks mined</h2>"
+                "</section>"
+                (address-transactions-section transactions)
+                "<section class=\"panel\"><h2>Blocks mined</h2>"
                 (block-table blocks) "</section>"))))
 
     ;;; The page for a path that names nothing.
@@ -1292,6 +1540,8 @@
         (cons "graffiti" (json-text (explorer-block-graffiti b)))
         (cons "transactions"
               (json-number (explorer-block-transaction-count b)))
+        (cons "transaction_details"
+              (map transaction-alist (explorer-block-transactions b)))
         (cons "size" (json-number (explorer-block-size b)))
         (cons "problem"
               (let ((problem (explorer-block-problem b)))
@@ -1324,6 +1574,73 @@
         (cons "commitments" (json-number (explorer-block-commit-count b)))
         (cons "outputs" (map output-alist (explorer-block-outputs b)))
         (cons "total_output" (json-number (explorer-block-total-output b)))))
+
+    (define (transaction-alist tx)
+      (list
+        (cons "index" (explorer-transaction-index tx))
+        (cons "id" (explorer-transaction-id tx))
+        (cons "coinbase" (explorer-transaction-coinbase? tx))
+        (cons "inputs" (explorer-transaction-input-count tx))
+        (cons "outputs" (explorer-transaction-output-count tx))
+        (cons "total_output" (explorer-transaction-total-output tx))))
+
+    (define (transaction-input-alist input)
+      (list
+        (cons "index"
+              (json-number (explorer-transaction-input-index input)))
+        (cons "coinbase" (explorer-transaction-input-coinbase? input))
+        (cons "previous_id"
+              (json-text
+                (explorer-transaction-input-previous-id input)))
+        (cons "previous_index"
+              (json-number
+                (explorer-transaction-input-previous-index input)))
+        (cons "address"
+              (json-text (explorer-transaction-input-address input)))
+        (cons "value"
+              (json-number (explorer-transaction-input-value input)))))
+
+    (define (transaction-output-alist output)
+      (list
+        (cons "index"
+              (json-number (explorer-transaction-output-index output)))
+        (cons "address"
+              (json-text (explorer-transaction-output-address output)))
+        (cons "value"
+              (json-number (explorer-transaction-output-value output)))))
+
+    (define (transaction-detail-alist tx)
+      (list
+        (cons "id" (json-text (explorer-transaction-id tx)))
+        (cons "height" (json-number (explorer-transaction-height tx)))
+        (cons "block_id"
+              (json-text (explorer-transaction-block-id tx)))
+        (cons "time" (json-number (explorer-transaction-time tx)))
+        (cons "coinbase" (explorer-transaction-coinbase? tx))
+        (cons "input_count"
+              (json-number (explorer-transaction-input-count tx)))
+        (cons "output_count"
+              (json-number (explorer-transaction-output-count tx)))
+        (cons "total_output"
+              (json-number (explorer-transaction-total-output tx)))
+        (cons "fee" (json-number (explorer-transaction-fee tx)))
+        (cons "inputs"
+              (map transaction-input-alist
+                   (explorer-transaction-inputs tx)))
+        (cons "outputs"
+              (map transaction-output-alist
+                   (explorer-transaction-outputs tx)))))
+
+    (define (address-transaction-alist tx)
+      (list
+        (cons "height" (explorer-address-transaction-height tx))
+        (cons "block_id" (explorer-address-transaction-block-id tx))
+        (cons "time" (explorer-address-transaction-time tx))
+        (cons "id" (explorer-address-transaction-id tx))
+        (cons "received" (explorer-address-transaction-received tx))
+        (cons "spent" (explorer-address-transaction-spent tx))
+        (cons "net" (- (explorer-address-transaction-received tx)
+                       (explorer-address-transaction-spent tx)))))
 
     (define (example-alist pair)
       (list (cons "input" (json-text (car pair)))
@@ -1468,17 +1785,25 @@
       (: explorer-block? -> string?)
       (json-encode (block-alist b)))
 
+    ;;; One transaction's endpoint body.
+    (define (explorer-transaction-json tx)
+      (: explorer-transaction? -> string?)
+      (json-encode (transaction-detail-alist tx)))
+
     ;;; An address endpoint body.
     ;;;
     ;;; ```scheme
-    ;;; (explorer-address-json "sgl1..." 0 '())
+    ;;; (explorer-address-json "sgl1..." 0 '() '())
     ;;; ```
-    (define (explorer-address-json address balance blocks)
-      (: string? integer? list? -> string?)
-      (json-encode (list (cons "address" (explorer-safe-text address))
-                         (cons "balance" balance)
-                         (cons "blocks_mined" (length blocks))
-                         (cons "blocks" (map block-alist blocks)))))
+    (define (explorer-address-json address balance blocks transactions)
+      (: string? integer? list? list? -> string?)
+      (json-encode
+        (list (cons "address" (explorer-safe-text address))
+              (cons "balance" balance)
+              (cons "blocks_mined" (length blocks))
+              (cons "blocks" (map block-alist blocks))
+              (cons "transactions"
+                    (map address-transaction-alist transactions)))))
 
     ;;; An error body, for the endpoints that have no data to return.
     ;;;

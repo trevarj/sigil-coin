@@ -95,6 +95,7 @@
     explorer-block-payout-script
     explorer-block-payout-address
     explorer-block-transaction-count
+    explorer-block-transactions
     explorer-block-size
     explorer-block-problem
     explorer-block-under-par
@@ -117,6 +118,49 @@
     explorer-block-total-output
     explorer-block-author
     explorer-block-margin
+
+    ;; Block transactions
+    explorer-transaction
+    explorer-transaction?
+    explorer-transaction-index
+    explorer-transaction-id
+    explorer-transaction-coinbase?
+    explorer-transaction-input-count
+    explorer-transaction-output-count
+    explorer-transaction-total-output
+    explorer-transaction-height
+    explorer-transaction-block-id
+    explorer-transaction-time
+    explorer-transaction-inputs
+    explorer-transaction-outputs
+    explorer-transaction-fee
+
+    ;; Transaction inputs
+    explorer-transaction-input
+    explorer-transaction-input?
+    explorer-transaction-input-index
+    explorer-transaction-input-coinbase?
+    explorer-transaction-input-previous-id
+    explorer-transaction-input-previous-index
+    explorer-transaction-input-address
+    explorer-transaction-input-value
+
+    ;; Transaction outputs
+    explorer-transaction-output
+    explorer-transaction-output?
+    explorer-transaction-output-index
+    explorer-transaction-output-address
+    explorer-transaction-output-value
+
+    ;; Address transactions
+    explorer-address-transaction
+    explorer-address-transaction?
+    explorer-address-transaction-height
+    explorer-address-transaction-block-id
+    explorer-address-transaction-time
+    explorer-address-transaction-id
+    explorer-address-transaction-received
+    explorer-address-transaction-spent
 
     ;; Co-op shares
     explorer-share
@@ -181,8 +225,10 @@
     explorer-chain-summary
     explorer-recent-blocks
     explorer-block-by-height
+    explorer-transaction-by-id
     explorer-block-by-id
     explorer-address-blocks
+    explorer-address-transactions
     explorer-address-balance
     explorer-next-halving-height)
 
@@ -434,6 +480,7 @@
       (payout-script default: #f)
       (payout-address default: #f)
       (transaction-count default: #f)
+      (transactions default: '())
       (size default: #f)
       (problem default: #f)
       (complexity default: #f)
@@ -453,6 +500,43 @@
       (total-output default: #f)
       (author default: #f)
       (margin default: #f))
+
+    ;;; One transaction in a block detail view.
+    (define-struct explorer-transaction
+      (index integer?)
+      (id string?)
+      (coinbase? boolean?)
+      (input-count integer?)
+      (output-count integer?)
+      (total-output integer?)
+      (height default: #f)
+      (block-id default: #f)
+      (time default: #f)
+      (inputs default: '())
+      (outputs default: '())
+      (fee default: #f))
+
+    (define-struct explorer-transaction-input
+      (index integer?)
+      (coinbase? boolean?)
+      (previous-id default: #f)
+      (previous-index default: #f)
+      (address default: #f)
+      (value default: #f))
+
+    (define-struct explorer-transaction-output
+      (index integer?)
+      (address default: #f)
+      (value integer?))
+
+    ;;; One transaction affecting an address on the active chain.
+    (define-struct explorer-address-transaction
+      (height integer?)
+      (block-id string?)
+      (time integer?)
+      (id string?)
+      (received integer?)
+      (spent integer?))
 
     ;;; One co-op share, as a block claims it (§6.2).
     ;;;
@@ -665,6 +749,102 @@
                                            (car (car expected))))
                           out))))))
 
+    (define (transaction-total-output tx)
+      (let loop ((outputs (transaction-outputs tx)) (sum 0))
+        (if (null? outputs)
+            sum
+            (loop (cdr outputs) (+ sum (txout-value (car outputs)))))))
+
+    (define (make-transaction-inputs store chain tx coinbase?)
+      (let loop ((inputs (transaction-inputs tx)) (index 0) (out '()))
+        (if (null? inputs)
+            (reverse out)
+            (let* ((op (txin-previous-output (car inputs)))
+                   (row (and (not coinbase?) (outpoint-row store op)))
+                   (script-text (and row (row-ref row 'script_pubkey)))
+                   (script (guard (e (#t #f))
+                             (and (string? script-text)
+                                  (hex-decode script-text)))))
+              (loop
+                (cdr inputs)
+                (+ index 1)
+                (cons
+                  (explorer-transaction-input
+                    index: index
+                    coinbase?: coinbase?
+                    previous-id:
+                      (and (not coinbase?)
+                           (hex-encode
+                             (reverse-bytevector (outpoint-txid op))))
+                    previous-index:
+                      (and (not coinbase?) (outpoint-index op))
+                    address:
+                      (and script
+                           (explorer-script->address-for-chain chain script))
+                    value: (and row (row-ref row 'value)))
+                  out))))))
+
+    (define (make-transaction-outputs chain tx)
+      (let loop ((outputs (transaction-outputs tx)) (index 0) (out '()))
+        (if (null? outputs)
+            (reverse out)
+            (let* ((output (car outputs))
+                   (script (txout-script-pubkey output)))
+              (loop
+                (cdr outputs)
+                (+ index 1)
+                (cons
+                  (explorer-transaction-output
+                    index: index
+                    address:
+                      (explorer-script->address-for-chain chain script)
+                    value: (txout-value output))
+                  out))))))
+
+    (define (transaction-input-total inputs)
+      (let loop ((xs inputs) (sum 0))
+        (cond
+          ((null? xs) sum)
+          ((number? (explorer-transaction-input-value (car xs)))
+           (loop (cdr xs)
+                 (+ sum (explorer-transaction-input-value (car xs)))))
+          (else #f))))
+
+    (define (make-transaction store chain tx index height block-id time)
+      (let* ((coinbase? (= index 0))
+             (inputs (make-transaction-inputs store chain tx coinbase?))
+             (outputs (make-transaction-outputs chain tx))
+             (total-output (transaction-total-output tx))
+             (input-total (and (not coinbase?)
+                               (transaction-input-total inputs))))
+        (explorer-transaction
+          index: index
+          id: (hex-encode (reverse-bytevector (transaction-txid tx)))
+          coinbase?: coinbase?
+          input-count: (length inputs)
+          output-count: (length outputs)
+          total-output: total-output
+          height: height
+          block-id: block-id
+          time: time
+          inputs: inputs
+          outputs: outputs
+          fee: (and input-total (- input-total total-output)))))
+
+    (define (make-transactions store chain parsed height block-id time)
+      (if (not parsed)
+          '()
+          (let loop ((txs (block-transactions parsed)) (index 0) (out '()))
+            (if (null? txs)
+                (reverse out)
+                (loop
+                  (cdr txs)
+                  (+ index 1)
+                  (cons
+                    (make-transaction store chain (car txs) index
+                                      height block-id time)
+                    out))))))
+
     (define (coinbase-output-total outputs)
       (and (pair? outputs)
            (let loop ((xs outputs) (sum 0))
@@ -767,6 +947,12 @@
           transaction-count: (and parsed
                                   (guard (e (#t #f))
                                     (length (block-transactions parsed))))
+          transactions: (if detail?
+                            (make-transactions
+                              store chain parsed height
+                              (explorer-block-id base)
+                              (explorer-block-time base))
+                            '())
           size: (and parsed (coin-block-size parsed))
           problem: (cond
                      ((not parsed) (explorer-block-problem base))
@@ -1086,6 +1272,7 @@
     ;;;
     ;;; ```scheme
     ;;; (explorer-block-by-id s coin-regtest-genesis-id-constant)
+
     ;;; ```
     (define (explorer-block-by-id store id)
       (: explorer-store? any? -> any?)
@@ -1096,6 +1283,39 @@
         (and hash-text
              (let ((hrow (header-row store hash-text)))
                (and hrow (make-block store hrow #t))))))
+
+    ;;; A confirmed active-chain transaction by display txid, or `#f`.
+    ;;;
+    ;;; ```scheme
+    ;;; (explorer-transaction-by-id store txid)
+    ;;; ```
+    (define (explorer-transaction-by-id store id)
+      (: explorer-store? any? -> any?)
+      (let ((txid-text
+              (guard (e (#t #f))
+                (and (string? id)
+                     (= 64 (string-length id))
+                     (hex-encode
+                       (reverse-bytevector (hex-decode id)))))))
+        (and txid-text
+             (let* ((row (query-row
+                           store
+                           "SELECT created_by FROM utxos WHERE txid = ? LIMIT 1"
+                           txid-text))
+                    (block-hash (row-ref row 'created_by))
+                    (hrow (and (string? block-hash)
+                               (header-row store block-hash)))
+                    (block (and hrow (make-block store hrow #t))))
+               (and block
+                    (let find ((transactions
+                                 (explorer-block-transactions block)))
+                      (cond
+                        ((null? transactions) #f)
+                        ((string=? id
+                                   (explorer-transaction-id
+                                     (car transactions)))
+                         (car transactions))
+                        (else (find (cdr transactions))))))))))
 
     ;;; Blocks on the active chain whose coinbase paid `script`, newest
     ;;; first, at most `limit` of them.
@@ -1135,3 +1355,85 @@
                         (hex-encode script)))
                  (value (row-ref row 'count)))
             (if (number? value) value 0))))))
+
+    (define (transaction-received tx script)
+      (let loop ((outputs (transaction-outputs tx)) (sum 0))
+        (if (null? outputs)
+            sum
+            (loop (cdr outputs)
+                  (+ sum
+                     (if (equal? script
+                                 (txout-script-pubkey (car outputs)))
+                         (txout-value (car outputs))
+                         0))))))
+
+    (define (outpoint-row store op)
+      (let ((txid (outpoint-txid op)))
+        (query-row
+          store
+          "SELECT value, script_pubkey FROM utxos WHERE (txid = ? OR txid = ?) AND output_index = ? LIMIT 1"
+          (hex-encode txid)
+          (hex-encode (reverse-bytevector txid))
+          (outpoint-index op))))
+
+    (define (transaction-spent store tx script-text)
+      (let loop ((inputs (transaction-inputs tx)) (sum 0))
+        (if (null? inputs)
+            sum
+            (let* ((row (outpoint-row store
+                                      (txin-previous-output (car inputs))))
+                   (value (row-ref row 'value))
+                   (owner (row-ref row 'script_pubkey)))
+              (loop (cdr inputs)
+                    (+ sum
+                       (if (and (number? value)
+                                (string? owner)
+                                (string=? owner script-text))
+                           value
+                           0)))))))
+
+    ;;; Recent active-chain transactions that pay or spend `script`.
+    ;;;
+    ;;; Coinbase payouts are included. A self-transfer reports both the input
+    ;;; value spent and all outputs returned to the address.
+    (define (explorer-address-transactions store script limit)
+      (: explorer-store? any? integer? -> list?)
+      (if (or (not (bytevector? script)) (<= limit 0))
+          '()
+          (let ((out '())
+                (found 0)
+                (script-text (hex-encode script)))
+            (walk-chain
+              store
+              %max-walk
+              (lambda (b)
+                (let ((parsed
+                        (stored-block
+                          store
+                          (hex-decode (explorer-block-hash-text b)))))
+                  (when parsed
+                    (let tx-loop ((txs (block-transactions parsed)) (index 0))
+                      (unless (or (null? txs) (>= found limit))
+                        (let* ((tx (car txs))
+                               (received (transaction-received tx script))
+                               (spent (if (= index 0)
+                                          0
+                                          (transaction-spent
+                                            store tx script-text))))
+                          (when (> (+ received spent) 0)
+                            (set! out
+                                  (cons
+                                    (explorer-address-transaction
+                                      height: (explorer-block-height b)
+                                      block-id: (explorer-block-id b)
+                                      time: (explorer-block-time b)
+                                      id: (hex-encode
+                                            (reverse-bytevector
+                                              (transaction-txid tx)))
+                                      received: received
+                                      spent: spent)
+                                    out))
+                            (set! found (+ found 1)))
+                          (tx-loop (cdr txs) (+ index 1)))))))
+                (< found limit)))
+            (reverse out))))

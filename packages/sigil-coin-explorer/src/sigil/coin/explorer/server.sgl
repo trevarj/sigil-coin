@@ -152,10 +152,12 @@
                       (explorer-store-config store)
                       token)))
         (and script
-             (cons (explorer-address-balance store script)
-                   (explorer-address-blocks store
-                                            script
-                                            explorer-default-page-size)))))
+             (list
+               (explorer-address-balance store script)
+               (explorer-address-blocks
+                 store script explorer-default-page-size)
+               (explorer-address-transactions
+                 store script explorer-default-page-size)))))
 
     ;;; Route a path against an open store.
     ;;;
@@ -202,13 +204,26 @@
                  (respond 404 %html
                           (explorer-missing-page
                             "No block by that height or id.")))))
+          ;; Confirmed transaction detail
+          ((and (= 2 (length segments)) (string=? (car segments) "tx"))
+           (let ((tx (explorer-transaction-by-id
+                       store (car (cdr segments)))))
+             (if tx
+                 (respond 200 %html (explorer-transaction-page tx))
+                 (respond 404 %html
+                          (explorer-missing-page
+                            "No confirmed transaction by that id.")))))
           ;; Address
           ((and (= 2 (length segments)) (string=? (car segments) "address"))
            (let* ((token (car (cdr segments)))
                   (view (address-view store token)))
              (if view
                  (respond 200 %html
-                          (explorer-address-page token (car view) (cdr view)))
+                          (explorer-address-page
+                            token
+                            (list-ref view 0)
+                            (list-ref view 1)
+                            (list-ref view 2)))
                  (respond 404 %html
                           (explorer-missing-page
                             "Not a SigilCoin address.")))))
@@ -243,6 +258,18 @@
                           (explorer-error-json
                             "not-found"
                             "no block by that height or id")))))
+          ;; JSON: one confirmed transaction
+          ((and (= 3 (length segments))
+                (string=? (car segments) "api")
+                (string=? (car (cdr segments)) "tx"))
+           (let ((tx (explorer-transaction-by-id
+                       store (car (cdr (cdr segments))))))
+             (if tx
+                 (respond 200 %json (explorer-transaction-json tx))
+                 (respond 404 %json
+                          (explorer-error-json
+                            "not-found"
+                            "no confirmed transaction by that id")))))
           ;; JSON: one address
           ((and (= 3 (length segments))
                 (string=? (car segments) "api")
@@ -251,9 +278,11 @@
                   (view (address-view store token)))
              (if view
                  (respond 200 %json
-                          (explorer-address-json token
-                                                 (car view)
-                                                 (cdr view)))
+                          (explorer-address-json
+                            token
+                            (list-ref view 0)
+                            (list-ref view 1)
+                            (list-ref view 2)))
                  (respond 404 %json
                           (explorer-error-json "not-found"
                                                "not a SigilCoin address")))))
