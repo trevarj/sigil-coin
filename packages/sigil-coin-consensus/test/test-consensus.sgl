@@ -1,15 +1,9 @@
-;;; Consensus derivation, verification, scoring and retargeting.
+;;; Consensus derivation, verification, lottery arithmetic and retargeting.
 ;;;
-;;; Everything here is a rule every node applies to a block someone else
-;;; produced, so every one of them is exercised with hostile input as well
-;;; as honest input. None of them may raise on network data: a rejection is
-;;; a tagged `coin-result`.
-;;;
-;;; The seed and score vectors are GOLDEN. A drifting seed is a chain split
-;;; and a drifting score word is a fork-choice split, so these must fail
-;;; loudly rather than be updated. The seed digests below were computed
-;;; independently of this implementation, from the specification's preimage,
-;;; so they check the code rather than record it.
+;;; Everything here is a rule every node applies to hostile block data as well
+;;; as honest input. Wire checks return tagged `coin-result` failures instead
+;;; of raising. Golden seed vectors and exact integer lottery examples make
+;;; consensus drift fail loudly.
 
 (import (sigil test)
         (sigil math)
@@ -48,7 +42,7 @@
 ;; `complexity` (for the builtin cap) and `examples`, so a synthetic spec
 ;; exercises the checker far more precisely — and far faster — than a
 ;; generated one, whose examples nobody chose.
-(define (spec-with constraint examples)
+(define (spec-with-par constraint examples par)
   (puzzle-spec height: 1
             complexity: 128
             constraint: constraint
@@ -56,13 +50,17 @@
             examples: examples
             hidden-source: "(lambda(x)(* x 2))"
             table-solution: "(lambda(x)(if(equal? x '1)'2 '6))"
-            par: 24
+            par: par
             retries: 0))
+
+(define (spec-with constraint examples)
+  (spec-with-par constraint examples coin-max-solution-bytes))
 
 ;; Doubling: three pairs, distinct outputs, no 1-arity builtin reproduces it.
 (define %doubling '((1 . 2) (2 . 4) (3 . 6)))
 
 (define %spec (spec-with 0 %doubling))
+(define %producer-spec (spec-with-par 0 %doubling 24))
 
 (define (reason spec source)
   (coin-result-reason (coin-check-solution spec source)))
@@ -73,60 +71,6 @@
 (define (report-of spec source)
   (coin-result-value (coin-check-solution spec source)))
 
-;; Words built from an explicit tuple, for the ordering proofs.
-(define %tuples
-  '((1 0 0 0) (1 0 0 15) (1 0 1 0) (1 1 0 0) (2 0 0 0)
-    (24 50 51 0) (24 50 51 1) (24 50 51 8) (24 50 51 15)
-    (24 50 52 0) (24 51 0 0) (25 0 0 15) (300 127 127 0)
-    (512 127 127 0) (512 127 127 15) (511 0 0 0) (100 64 64 12)))
-
-(define %words
-  (map (lambda (t)
-         (coin-score-pack (list-ref t 0) (list-ref t 1)
-                             (list-ref t 2) (list-ref t 3)))
-       %tuples))
-
-;; Lexicographic order on the projected ranking tuple `(L, MB, SB)`, written
-;; out the slow, obvious way. If projection and packing are right, comparison
-;; of raw authenticated words agrees with this on every pair.
-(define (rank-tuple t)
-  (list (list-ref t 0) (list-ref t 1) (list-ref t 2)))
-
-(define (lex-compare a b)
-  (cond
-    ((null? a) 0)
-    ((< (car a) (car b)) -1)
-    ((> (car a) (car b)) 1)
-    (else (lex-compare (cdr a) (cdr b)))))
-
-(define (all-pairs? xs ok?)
-  (let loop ((as xs))
-    (cond
-      ((null? as) #t)
-      ((let inner ((bs xs))
-         (cond
-           ((null? bs) #t)
-           ((ok? (car as) (car bs)) (inner (cdr bs)))
-           (else #f)))
-       (loop (cdr as)))
-      (else #f))))
-
-(define (all-triples? xs ok?)
-  (let a-loop ((as xs))
-    (cond
-      ((null? as) #t)
-      ((let b-loop ((bs xs))
-         (cond
-           ((null? bs) #t)
-           ((let c-loop ((cs xs))
-              (cond
-                ((null? cs) #t)
-                ((ok? (car as) (car bs) (car cs)) (c-loop (cdr cs)))
-                (else #f)))
-            (b-loop (cdr bs)))
-           (else #f)))
-       (a-loop (cdr as)))
-      (else #f))))
 
 ;; A deterministic margin history, one value per height.
 (define (margins-of n)
@@ -144,8 +88,8 @@
                 previous-block: previous
                 merkle-root: %zero32
                 time: time
-                bits: (coin-bits-encode 128)
-                nonce: (coin-score-pack 24 50 51 0)))
+                bits: (coin-bits-encode 128 24)
+                nonce: 0))
 
 (define (chain-of n start)
   (let loop ((i 0) (previous %zero32) (acc '()))
@@ -482,12 +426,19 @@
                              %spec
                              (string->bytes "(lambda(x)(* x 2))")))))
 
-  (test "par is not a bound: shorter than par is legal"
-    ;; `par` on this spec is 24; the accepted program is 18 bytes.
-    (assert-equal 24 (puzzle-spec-par %spec))
-    (assert-equal 18 (coin-solution-length "(lambda(x)(* x 2))"))
-    (assert-true (coin-ok? (coin-check-solution %spec
-                                                   "(lambda(x)(* x 2))"))))
+  (test "text solution length is its UTF-8 wire length"
+    (assert-equal 2 (coin-solution-length "λ")))
+
+  (test "producer solutions may beat or equal par but never exceed it"
+    (let ((short "(lambda(x)(* x 2))")
+          (equal (string-append "      " "(lambda(x)(* x 2))"))
+          (long (string-append "       " "(lambda(x)(* x 2))")))
+      (assert-equal 24 (puzzle-spec-par %producer-spec))
+      (assert-equal 18 (coin-solution-length short))
+      (assert-true (coin-ok? (coin-check-solution %producer-spec short)))
+      (assert-true (coin-ok? (coin-check-solution %producer-spec equal)))
+      (assert-equal 'solution-over-par
+                    (reason %producer-spec long))))
 
   (test "a bare builtin is a legal solution shape"
     ;; Three bytes. §3.4 step 7 is what keeps a published puzzle from being
@@ -496,12 +447,15 @@
                              (spec-with 0 '(((1 2) . 1) ((3 4) . 3)))
                              "car"))))
 
-  (test "a real generated puzzle accepts its own table and hidden source"
+  (test "a real generated puzzle accepts its par witness"
     (let ((spec (coin-puzzle-for (filled 32 7) 1 128)))
+      (assert-equal
+        (puzzle-spec-par spec)
+        (string-length (puzzle-spec-par-solution spec)))
       (assert-true (coin-ok? (coin-check-solution
-                               spec (puzzle-spec-table-solution spec))))
-      (assert-true (coin-ok? (coin-check-solution
-                               spec (puzzle-spec-hidden-source spec)))))))
+                               spec (puzzle-spec-par-solution spec))))
+      (assert-equal 'solution-over-par
+                    (reason spec (puzzle-spec-table-solution spec))))))
 
 (test-group "sigil-coin canonical solution rejection"
   (test "a non-source solution is malformed"
@@ -626,31 +580,21 @@
                                 par: 24 retries: 0)))))
 
 ;; ============================================================
-;; The score word (§5)
+;; Resource reporting, lottery and fork choice
 ;; ============================================================
 
 (test-group "sigil-coin canonical bucketing"
-  (test "bucket7 matches the specification's worked examples"
+  (test "bucket7 keeps the reporting examples"
     (assert-equal 0 (coin-bucket7 0))
     (assert-equal 1 (coin-bucket7 1))
     (assert-equal 7 (coin-bucket7 2))
     (assert-equal 50 (coin-bucket7 300))
-    (assert-equal 51 (coin-bucket7 340)))
-
-  (test "both resource caps fit seven bits with headroom"
+    (assert-equal 51 (coin-bucket7 340))
     (assert-equal 100 (coin-bucket7 100000))
     (assert-equal 106 (coin-bucket7 200000))
     (assert-true (< 106 coin-max-bucket)))
 
-  (test "the octave boundaries are exact"
-    ;; Six buckets per octave, so a doubling is exactly six buckets on.
-    (assert-equal 1 (coin-bucket7 1))
-    (assert-equal 7 (coin-bucket7 2))
-    (assert-equal 13 (coin-bucket7 4))
-    (assert-equal 19 (coin-bucket7 8))
-    (assert-equal 61 (coin-bucket7 1024)))
-
-  (test "bucket7 is monotone non-decreasing"
+  (test "bucket7 remains monotone"
     (assert-true
       (let loop ((x 0) (previous -1))
         (cond
@@ -659,7 +603,7 @@
            (loop (+ x 1) (coin-bucket7 x)))
           (else #f)))))
 
-  (test "bucket7 rejects anything that is not a count"
+  (test "bucket7 rejects non-counts"
     (assert-error (coin-bucket7 -1))
     (assert-error (coin-bucket7 "3"))))
 
@@ -686,41 +630,18 @@
     (assert-equal 15 (coin-quality '(4 4 4 4)))
     (assert-equal 15 (coin-quality '(4 4 4 4 4 4 4 4))))
 
-  (test "aggregate quality changes authenticated W but not fork-choice rank"
-    (let* ((strong (coin-quality '(4 4 4)))
-           (weak (coin-quality '(1 1 1 1 1 1 1 1)))
-           (strong-word (coin-score-pack 40 50 51 strong))
-           (weak-word (coin-score-pack 40 50 51 weak)))
-      (assert-equal 12 strong)
-      (assert-equal 8 weak)
-      (assert-true (< strong-word weak-word))
-      (assert-equal strong
-                    (coin-score-quality (coin-score-decode strong-word)))
-      (assert-equal weak
-                    (coin-score-quality (coin-score-decode weak-word)))
-      (assert-equal (coin-score-rank-word strong-word)
-                    (coin-score-rank-word weak-word))
-      (assert-equal 0 (coin-score-compare strong-word weak-word))
-      (assert-false (coin-score-better? strong-word weak-word))))
-
   (test "unrelated block data cannot move a share puzzle or quality"
-    ;; Graffiti, including-block hash and including block are absent from
-    ;; both derivation APIs. Parent commitments are present but irrelevant.
     (let* ((pk (share-key 3))
            (other-context
              (coin-coop-context parent-prev-hash: (filled 32 7)
-                                   puzzle-height: 1
-                                   complexity: 128
-                                   spec: %share-global
-                                   commits: (list (filled 32 99))))
+                                puzzle-height: 1
+                                complexity: 128
+                                spec: %share-global
+                                commits: (list (filled 32 99))))
            (a (coin-share-puzzle %share-context pk))
            (b (coin-share-puzzle other-context pk))
            (source (filled (- (puzzle-spec-par a) 1) #x78)))
       (assert-equal (puzzle-spec-examples a) (puzzle-spec-examples b))
-      ;; Quality of an unvalidated share is intentionally unavailable. The
-      ;; deterministic score inputs remain independent of unrelated block
-      ;; data: same personalized par and same source length imply the same
-      ;; contribution once validation caches the report.
       (assert-equal
         (coin-share-contribution
           (coin-share-margin-milli (puzzle-spec-par a)
@@ -729,197 +650,76 @@
           (coin-share-margin-milli (puzzle-spec-par b)
                                    (bytevector-length source)))))))
 
-(test-group "sigil-coin canonical score word"
-  (test "the bit layout is frozen"
-    ;; L-1 at 22, MB at 15, SB at 8, 15-Q at 4, low nibble reserved zero.
-    (assert-equal 0 (coin-score-pack 1 0 0 15))
-    (assert-equal (arithmetic-shift 1 22) (coin-score-pack 2 0 0 15))
-    (assert-equal (arithmetic-shift 1 15) (coin-score-pack 1 1 0 15))
-    (assert-equal (arithmetic-shift 1 8) (coin-score-pack 1 0 1 15))
-    (assert-equal (arithmetic-shift 1 4) (coin-score-pack 1 0 0 14))
-    (assert-equal (arithmetic-shift 15 4) (coin-score-pack 1 0 0 0)))
+(test-group "sigil-coin program-golf lottery"
+  (test "constants and exact target examples are frozen"
+    (assert-equal 32 coin-lottery-work-factor)
+    (assert-equal 8 coin-lottery-max-bonus)
+    (assert-equal (- (arithmetic-shift 1 256) 1)
+                  coin-lottery-max-integer)
+    (assert-equal (- (arithmetic-shift 1 255) 1)
+                  coin-lottery-target-ceiling)
+    ;; C=128 at par: floor(2^256 / 4096) winning integers.
+    (assert-equal (- (arithmetic-shift 1 244) 1)
+                  (coin-lottery-target 128 100 100))
+    (assert-equal (- (arithmetic-shift 1 245) 1)
+                  (coin-lottery-target 128 100 99))
+    (assert-equal (- (arithmetic-shift 1 252) 1)
+                  (coin-lottery-target 128 100 92)))
 
-  (test "the widest legal word still fits 32 bits"
-    (assert-equal 4294967296 coin-max-score-word)
-    (assert-true (< (coin-score-pack 512 127 127 0)
-                    coin-max-score-word)))
+  (test "each saved byte doubles odds through the eighth"
+    (assert-equal 0 (coin-lottery-bonus 100 100))
+    (assert-equal 1 (coin-lottery-bonus 100 99))
+    (assert-equal 8 (coin-lottery-bonus 100 92))
+    (assert-equal 8 (coin-lottery-bonus 100 1))
+    (assert-equal 1 (coin-lottery-multiplier 100 100))
+    (assert-equal 2 (coin-lottery-multiplier 100 99))
+    (assert-equal 256 (coin-lottery-multiplier 100 92))
+    (assert-equal
+      (* 2 (+ 1 (coin-lottery-target 128 100 100)))
+      (+ 1 (coin-lottery-target 128 100 99))))
 
-  (test "the reserved nibble is always zero, so there is no nonce to grind"
-    (assert-true
-      (let loop ((ws %words))
-        (cond
-          ((null? ws) #t)
-          ((= 0 (bitwise-and (car ws) #xf)) (loop (cdr ws)))
-          (else #f)))))
+  (test "expected rolls are exact integers rounded up"
+    (assert-equal 4096 (coin-lottery-expected-rolls 128 100 100))
+    (assert-equal 2048 (coin-lottery-expected-rolls 128 100 99))
+    (assert-equal 16 (coin-lottery-expected-rolls 128 100 92))
+    ;; 127 does not divide 2^256, so the honest rounded-up display is 4065.
+    (assert-equal 4065 (coin-lottery-expected-rolls 127 100 100)))
 
-  (test "packing round-trips through decoding"
-    (assert-true
-      (let loop ((ts %tuples))
-        (cond
-          ((null? ts) #t)
-          (else
-            (let* ((t (car ts))
-                   (s (coin-score-decode
-                        (coin-score-pack (list-ref t 0) (list-ref t 1)
-                                            (list-ref t 2) (list-ref t 3)))))
-              (if (and (= (list-ref t 0) (coin-score-length s))
-                       (= (list-ref t 1) (coin-score-memory s))
-                       (= (list-ref t 2) (coin-score-steps s))
-                       (= (list-ref t 3) (coin-score-quality s)))
-                  (loop (cdr ts))
-                  #f)))))))
+  (test "the target ceiling prevents certainty"
+    (assert-equal coin-lottery-target-ceiling
+                  (coin-lottery-target 16 100 92))
+    (assert-equal coin-lottery-target-ceiling
+                  (coin-lottery-target 16 100 1))
+    (assert-equal 2 (coin-lottery-expected-rolls 16 100 92)))
 
-  (test "encoding buckets the raw counts"
-    (let ((s (coin-score-decode (coin-score-encode 25 80 300 3))))
-      (assert-equal 25 (coin-score-length s))
-      (assert-equal (coin-bucket7 80) (coin-score-memory s))
-      (assert-equal (coin-bucket7 300) (coin-score-steps s))
-      (assert-equal 3 (coin-score-quality s))))
+  (test "target comparison is inclusive and rejects non-uint256 rolls"
+    (let ((target (coin-lottery-target 128 100 100)))
+      (assert-true (coin-lottery-valid? target 128 100 100))
+      (assert-false (coin-lottery-valid? (+ target 1) 128 100 100))
+      (assert-false (coin-lottery-valid? -1 128 100 100))
+      (assert-false
+        (coin-lottery-valid?
+          (+ coin-lottery-max-integer 1) 128 100 100))
+      (assert-false (coin-lottery-valid? "0" 128 100 100))))
 
-  (test "out-of-domain fields raise rather than pack wrong"
-    (assert-error (coin-score-pack 0 0 0 0))
-    (assert-error (coin-score-pack 513 0 0 0))
-    (assert-error (coin-score-pack 1 128 0 0))
-    (assert-error (coin-score-pack 1 0 128 0))
-    (assert-error (coin-score-pack 1 0 0 16))
-    (assert-error (coin-score-encode 1 -1 0 0))
-    (assert-error (coin-score-decode 1))))
+  (test "lottery parameters reject inexact or non-positive values"
+    (assert-error (coin-lottery-target 0 100 100))
+    (assert-error (coin-lottery-target 128 0 1))
+    (assert-error (coin-lottery-target 128 100 0))
+    (assert-error (coin-lottery-target 128 100 1.0))))
 
-(test-group "sigil-coin canonical score header check"
-  (test "a legal word decodes"
-    (let ((result (coin-score-check (coin-score-pack 24 50 51 2))))
-      (assert-true (coin-ok? result))
-      (assert-equal 24 (coin-score-length (coin-result-value result)))
-      (assert-equal 2 (coin-score-quality (coin-result-value result)))))
+(test-group "sigil-coin height-only fork choice"
+  (test "taller wins and equal height is first-seen"
+    (assert-equal -1 (coin-block-compare 2 1))
+    (assert-equal 1 (coin-block-compare 1 2))
+    (assert-equal 0 (coin-block-compare 2 2))
+    (assert-true (coin-better-block? 2 1))
+    (assert-false (coin-better-block? 2 2))
+    (assert-false (coin-better-block? 1 2)))
 
-  (test "the reserved nibble must be zero"
-    (assert-equal 'score-reserved-nonzero
-                  (coin-result-reason (coin-score-check 1)))
-    (assert-equal 'score-reserved-nonzero
-                  (coin-result-reason (coin-score-check #xf))))
-
-  (test "every aggregate-quality nibble is valid"
-    (assert-true
-      (let loop ((stored 0))
-        (if (> stored 15)
-            #t
-            (and (coin-ok? (coin-score-check
-                             (arithmetic-shift stored 4)))
-                 (loop (+ stored 1)))))))
-
-  (test "a word that is not a 32-bit unsigned integer is malformed"
-    (assert-equal 'malformed-header
-                  (coin-result-reason (coin-score-check -16)))
-    (assert-equal 'malformed-header
-                  (coin-result-reason
-                    (coin-score-check coin-max-score-word)))
-    (assert-equal 'malformed-header
-                  (coin-result-reason (coin-score-check "0")))
-    (assert-false (coin-score-valid? "0"))))
-
-(test-group "sigil-coin canonical score ordering"
-  (test "projected comparison is lexicographic comparison on producer fields"
-    (assert-true
-      (all-pairs?
-        %tuples
-        (lambda (a b)
-          (= (lex-compare (rank-tuple a) (rank-tuple b))
-             (coin-score-compare
-               (coin-score-pack (list-ref a 0) (list-ref a 1)
-                                (list-ref a 2) (list-ref a 3))
-               (coin-score-pack (list-ref b 0) (list-ref b 1)
-                                (list-ref b 2) (list-ref b 3))))))))
-
-  (test "rank projection clears only the authenticated quality nibble"
-    (let* ((raw (coin-score-pack 300 64 65 7))
-           (rank (coin-score-rank-word raw))
-           (decoded (coin-score-decode rank)))
-      (assert-equal (bitwise-and raw #xffffff0f) rank)
-      (assert-equal (coin-score-pack 300 64 65 15) rank)
-      (assert-equal 300 (coin-score-length decoded))
-      (assert-equal 64 (coin-score-memory decoded))
-      (assert-equal 65 (coin-score-steps decoded))
-      (assert-equal 15 (coin-score-quality decoded))))
-
-  (test "all Q values share one projected rank at fixed producer fields"
-    (let* ((baseline (coin-score-pack 24 50 51 0))
-           (rank (coin-score-rank-word baseline)))
-      (assert-true
-        (let loop ((quality 0))
-          (if (> quality 15)
-              #t
-              (let ((word (coin-score-pack 24 50 51 quality)))
-                (and (= rank (coin-score-rank-word word))
-                     (= 0 (coin-score-compare baseline word))
-                     (not (coin-score-better? baseline word))
-                     (not (coin-score-better? word baseline))
-                     (loop (+ quality 1)))))))))
-
-  (test "length then memory then steps remain strictly ordered"
-    (let ((shorter (coin-score-pack 24 127 127 0))
-          (longer (coin-score-pack 25 0 0 15))
-          (less-memory (coin-score-pack 24 50 127 0))
-          (more-memory (coin-score-pack 24 51 0 15))
-          (fewer-steps (coin-score-pack 24 50 51 0))
-          (more-steps (coin-score-pack 24 50 52 15)))
-      (assert-equal -1 (coin-score-compare shorter longer))
-      (assert-equal 1 (coin-score-compare longer shorter))
-      (assert-equal -1 (coin-score-compare less-memory more-memory))
-      (assert-equal 1 (coin-score-compare more-memory less-memory))
-      (assert-equal -1 (coin-score-compare fewer-steps more-steps))
-      (assert-equal 1 (coin-score-compare more-steps fewer-steps))))
-
-  (test "different raw words in one rank class keep the incumbent"
-    (let ((q3 (coin-score-pack 24 50 51 3))
-          (q12 (coin-score-pack 24 50 51 12)))
-      (assert-true (not (= q3 q12)))
-      (assert-equal 3 (coin-score-quality (coin-score-decode q3)))
-      (assert-equal 12 (coin-score-quality (coin-score-decode q12)))
-      (assert-equal 0 (coin-score-compare q3 q12))
-      (assert-false (coin-score-better? q3 q12))
-      (assert-false (coin-score-better? q12 q3))))
-
-  (test "the projected order is a strict weak ordering"
-    ;; Irreflexive.
-    (assert-true
-      (let loop ((ws %words))
-        (cond ((null? ws) #t)
-              ((coin-score-better? (car ws) (car ws)) #f)
-              (else (loop (cdr ws))))))
-    ;; Asymmetric.
-    (assert-true
-      (all-pairs? %words
-                  (lambda (a b)
-                    (not (and (coin-score-better? a b)
-                              (coin-score-better? b a))))))
-    ;; Transitive.
-    (assert-true
-      (all-triples? %words
-                    (lambda (a b c)
-                      (if (and (coin-score-better? a b)
-                               (coin-score-better? b c))
-                          (coin-score-better? a c)
-                          #t))))
-    ;; Incomparability is transitive, which is what makes it *weak*.
-    (assert-true
-      (all-triples?
-        %words
-        (lambda (a b c)
-          (let ((ab (and (not (coin-score-better? a b))
-                         (not (coin-score-better? b a))))
-                (bc (and (not (coin-score-better? b c))
-                         (not (coin-score-better? c b))))
-                (ac (and (not (coin-score-better? a c))
-                         (not (coin-score-better? c a)))))
-            (if (and ab bc) ac #t))))))
-
-  (test "projection and comparison reject the same illegal word domain"
-    (assert-error (coin-score-rank-word -1))
-    (assert-error (coin-score-rank-word coin-max-score-word))
-    (assert-error (coin-score-rank-word 1))
-    (assert-error (coin-score-compare -1 0))
-    (assert-error (coin-score-compare 0 coin-max-score-word))
-    (assert-error (coin-score-compare 1 0))))
+  (test "height comparison rejects malformed heights"
+    (assert-error (coin-block-compare -1 0))
+    (assert-error (coin-better-block? 1.0 1))))
 
 ;; ============================================================
 ;; Retargeting (§9)
@@ -1085,62 +885,82 @@
 ;; ============================================================
 
 (test-group "sigil-coin canonical bits codec"
-  (test "the prefix is frozen and stays under the max-target compact number"
-    (assert-equal #x207f0000 coin-bits-prefix)
-    (assert-true (<= (coin-bits-encode 4095) #x207fffff)))
+  (test "the frozen layout encodes L-1 above C"
+    (assert-equal #x20600000 coin-bits-prefix)
+    (assert-equal #x20600080 (coin-bits-encode 128 1))
+    (assert-equal #x20601080 (coin-bits-encode 128 2))
+    (assert-equal #x207ff080 (coin-bits-encode 128 512))
+    (assert-equal #x207fffff (coin-bits-encode 4095 512))
+    (assert-equal coin-bits-prefix
+                  (bitwise-and (coin-bits-encode 128 237)
+                               #xffe00000)))
 
-  (test "encoding round-trips over the whole complexity range"
-    (assert-equal #x207f0080 (coin-bits-encode 128))
+  (test "both projections round-trip their full field domains"
     (assert-true
       (let loop ((c 16))
         (cond
           ((> c 4095) #t)
-          ((= c (coin-result-value (coin-bits-decode
-                                     (coin-bits-encode c))))
+          ((= c (coin-result-value
+                  (coin-bits-decode (coin-bits-encode c 237))))
            (loop (+ c 1)))
+          (else #f))))
+    (assert-true
+      (let loop ((length 1))
+        (cond
+          ((> length 512) #t)
+          ((= length
+              (coin-result-value
+                (coin-bits-solution-length
+                  (coin-bits-encode 128 length))))
+           (loop (+ length 1)))
           (else #f)))))
 
-  (test "a wrong prefix is rejected"
+  (test "only the high prefix and complexity range constrain wire bits"
     (assert-equal 'bits-prefix
                   (coin-result-reason (coin-bits-decode #x1d00ffff)))
     (assert-equal 'bits-prefix
-                  (coin-result-reason (coin-bits-decode #x207e0080))))
-
-  (test "bits 15:12 are reserved zero"
-    (assert-equal 'bits-reserved-nonzero
-                  (coin-result-reason (coin-bits-decode #x207fffff)))
-    (assert-equal 'bits-reserved-nonzero
-                  (coin-result-reason (coin-bits-decode #x207f1080))))
-
-  (test "a complexity outside [16, 4095] is rejected"
+                  (coin-result-reason (coin-bits-decode #x20400080)))
     (assert-equal 'complexity-range
-                  (coin-result-reason (coin-bits-decode #x207f0000)))
+                  (coin-result-reason (coin-bits-decode #x20600000)))
     (assert-equal 'complexity-range
-                  (coin-result-reason (coin-bits-decode #x207f000f))))
+                  (coin-result-reason (coin-bits-decode #x2060000f))))
 
-  (test "a word that is not 32-bit unsigned is malformed"
-    (assert-equal 'malformed-header
-                  (coin-result-reason (coin-bits-decode -1)))
-    (assert-equal 'malformed-header
-                  (coin-result-reason (coin-bits-decode 4294967296)))
-    (assert-equal 'malformed-header
-                  (coin-result-reason (coin-bits-decode "0"))))
+  (test "encoding rejects values that do not fit"
+    (assert-error (coin-bits-encode 15 1))
+    (assert-error (coin-bits-encode 4096 1))
+    (assert-error (coin-bits-encode 128 0))
+    (assert-error (coin-bits-encode 128 513))
+    (assert-error (coin-bits-encode 128 1.0)))
 
-  (test "the derived complexity wins: C is never miner-chosen"
-    (assert-true (coin-ok? (coin-check-bits #x207f0080 128)))
-    (assert-equal 128 (coin-result-value (coin-check-bits #x207f0080 128)))
-    (assert-equal 'complexity-mismatch
-                  (coin-result-reason (coin-check-bits #x207f0080 129)))
-    ;; The codec's own rejections come through first.
-    (assert-equal 'bits-prefix
-                  (coin-result-reason (coin-check-bits #x207e0080 128)))
-    ;; The expected value is the node's own, so a bad one raises.
-    (assert-error (coin-check-bits #x207f0080 15)))
+  (test "non-uint32 values are malformed for either projection"
+    (let ((hostile (list -1 4294967296 "0" '())))
+      (assert-true
+        (let loop ((xs hostile))
+          (cond
+            ((null? xs) #t)
+            ((and (eq? 'malformed-header
+                       (coin-result-reason (coin-bits-decode (car xs))))
+                  (eq? 'malformed-header
+                       (coin-result-reason
+                         (coin-bits-solution-length (car xs)))))
+             (loop (cdr xs)))
+            (else #f))))))
+
+  (test "the parent-derived complexity wins without changing L"
+    (let ((bits (coin-bits-encode 128 237)))
+      (assert-equal 128 (coin-result-value (coin-check-bits bits 128)))
+      (assert-equal 237
+                    (coin-result-value (coin-bits-solution-length bits)))
+      (assert-equal 'complexity-mismatch
+                    (coin-result-reason (coin-check-bits bits 129)))
+      (assert-error (coin-check-bits bits 15))))
 
   (test "bits checking is total on hostile input"
     (assert-true
-      (let loop ((xs (list -1 0 "0" '() 4294967296 #x207fffff #x207f0000)))
+      (let loop ((xs (list -1 0 "0" '() 4294967296
+                           #x20400080 #x20600000)))
         (cond
           ((null? xs) #t)
-          ((coin-failed? (coin-check-bits (car xs) 128)) (loop (cdr xs)))
+          ((coin-failed? (coin-check-bits (car xs) 128))
+           (loop (cdr xs)))
           (else #f))))))

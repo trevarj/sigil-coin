@@ -29,10 +29,10 @@
 
 (test-group "locked landing-page content"
   (test "hero and primary links are exact"
-    (assert-true (has? %html "Mine programs, not hashes."))
+    (assert-true (has? %html "Short programs. Better odds."))
     (assert-true
       (has? %html
-            "Puzzle. Program. Block. Each block publishes a puzzle. Shortest valid program wins."))
+            "Solve the puzzle, then roll the nonce. Every byte saved doubles your odds, up to eight."))
     (assert-true (has? %html "https://explorer.testnet.sigilcoin.lol"))
     (assert-true (not (has? %html "https://explorer.sigilcoin.lol")))
     (assert-true
@@ -55,17 +55,19 @@
   (test "automation language and all six fundamentals are present"
     (assert-true
       (has? %html
-            "Puzzles are intended for LLMs and program-synthesis scripts"))
+            "Models and synthesis scripts search for short programs"))
     (for-each
       (lambda (fact) (assert-true (has? %html fact)))
-      '("Program synthesis" "~1 block/day" "512 bytes" "Zero" "premine"
-        "143029.99991970 SGL" "maximum co-op shares")))
+      '("Program-weighted" "nonce lottery" "~1 block/day" "512 bytes" "Zero"
+        "premine" "143029.99991970 SGL" "maximum co-op shares")))
 
   (test "consensus layers and public URLs are explicit"
     (for-each
       (lambda (text) (assert-true (has? %html text)))
-      '("Bitcoin foundation" "Frozen puzzle machine" "Composite score"
-        "Margin retarget" "Co-op commit–reveal"
+      '("Bitcoin foundation" "Frozen puzzle machine" "Header nonce lottery"
+        "Complexity and base-target retarget" "Co-op commit–reveal"
+        "full-header HASH256" "4096 rolls at par or 16 at par−8"
+        "settled, taller, then first-seen"
         "https://usesigil.org"
         "https://github.com/trevarj/sigil-coin"
         "https://github.com/trevarj/sigil-coin/blob/HEAD/docs/consensus.md"
@@ -90,7 +92,8 @@
       '("Contribute without a node"
         "wallet key local"
         "blind and source remain local until your commitment appears in a canonical block"
-        "only then does the watcher submit the signed reveal"
+        "then submits the signed reveal"
+        "strictly below its personalized par"
         "Keep the watcher running through the following block"
         "resume it from the saved commitment"
         "direct coinbase payout to your wallet"
@@ -112,7 +115,11 @@
     (assert-true (has? %html "aria-label=\"Copy"))
     (assert-true (has? %js "navigator.clipboard")))
 
-  (test "forbidden phrase and finance features are absent"
+  (test "stale deterministic-rank claims and finance features are absent"
+    (for-each
+      (lambda (text) (assert-true (not (has? %html text))))
+      '("Shortest valid program wins" "Composite score" "projected rank"
+        "Lower projected rank" "nonce carries a composite score"))
     (assert-true (not (has? %html "worth nothing")))
     (assert-true (not (has? %js "fetch(")))
     (assert-true (not (has? %js "XMLHttpRequest")))))
@@ -174,5 +181,17 @@
           (assert-true (not (has? svg "http://www.w3.org/1999/xlink")))
           (assert-true (not (has? svg " href=")))))
       '("mining.svg" "score-fork.svg" "ecosystem.svg"))))
+
+  (test "mining diagrams show lottery odds and first-seen forks"
+    (let ((mining (generated %a "assets/mining.svg"))
+          (fork (generated %a "assets/score-fork.svg")))
+      (for-each
+        (lambda (text) (assert-true (has? mining text)))
+        '("uint32 nonces" "full-header HASH256" "ROLL ≤ TARGET"
+          "Shorter improves odds"))
+      (for-each
+        (lambda (text) (assert-true (has? fork text)))
+        '("4096 expected" "16 expected" "FIRST SEEN" "equal unit weight"
+          "No length, share, nonce, or hash sibling tie-break"))))
 
 (run-tests)

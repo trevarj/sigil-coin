@@ -5,7 +5,7 @@
 ;;; solutions to the PREVIOUS puzzle as signed "shares" inside his coinbase,
 ;;; and pays them for it. A losing solver is paid instead of discarding work.
 ;;; Aggregate quality `Q` from verified personalized tasks remains authenticated
-;;; and reportable, but fork choice projects it out of the score word (§5.3).
+;;; by signatures and payouts, but does not affect fork choice.
 ;;;
 ;;; THE PIPELINE (§7.2). Puzzle `H` is not knowable until block `H-1`
 ;;; exists, so a share cannot be committed and revealed in the same block:

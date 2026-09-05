@@ -13,6 +13,10 @@ the operator chooses launch day. Seed, explorer, and public-testnet pool
 hostnames are in tree; the pool is not a mainnet service. See
 [Decisions still owed](#decisions-still-owed-by-the-operator) for what is left.
 
+The producer-length `bits` layout and nonce-lottery cutover change every
+generated genesis header and hash. Chain state created under the earlier rules
+is incompatible; each network starts from fresh state for its matching genesis.
+
 ---
 
 ## 0. Complete the public testnet
@@ -21,9 +25,8 @@ Mainnet preparation may continue in source, but the mainnet soak must not start
 until the public testnet has completed its full 30-day run.
 
 - [ ] `seed.testnet.sigilcoin.lol:19446` bootstraps a fresh, empty community
-      node from reset genesis
-      `15447f3226699f537969cbea4b493bbbe25a4d856832bf28bce3e7df579e6ddc`
-      without a hand-entered IP.
+      node from the reset genesis emitted by the reviewed all-network constants
+      generator, without a hand-entered IP.
 - [ ] `explorer.testnet.sigilcoin.lol` serves through TLS while the explorer
       container remains host-loopback-only on 8080.
 - [ ] `pool.testnet.sigilcoin.lol` has an A record to `104.223.122.157`, serves
@@ -86,8 +89,12 @@ to upgrade in lockstep. Treat "we should add one more builtin" as a
 post-launch discussion, not a launch blocker. `docs/consensus.md` is the sole
 normative protocol specification.
 
-The same freeze applies to `sigil-coin-consensus`: emission, the solution
-rules, the coinbase codec and fork choice.
+The same freeze applies to `sigil-coin-consensus`: emission, solution rules,
+header lottery, coinbase codec, and fork choice. Producer solutions must
+satisfy `L <= par`; shares must satisfy `L < personalized_par`. The generator's
+shorter verified witness (hidden on ties) has length exactly `par`, so an
+eligible producer candidate is always available. It does not itself produce a
+block: the builder must find a qualifying uint32 header nonce.
 
 ## 2. Choose the genesis quote and regenerate the constants
 
@@ -111,15 +118,10 @@ the genesis hash: change one byte and every constant below changes.
       The empty cache is part of the check: a launch-critical genesis must
       compile from the current source, never reuse bytecode from an older build.
 
-      Current coherent provisional mainnet output:
-
-      network: mainnet
-      quote: Sigil - Practical Symbolic Power
-      quote-bytes: 32
-      time: 1785542400
-      header-hex: 0500000000000000000000000000000000000000000000000000000000000000000000003abfe61141772020f88eca3b4d628189441ac4d82de5f706d5b0df0c764d381200376d6a80007f20f0a55515
-      hash: edf1ae51f078002fdcb7b30a1a4f9ad7e86ac6cd1a8fceba3e5a459731331516
-      id: 1615333197455a3ebace8f1acdc66ae8d79a4f1a0ab3b7dc2f0078f051aef1ed
+      Record the current coherent provisional mainnet quote, timestamp,
+      80-byte header hex, internal hash, and display id emitted by that run.
+      Never reuse values generated before the producer-length `bits` and
+      nonce-lottery cutover.
 
 - [x] Check `quote-bytes` against the 400-byte graffiti cap. 32 bytes used,
       368 to spare. It is a BYTE
@@ -128,10 +130,10 @@ the genesis hash: change one byte and every constant below changes.
 
 - [ ] Copy the selected mainnet quote/time to `chain.sgl` and copy every
       emitted header/id pair to `genesis.sgl`. The generator prints mainnet,
-      reset public-testnet, and regtest together because a generated-witness
-      change moves every genesis. A quote/time-only mainnet change should
-      reproduce the two fixed non-mainnet pairs unchanged; never copy mainnet
-      values over them.
+      reset public-testnet, and regtest together because witness selection,
+      encoded length/complexity, and the searched nonce all affect genesis. A
+      quote/time-only mainnet change should reproduce the two fixed non-mainnet
+      pairs unchanged; never copy mainnet values over them.
 - [ ] Re-run the suite. `test-node.sgl` rebuilds all three genesis blocks from
       their configured quotes and timestamps, so any mismatch fails before
       shipping.
@@ -172,18 +174,23 @@ should be in the same place the code is.
       `floor(S/10)` by verified contributions 1..4, the parent carrier receives
       `floor(S/20)`, and output 0 receives fees and every integer residual.
       Required share/carrier outputs remain even at value zero.
-- [ ] Rules a miner hits: solutions at most 512 bytes, graffiti at most 400
-      bytes, blocks at most 16384 bytes, at most 8 example pairs per puzzle,
-      block spacing floor 72000 seconds, future drift allowance 7200 seconds,
-      SigilCoin coinbase maturity 1 block (Bitcoin's default remains 100).
-      The bundled mainnet wallet waits for six confirmations before selecting
-      a coinbase; consensus-valid external spends remain accepted after one.
-- [ ] Fork choice, stated plainly: greater height wins; at equal height the
-      shorter producer source wins, then lower producer allocation bucket,
-      then lower producer step bucket. Raw `W` authenticates `Q` for reporting
-      and payouts, but `Q` is projected out of rank. Exact rank ties retain the
-      first valid arrival; neither raw `W` nor block hash breaks the tie. A
-      child linking the incumbent settles that height against later siblings.
+- [ ] Rules a miner hits: producer solutions must be at most their generated
+      par (`L <= par`) and 512 bytes; shares must be strictly below their
+      personalized par (`L < personalized_par`); graffiti is at most 400 bytes,
+      blocks at most 16384 bytes, and puzzles contain at most 8 example pairs.
+      `bits = 0x20600000 | ((L-1)<<12) | C`; the builder finalizes the body and
+      merkle root once, then searches nonce `0..0xffffffff`. The little-endian
+      integer from full-header `HASH256` must not exceed
+      `min(2^255-1, floor(2^256/(32*C))*2^min(max(par-L,0),8)-1)`. At `C=128`, par
+      expects 4096 rolls and `par-8` expects 16. Block spacing is at least
+      72000 seconds with 7200 seconds of future drift. SigilCoin coinbase
+      maturity is 1 block; the bundled mainnet wallet waits six confirmations.
+- [ ] Fork choice, stated plainly: each accepted block contributes one unit.
+      An observed child settles its parent against late siblings; otherwise a
+      taller validated chain wins, and equal-height siblings retain the first
+      valid arrival. Solution length, evaluator cost, shares, nonce, and block
+      hash never break a sibling tie. Shorter programs improve lottery odds;
+      they do not deterministically outrank accepted blocks.
 
 Anyone can check the internal hash with `sigilcoin status` on a fresh data
 directory and reproduce header, hash, and display id with
@@ -250,25 +257,23 @@ direct questions.
 
 Draft, to send as-is:
 
-> SigilCoin is up: a blockchain where mining is program synthesis instead of
-> hash grinding. Each block publishes a handful of input/output pairs and a
-> rule for the day, and you win by writing the smallest function that
-> reproduces every pair. Mining it with a model or a search script is the
-> intended way to play, not a loophole. It's written in Sigil, it's worth
-> nothing and is never intended to be worth anything, and there's no premine.
-> Blocks are one a day. Graffiti in the coinbase is by convention a quote
-> from here. Code, genesis hash and network parameters:
-> https://github.com/trevarj/sigil-coin. To play: build the `sigilcoin`
-> binary, run
-> `sigilcoin sync`, then `sigilcoin puzzle` to see today's pairs and
-> `sigilcoin mine --solution '<your program>'` when you have something that
-> beats the baseline it prints.
+> SigilCoin is up: a blockchain where program golf weights a lightweight
+> header-nonce lottery. Each block publishes input/output pairs and a rule for
+> the day. Write a function no longer than the printed par; every byte saved
+> doubles its odds, up to eight bytes, while the CLI searches the nonce
+> automatically. Mining with a model or search script is the intended way to
+> play, not a loophole. It's written in Sigil, it's worth nothing and is never
+> intended to be worth anything, and there's no premine. Blocks target one a
+> day. Graffiti in the coinbase is by convention a quote from here. Code and
+> network parameters: https://github.com/trevarj/sigil-coin. To play: build
+> `sigilcoin`, run `sigilcoin sync`, then `sigilcoin puzzle` and
+> `sigilcoin mine --solution '<your program>'`.
 
 Before sending:
 
-- [x] Repository URL is `https://github.com/trevarj/sigil-coin`.
 - [ ] The claims match what shipped: worth nothing, no premine, one block a
-      day, smallest function reproducing every pair wins.
+      day, producer `L <= par`, and shorter programs improve capped lottery
+      odds rather than deterministically winning.
 - [ ] The three commands were run against the real mainnet build, in that
       order, on a machine that is not the seed.
 - [x] The quote in genesis needs no third-party credit:
@@ -297,8 +302,8 @@ instructions were followed; `validated-blocks` matching between the seed and
 the second node at the same height; `peer-successes` still rising on both.
 
 **First two weeks:** cadence roughly one block a day; reorgs happening and
-resolving without intervention (equal projected ranks are incomparable and
-retain the first arrival until an explicit child settles the height);
+resolving without intervention (same-height accepted siblings retain the first
+arrival until an explicit child settles the height);
 `issued-supply` matching active-chain coinbase issuance and never exceeding
 `scheduled-supply-cap`; disk growth measured and extrapolated. At 16384 bytes
 per block, roughly 6 MB a year should be a non-issue.
@@ -331,11 +336,14 @@ What to run:
 - Seed host with the real module, real ports, real firewall. Not a laptop.
 - Second node on unrelated hardware and a different network, syncing from the
   seed by DNS name, never by IP.
-- Mine deliberately awkward blocks: a solution at exactly 512 bytes, graffiti
-  at exactly 400 bytes, a block filled to the 16384-byte cap, a block at the
-  earliest legal timestamp, and equal-rank siblings with different
-  authenticated `Q`. Submit the incumbent's child, then a late sibling, to
-  exercise first-seen retention and explicit child settlement.
+- Mine deliberately awkward blocks: a producer solution exactly at par,
+  graffiti at exactly 400 bytes, a block filled to the 16384-byte cap, and a
+  block at the earliest legal timestamp. Confirm a producer source above par
+  and a header roll just above its target are rejected, while the boundary
+  target is accepted. Submit same-height qualifying siblings with different
+  lengths, contributions, nonces, and hashes; none may displace the first valid
+  arrival. Submit the incumbent's child, then a late sibling, to exercise
+  first-seen retention and explicit child settlement.
 - Restart both hosts at least once. Kill the seed with `SIGKILL` mid-write at
   least once, and confirm both node units come back. The explorer will NOT
   recover on its own: a hard kill can leave a SQLite hot journal, rolling it

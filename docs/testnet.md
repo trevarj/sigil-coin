@@ -17,12 +17,25 @@ because a testnet gate passed.
 - Address HRP: `tsgl`, producing `tsgl1...` addresses.
 - Genesis marker: `SigilCoin public testnet reset - 2026-09-02`.
 - Genesis timestamp: `1788307200` (`2026-09-02T00:00:00Z`).
-- Genesis display id:
-  `15447f3226699f537969cbea4b493bbbe25a4d856832bf28bce3e7df579e6ddc`.
-- Genesis internal hash reported by node status:
-  `dc6d9e57dfe7e3bc28bf3268854d5ae2bb3b494beacb6979539f6926327f4415`.
+- Genesis hashes: use the all-network constants generated from this reset
+  marker, timestamp, lottery `bits` layout, and searched nonce; pre-lottery
+  hashes are incompatible.
 - Minimum spacing: one hour.
 - Maximum future drift: five minutes.
+- Producer validity: `L <= par`; shares require `L < personalized_par`.
+  The generated par witness is an eligible producer candidate, not a block by
+  itself.
+- Header `bits`:
+  `0x20600000 | ((L - 1) << 12) | C`, with mask `0xffe00000`, `L - 1` in
+  bits 20..12, and `C` in bits 11..0.
+- Lottery: search the uint32 nonce automatically and accept only when the
+  little-endian integer from full-header `HASH256` is at most
+  `min(2^255-1, floor(2^256/(32*C))*2^min(max(par-L,0),8)-1)`.
+- At `C = 128`: 4096 expected rolls at par; each saved byte doubles the odds
+  through eight bytes, for 16 expected rolls at `par - 8`.
+- Fork choice: one unit per accepted block; settled branch, taller chain, then
+  first-seen same-height arrival. No program, contribution, nonce, or hash
+  sibling tie-break.
 - Explorer: `https://explorer.testnet.sigilcoin.lol` through Caddy to the
   container's loopback-only `127.0.0.1:8080` mapping.
 - Co-op relay: `https://pool.testnet.sigilcoin.lol` through Caddy to the
@@ -39,12 +52,14 @@ must not mine catch-up bursts.
 
 ## Reset cutover
 
-This public testnet is a genesis reset, not a height activation. It starts at
-height 0 from the marker and timestamp above. Heights from the previous public
-testnet are not canonical on the reset chain. Old chain and relay databases,
-histories, and backups of that state are incompatible. An archived wallet key
-may still be a valid key format, but no old-chain balance, history, or relay
-receipt carries over; keep both old state directories out of reset operation.
+This public testnet is a genesis reset, not a height activation. Producer
+`L <= par`, the new `bits` encoding, and the full-header nonce lottery all
+change genesis. The chain starts at height 0 from the marker and timestamp
+above, using fresh chain state. Heights from the previous public testnet are
+not canonical on the reset chain. Old chain and relay databases, histories,
+and backups are incompatible. An archived wallet key may still be a valid key
+format, but no old-chain balance, history, or relay receipt carries over; keep
+both old state directories out of reset operation.
 
 The network magic remains `d3 7a 91 c5`; magic alone therefore does not
 distinguish an old node from the reset. Genesis validation is the boundary.
@@ -190,11 +205,9 @@ Require P2P on the intended public interface, explorer only at
 `127.0.0.1:8080`, pool only at `127.0.0.1:8082`, all four containers healthy,
 and no unexpected listener. The pool must have a distinct UID, a read-only
 chain-state mount, and a separate writable state directory. Before connecting
-miners, node status must report internal genesis hash
-`dc6d9e57dfe7e3bc28bf3268854d5ae2bb3b494beacb6979539f6926327f4415`,
-while explorer/API display order is
-`15447f3226699f537969cbea4b493bbbe25a4d856832bf28bce3e7df579e6ddc`.
-Any previous-testnet tip is a failed cutover.
+miners, compare node status and explorer/API display order with the reviewed
+all-network genesis output produced by this build. Any mismatch or
+previous-testnet tip is a failed cutover.
 
 ## Community bootstrap
 
@@ -288,6 +301,14 @@ per-address limit of eight new mutations per 60 seconds is not Sybil resistance.
 Every accepted current-context commitment is offered to the producer in
 canonical digest order; the grindable digest does not decide admission.
 
+Relay participation does not change solution validity: the producer's global
+solution must satisfy `L <= par`, while every personalized share supplied by
+the relay must satisfy `L < personalized_par`. The generated par witness
+provides an eligible at-par candidate. After the complete body and merkle root
+are final, `mine` searches nonce values automatically for a qualifying
+full-header roll; shorter producer programs double the odds per saved byte,
+through the eight-byte bonus cap.
+
 A producer opts in explicitly:
 
 ```sh
@@ -372,8 +393,9 @@ Record evidence in UTC. Do not record environment dumps, wallet material,
 contributor request bodies, encoded reveals, or unsanitized relay details. At
 least daily:
 
-1. Capture node status: tip height/hash, validated bodies, next complexity,
-   peer successes/failures, last sync outcome, `issued-supply`, and
+1. Capture node status: tip height/hash, nonce, full-header roll and target,
+   expected rolls, validated bodies, next complexity and corresponding base
+   target, peer successes/failures, last sync outcome, `issued-supply`, and
    `scheduled-supply-cap`.
 2. Compare the seed with at least one independently operated node at the same
    height.
@@ -399,16 +421,16 @@ volunteer's missed hour as an incident or impose a participation roster.
 
 Complete these before day 7 and repeat representative cases before day 30:
 
-- Retarget: capture H15, H16, and H17 puzzle complexity and historical queries;
-  the first 16-block boundary must agree across nodes.
+- Retarget: capture H15, H16, and H17 puzzle complexity, lottery base target,
+  and historical queries; the first 16-block boundary must agree across nodes.
 - Maturity: show the H1 coinbase cannot be spent in H1 and is selectable for
   H2, then send a small amount between disposable `tsgl1...` wallets.
 - Co-op: use the node-free watcher to carry a commitment at H and its
-  authorized reveal at H+1; require authenticated non-zero `Q`, contribution
-  in `1..4`, canonical output order, a direct contributor output spendable in
-  the following block, the 10% contribution-weighted share pool, 5% carrier
-  target, and the producer's fee and integer residual. Exercise every watcher
-  status and a reorg that moves a receipt backward or makes it stale/missed.
+  authorized reveal at H+1; require contribution in `1..4`, canonical output
+  order, a direct contributor output spendable in the following block, the 10%
+  contribution-weighted share pool, 5% carrier target, and the producer's fee
+  and integer residual. Exercise every watcher status and a reorg that moves a
+  receipt backward or makes it stale/missed.
 - Four-role smoke: producer A mines D's commitment in H100; light contributor D
   has no node database and the pre-H100 relay row contains no private key,
   blind, solution source, consensus share signature, or encoded share; H101
@@ -423,10 +445,11 @@ Complete these before day 7 and repeat representative cases before day 30:
 - Supply: compare branch-aware `issued-supply` from active UTXOs with the
   separately labeled `scheduled-supply-cap`; issued supply may be lower after
   solo blocks and must never exceed the cap.
-- Reorg: create equal-height siblings in a controlled window, verify rank by
-  `(L, MB, SB)` with `Q` report-only, extend the selected incumbent, and require
-  all nodes and explorer canonical views to converge after the explicit child
-  without database editing.
+- Reorg: create qualifying equal-height siblings with different solution
+  lengths, contributions, nonces, and hashes. Require the first valid arrival
+  to remain incumbent, extend it, and require all nodes and explorer canonical
+  views to converge after the explicit child without database editing. None of
+  those sibling differences is a tie-break.
 - Restart: cleanly restart each service and preserve tip, balance, peers,
   explorer state, and idempotent pool receipts.
 - Hard kill: once while the listener is idle, kill only one node, recover via
@@ -434,10 +457,11 @@ Complete these before day 7 and repeat representative cases before day 30:
 - Restore: restore matching reset-genesis chain and pool offline backups into
   empty test locations and verify status, disposable address, balance, sync,
   pool health/context, and explorer routes.
-- Explorer and pool: check canonical block/PBE/score/Q/co-op and address
-  HTML/JSON, issued-supply and scheduled-maximum labels, read-only behavior,
-  relay status against exact block membership, and escaping of harmless
-  hostile-looking graffiti such as `<b>test</b>`.
+- Explorer and pool: check canonical block/PBE/lottery roll, target, bonus,
+  multiplier, expected rolls, co-op and address HTML/JSON; issued-supply and
+  scheduled-maximum labels; read-only behavior; relay status against exact
+  block membership; and escaping of harmless hostile-looking graffiti such as
+  `<b>test</b>`.
 
 Never coordinate a fault drill that takes every reachable bootstrap node down
 at once. Announce a bounded drill window, but do not assign mining obligations
@@ -492,7 +516,8 @@ Before every upgrade:
 1. Review and record exact source revisions and image identity.
 2. Stop database users and take a verified offline backup.
 3. Preserve the current image under an immutable rollback tag.
-4. Build and start the reviewed image without changing genesis or rules.
+4. Build and start the reviewed image only when its consensus rules and genesis
+   match fresh or explicitly compatible chain state.
 5. Compare status, resource use, public P2P, explorer routes, pool
    health/context, and active receipt projections with the pre-upgrade baseline
    and an independent node.
@@ -537,12 +562,13 @@ Continue only when all of these are evidenced:
 1. Seed and an independent node agree on canonical tip and validated bodies.
 2. DNS bootstrap, public TCP/19446, HTTPS explorer, and HTTPS pool health/context
    work off-host while direct TCP/8080 and TCP/8082 remain unreachable.
-3. H16 retarget, H1-to-H2 maturity/transfer, solo under-minting,
-   issued-versus-scheduled supply labels, and one node-free contribution-weighted
-   commit/reveal payout cycle pass where their heights have been reached. The
-   four-role smoke must show the co-op reveal alongside an ordinary signed
-   transaction and a later B-to-C transaction crossing P2P before inclusion.
-   If cadence has not reached a boundary, extend the gate rather than waive it.
+3. H16 complexity and base-target retarget, H1-to-H2 maturity/transfer, solo
+   under-minting, issued-versus-scheduled supply labels, and one node-free
+   contribution-weighted commit/reveal payout cycle pass where their heights
+   have been reached. The four-role smoke must show the co-op reveal alongside
+   an ordinary signed transaction and a later B-to-C transaction crossing P2P
+   before inclusion. If cadence has not reached a boundary, extend the gate
+   rather than waive it.
 4. Relay admission proves first-16 acceptance, seventeenth rejection, one slot
    per pubkey/context, and miner-owned contribution-first R8 selection without
    claiming Sybil resistance or guaranteed inclusion.
@@ -568,11 +594,12 @@ The public testnet exercise completes only when:
 - it operated for 30 consecutive days with the one-hour cadence used as a
   network target, not an enforced community participation schedule;
 - seed and independent nodes finish on the same reset-genesis canonical tip,
-  validated body count, next complexity, branch-aware issued supply, and
-  UTXO-derived balances;
-- every observed retarget and the one-block maturity boundary are correct;
+  validated body count, next complexity and lottery base target, branch-aware
+  issued supply, and UTXO-derived balances;
+- every observed complexity/base-target retarget and the one-block maturity
+  boundary are correct;
 - at least two node-free commit/reveal/co-op cycles from distinct periods
-  produce valid authenticated `Q`, direct contributor outputs spendable in the
+  produce valid contributions, direct contributor outputs spendable in the
   following block, and contribution-weighted 10%/5% payouts without custody or
   inclusion promise;
 - repeated chain/status reorg, restart, hard-kill, matching reset-genesis

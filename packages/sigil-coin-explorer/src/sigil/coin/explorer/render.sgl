@@ -472,6 +472,18 @@
 
     (define (optional-number value)
       (if (number? value) (number->string value) "&mdash;"))
+    ;; Targets are uint256 values. JSON keeps them as fixed-width hex strings
+    ;; so browser clients never round consensus integers through IEEE-754.
+    (define (lottery-target-hex value)
+      (and (number? value)
+           (exact? value)
+           (integer? value)
+           (>= value 0)
+           (let ((raw (number->string value 16)))
+             (and (<= (string-length raw) 64)
+                  (string-append
+                    (make-string (- 64 (string-length raw)) #\0)
+                    raw)))))
 
     (define (graffiti-cell b)
       (let ((graffiti (explorer-block-graffiti b)))
@@ -518,32 +530,45 @@
         "scheduled subsidy" "quote"))
 
     (define (block-tile b)
-      (let ((id (explorer-block-id b))
-            (height (number->string (explorer-block-height b)))
-            (transactions (explorer-block-transaction-count b))
-            (size (explorer-block-size b))
-            (quality (explorer-block-score-quality b))
-            (problem (explorer-block-problem b)))
+      (let* ((id (explorer-block-id b))
+             (roll (explorer-block-lottery-roll b))
+             (roll-text (if (string? roll) roll id))
+             (height (number->string (explorer-block-height b)))
+             (nonce (explorer-block-nonce b))
+             (target (lottery-target-hex
+                       (explorer-block-lottery-target b)))
+             (bonus (explorer-block-lottery-bonus b))
+             (multiplier (explorer-block-lottery-multiplier b))
+             (expected (explorer-block-lottery-expected-rolls b))
+             (problem (explorer-block-problem b)))
         (join (list
                 "<a class=\"block-tile\" href=\"/block/" height
                 "\" role=\"listitem\" aria-label=\"Block " height
+                "; nonce " (explorer-escape (optional-number nonce))
+                "; bonus " (explorer-escape (optional-number bonus))
+                "; multiplier "
+                (explorer-escape (optional-number multiplier))
+                "; expected rolls "
+                (explorer-escape (optional-number expected))
                 "\" data-height=\"" height "\" data-block-id=\""
-                (explorer-escape id) "\" title=\""
-                (explorer-escape id) "\">"
+                (explorer-escape id) "\" data-lottery-roll=\""
+                (explorer-escape roll-text) "\" data-lottery-target=\""
+                (explorer-escape (if target target "")) "\" title=\"Winning roll "
+                (explorer-escape roll-text) "; target "
+                (explorer-escape (if target target "unavailable")) "\">"
                 "<span class=\"block-tile-head\"><span class=\"block-height\">#"
                 height "</span>"
                 (if problem
                     (badge "badge-bad"
                            (explorer-escape (symbol->string problem)))
-                    (badge "badge-good" "validated"))
-                "</span><span class=\"block-hash\">"
-                (explorer-escape (short-id id)) "</span>"
-                "<span class=\"block-meta\"><span>TX "
-                (optional-number transactions) "</span><span>"
-                (if (number? size)
-                    (string-append (number->string size) " B")
-                    "size —")
-                "</span><span>Q " (optional-number quality) "</span></span></a>"))))
+                    (badge "badge-good" "qualifying"))
+                "</span><span class=\"block-hash\">roll "
+                (explorer-escape (short-id roll-text)) "</span>"
+                "<span class=\"block-meta\"><span>N "
+                (optional-number nonce) "</span><span>&times;"
+                (optional-number multiplier) " (+"
+                (optional-number bonus) " B)</span><span>1/"
+                (optional-number expected) "</span></span></a>"))))
 
     (define (block-strip blocks)
       (string-append
@@ -555,7 +580,7 @@
         "</div>"))
 
     ;; ============================================================
-    ;; Puzzle, score, shares and payout sections
+    ;; Puzzle, lottery, shares and payout sections
     ;; ============================================================
 
     (define (hex-word n)
@@ -625,49 +650,95 @@
               (examples-table (explorer-block-examples b))
               "</section>")))
 
-    (define (score-section b)
-      (join (list
-              "<section class=\"panel content-panel\"><h2>Producer score</h2>"
-              "<p class=\"q\">Lower is better for projected fork rank. Length"
-              " dominates memory, memory dominates steps, and aggregate"
-              " personalized-share quality Q remains authenticated in raw W"
-              " but is cleared before comparison. Memory and steps are 7-bit"
-              " buckets: raw counts are not recoverable from a header.</p>"
-              (table-wrap
-                (join (list
-                        "<table><thead><tr>"
-                        (headings '("field" "value" "against par"))
-                        "</tr></thead><tbody><tr>"
-                        (rows (list "length L"
-                                    (string-append
-                                      (optional-number
-                                        (explorer-block-score-length b))
-                                      " bytes")
-                                    (margin-badge
-                                      (explorer-block-margin b))))
-                        "</tr><tr>"
-                        (rows (list "memory MB"
-                                    (optional-number
-                                      (explorer-block-score-memory b))
-                                    "<span class=\"q\">bucket</span>"))
-                        "</tr><tr>"
-                        (rows (list "steps SB"
-                                    (optional-number
-                                      (explorer-block-score-steps b))
-                                    "<span class=\"q\">bucket</span>"))
-                        "</tr><tr>"
-                        (rows (list "aggregate Q"
-                                    (badge "badge-violet"
-                                      (optional-number
-                                        (explorer-block-score-quality b)))
-                                    "<span class=\"q\">authenticated; rank-inert</span>"))
-                        "</tr><tr>"
-                        (rows (list "score word W"
-                                    (explorer-escape
-                                      (hex-word (explorer-block-score-word b)))
-                                    "<span class=\"q\">the header nonce</span>"))
-                        "</tr></tbody></table>")))
-              "</section>")))
+    (define (lottery-section b)
+      (let ((target (lottery-target-hex
+                      (explorer-block-lottery-target b)))
+            (problem (explorer-block-problem b)))
+        (join
+          (list
+            "<section class=\"panel content-panel\"><h2>Nonce lottery</h2>"
+            "<p class=\"q\">The block ID is the header's 256-bit roll. A"
+            " header qualifies when that roll is at or below its target."
+            " Each byte saved below par doubles the odds, up to eight bytes."
+            " Every qualifying block counts once; length, nonce and roll do"
+            " not rank same-height siblings.</p>"
+            (table-wrap
+              (join
+                (list
+                  "<table><thead><tr>"
+                  (headings '("field" "value" "meaning"))
+                  "</tr></thead><tbody><tr>"
+                  (rows
+                    (list
+                      "winning roll (block ID)"
+                      (string-append
+                        "<span class=\"hash-cell mono\">"
+                        (explorer-escape
+                          (explorer-block-lottery-roll b))
+                        "</span>")
+                      (cond
+                        ((or (eq? problem 'lottery-not-qualified)
+                             (eq? problem 'solution-over-par))
+                         (badge "badge-bad" "not qualifying"))
+                        (target (badge "badge-good" "qualifying"))
+                        (else "<span class=\"q\">unavailable</span>"))))
+                  "</tr><tr>"
+                  (rows
+                    (list
+                      "target"
+                      (if target
+                          (string-append
+                            "<span class=\"hash-cell mono\">0x"
+                            (explorer-escape target) "</span>")
+                          "&mdash;")
+                      "<span class=\"q\">roll must be at or below this value</span>"))
+                  "</tr><tr>"
+                  (rows
+                    (list
+                      "header nonce"
+                      (let ((nonce (explorer-block-nonce b)))
+                        (if (number? nonce)
+                            (string-append
+                              (number->string nonce) " ("
+                              (hex-word nonce) ")")
+                            "&mdash;"))
+                      "<span class=\"q\">uint32 lottery search nonce</span>"))
+                  "</tr><tr>"
+                  (rows
+                    (list
+                      "claimed length L"
+                      (string-append
+                        (optional-number
+                          (explorer-block-claimed-length b))
+                        " bytes")
+                      "<span class=\"q\">encoded in header bits</span>"))
+                  "</tr><tr>"
+                  (rows
+                    (list
+                      "savings bonus"
+                      (string-append "+"
+                        (optional-number
+                          (explorer-block-lottery-bonus b))
+                        " bytes")
+                      "<span class=\"q\">capped at eight bytes below par</span>"))
+                  "</tr><tr>"
+                  (rows
+                    (list
+                      "odds multiplier"
+                      (string-append
+                        (optional-number
+                          (explorer-block-lottery-multiplier b))
+                        "&times;")
+                      "<span class=\"q\">one doubling per bonus byte</span>"))
+                  "</tr><tr>"
+                  (rows
+                    (list
+                      "expected rolls"
+                      (optional-number
+                        (explorer-block-lottery-expected-rolls b))
+                      "<span class=\"q\">exact expectation, rounded up</span>"))
+                  "</tr></tbody></table>")))
+            "</section>"))))
 
     (define (share-source-text s)
       (let ((source (explorer-share-solution-source s))
@@ -740,7 +811,9 @@
                                 "</tr></thead><tbody>"
                                 (join (map share-row shares))
                                 "</tbody></table></div>")))
-                    "<p>commitments carried: "
+                    "<p>aggregate share quality: "
+                    (optional-number (explorer-block-share-quality b))
+                    " &middot; commitments carried: "
                     (optional-number (explorer-block-commit-count b))
                     "</p></section>"))))
 
@@ -1114,7 +1187,7 @@
                     "node-reported UTC")
                   (live-metric-card
                     "live-block-count" "live-header-detail"
-                    "validated blocks"
+                    "qualifying blocks"
                     (number->string (explorer-summary-block-count summary))
                     (string-append
                       (number->string (explorer-summary-header-count summary))
@@ -1160,8 +1233,9 @@
                   "</section>"
                   "<section class=\"panel content-panel\"><h2 id=\"live-puzzle-heading\">Puzzle for height "
                   (number->string (explorer-summary-next-height summary))
-                  "</h2><p class=\"q\">The deterministic target for the next"
-                  " producer. Lower valid source length wins.</p>"
+                  "</h2><p class=\"q\">Programs at or under par enter the"
+                  " nonce lottery. Each byte saved doubles the chance to"
+                  " qualify, up to the eight-byte bonus cap.</p>"
                   (table-wrap
                     (join (list
                             "<table><tbody>"
@@ -1260,7 +1334,7 @@
         (string-append (explorer-summary-chain-name summary) " blocks")
         (join (list
                 "<section class=\"page-head\"><div><p class=\"eyebrow\">"
-                "Validated ledger</p><h1>Blocks</h1></div>"
+                "Qualifying ledger</p><h1>Blocks</h1></div>"
                 (badge "badge-warn"
                        (string-append (number->string (length blocks))
                                       " shown"))
@@ -1280,14 +1354,14 @@
         (string-append "Block " (number->string (explorer-block-height b)))
         (join (list
                 "<section class=\"page-head\"><div><p class=\"eyebrow\">"
-                "Validated block</p><h1>Block "
+                "Lottery block</p><h1>Block "
                 (number->string (explorer-block-height b))
                 "</h1></div>"
                 (let ((problem (explorer-block-problem b)))
                   (if problem
                       (badge "badge-bad"
                              (explorer-escape (symbol->string problem)))
-                      (badge "badge-good" "validated")))
+                      (badge "badge-good" "qualifying")))
                 "</section><section class=\"panel\">"
                 "<h2 class=\"sr-only\">Block data</h2>"
                 "<div class=\"table-scroll\"><table><tbody>"
@@ -1348,7 +1422,7 @@
                 (puzzle-section b)
                 "<section class=\"panel content-panel\"><h2>Solution</h2><pre>"
                 (solution-text b) "</pre></section>"
-                (score-section b)
+                (lottery-section b)
                 (transactions-section b)
                 (shares-section b)
                 (payout-section b)
@@ -1558,17 +1632,27 @@
                   'null))
         (cons "k" (json-number (explorer-block-k b)))
         (cons "examples" (map example-alist (explorer-block-examples b)))
-        (cons "score"
-              (list (cons "word" (json-number
-                                    (explorer-block-score-word b)))
-                    (cons "length" (json-number
-                                      (explorer-block-score-length b)))
-                    (cons "memory" (json-number
-                                      (explorer-block-score-memory b)))
-                    (cons "steps" (json-number
-                                     (explorer-block-score-steps b)))
-                    (cons "quality" (json-number
-                                       (explorer-block-score-quality b)))))
+        (cons "lottery"
+              (list
+                (cons "nonce"
+                      (json-number (explorer-block-nonce b)))
+                (cons "claimed_length"
+                      (json-number (explorer-block-claimed-length b)))
+                (cons "roll"
+                      (json-text (explorer-block-lottery-roll b)))
+                (cons "target"
+                      (or (lottery-target-hex
+                            (explorer-block-lottery-target b))
+                          'null))
+                (cons "bonus"
+                      (json-number (explorer-block-lottery-bonus b)))
+                (cons "multiplier"
+                      (json-number (explorer-block-lottery-multiplier b)))
+                (cons "expected_rolls"
+                      (json-number
+                        (explorer-block-lottery-expected-rolls b)))))
+        (cons "share_quality"
+              (json-number (explorer-block-share-quality b)))
         (cons "share_count" (json-number (explorer-block-share-count b)))
         (cons "shares" (map share-alist (explorer-block-shares b)))
         (cons "commitments" (json-number (explorer-block-commit-count b)))

@@ -38,7 +38,7 @@
     ;;;
     ;;; Ancestry starts at `parent`; height-only rows from stale forks cannot
     ;;; enter the result. Non-genesis headers must have validated bodies, since
-    ;;; only those score commitments belong to the canonical block chain.
+    ;;; only those solution-length commitments belong to the canonical chain.
     ;;;
     ;;; ```scheme
     ;;; (length (coin-canonical-history n parent 16)) ; => 16

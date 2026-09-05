@@ -106,11 +106,14 @@
     explorer-block-constraint-text
     explorer-block-k
     explorer-block-examples
-    explorer-block-score-word
-    explorer-block-score-length
-    explorer-block-score-memory
-    explorer-block-score-steps
-    explorer-block-score-quality
+    explorer-block-nonce
+    explorer-block-claimed-length
+    explorer-block-lottery-roll
+    explorer-block-lottery-target
+    explorer-block-lottery-bonus
+    explorer-block-lottery-multiplier
+    explorer-block-lottery-expected-rolls
+    explorer-block-share-quality
     explorer-block-share-count
     explorer-block-shares
     explorer-block-commit-count
@@ -488,11 +491,14 @@
       (constraint-text default: #f)
       (k default: #f)
       (examples default: '())
-      (score-word default: #f)
-      (score-length default: #f)
-      (score-memory default: #f)
-      (score-steps default: #f)
-      (score-quality default: #f)
+      (nonce default: #f)
+      (claimed-length default: #f)
+      (lottery-roll default: #f)
+      (lottery-target default: #f)
+      (lottery-bonus default: #f)
+      (lottery-multiplier default: #f)
+      (lottery-expected-rolls default: #f)
+      (share-quality default: #f)
       (share-count default: #f)
       (shares default: '())
       (commit-count default: #f)
@@ -607,10 +613,10 @@
              (guard (e (#t #f))
                (puzzle-print-expression (puzzle-result-value parsed))))))
 
-    ;; The header a row carries, or #f. Complexity (`bits`) and the score
-    ;; (`nonce`) live here rather than in the body, so a header-only row still
-    ;; states the consensus parameters and quality claim it will have to
-    ;; prove when the body arrives.
+    ;; The header a row carries, or #f. Complexity and claimed solution length
+    ;; live in `bits`; the nonce chooses a lottery roll. A header-only row can
+    ;; therefore expose those claims and their derived odds without inventing
+    ;; any body content or validated execution metrics.
     (define (row-header hrow)
       (guard (e (#t #f))
         (let ((hex (row-ref hrow 'header_hex)))
@@ -873,10 +879,13 @@
     ;; SHARES/COMMITS fields are decoded only by consensus-owned codecs.
     (define (canonical-fields store base header parsed parent-hash detail?)
       (let* ((height (explorer-block-height base))
-             (complexity (explorer-complexity (block-header-bits header)))
-             (score-result (coin-score-check (block-header-nonce header)))
-             (score (and (coin-ok? score-result)
-                         (explorer-score (block-header-nonce header))))
+             (bits (block-header-bits header))
+             (complexity-result (coin-bits-decode bits))
+             (length-result (coin-bits-solution-length bits))
+             (complexity (and (coin-ok? complexity-result)
+                              (coin-result-value complexity-result)))
+             (claimed-length (and (coin-ok? length-result)
+                                  (coin-result-value length-result)))
              (spec (and (> height 0)
                         (explorer-puzzle parent-hash height complexity)))
              (view (explorer-puzzle-view spec))
@@ -925,7 +934,39 @@
              (solution (and payload
                             (coin-coinbase-payload-solution payload)))
              (par (and view (car view)))
-             (length-used (and solution (bytevector-length solution))))
+             (length-used (and solution (bytevector-length solution)))
+             (lottery-target
+               (and complexity par claimed-length
+                    (guard (e (#t #f))
+                      (coin-lottery-target complexity par claimed-length))))
+             (lottery-bonus
+               (and par claimed-length
+                    (guard (e (#t #f))
+                      (coin-lottery-bonus par claimed-length))))
+             (lottery-multiplier
+               (and par claimed-length
+                    (guard (e (#t #f))
+                      (coin-lottery-multiplier par claimed-length))))
+             (lottery-expected-rolls
+               (and complexity par claimed-length
+                    (guard (e (#t #f))
+                      (coin-lottery-expected-rolls
+                        complexity par claimed-length))))
+             (roll-value (guard (e (#t #f))
+                           (block-header-work-value header)))
+             (lottery-valid?
+               (and (number? roll-value)
+                    complexity
+                    par
+                    claimed-length
+                    (guard (e (#t #f))
+                      (coin-lottery-valid?
+                        roll-value complexity par claimed-length))))
+             (share-quality
+               (and detail?
+                    contributions
+                    (guard (e (#t #f))
+                      (coin-quality contributions)))))
         (explorer-block
           height: height
           id: (explorer-block-id base)
@@ -955,15 +996,30 @@
                             '())
           size: (and parsed (coin-block-size parsed))
           problem: (cond
-                     ((not parsed) (explorer-block-problem base))
-                     ((coin-failed? score-result)
-                      (coin-result-reason score-result))
+                     ((= height 0) (explorer-block-problem base))
+                     ((coin-failed? complexity-result)
+                      (coin-result-reason complexity-result))
+                     ((coin-failed? length-result)
+                      (coin-result-reason length-result))
+                     ((and (number? par)
+                           (number? claimed-length)
+                           (> claimed-length par))
+                      'solution-over-par)
+                     ((and (number? lottery-target) (not lottery-valid?))
+                      'lottery-not-qualified)
+                     ((not parsed)
+                      (or (explorer-block-problem base)
+                          'block-unparsable))
                      ((and decoded (coin-failed? decoded))
                       (coin-result-reason decoded))
                      ((and payload
                            (not (= height
                                    (coin-coinbase-payload-height payload))))
                       'coinbase-height-mismatch)
+                     ((and solution
+                           (number? claimed-length)
+                           (not (= claimed-length length-used)))
+                      'solution-length-mismatch)
                      ((and shares-result (coin-failed? shares-result))
                       (coin-result-reason shares-result))
                      ((and commits-result (coin-failed? commits-result))
@@ -974,11 +1030,14 @@
           constraint-text: (and view (car (cdr (cdr view))))
           k: (and view (car (cdr (cdr (cdr view)))))
           examples: (if view (car (cdr (cdr (cdr (cdr view))))) '())
-          score-word: (block-header-nonce header)
-          score-length: (and score (list-ref score 0))
-          score-memory: (and score (list-ref score 1))
-          score-steps: (and score (list-ref score 2))
-          score-quality: (and score (list-ref score 3))
+          nonce: (block-header-nonce header)
+          claimed-length: claimed-length
+          lottery-roll: (explorer-block-id base)
+          lottery-target: lottery-target
+          lottery-bonus: lottery-bonus
+          lottery-multiplier: lottery-multiplier
+          lottery-expected-rolls: lottery-expected-rolls
+          share-quality: share-quality
           share-count: share-count
           shares: (let loop ((xs (if shares shares '()))
                              (previews previews)

@@ -9,39 +9,32 @@
   (export
     node-package-version
     coin-header-version
-    coin-header-score
-    coin-header-score-ok?
     coin-header-complexity
+    coin-header-solution-length
     coin-node-puzzle-cache
     coin-node-puzzle
     coin-node-puzzle-cache-size
     coin-header-height
     coin-window-margins
     coin-required-complexity
-    coin-rank-base
-    coin-score-saving
-    coin-rank-encode
-    coin-rank-accumulated
-    coin-rank-tip-saving
     coin-chain-work
     coin-better-chain?
     coin-accept-header?
     coin-header-rules
-    coin-score-for-solution
     coin-parent-context
-    coin-block-score
+    coin-block-solution-length
     coin-connect-block
     coin-block-rules
     coin-block-rules-for-genesis
-    coin-table-solution
+    coin-par-solution
     coin-mining-coinbase
     coin-mining-coinbase/coop
     coin-build-block
+    coin-mine-header
     coin-build-coop-block
     coin-genesis-complexity
     coin-genesis-bits
     coin-genesis-solution
-    coin-genesis-score
     coin-genesis-script-pubkey
     coin-genesis-coinbase
     coin-genesis-block

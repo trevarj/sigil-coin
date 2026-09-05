@@ -1,5 +1,5 @@
 ;;; Consensus coinbase codec, co-op shares, commit-reveal,
-;;; contribution-aware payouts and aggregate fork choice.
+;;; contribution-aware payouts and height-only fork choice.
 ;;;
 ;;; Every rule here is applied by every node to a block someone else
 ;;; produced, so every one is exercised with hostile input as well as
@@ -283,7 +283,9 @@
                 previous-block: %zero32
                 merkle-root: %zero32
                 time: 1
-                bits: #x207f0080
+                bits: (coin-bits-encode
+                        %complexity
+                        (bytevector-length (string->bytes %sol-a)))
                 nonce: 0))
 
 (define (block-with txs)
@@ -559,7 +561,11 @@
                                                  previous-block: %zero32
                                                  merkle-root: %zero32
                                                  time: 1
-                                                 bits: #x207f0080
+                                                 bits: (coin-bits-encode
+                                                         %complexity
+                                                         (bytevector-length
+                                                           (string->bytes
+                                                             %sol-a)))
                                                  nonce: 0)
                      transactions: (list (coinbase-tx
                                            script
@@ -577,7 +583,11 @@
                                                  previous-block: %zero32
                                                  merkle-root: %zero32
                                                  time: 1
-                                                 bits: #x207f0080
+                                                 bits: (coin-bits-encode
+                                                         %complexity
+                                                         (bytevector-length
+                                                           (string->bytes
+                                                             %sol-a)))
                                                  nonce: 0)
                      transactions: (list (coinbase-tx
                                            script
@@ -1331,242 +1341,21 @@
             42 %subsidy %fees shares contributions %burn))))))
 
 ;; ============================================================
-;; Q-neutral fork choice (§5.6, §5.7)
+;; Height-only fork choice (§5.6, §5.7)
 ;; ============================================================
 
-(define (word length memory steps quality)
-  (coin-score-pack length memory steps quality))
+(test-group "fork choice: height and first-seen"
+  (test "taller wins and equal height retains the incumbent"
+    (assert-equal -1 (coin-block-compare 2 1))
+    (assert-equal 1 (coin-block-compare 1 2))
+    (assert-equal 0 (coin-block-compare 2 2))
+    (assert-true (coin-better-block? 2 1))
+    (assert-false (coin-better-block? 2 2))
+    (assert-false (coin-better-block? 1 2)))
 
-(test-group "fork choice: the block key"
-  (test "greater height always wins"
-    (assert-equal -1 (coin-block-compare 2 (word 512 127 127 0)
-                                          1 (word 1 0 0 15)))
-    (assert-equal 1 (coin-block-compare 1 (word 1 0 0 15)
-                                         2 (word 512 127 127 0))))
-
-  (test "at equal height the lower projected producer rank wins"
-    (assert-equal -1 (coin-block-compare 5 (word 24 50 51 0)
-                                          5 (word 25 50 51 15)))
-    (assert-true (coin-better-block? 5 (word 24 50 51 0)
-                                      5 (word 25 50 51 15))))
-
-  (test "different raw Q words in one projected key are incomparable"
-    (assert-equal 0 (coin-block-compare 5 (word 24 50 51 3)
-                                         5 (word 24 50 51 12)))
-    (assert-false (coin-better-block? 5 (word 24 50 51 3)
-                                       5 (word 24 50 51 12))))
-
-  (test "a negative height raises"
-    (assert-error (coin-block-compare -1 0 1 0))))
-
-(test-group "fork choice: the tip rule"
-  (test "a strictly better producer sibling displaces a childless tip"
-    (assert-true (coin-replaces-tip? (word 25 50 51 15) #f
-                                      (word 24 50 51 0))))
-
-  (test "nothing displaces an extended tip"
-    (assert-false (coin-replaces-tip? (word 25 50 51 15) #t
-                                       (word 24 50 51 0))))
-
-  (test "higher authenticated Q does not displace the first-seen tip"
-    (let ((incumbent (word 24 50 51 0))
-          (copy (word 24 50 51 15)))
-      (assert-true (not (= incumbent copy)))
-      (assert-equal 0 (coin-score-compare incumbent copy))
-      (assert-false (coin-replaces-tip? incumbent #f copy))))
-
-  (test "a thief cannot grind graffiti into a win"
-    ;; Graffiti is absent from both raw W and its projected rank.
-    (let ((score (word 24 50 51 0)))
-      (assert-equal 0 (coin-score-compare score score))
-      (assert-false (coin-replaces-tip? score #f score))))
-
-  (test "a worse producer sibling never displaces"
-    (assert-false (coin-replaces-tip? (word 24 50 51 0) #f
-                                       (word 25 50 51 15)))))
-
-(test-group "fork choice: authenticated quality is rank-inert"
-  (test "raw W preserves Q while projection erases it"
-    (let ((low-q (word 24 50 51 0))
-          (high-q (word 24 50 51 15)))
-      (assert-true (not (= low-q high-q)))
-      (assert-equal 0
-                    (coin-score-quality (coin-score-decode low-q)))
-      (assert-equal 15
-                    (coin-score-quality (coin-score-decode high-q)))
-      (assert-equal (coin-score-rank-word low-q)
-                    (coin-score-rank-word high-q))
-      (assert-equal 0 (coin-block-compare 5 low-q 5 high-q))))
-
-  (test "every Q value is tied at fixed producer fields"
-    (let ((baseline (word 24 50 51 0)))
-      (assert-true
-        (let loop ((quality 0))
-          (if (> quality 15)
-              #t
-              (let ((candidate (word 24 50 51 quality)))
-                (and (= 0 (coin-score-compare baseline candidate))
-                     (not (coin-better-block? 5 baseline 5 candidate))
-                     (not (coin-better-block? 5 candidate 5 baseline))
-                     (loop (+ quality 1)))))))))
-
-  (test "quality cannot beat a shorter solution"
-    (assert-true
-      (let loop ((quality 0))
-        (cond
-          ((> quality 15) #t)
-          ((coin-better-block? 5 (word 24 50 51 0)
-                               5 (word 25 50 51 quality))
-           (loop (+ quality 1)))
-          (else #f)))))
-
-  (test "quality cannot beat a smaller memory bucket"
-    (assert-true
-      (let loop ((quality 0))
-        (cond
-          ((> quality 15) #t)
-          ((coin-better-block? 5 (word 24 49 51 0)
-                               5 (word 24 50 51 quality))
-           (loop (+ quality 1)))
-          (else #f)))))
-
-  (test "quality cannot beat a smaller step bucket"
-    (assert-true
-      (let loop ((quality 0))
-        (cond
-          ((> quality 15) #t)
-          ((coin-better-block? 5 (word 24 50 50 0)
-                               5 (word 24 50 51 quality))
-           (loop (+ quality 1)))
-          (else #f)))))
-
-  (test "producer fields alone determine every strict comparison"
-    (assert-true
-      (let a-loop ((as '((24 50 51) (24 50 52) (24 51 0) (25 0 0)
-                         (1 0 0))))
-        (cond
-          ((null? as) #t)
-          ((let b-loop ((bs '((24 50 51) (24 50 52) (24 51 0)
-                              (25 0 0) (1 0 0))))
-             (cond
-               ((null? bs) #t)
-               ((equal? (car as) (car bs)) (b-loop (cdr bs)))
-               ((let q-a-loop ((q-a 0))
-                  (cond
-                    ((> q-a 15) #t)
-                    ((let q-b-loop ((q-b 0))
-                       (cond
-                         ((> q-b 15) #t)
-                         ((= (coin-score-compare
-                               (word (list-ref (car as) 0)
-                                     (list-ref (car as) 1)
-                                     (list-ref (car as) 2) 0)
-                               (word (list-ref (car bs) 0)
-                                     (list-ref (car bs) 1)
-                                     (list-ref (car bs) 2) 0))
-                             (coin-score-compare
-                               (word (list-ref (car as) 0)
-                                     (list-ref (car as) 1)
-                                     (list-ref (car as) 2) q-a)
-                               (word (list-ref (car bs) 0)
-                                     (list-ref (car bs) 1)
-                                     (list-ref (car bs) 2) q-b)))
-                          (q-b-loop (+ q-b 1)))
-                         (else #f)))
-                     (q-a-loop (+ q-a 1)))
-                    (else #f)))
-                (b-loop (cdr bs)))
-               (else #f)))
-           (a-loop (cdr as)))
-          (else #f))))))
-
-;; Keys for the ordering axioms: heights crossed with score words.
-(define %keys
-  '((1 1 0 0 0) (1 1 0 0 8) (1 24 50 51 0) (1 24 50 51 3) (1 24 50 51 8)
-    (1 25 50 51 0) (1 512 127 127 0) (2 512 127 127 0) (2 1 0 0 0)
-    (3 300 64 64 4) (0 1 0 0 0)))
-
-(define (key-height k) (car k))
-
-(define (key-word k)
-  (word (list-ref k 1) (list-ref k 2) (list-ref k 3) (list-ref k 4)))
-
-(define (key-better? a b)
-  (coin-better-block? (key-height a) (key-word a)
-                         (key-height b) (key-word b)))
-
-(define (all-pairs? xs ok?)
-  (let loop ((as xs))
-    (cond
-      ((null? as) #t)
-      ((let inner ((bs xs))
-         (cond
-           ((null? bs) #t)
-           ((ok? (car as) (car bs)) (inner (cdr bs)))
-           (else #f)))
-       (loop (cdr as)))
-      (else #f))))
-
-(define (all-triples? xs ok?)
-  (let a-loop ((as xs))
-    (cond
-      ((null? as) #t)
-      ((let b-loop ((bs xs))
-         (cond
-           ((null? bs) #t)
-           ((let c-loop ((cs xs))
-              (cond
-                ((null? cs) #t)
-                ((ok? (car as) (car bs) (car cs)) (c-loop (cdr cs)))
-                (else #f)))
-            (b-loop (cdr bs)))
-           (else #f)))
-       (a-loop (cdr as)))
-      (else #f))))
-
-(test-group "fork choice: the order is a strict weak ordering"
-  (test "irreflexive"
-    (assert-true
-      (let loop ((ks %keys))
-        (cond
-          ((null? ks) #t)
-          ((key-better? (car ks) (car ks)) #f)
-          (else (loop (cdr ks)))))))
-
-  (test "asymmetric"
-    (assert-true
-      (all-pairs? %keys
-                  (lambda (a b)
-                    (not (and (key-better? a b) (key-better? b a)))))))
-
-  (test "transitive"
-    (assert-true
-      (all-triples? %keys
-                    (lambda (a b c)
-                      (if (and (key-better? a b) (key-better? b c))
-                          (key-better? a c)
-                          #t)))))
-
-  (test "incomparability is transitive"
-    (assert-true
-      (all-triples?
-        %keys
-        (lambda (a b c)
-          (let ((ab (and (not (key-better? a b)) (not (key-better? b a))))
-                (bc (and (not (key-better? b c)) (not (key-better? c b)))))
-            (if (and ab bc)
-                (and (not (key-better? a c)) (not (key-better? c a)))
-                #t))))))
-
-  (test "incomparable is exactly same height and projected rank"
-    (assert-true
-      (all-pairs? %keys
-                  (lambda (a b)
-                    (eq? (and (not (key-better? a b))
-                              (not (key-better? b a)))
-                         (and (= (key-height a) (key-height b))
-                              (= (coin-score-rank-word (key-word a))
-                                 (coin-score-rank-word (key-word b))))))))))
+  (test "malformed heights raise"
+    (assert-error (coin-block-compare -1 0))
+    (assert-error (coin-better-block? 1.0 1))))
 
 ;; ============================================================
 ;; Share validation without a key
@@ -1857,7 +1646,7 @@
             (assert-equal 1 (length (coin-result-value checked)))
             (assert-true (> (coin-shares-quality context shares) 0))))
 
-        (test "accepted shares derive once and Q reuses validation reports"
+        (test "accepted shares derive once and body quality reuses reports"
           (let* ((shares (in-share-order (map valid-share-of '(0 1 2))))
                  (context (context-for shares))
                  (checked (coin-check-shares
@@ -2078,27 +1867,98 @@
                                (outs (list (cons %subsidy %burn))))
                   %subsidy 0 shares '(1) %burn)))))
 
-        (test "copying a producer and attaching shares cannot outrank it"
-          ;; The raw words authenticate different Q values, but the producer
-          ;; tuple is identical. The copy loses both before and after a child.
-          (let ((honest (word 24 50 51 0))
-                (copy (word 24 50 51 12)))
-            (assert-true (not (= honest copy)))
-            (assert-equal 0
-                          (coin-score-quality (coin-score-decode honest)))
-            (assert-equal 12
-                          (coin-score-quality (coin-score-decode copy)))
-            (assert-equal (coin-score-rank-word honest)
-                          (coin-score-rank-word copy))
-            (assert-equal 0 (coin-score-compare honest copy))
-            (assert-false (coin-replaces-tip? honest #f copy))
-            (assert-false (coin-replaces-tip? honest #t copy))))
+        (test "copying a producer and attaching shares cannot displace it"
+          (let* ((share (valid-share-of 2))
+                 (shares (list share))
+                 (context (context-for shares))
+                 (solution (string->bytes %sol-d))
+                 (honest-body
+                   (simple-payload (+ %puzzle-height 1) solution #u8()))
+                 (copy-body
+                   (payload (+ %puzzle-height 1) solution
+                            (coin-shares-encode shares)
+                            coin-empty-commits #u8()))
+                 (honest-checked (coin-check-coop honest-body context))
+                 (copy-checked (coin-check-coop copy-body context))
+                 (accepted (coin-result-value copy-checked))
+                 (contributions
+                   (map (lambda (item)
+                          (coin-share-quality context item))
+                        accepted))
+                 (par (puzzle-spec-par %spec))
+                 (solution-length (bytevector-length solution))
+                 (bits (coin-bits-encode %complexity solution-length))
+                 (honest-tx
+                   (coinbase-tx
+                     (coin-coinbase-payload-encode honest-body)
+                     (payout-outputs
+                       (coin-payout-plan %subsidy 0 '() '() #f))))
+                 (copy-tx
+                   (coinbase-tx
+                     (coin-coinbase-payload-encode copy-body)
+                     (payout-outputs
+                       (coin-payout-plan
+                         %subsidy 0 accepted contributions %burn))))
+                 (mine-header
+                   (lambda (tx)
+                     (let loop ((nonce 0))
+                       (let ((header
+                               (block-header
+                                 version: 5
+                                 previous-block: %zero32
+                                 merkle-root:
+                                   (merkle-root
+                                     (list (transaction-txid tx)))
+                                 time: 1
+                                 bits: bits
+                                 nonce: nonce)))
+                         (if (coin-lottery-valid?
+                               (block-header-work-value header)
+                               %complexity par solution-length)
+                             header
+                             (loop (+ nonce 1)))))))
+                 (honest-header (mine-header honest-tx))
+                 (copy-header (mine-header copy-tx)))
+            (assert-true (coin-ok? honest-checked))
+            (assert-true (coin-ok? copy-checked))
+            (assert-equal '() (coin-result-value honest-checked))
+            (assert-equal 1 (length accepted))
+            (assert-true (> (coin-quality contributions) 0))
+            (assert-equal (coin-quality contributions)
+                          (coin-shares-quality context accepted))
+            (assert-true
+              (coin-ok?
+                (coin-check-payout
+                  copy-tx %subsidy 0 accepted contributions %burn)))
+            (assert-equal bits (block-header-bits honest-header))
+            (assert-equal bits (block-header-bits copy-header))
+            (assert-true
+              (coin-lottery-valid?
+                (block-header-work-value honest-header)
+                %complexity par solution-length))
+            (assert-true
+              (coin-lottery-valid?
+                (block-header-work-value copy-header)
+                %complexity par solution-length))
+            (assert-true
+              (not (= (block-header-work-value honest-header)
+                      (block-header-work-value copy-header))))
+            (assert-equal
+              0 (coin-block-compare (+ %puzzle-height 1)
+                                    (+ %puzzle-height 1)))
+            (assert-false
+              (coin-better-block? (+ %puzzle-height 1)
+                                  (+ %puzzle-height 1)))))
 
-        (test "a thief cannot mine a sibling of the block he stole from"
-          ;; A reveal for puzzle P appears in a block at height P+1, so by
-          ;; the time it is readable, height P is already extended.
-          (assert-true (not (coin-replaces-tip? (word 25 50 51 0) #t
-                                                   (word 1 0 0 8))))))
+        (test "a revealed share can extend but never replace its parent"
+          ;; The reveal is readable only in P+1. At equal height the
+          ;; incumbent stays selected; the next child wins by height alone.
+          (assert-false
+            (coin-better-block? (+ %puzzle-height 1)
+                                (+ %puzzle-height 1)))
+          (assert-true
+            (coin-better-block? (+ %puzzle-height 2)
+                                (+ %puzzle-height 1)))))
 
       (test-group "commit-reveal round trip"
         (test "a commitment made at H opens exactly once at H+1"

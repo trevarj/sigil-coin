@@ -9,9 +9,15 @@
     "coin-check-shares",
     "coin-share-quality",
     "coin-quality",
-    "coin-score-rank-word",
-    "coin-score-compare",
-    "coin-replaces-tip?",
+    "coin-bits-encode",
+    "coin-bits-solution-length",
+    "coin-lottery-bonus",
+    "coin-lottery-multiplier",
+    "coin-lottery-target",
+    "coin-lottery-expected-rolls",
+    "coin-lottery-valid?",
+    "coin-block-compare",
+    "coin-mine-header",
     "coin-payout-plan",
     "coin-build-block",
     "coin-build-coop-block",
@@ -114,8 +120,8 @@
   },
   "personalized_shares": {
     "evaluated": 1024,
-    "available": 683,
-    "unavailable": 341,
+    "available": 705,
+    "unavailable": 319,
     "margin_milli": {
       "min": 17,
       "median": 18,
@@ -123,7 +129,7 @@
       "mean_floor": 17
     },
     "contribution_counts": {
-      "one": 683,
+      "one": 705,
       "two": 0,
       "three": 0,
       "four": 0
@@ -200,18 +206,18 @@
     },
     "candidate_pool": {
       "evaluated": 1024,
-      "available": 683,
-      "unavailable": 341
+      "available": 705,
+      "unavailable": 319
     },
     "matrix": {
       "rows": 21,
-      "legacy_quality_rule_would_replace_rows": 12,
-      "canonical_pre_child_replacements": 0,
-      "canonical_post_child_replacements": 0,
+      "quality_only_copy_advantage_rows": 12,
+      "first_seen_pre_child_replacements": 0,
+      "settled_post_child_replacements": 0,
       "original_solver_capture_permille_min": 1000,
       "settlement": "explicit accepted child"
     },
-    "scope": "frozen deterministic copy-and-attach experiment; legacy quality replacement is counterfactual"
+    "scope": "frozen deterministic copy-and-attach experiment under first-seen sibling selection"
   },
   "market": {
     "parameters": {
@@ -227,7 +233,10 @@
     "modeled_assumptions": [
       "transaction envelopes use modeled bytes and fees, not wire serialization",
       "arrival-order first-fit mirrors current CLI selection; no fee priority is added",
-      "same-height siblings remain eligible until an explicit child names the incumbent",
+      "candidate identities and timestamps are synthetic; no block header or program body is constructed",
+      "each candidate represents a qualifying block arrival; nonce search is outside this bodyless model",
+      "the first observed same-height candidate remains incumbent",
+      "an explicit child of the incumbent settles its sibling height",
       "the height-13 sentinel settles height 12",
       "fees do not enter current fork choice",
       "future-dater retries legally and never censors",
@@ -250,11 +259,11 @@
       "minted_subsidy": 960000000,
       "unminted_subsidy": 240000000,
       "future_drift_rejections": 12,
-      "fork_choice_losses": 48,
+      "first_seen_losses": 48,
       "settled_late_candidates": 0,
       "censorship_observations": 16,
-      "latency_mean_seconds": 3609,
-      "latency_max_seconds": 6950,
+      "latency_mean_seconds": 3492,
+      "latency_max_seconds": 6700,
       "utilization_mean_permille": 902,
       "mempool_final": 5,
       "pending_arrivals_final": 0
@@ -264,16 +273,16 @@
         "actor": "fair-eager",
         "archetype": "fair eager",
         "candidates": 12,
-        "wins": 0,
-        "rank_losses": 12,
+        "wins": 12,
+        "first_seen_losses": 0,
         "settled_late_losses": 0,
         "future_drift_rejections": 0,
-        "fees_collected": 0,
-        "scheduled_subsidy": 0,
-        "producer_payout": 0,
-        "total_coinbase": 0,
-        "minted_subsidy": 0,
-        "unminted_subsidy": 0,
+        "fees_collected": 93250,
+        "scheduled_subsidy": 1200000000,
+        "producer_payout": 960093250,
+        "total_coinbase": 960093250,
+        "minted_subsidy": 960000000,
+        "unminted_subsidy": 240000000,
         "censorship_observations": 0
       },
       {
@@ -281,7 +290,7 @@
         "archetype": "fair fee-waiting",
         "candidates": 12,
         "wins": 0,
-        "rank_losses": 12,
+        "first_seen_losses": 12,
         "settled_late_losses": 0,
         "future_drift_rejections": 0,
         "fees_collected": 0,
@@ -296,16 +305,16 @@
         "actor": "strong-golfer",
         "archetype": "strong golfer",
         "candidates": 12,
-        "wins": 12,
-        "rank_losses": 0,
+        "wins": 0,
+        "first_seen_losses": 12,
         "settled_late_losses": 0,
         "future_drift_rejections": 0,
-        "fees_collected": 93250,
-        "scheduled_subsidy": 1200000000,
-        "producer_payout": 960093250,
-        "total_coinbase": 960093250,
-        "minted_subsidy": 960000000,
-        "unminted_subsidy": 240000000,
+        "fees_collected": 0,
+        "scheduled_subsidy": 0,
+        "producer_payout": 0,
+        "total_coinbase": 0,
+        "minted_subsidy": 0,
+        "unminted_subsidy": 0,
         "censorship_observations": 0
       },
       {
@@ -313,7 +322,7 @@
         "archetype": "future dater",
         "candidates": 12,
         "wins": 0,
-        "rank_losses": 12,
+        "first_seen_losses": 12,
         "settled_late_losses": 0,
         "future_drift_rejections": 12,
         "fees_collected": 0,
@@ -329,7 +338,7 @@
         "archetype": "urgent-transaction censor",
         "candidates": 12,
         "wins": 0,
-        "rank_losses": 12,
+        "first_seen_losses": 12,
         "settled_late_losses": 0,
         "future_drift_rejections": 0,
         "fees_collected": 0,
@@ -349,8 +358,8 @@
         "confirmed": 12,
         "outstanding": 0,
         "fees_paid": 9600,
-        "latency_mean_seconds": 3420,
-        "latency_max_seconds": 6950,
+        "latency_mean_seconds": 3375,
+        "latency_max_seconds": 6700,
         "censorship_observations": 0
       },
       {
@@ -360,8 +369,8 @@
         "confirmed": 11,
         "outstanding": 1,
         "fees_paid": 66000,
-        "latency_mean_seconds": 1931,
-        "latency_max_seconds": 4350,
+        "latency_mean_seconds": 1772,
+        "latency_max_seconds": 4200,
         "censorship_observations": 16
       },
       {
@@ -371,8 +380,8 @@
         "confirmed": 14,
         "outstanding": 2,
         "fees_paid": 16800,
-        "latency_mean_seconds": 3332,
-        "latency_max_seconds": 5650,
+        "latency_mean_seconds": 3064,
+        "latency_max_seconds": 4500,
         "censorship_observations": 0
       },
       {
@@ -382,8 +391,8 @@
         "confirmed": 34,
         "outstanding": 2,
         "fees_paid": 850,
-        "latency_mean_seconds": 4333,
-        "latency_max_seconds": 6750,
+        "latency_mean_seconds": 4267,
+        "latency_max_seconds": 6500,
         "censorship_observations": 0
       }
     ],

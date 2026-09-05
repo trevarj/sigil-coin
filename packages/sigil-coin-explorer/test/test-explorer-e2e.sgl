@@ -164,24 +164,35 @@
                     %script-a
                     (+ coin-regtest-genesis-time %spacing)))
 (define %share-context (coin-parent-context %prototype-parent))
-(define (share-source-for secret-byte)
-  (let* ((secret (make-bytevector 32 secret-byte))
-         (pubkey (secp256k1-pubkey-create secret))
-         (source
-           (semantic-share-source
-             (coin-share-puzzle %share-context pubkey))))
-    (unless source
-      (error "test-explorer-e2e: key has no semantic share candidate"))
-    source))
+(define (share-fixtures)
+  (let loop ((secret-byte 1) (out '()))
+    (cond
+      ((= 2 (length out))
+       (sort-bytes out coin-share-pubkey))
+      ((> secret-byte 199)
+       (error "test-explorer-e2e: fewer than two semantic share fixtures"))
+      (else
+        (let* ((secret (make-bytevector 32 secret-byte))
+               (pubkey (secp256k1-pubkey-create secret))
+               (source
+                 (semantic-share-source
+                   (coin-share-puzzle %share-context pubkey)))
+               (share
+                 (and source
+                      (signed-share
+                        secret-byte source %share-context
+                        (if (null? out)
+                            %hostile-blind
+                            (make-bytevector 32 106))))))
+          (loop
+            (+ secret-byte 1)
+            (if (and share
+                     (not (member (coin-share-solution share)
+                                  (map coin-share-solution out))))
+                (cons share out)
+                out)))))))
 (define %shares
-  (if %native-secp256k1?
-      (sort-bytes
-        (list (signed-share 1 (share-source-for 1) %share-context
-                            %hostile-blind)
-              (signed-share 6 (share-source-for 6) %share-context
-                            (make-bytevector 32 106)))
-        coin-share-pubkey)
-      '()))
+  (if %native-secp256k1? (share-fixtures) '()))
 (define %commitments
   (sort-bytes (map (lambda (share)
                      (coin-share-commitment %share-context share))
@@ -198,21 +209,13 @@
                     '()
                     0
                     %commitments))
-(define %hostile-producer-solution
-  (string-append
-    "(if #f \"<script>producer</script>\" "
-    (puzzle-spec-hidden-source
-      (coin-puzzle-for (block-header-hash (block-header-field %producer-block))
-                       2
-                       coin-genesis-complexity))
-    ")"))
 (define %coop-block
   (and %native-secp256k1?
        (coin-build-coop-block
          %producer-block
          2
          coin-genesis-complexity
-         %hostile-producer-solution
+         #f
          %shares
          %hostile-graffiti
          %script-b
@@ -265,6 +268,26 @@
     (assert-equal 2
                   (node-status-snapshot-validated-block-count
                     (car (cdr (cdr %node-built))))))
+
+  (test "canonical headers surface their qualifying lottery"
+    (with-store
+      (lambda (store)
+        (let* ((b (explorer-block-by-height store 2))
+               (header (block-header-field %coop-block))
+               (complexity (explorer-block-complexity b))
+               (par (explorer-block-par b))
+               (length (explorer-block-claimed-length b)))
+          (assert-equal (explorer-block-id b)
+                        (explorer-block-lottery-roll b))
+          (assert-equal (explorer-block-solution-length b) length)
+          (assert-equal (block-header-nonce header)
+                        (explorer-block-nonce b))
+          (assert-equal (coin-lottery-target complexity par length)
+                        (explorer-block-lottery-target b))
+          (assert-true
+            (coin-lottery-valid?
+              (block-header-work-value header)
+              complexity par length))))))
 
   (test "summary reports actual solo plus cooperative issuance"
     (let ((issued (+ (coinbase-total %producer-block)
@@ -343,7 +366,7 @@
                   (assert-equal (puzzle-report-cells report)
                                 (explorer-share-cells share))
                   (loop (cdr shown) (cdr raw)))))
-            (assert-equal quality (explorer-block-score-quality b))
+            (assert-equal quality (explorer-block-share-quality b))
             (assert-equal '(producer share share carrier)
                           (map explorer-output-role outputs))
             (assert-equal (coin-block-reward 2)
@@ -363,7 +386,7 @@
     (let ((page (body-of "/block/2")))
       (assert-equal 200 (status-of "/block/2"))
       (assert-true (has? page "<h2>Co-op shares</h2>"))
-      (assert-true (has? page "aggregate Q"))
+      (assert-true (has? page "aggregate share quality"))
       (assert-true (has? page "carrier (the previous producer)"))
       (assert-true (has? page "<h2>Coinbase payout</h2>"))
       (assert-true (has? page "actual coinbase total"))
@@ -389,29 +412,30 @@
     (let* ((dir (fresh-dir))
            (n (node-open sigilcoin-regtest-chain dir))
            (parent-header (block-header-field %producer-block))
-           (solution
-             (puzzle-spec-hidden-source
-               (coin-puzzle-for (block-header-hash parent-header)
-                                2
-                                coin-genesis-complexity)))
            (solo-sibling
              (coin-build-block
                parent-header
                2
                coin-genesis-complexity
-               solution
-               "/solo-reorg/ shorter"
+               #f
+               "/solo-reorg/ sibling"
                %script-b
                (block-header-time (block-header-field %coop-block))))
+           (solo-child
+             (coin-build-block
+               (block-header-field solo-sibling)
+               3
+               coin-genesis-complexity
+               #f
+               "/solo-reorg/ child"
+               %script-b
+               (+ (block-header-time (block-header-field solo-sibling))
+                  %spacing)))
            (before (+ (coinbase-total %producer-block)
                       (coinbase-total %coop-block)))
            (after (+ (coinbase-total %producer-block)
-                     (coinbase-total solo-sibling))))
-      (assert-equal
-        -1
-        (coin-score-compare
-          (block-header-nonce (block-header-field solo-sibling))
-          (block-header-nonce (block-header-field %coop-block))))
+                     (coinbase-total solo-sibling)
+                     (coinbase-total solo-child))))
       (assert-equal 1 (submit-block n %producer-block))
       (assert-equal 1 (submit-block n %coop-block))
       (let ((store (explorer-open sigilcoin-regtest-chain dir)))
@@ -419,36 +443,36 @@
                       (explorer-summary-supply
                         (explorer-chain-summary store)))
         (explorer-close store))
-      ;; The shorter producer solution replaces the unsettled cooperative
-      ;; sibling; only its solo 80% output remains active at height 2.
-      (assert-equal 1 (submit-block n solo-sibling))
-      (assert-equal (block-header-hash (block-header-field solo-sibling))
+      ;; The first-seen sibling remains the active branch until the other
+      ;; branch becomes taller.
+      (assert-equal 0 (submit-block n solo-sibling))
+      (assert-equal 2 (submit-block n solo-child))
+      (assert-equal (block-header-hash (block-header-field solo-child))
                     (block-header-hash (node-best-header n)))
       (let ((store (explorer-open sigilcoin-regtest-chain dir)))
         (let ((summary (explorer-chain-summary store)))
           (assert-equal after (explorer-summary-supply summary))
           (assert-true
             (< (explorer-summary-supply summary)
-               (coin-cumulative-supply 2)))
+               (coin-cumulative-supply 3)))
           (assert-equal coin-max-supply
                         (explorer-summary-max-supply summary)))
         (explorer-close store))
-      (assert-true (< after before))
+      (assert-true (> after before))
       (assert-equal (quotient (* 4 (coin-block-reward 2)) 5)
                     (coinbase-total solo-sibling))
+      (assert-equal (quotient (* 4 (coin-block-reward 3)) 5)
+                    (coinbase-total solo-child))
       (node-close n)
       (remove-tree dir))))
 
 (test-group "consensus-valid hostile block stays inert"
-  (test "hostile share, program, author, and UTF-8 reached validated block"
+  (test "hostile share, author, and UTF-8 reached validated block"
     (let* ((payload-result (coin-block-coinbase-payload %coop-block))
            (payload (coin-result-value payload-result))
            (decoded (coin-shares-decode (coin-coinbase-payload-shares payload))))
       (assert-true (coin-ok? payload-result))
       (assert-true (coin-ok? decoded))
-      (assert-true
-        (has? (utf8->string (coin-coinbase-payload-solution payload))
-              "<script>producer</script>"))
       (assert-true (member %hostile-blind
                            (map coin-share-blind (coin-result-value decoded))))
       (assert-equal %hostile-graffiti
@@ -475,8 +499,6 @@
       (assert-equal %hostile-tag (dict-get value "author"))
       (assert-true (has? (dict-get value "graffiti")
                          "<script>alert(1)</script>"))
-      (assert-true (has? (dict-get value "solution")
-                         "<script>producer</script>"))
       (assert-true (member (hex-encode %hostile-blind)
                            (map (lambda (share) (dict-get share "blind"))
                                 shares))))))

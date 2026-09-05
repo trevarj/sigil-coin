@@ -364,6 +364,9 @@
           (and (= (puzzle-spec-par spec)
                   (min (string-length (puzzle-spec-hidden-source spec))
                        (string-length (puzzle-spec-table-solution spec))))
+               (= (puzzle-spec-par spec)
+                  (string-length (puzzle-spec-par-solution spec)))
+               (solves? spec (puzzle-spec-par-solution spec))
                (>= (puzzle-spec-par spec) puzzle-min-par-bytes)))))
     ;; The hidden function is what par tracks in practice; the table is the
     ;; ceiling nobody would submit.

@@ -248,9 +248,6 @@
       ;; branch from the height-only scheduled subsidy cap.
       (let* ((height (node-status-snapshot-best-block-height status))
              (next (+ height 1)))
-        (println "tip-solution-bytes: ~a"
-                 (coin-solution-bytes-of
-                   (node-status-snapshot-best-work status)))
         (println "next-height: ~a" next)
         (println "next-reward: ~a SGL"
                  (cli-daviwils->sgl (coin-block-reward next)))
@@ -261,15 +258,6 @@
         (println "max-supply: ~a SGL" (cli-daviwils->sgl coin-max-supply)))
       status)
 
-    ;; Recover the projected rank word from the persisted saving. Only its
-    ;; producer solution length is decoded; authenticated `Q` was deliberately
-    ;; erased before this rank was saved and cannot be inferred here.
-    (define (coin-solution-bytes-of work)
-      (let* ((saving (coin-rank-tip-saving work))
-             (rank-word (- coin-max-score-word saving)))
-        (if (coin-score-valid? rank-word)
-            (coin-score-length (coin-score-decode rank-word))
-            0)))
 
     ;;; Print the node's view of the chain.
     ;;;

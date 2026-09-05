@@ -1,16 +1,15 @@
 ;;; The explorer's rendering, driven against a real chain on disk.
 ;;;
-;;; This file opens a real regtest database, then writes headers and
-;;; bodies into it exactly as a synced node would have — version 5 headers,
-;;; `bits = 0x207F0000 | C`, a `nonce` that is the score word recomputed
-;;; from the body, five-push coinbases, and contribution-aware coinbase
-;;; outputs. Everything the explorer then reads back is real bytes off a
+;;; This file opens a real regtest database, then writes headers and bodies
+;;; into it exactly as a synced node would have: version 5 headers, bits that
+;;; encode both C and L, a uint32 nonce whose block-ID roll qualifies against
+;;; the consensus lottery target, five-push coinbases, and contribution-aware
+;;; coinbase outputs. Everything the explorer reads back is real bytes off a
 ;;; real SQLite file.
 ;;;
-;;; The puzzles, solutions, score words and margins are the CONSENSUS
-;;; package's own — `coin-puzzle-for`, `puzzle-spec-*`, `coin-score-*`,
-;;; `coin-margin` — so every assertion compares the explorer against the
-;;; thing it claims to be showing rather than against a copy of itself.
+;;; Puzzles, lottery odds, solution lengths and margins come from the
+;;; CONSENSUS package's own APIs, so every assertion compares the explorer
+;;; against the rules it claims to present rather than a local formula.
 ;;;
 ;;; Two blocks are hostile on purpose:
 ;;;
@@ -65,6 +64,7 @@
 (define %zero32 (make-bytevector 32 0))
 (define %coinbase-index #xffffffff)
 (define %sequence-final #xffffffff)
+(define %max-nonce #xffffffff)
 
 ;; An author tag that is itself an injection, a `<script>` in the body, then
 ;; a NUL, an ESC and two ill-formed bytes. A naive `utf8->string` would pass
@@ -84,6 +84,43 @@
 
 (define (as-bytes value)
   (if (bytevector? value) value (string->utf8 value)))
+
+;; Finalize every non-nonce header field once, then search the uint32 nonce
+;; space exactly as a producer does.
+(define (qualifying-header template height)
+  (let* ((complexity-result
+           (coin-bits-decode (block-header-bits template)))
+         (length-result
+           (coin-bits-solution-length (block-header-bits template))))
+    (unless (and (coin-ok? complexity-result) (coin-ok? length-result))
+      (error "qualifying-header: malformed bits"))
+    (let* ((complexity (coin-result-value complexity-result))
+           (length (coin-result-value length-result))
+           (par
+             (puzzle-spec-par
+               (coin-puzzle-for
+                 (block-header-previous-block template)
+                 height
+                 complexity))))
+      (let loop ((nonce 0))
+        (if (> nonce %max-nonce)
+            (error "qualifying-header: nonce space exhausted")
+            (let ((candidate
+                    (block-header
+                      version: (block-header-version template)
+                      previous-block:
+                        (block-header-previous-block template)
+                      merkle-root: (block-header-merkle-root template)
+                      time: (block-header-time template)
+                      bits: (block-header-bits template)
+                      nonce: nonce)))
+              (if (coin-lottery-valid?
+                    (block-header-work-value candidate)
+                    complexity
+                    par
+                    length)
+                  candidate
+                  (loop (+ nonce 1)))))))))
 
 ;; A share's pubkey. Compressed-looking and, with an ascending `i`, in the
 ;; strictly ascending order §6.2 requires.
@@ -120,30 +157,19 @@
                          (map (lambda (share) 1) shares)
                          carrier-script)))
 
-;; Aggregate only successful pure previews. These deliberately malformed
-;; synthetic shares make the header claim zero Q.
-(define (preview-quality context shares)
-  (let loop ((xs shares) (contributions '()))
-    (if (null? xs)
-        (coin-quality (reverse contributions))
-        (let ((preview (coin-check-share-solution context (car xs))))
-          (if (coin-failed? preview)
-              0
-              (loop (cdr xs)
-                    (cons (list-ref (coin-result-value preview) 2)
-                          contributions)))))))
-
-;; Build one  block. `solution` is the producer's own program for THIS
+;; Build one block. `solution` is the producer's own program for THIS
 ;; height's puzzle; the shares solve the PARENT's.
 (define (build-block parent-header height complexity solution shares
                         commits graffiti producer-script carrier-script)
   (let* ((parent-hash (block-header-hash parent-header))
+         (solution-bytes (as-bytes solution))
          (spec (coin-puzzle-for parent-hash height complexity))
-         (report (puzzle-run-examples solution (puzzle-spec-examples spec)))
+         (report
+           (puzzle-run-examples solution-bytes (puzzle-spec-examples spec)))
          (subsidy (coin-block-reward height))
          (payload (coin-coinbase-payload
                     height: height
-                    solution: (as-bytes solution)
+                    solution: solution-bytes
                     shares: (coin-shares-encode shares)
                     commits: (coin-commits-encode commits)
                     graffiti: (as-bytes graffiti)))
@@ -160,50 +186,42 @@
                      outputs: (payout-outputs subsidy shares producer-script
                                               carrier-script)
                      lock-time: 0))
-         (transactions (list coinbase)))
+         (transactions (list coinbase))
+         (template
+           (block-header
+             version: 5
+             previous-block: parent-hash
+             merkle-root: (merkle-root (map transaction-txid transactions))
+             time: (+ (block-header-time parent-header) 1)
+             bits: (coin-bits-encode
+                     complexity (bytevector-length solution-bytes))
+             nonce: 0)))
     (unless (puzzle-report-ok? report)
       (error (string-append "build-block: solution does not solve height "
                             (number->string height))))
     (block
-      header-field:
-        (block-header
-          version: 5
-          previous-block: parent-hash
-          merkle-root: (merkle-root (map transaction-txid transactions))
-          time: (+ (block-header-time parent-header) 1)
-          bits: (coin-bits-encode complexity)
-          ;; §5.5: the header's claim is recomputed from the body.
-          nonce: (coin-score-encode
-                   (bytevector-length (as-bytes solution))
-                   (puzzle-report-cells report)
-                   (puzzle-report-steps report)
-                   (if (null? shares)
-                       0
-                       (let* ((puzzle-height (- height 1))
-                              (parent-prev
-                                (block-header-previous-block parent-header))
-                              (parent-complexity
-                                (coin-result-value
-                                  (coin-bits-decode
-                                    (block-header-bits parent-header))))
-                              (context
-                                (coin-coop-context
-                                  parent-prev-hash: parent-prev
-                                  puzzle-height: puzzle-height
-                                  complexity: parent-complexity
-                                  spec: (coin-puzzle-for
-                                          parent-prev puzzle-height
-                                          parent-complexity)
-                                  commits: '())))
-                         (preview-quality context shares)))))
+      header-field: (qualifying-header template height)
       transactions: transactions)))
 
-;; Preserve a block's payload and score claim while replacing its single
-;; coinbase value. This constructs deliberately invalid issuance for explorer
-;; failure-display coverage; it is never submitted to a node.
-(define (with-solo-coinbase-value b value)
+;; Recompute the merkle root and lottery nonce after a synthetic body change.
+(define (with-transactions b transactions height)
   (let* ((header (block-header-field b))
-         (coinbase (car (block-transactions b)))
+         (template
+           (block-header
+             version: (block-header-version header)
+             previous-block: (block-header-previous-block header)
+             merkle-root: (merkle-root (map transaction-txid transactions))
+             time: (block-header-time header)
+             bits: (block-header-bits header)
+             nonce: 0)))
+    (block
+      header-field: (qualifying-header template height)
+      transactions: transactions)))
+
+;; Replace the solo coinbase value for failure-display coverage. The resulting
+;; issuance is deliberately invalid and is never submitted to a node.
+(define (with-solo-coinbase-value b value height)
+  (let* ((coinbase (car (block-transactions b)))
          (old-output (car (transaction-outputs coinbase)))
          (replacement
            (transaction
@@ -213,32 +231,12 @@
                         (txout value: value
                                script-pubkey:
                                  (txout-script-pubkey old-output)))
-             lock-time: (transaction-lock-time coinbase)))
-         (transactions (list replacement)))
-    (block
-      header-field:
-        (block-header
-          version: (block-header-version header)
-          previous-block: (block-header-previous-block header)
-          merkle-root: (merkle-root (map transaction-txid transactions))
-          time: (block-header-time header)
-          bits: (block-header-bits header)
-          nonce: (block-header-nonce header))
-      transactions: transactions)))
+             lock-time: (transaction-lock-time coinbase))))
+    (with-transactions b (list replacement) height)))
 
-(define (with-extra-transactions b extra)
-  (let* ((header (block-header-field b))
-         (transactions (append (block-transactions b) extra)))
-    (block
-      header-field:
-        (block-header
-          version: (block-header-version header)
-          previous-block: (block-header-previous-block header)
-          merkle-root: (merkle-root (map transaction-txid transactions))
-          time: (block-header-time header)
-          bits: (block-header-bits header)
-          nonce: (block-header-nonce header))
-      transactions: transactions)))
+(define (with-extra-transactions b extra height)
+  (with-transactions
+    b (append (block-transactions b) extra) height))
 
 (define (fixture-transfer funding)
   (let* ((value (txout-value (car (transaction-outputs funding))))
@@ -341,14 +339,10 @@
               "INSERT OR REPLACE INTO metadata(key, value) VALUES (?, ?)"
               "active-chain-tip-height" (number->string height)))
 
-;; The generator's own hidden function, which is always a legal solution and
-;; is usually shorter than the table escape.
-(define (hidden-solution parent-hash height complexity)
-  (puzzle-spec-hidden-source
-    (coin-puzzle-for parent-hash height complexity)))
+;; The generated witness exactly at the producer validity ceiling.
 
-(define (table-solution parent-hash height complexity)
-  (puzzle-spec-table-solution
+(define (par-solution parent-hash height complexity)
+  (puzzle-spec-par-solution
     (coin-puzzle-for parent-hash height complexity)))
 
 (define (coop-context parent-header puzzle-height complexity)
@@ -462,13 +456,8 @@
                                      ((= 0 (modulo height 5))
                                       "/fable-5/ reviewed it")
                                      (else "no tag here")))
-                     ;; A couple of heights publish the long table escape
-                     ;; instead, so the margin window is not constant.
-                     (solution (if (= 0 (modulo height 7))
-                                   (table-solution parent-hash height
-                                                   complexity)
-                                   (hidden-solution parent-hash height
-                                                    complexity)))
+                     (solution
+                       (par-solution parent-hash height complexity))
                      (base (build-block
                              parent height complexity solution
                              shares commits graffiti
@@ -481,7 +470,8 @@
                      (remember-transfer
                        (when transfer (set! %transfer transfer)))
                      (b (if transfer
-                            (with-extra-transactions base (list transfer))
+                            (with-extra-transactions
+                              base (list transfer) height)
                             base)))
                 (set! %blocks (cons (cons height b) %blocks))
                 (loop (+ height 1)
@@ -513,6 +503,12 @@
 
 (define (has? haystack needle)
   (string-contains? haystack needle))
+
+(define (canonical-target? text)
+  (and (string? text)
+       (= 64 (string-length text))
+       (guard (e (#t #f))
+         (string=? text (hex-encode (hex-decode text))))))
 
 (define (spec-at height)
   (coin-puzzle-for (parent-hash-at height) height (complexity-at height)))
@@ -562,13 +558,24 @@
               (< issued (coin-cumulative-supply %tip-height))))))
       (assert-equal issued (dict-get (json-of "/api/summary") "supply"))))
 
-  (test "every block declares consensus "
+  (test "every recent block exposes its qualifying lottery claim"
     (with-store
       (lambda (store)
         (for-each
           (lambda (b)
-            (assert-true (number? (explorer-block-complexity b)))
-            (assert-true (number? (explorer-block-score-word b))))
+            (let ((header
+                    (block-header-field
+                      (block-at (explorer-block-height b)))))
+              (assert-true (number? (explorer-block-complexity b)))
+              (assert-true (number? (explorer-block-nonce b)))
+              (assert-equal (explorer-block-id b)
+                            (explorer-block-lottery-roll b))
+              (assert-true
+                (coin-lottery-valid?
+                  (block-header-work-value header)
+                  (explorer-block-complexity b)
+                  (explorer-block-par b)
+                  (explorer-block-claimed-length b)))))
           (explorer-recent-blocks store 5)))))
 
   (test "the hostile blind-bearing consensus shares reached the chain"
@@ -626,7 +633,7 @@
                   (explorer-address->script-for-chain
                     sigilcoin-main-chain %testnet-miner-a)))
 
-  (test "testnet summary, address, block, PBE, Q, co-op, and difficulty routes answer read-only"
+  (test "testnet summary, address, lottery, co-op, and difficulty routes answer read-only"
     (let* ((dir (fresh-dir))
            (n (node-open sigilcoin-testnet-chain dir))
            (genesis (node-best-header n)))
@@ -636,12 +643,12 @@
              (complexity 128)
              (b1 (build-block
                    genesis 1 complexity
-                   (hidden-solution (block-header-hash genesis) 1 complexity)
+                   (par-solution (block-header-hash genesis) 1 complexity)
                    '() '() "testnet producer" %script-a %script-a))
              (shares (personalized-shares genesis 1 complexity))
              (b2 (build-block
                    (block-header-field b1) 2 complexity
-                   (hidden-solution (block-header-hash (block-header-field b1))
+                   (par-solution (block-header-hash (block-header-field b1))
                                     2 complexity)
                    shares '() %hostile-graffiti %script-a %script-a)))
         (store-block! db b1 1)
@@ -676,8 +683,13 @@
             (assert-equal "sigilcoin-testnet" (dict-get summary "chain"))
             (assert-equal 3 (dict-get block "share_count"))
             (assert-true (number? (dict-get block "complexity")))
-            (assert-true (number? (dict-get (dict-get block "score")
-                                            "quality")))
+            (let ((lottery (dict-get block "lottery")))
+              (assert-equal (dict-get block "id")
+                            (dict-get lottery "roll"))
+              (assert-true (number? (dict-get lottery "nonce")))
+              (assert-equal 64
+                            (string-length (dict-get lottery "target"))))
+            (assert-equal 'null (dict-get block "share_quality"))
             (assert-true (has? page "<h2>Puzzle</h2>"))
             (assert-true (has? page "<h2>Co-op shares</h2>"))
             (assert-true (has? page %testnet-miner-a))
@@ -821,7 +833,7 @@
       (let ((db (sqlite-open (explorer-db-path sigilcoin-regtest-chain dir))))
         (let* ((complexity 2048)
                (b (build-block genesis 1 complexity
-                                  (hidden-solution
+                                  (par-solution
                                     (block-header-hash genesis) 1 complexity)
                                   '() '() "/opus-5/ tier two"
                                   %script-a %script-a))
@@ -861,34 +873,49 @@
                                             b))))))))))))
 
 ;; ============================================================
-;; Score rendering
+;; Lottery rendering
 ;; ============================================================
 
-(test-group "score rendering"
-  (test "the decomposition is the header's own"
+(test-group "lottery rendering"
+  (test "the fields are consensus derivations of the header claim"
     (with-store
       (lambda (store)
         (for-each
           (lambda (height)
             (let* ((b (explorer-block-by-height store height))
                    (header (block-header-field (block-at height)))
-                   (score (coin-score-decode (block-header-nonce header))))
+                   (complexity (explorer-block-complexity b))
+                   (par (explorer-block-par b))
+                   (length (coin-result-value
+                             (coin-bits-solution-length
+                               (block-header-bits header)))))
               (assert-equal (block-header-nonce header)
-                            (explorer-block-score-word b))
-              (assert-equal (coin-score-length score)
-                            (explorer-block-score-length b))
-              (assert-equal (coin-score-memory score)
-                            (explorer-block-score-memory b))
-              (assert-equal (coin-score-steps score)
-                            (explorer-block-score-steps b))
-              (assert-equal (coin-score-quality score)
-                            (explorer-block-score-quality b))
-              ;; The header's L is the solution actually published.
+                            (explorer-block-nonce b))
+              (assert-equal length (explorer-block-claimed-length b))
+              (assert-equal (block-header-id header)
+                            (explorer-block-lottery-roll b))
+              (assert-equal (block-header-work-value header)
+                            (string->number
+                              (explorer-block-lottery-roll b) 16))
+              (assert-equal (coin-lottery-target complexity par length)
+                            (explorer-block-lottery-target b))
+              (assert-equal (coin-lottery-bonus par length)
+                            (explorer-block-lottery-bonus b))
+              (assert-equal (coin-lottery-multiplier par length)
+                            (explorer-block-lottery-multiplier b))
+              (assert-equal
+                (coin-lottery-expected-rolls complexity par length)
+                (explorer-block-lottery-expected-rolls b))
+              (assert-true
+                (coin-lottery-valid?
+                  (block-header-work-value header)
+                  complexity par length))
+              ;; A downloaded validated body proves the bits claim.
               (assert-equal (explorer-block-solution-length b)
-                            (explorer-block-score-length b))))
+                            (explorer-block-claimed-length b))))
           (list 3 7 %coop-height %tip-height)))))
 
-  (test "length is shown against par, in bytes and as a margin"
+  (test "length remains body-derived and is shown against par"
     (with-store
       (lambda (store)
         (let ((b (explorer-block-by-height store 7)))
@@ -896,27 +923,25 @@
                            (explorer-block-solution-length b))
                         (explorer-block-under-par b))
           (assert-equal (coin-margin (explorer-block-par b)
-                                        (explorer-block-solution-length b))
-                        (explorer-block-margin b))))))
+                                     (explorer-block-solution-length b))
+                        (explorer-block-margin b))
+          (assert-equal 4096
+                        (explorer-block-lottery-expected-rolls b))))))
 
-  (test "the block page prints every score field"
+  (test "the block page presents qualification without sibling ranking"
     (let ((page (body-of "/block/7")))
-      (assert-true (has? page "<h2>Producer score</h2>"))
-      (assert-true (has? page "length L"))
-      (assert-true (has? page "memory MB"))
-      (assert-true (has? page "steps SB"))
-      (assert-true (has? page "aggregate Q"))
-      (assert-true (has? page "authenticated; rank-inert"))
-      (assert-false (has? page "breaks ties"))
-      (assert-true (has? page "score word W"))
-      (assert-true (has? page (explorer-escape
-                                (explorer-under-par-text
-                                  (with-store
-                                    (lambda (store)
-                                      (explorer-block-under-par
-                                        (explorer-block-by-height store
-                                                                  7))))))))))
-
+      (assert-true (has? page "<h2>Nonce lottery</h2>"))
+      (assert-true (has? page "winning roll (block ID)"))
+      (assert-true (has? page "target"))
+      (assert-true (has? page "header nonce"))
+      (assert-true (has? page "claimed length L"))
+      (assert-true (has? page "savings bonus"))
+      (assert-true (has? page "odds multiplier"))
+      (assert-true (has? page "expected rolls"))
+      (assert-true (has? page "qualifying"))
+      (assert-true (has? page "do not rank same-height siblings"))
+      (assert-false (has? page "deterministic"))
+      (assert-false (has? page "Producer score"))))
   (test "a margin reads as a signed percentage of par"
     (assert-equal "+10.0% (under par)" (explorer-margin-text 100))
     (assert-equal "-2.3% (over par)" (explorer-margin-text -23))
@@ -985,7 +1010,7 @@
                   ;; Pure preview must not grant verified-cache provenance.
                   (assert-error (coin-share-quality context raw-share))
                   (loop (cdr xs) (cdr raw))))))
-          (assert-equal 0 (explorer-block-score-quality b))
+          (assert-equal #f (explorer-block-share-quality b))
           ;; The three programs are byte-wise distinct, as §6.4 requires.
           (assert-true (not (equal? (explorer-share-solution
                                       (list-ref shares 0))
@@ -1064,11 +1089,11 @@
            (complexity coin-genesis-complexity))
       (node-close n)
       (let* ((solution
-               (hidden-solution (block-header-hash genesis) 1 complexity))
+               (par-solution (block-header-hash genesis) 1 complexity))
              (valid
                (build-block genesis 1 complexity solution '() '()
                             "negative fee fixture" %script-a %script-a))
-             (under-minted (with-solo-coinbase-value valid 0))
+             (under-minted (with-solo-coinbase-value valid 0 1))
              (db (sqlite-open
                    (explorer-db-path sigilcoin-regtest-chain dir)))
              (hash (store-block! db under-minted 1)))
@@ -1088,7 +1113,7 @@
                                         (number->string %coop-height)))))
       (assert-true (has? page "<h2>Co-op shares</h2>"))
       (assert-true (has? page "personal par"))
-      (assert-true (has? page "aggregate Q"))
+      (assert-true (has? page "aggregate share quality"))
       (assert-true (has? page "blind"))
       (assert-true (has? page "<h2>Coinbase payout</h2>"))
       (assert-true (has? page "actual coinbase total"))
@@ -1494,17 +1519,32 @@
                         (dict-get (dict-get value "constraint") "text"))
           (assert-equal (explorer-block-k b) (dict-get value "k"))
           (assert-equal (explorer-block-margin b) (dict-get value "margin"))
-          (let ((score (dict-get value "score")))
-            (assert-equal (explorer-block-score-word b)
-                          (dict-get score "word"))
-            (assert-equal (explorer-block-score-length b)
-                          (dict-get score "length"))
-            (assert-equal (explorer-block-score-memory b)
-                          (dict-get score "memory"))
-            (assert-equal (explorer-block-score-steps b)
-                          (dict-get score "steps"))
-            (assert-equal (explorer-block-score-quality b)
-                          (dict-get score "quality")))
+          (let* ((lottery (dict-get value "lottery"))
+                 (target (dict-get lottery "target")))
+            (assert-equal (explorer-block-nonce b)
+                          (dict-get lottery "nonce"))
+            (assert-equal (explorer-block-claimed-length b)
+                          (dict-get lottery "claimed_length"))
+            (assert-equal (explorer-block-id b)
+                          (dict-get lottery "roll"))
+            (assert-true (canonical-target? target))
+            (assert-equal (explorer-block-lottery-target b)
+                          (string->number target 16))
+            (assert-equal (explorer-block-lottery-bonus b)
+                          (dict-get lottery "bonus"))
+            (assert-equal (explorer-block-lottery-multiplier b)
+                          (dict-get lottery "multiplier"))
+            (assert-equal (explorer-block-lottery-expected-rolls b)
+                          (dict-get lottery "expected_rolls")))
+          (assert-equal
+            (if (number? (explorer-block-share-quality b))
+                (explorer-block-share-quality b)
+                'null)
+            (dict-get value "share_quality"))
+          (assert-equal (dict-get value "solution_bytes")
+                        (dict-get (dict-get value "lottery")
+                                  "claimed_length"))
+          (assert-false (has? (explorer-block-json b) "\"score\""))
           (assert-equal (explorer-block-share-count b)
                         (dict-get value "share_count"))
           (assert-equal (explorer-block-total-output b)
@@ -1620,7 +1660,7 @@
       (let* ((db (sqlite-open (explorer-db-path sigilcoin-regtest-chain dir)))
              (complexity 128)
              (b (build-block genesis 1 complexity
-                                (hidden-solution (block-header-hash genesis)
+                                (par-solution (block-header-hash genesis)
                                                  1 complexity)
                                 '() '() "/opus-5/ pending"
                                 %script-a %script-a))
@@ -1633,22 +1673,64 @@
             (assert-equal 1 (explorer-block-height pending))
             (assert-equal 'body-not-downloaded
                           (explorer-block-problem pending))
-            ;; The header alone carries C and the score word.
-            (assert-equal complexity (explorer-block-complexity pending))
-            (assert-equal (block-header-nonce header)
-                          (explorer-block-score-word pending))
-            (assert-equal (coin-score-length
-                            (coin-score-decode (block-header-nonce header)))
-                          (explorer-block-score-length pending))
-            ;; And nothing from the body is invented.
+            ;; The header alone carries C, claimed L, nonce and lottery odds.
+            (let* ((length
+                     (coin-result-value
+                       (coin-bits-solution-length
+                         (block-header-bits header))))
+                   (par (explorer-block-par pending)))
+              (assert-equal complexity
+                            (explorer-block-complexity pending))
+              (assert-equal length
+                            (explorer-block-claimed-length pending))
+              (assert-equal (block-header-nonce header)
+                            (explorer-block-nonce pending))
+              (assert-equal (block-header-id header)
+                            (explorer-block-lottery-roll pending))
+              (assert-equal (coin-lottery-target complexity par length)
+                            (explorer-block-lottery-target pending))
+              (assert-equal (coin-lottery-bonus par length)
+                            (explorer-block-lottery-bonus pending))
+              (assert-equal (coin-lottery-multiplier par length)
+                            (explorer-block-lottery-multiplier pending))
+              (assert-equal
+                (coin-lottery-expected-rolls complexity par length)
+                (explorer-block-lottery-expected-rolls pending)))
+            ;; No body source, execution result, payout or share metric is
+            ;; invented from those header claims.
             (assert-equal #f (explorer-block-solution pending))
+            (assert-equal #f (explorer-block-solution-source pending))
+            (assert-equal #f (explorer-block-solution-length pending))
+            (assert-equal #f (explorer-block-margin pending))
+            (assert-equal #f (explorer-block-share-quality pending))
             (assert-equal #f (explorer-block-payout-address pending))
+            (assert-equal #f (explorer-block-transaction-count pending))
+            (assert-equal #f (explorer-block-size pending))
             (assert-equal '() (explorer-block-outputs pending))
             (assert-equal #f (explorer-block-total-output pending))
             (assert-equal '() (explorer-block-shares pending))
             (assert-equal #f (explorer-block-commit-count pending))
             (assert-equal #f (explorer-block-author pending)))
           (explorer-close store))
+        (let* ((token (block-header-id header))
+               (page (explorer-response-body
+                       (explorer-respond
+                         sigilcoin-regtest-chain dir
+                         (string-append "/block/" token))))
+               (value (json-decode
+                        (explorer-response-body
+                          (explorer-respond
+                            sigilcoin-regtest-chain dir
+                            (string-append "/api/block/" token)))))
+               (lottery (dict-get value "lottery")))
+          (assert-equal token (dict-get lottery "roll"))
+          (assert-true (canonical-target? (dict-get lottery "target")))
+          (assert-equal 'null (dict-get value "solution"))
+          (assert-equal 'null (dict-get value "solution_bytes"))
+          (assert-equal 'null (dict-get value "share_quality"))
+          (assert-equal 'null (dict-get value "margin"))
+          (assert-false (has? page "/opus-5/ pending"))
+          (assert-true (has? page "<h2>Nonce lottery</h2>")))
         (assert-equal 200
                       (explorer-response-status
                         (explorer-respond
@@ -1674,16 +1756,19 @@
                          outputs: (list (txout value: (coin-block-reward 1)
                                                script-pubkey: %script-a))
                          lock-time: 0))
-             (b (block header-field:
-                         (block-header
-                           version: 5
-                           previous-block: (block-header-hash genesis)
-                           merkle-root: (merkle-root
-                                          (list (transaction-txid coinbase)))
-                           time: (+ 1 (block-header-time genesis))
-                           bits: (coin-bits-encode 128)
-                           nonce: (coin-score-pack 3 1 1 0))
-                       transactions: (list coinbase)))
+             (b (block
+                  header-field:
+                    (qualifying-header
+                      (block-header
+                        version: 5
+                        previous-block: (block-header-hash genesis)
+                        merkle-root: (merkle-root
+                                       (list (transaction-txid coinbase)))
+                        time: (+ 1 (block-header-time genesis))
+                        bits: (coin-bits-encode 128 3)
+                        nonce: 0)
+                      1)
+                  transactions: (list coinbase)))
              (hash (store-block! db b 1)))
         (set-tip! db hash 1)
         (sqlite-close db)
@@ -1754,16 +1839,19 @@
                                     (txout value: (coin-block-reward 1)
                                            script-pubkey: %script-a))
                          lock-time: 0))
-             (b (block header-field:
-                         (block-header
-                           version: 5
-                           previous-block: (block-header-hash genesis)
-                           merkle-root: (merkle-root
-                                          (list (transaction-txid coinbase)))
-                           time: (+ 1 (block-header-time genesis))
-                           bits: (coin-bits-encode 128)
-                           nonce: (coin-score-pack 18 1 1 0))
-                       transactions: (list coinbase)))
+             (b (block
+                  header-field:
+                    (qualifying-header
+                      (block-header
+                        version: 5
+                        previous-block: (block-header-hash genesis)
+                        merkle-root: (merkle-root
+                                       (list (transaction-txid coinbase)))
+                        time: (+ 1 (block-header-time genesis))
+                        bits: (coin-bits-encode 128 18)
+                        nonce: 0)
+                      1)
+                  transactions: (list coinbase)))
              (hash (store-block! db b 1)))
         (set-tip! db hash 1)
         (sqlite-close db)
@@ -1811,6 +1899,9 @@
               "class=\"block-strip\" role=\"list\" aria-label=\"Recent blocks\""))
       (assert-true
         (has? page "class=\"block-tile\" href=\"/block/31\""))
+      (assert-true (has? page "data-lottery-roll="))
+      (assert-true (has? page "data-lottery-target="))
+      (assert-true (has? page "qualifying blocks"))
       (assert-true (has? page "Detailed block ledger"))
       (assert-true (has? page "<thead><tr>"))))
 
@@ -1824,7 +1915,7 @@
               "<section class=\"panel content-panel\"><h2>Puzzle</h2>"))
       (assert-true
         (has? block
-              "<section class=\"panel content-panel\"><h2>Producer score</h2>"))
+              "<section class=\"panel content-panel\"><h2>Nonce lottery</h2>"))
       (assert-true (has? block "class=\"badge badge-violet\""))
       (assert-true (has? block "class=\"table-scroll\""))
       (assert-true (has? block "scheduled subsidy"))
@@ -1883,6 +1974,12 @@
       (assert-true (has? javascript "document.hidden"))
       (assert-true (has? javascript "scheduled maximum supply"))
       (assert-true (has? javascript "nextHeight !== tipHeight || nextId !== tipId"))
+      (for-each
+        (lambda (field) (assert-true (has? javascript field)))
+        '("lottery.nonce" "lottery.target" "lottery.bonus"
+          "lottery.multiplier" "lottery.expected_rolls" "lottery.roll"))
+      (assert-true (has? javascript "qualifying"))
+      (assert-false (has? javascript "block.score"))
       (assert-true (not (has? javascript "setTimeout(() => window.location.reload")))
       (assert-true (has? javascript "document.createElement"))
       (assert-true (has? javascript "textContent"))

@@ -219,7 +219,7 @@
           test -f ${built.sigilcoin}/share/sigilcoin-site/assets/mining.svg
           test -f ${built.sigilcoin}/share/sigilcoin-site/assets/sigilcoin-symbol.png
           test -f ${built.sigilcoin}/share/sigilcoin-site/assets/sigilcoin-favicon.png
-          grep -q "Mine programs, not hashes." \
+          grep -q "Short programs. Better odds." \
             ${built.sigilcoin}/share/sigilcoin-site/index.html
           grep -q "143029.99991970 SGL" \
             ${built.sigilcoin}/share/sigilcoin-site/index.html

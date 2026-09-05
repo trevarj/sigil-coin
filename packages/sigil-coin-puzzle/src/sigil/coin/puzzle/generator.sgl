@@ -42,6 +42,7 @@
     puzzle-spec-hidden-source
     puzzle-spec-table-solution
     puzzle-spec-par
+    puzzle-spec-par-solution
     puzzle-spec-retries
 
     ;; Generation
@@ -531,8 +532,9 @@
                  (string-append "(if(equal? x " input ")" output
                                 " " rest ")"))))))
 
-    ;;; The table solution for a puzzle: the mechanical answer any miner can
-    ;;; build from public data, carrying constraint `ci`'s repair wrapper.
+    ;;; The lookup-table witness for a puzzle, carrying constraint `ci`'s
+    ;;; repair wrapper. `puzzle-spec-par-solution` selects the admissible
+    ;;; production fallback from this source and the generated hidden source.
     ;;;
     ;;; Returns `#f` when a literal has no legal spelling under the
     ;;; constraint. Callers must still verify the result — `puzzle-compose`
@@ -554,11 +556,11 @@
     ;;; One generated program-by-example puzzle.
     ;;;
     ;;; `examples` is the list of `k` `(input . output)` pairs in draw order,
-    ;;; `constraint` the id every solution must satisfy, `hidden-source` the
-    ;;; generator's own function and `table-solution` the verified liveness
-    ;;; escape. `par` is the shorter of the two, and is an upper bound on the
-    ;;; true optimum. None of this is serialized into a block; every node
-    ;;; derives it.
+    ;;; `constraint` the id every solution must satisfy, and `hidden-source`
+    ;;; and `table-solution` two verified witnesses. `par` is the shorter
+    ;;; witness length and an upper bound on the true optimum;
+    ;;; `puzzle-spec-par-solution` returns the admissible liveness witness.
+    ;;; None of this is serialized into a block; every node derives it.
     ;;;
     ;;; ```scheme
     ;;; (puzzle-spec-k (puzzle-fallback 1 128)) ; => 3
@@ -573,6 +575,24 @@
       (table-solution)
       (par)
       (retries))
+
+    ;;; The verified generated witness whose source length is exactly `par`.
+    ;;;
+    ;;; The hidden witness wins an equal-length tie. Both candidates already
+    ;;; passed the same parser, constraint and example checks in
+    ;;; `puzzle-compose`.
+    ;;;
+    ;;; ```scheme
+    ;;; (= (string-length (puzzle-spec-par-solution spec))
+    ;;;    (puzzle-spec-par spec)) ; => #t
+    ;;; ```
+    (define (puzzle-spec-par-solution spec)
+      (: puzzle-spec? -> string?)
+      (let ((hidden (puzzle-spec-hidden-source spec))
+            (table (puzzle-spec-table-solution spec)))
+        (if (<= (string-length hidden) (string-length table))
+            hidden
+            table)))
 
     ;; ============================================================
     ;; Verification

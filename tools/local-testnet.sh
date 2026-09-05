@@ -328,7 +328,7 @@ address_c=$(field "$logs/address-c.out" address)
 say "full-node wallets: producer A=$address_a sender B=$address_b recipient C=$address_c"
 
 show "$coin" puzzle --regtest --data-dir "$node_a" | tee "$logs/puzzle-h1.out" >/dev/null
-require_line "$logs/puzzle-h1.out" '^fallback: '
+require_line "$logs/puzzle-h1.out" '^par-witness: '
 show "$coin" mine --regtest --data-dir "$node_a" --graffiti "local-testnet H1" \
   | tee "$logs/mine-h1.out" >/dev/null
 require_line "$logs/mine-h1.out" '^submitted: yes$'
@@ -512,7 +512,7 @@ show "$coin" mine --relay "$relay_url" --regtest --data-dir "$node_a" \
 require_line "$logs/mine-h100.out" '^height: 100$'
 require_line "$logs/mine-h100.out" "^accepted-commitment: $commitment$"
 [[ $(grep -c '^accepted-commitment:' "$logs/mine-h100.out") == 1 ]]
-block_h100=$(field "$logs/mine-h100.out" block)
+block_h100=$(field "$logs/mine-h100.out" block-id)
 [[ $block_h100 =~ ^[0-9a-f]{64}$ ]]
 
 show "$coin" send --to "$address_b" --amount 0.50000000 --fee 0.00001000 \
@@ -556,7 +556,7 @@ require_line "$logs/mine-h101.out" \
 require_line "$logs/mine-h101.out" \
   '^payout: role=carrier value=[1-9][0-9]*\.[0-9]{8} SGL$'
 require_line "$logs/mine-h101.out" '^transactions: 1$'
-block_h101=$(field "$logs/mine-h101.out" block)
+block_h101=$(field "$logs/mine-h101.out" block-id)
 show "$helper" assert-block-transaction "$node_a" 101 "$txid_a_b" \
   | tee "$logs/block-h101-tx.out" >/dev/null
 
@@ -682,7 +682,7 @@ show "$coin" mine --regtest --data-dir "$node_a" \
   | tee "$logs/mine-h102.out" >/dev/null
 require_line "$logs/mine-h102.out" '^height: 102$'
 require_line "$logs/mine-h102.out" '^transactions: 1$'
-block_h102=$(field "$logs/mine-h102.out" block)
+block_h102=$(field "$logs/mine-h102.out" block-id)
 show "$helper" assert-block-transaction "$node_a" 102 "$txid_b_c" \
   | tee "$logs/block-h102-tx.out" >/dev/null
 fee_b_c=2000
@@ -709,7 +709,7 @@ show "$coin" mine --regtest --data-dir "$node_a" \
   | tee "$logs/mine-h103.out" >/dev/null
 require_line "$logs/mine-h103.out" '^height: 103$'
 require_line "$logs/mine-h103.out" '^transactions: 0$'
-block_h103=$(field "$logs/mine-h103.out" block)
+block_h103=$(field "$logs/mine-h103.out" block-id)
 say "restart: reopened durable H102 parent and mined H103"
 
 start_listener "$node_a" "$port_a" "$logs/listen-a-final.log"
@@ -791,7 +791,12 @@ jq -e --arg id "$block_h100" \
 jq -e --arg id "$block_h101" --arg contributor "$address_d" \
   --arg producer "$address_a" --argjson q "$q" \
   '.id == $id and .height == 101 and .share_count == 1 and
-   .score.quality == $q and .transactions == 2 and
+   .share_quality == $q and .transactions == 2 and
+   .lottery.roll == $id and
+   (.lottery.nonce >= 0 and .lottery.nonce < 4294967296) and
+   (.lottery.claimed_length >= 1 and .lottery.claimed_length <= 512) and
+   (.lottery.target | test("^[0-9a-f]{64}$")) and
+   .lottery.expected_rolls >= 1 and
    any(.outputs[]; .role == "share" and .address == $contributor and .value > 0) and
    any(.outputs[]; .role == "carrier" and .address == $producer and .value > 0)' \
   "$http/block-101.json" >/dev/null

@@ -110,14 +110,13 @@
     (define (puzzle-row mode seed-index height complexity ci spec)
       (let* ((hidden (puzzle-spec-hidden-source spec))
              (table (puzzle-spec-table-solution spec))
-             (hidden-check (coin-check-solution spec hidden))
-             (table-check (coin-check-solution spec table)))
-        (need (coin-ok? hidden-check)
-              "generated hidden source failed validation")
-        (need (coin-ok? table-check)
-              "generated table source failed validation")
-        (let ((hidden-report (coin-result-value hidden-check))
-              (table-report (coin-result-value table-check)))
+             (examples (puzzle-spec-examples spec))
+             (hidden-report (puzzle-run-examples hidden examples))
+             (table-report (puzzle-run-examples table examples)))
+        (need (puzzle-report-ok? hidden-report)
+              "generated hidden source failed evaluation")
+        (need (puzzle-report-ok? table-report)
+              "generated table source failed evaluation")
           (list mode seed-index height complexity ci
                 (puzzle-constraint-name ci)
                 (puzzle-spec-k spec)
@@ -129,7 +128,7 @@
                 (puzzle-report-steps hidden-report)
                 (puzzle-report-cells hidden-report)
                 (puzzle-report-steps table-report)
-                (puzzle-report-cells table-report)))))
+              (puzzle-report-cells table-report))))
 
     (define %global-puzzle-rows
       (let seed-loop ((seed-index 0) (rows '()))
@@ -447,9 +446,15 @@
                  "coin-check-shares"
                  "coin-share-quality"
                  "coin-quality"
-                 "coin-score-rank-word"
-                 "coin-score-compare"
-                 "coin-replaces-tip?"
+                 "coin-bits-encode"
+                 "coin-bits-solution-length"
+                 "coin-lottery-bonus"
+                 "coin-lottery-multiplier"
+                 "coin-lottery-target"
+                 "coin-lottery-expected-rolls"
+                 "coin-lottery-valid?"
+                 "coin-block-compare"
+                 "coin-mine-header"
                  "coin-payout-plan"
                  "coin-build-block"
                  "coin-build-coop-block"

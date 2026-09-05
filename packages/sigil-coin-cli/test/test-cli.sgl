@@ -127,6 +127,7 @@
         (set! result (raises-message (lambda () (cli-run args))))))
     result))
 
+
 ;; Build next canonical block directly for integration setup.
 (define (build-next n graffiti script)
   (let* ((tip (coin-validated-tip-height n))
@@ -143,8 +144,8 @@
                          (coin-chain-min-block-spacing (node-config n))))))
 
 ;; Advance the chain by `count` blocks without going through the CLI, for
-;; tests that only need a height. The solution is the generator's own, so
-;; every block is valid.
+;; tests that only need a height. The builder supplies the generated par
+;; witness, so every block exercises the production default.
 (define (fast-forward args count)
   (quietly
     (lambda ()
@@ -443,6 +444,12 @@
       (assert-true (string-contains? text "sigilcoin contribute"))
       (assert-true (string-contains? text "sigilcoin relay serve"))
       (assert-true (string-contains? text "mine [--solution EXPR]"))
+      (assert-true (string-contains? text "guaranteed par witness"))
+      (assert-true (string-contains? text "par is still lottery-gated"))
+      (assert-true (string-contains? text "Every byte saved"))
+      (assert-true (string-contains? text "eight-byte (256x) bonus"))
+      (assert-false (string-contains? text "--nonce"))
+      (assert-false (string-contains? text "Blocks are ranked"))
       (assert-true (string-contains? text "[--relay URL]"))
       (assert-true (string-contains? text "sigilcoin address"))
       (assert-true (string-contains? text "sigilcoin balance"))
@@ -651,13 +658,7 @@
                      text
                      (string-append "max-supply: "
                                     (cli-daviwils->sgl coin-max-supply))))
-      ;; Genesis's generated solution length, recovered from the stored rank.
-      (assert-true (string-contains?
-                     text
-                     (string-append "tip-solution-bytes: "
-                       (number->string
-                         (coin-score-length
-                           (coin-score-decode coin-genesis-score))))))
+      (assert-false (string-contains? text "tip-solution-bytes:"))
       (assert-true (string-contains?
                      text
                      (string-append "best-hash: "
@@ -672,12 +673,7 @@
         (assert-true (string-contains? text "best-block-height: 1"))
         (assert-true (string-contains? text "validated-blocks: 1"))
         (assert-true (string-contains? text "next-height: 2"))
-        ;; The tip's solution length, straight from the stored rank.
-        (assert-true (string-contains?
-                       text
-                       (string-append "tip-solution-bytes: "
-                                      (number->string
-                                        (string-length %height-one-source)))))
+        (assert-false (string-contains? text "tip-solution-bytes:"))
         (let ((issued (quotient (* 4 (coin-block-reward 1)) 5))
               (scheduled (coin-cumulative-supply 1)))
           (assert-true
@@ -696,46 +692,6 @@
               (string-append "issued-supply: "
                              (cli-daviwils->sgl scheduled)))))))))
 
-(test-group "sigilcoin Q-neutral rank status"
-  (test "status decodes only solution length from the persisted rank word"
-    (let* ((args (fresh-args))
-           (raw-word (coin-score-pack 37 12 34 7))
-           (rank-word (coin-score-rank-word raw-word))
-           (saving (coin-score-saving raw-word)))
-      (assert-true (not (= raw-word rank-word)))
-      (assert-equal 7
-                    (coin-score-quality (coin-score-decode raw-word)))
-      ;; A projected word decodes as Q15, which is why status must never treat
-      ;; persisted rank as the raw authenticated word.
-      (assert-equal 15
-                    (coin-score-quality (coin-score-decode rank-word)))
-      (fast-forward args 1)
-      (quietly
-        (lambda ()
-          (cli-with-node
-            args
-            (lambda (n)
-              (let* ((parent (coin-validated-tip-header n))
-                     (header
-                       (block-header
-                         version: coin-header-version
-                         previous-block: (block-header-hash parent)
-                         merkle-root: (make-bytevector 32 37)
-                         time: (+ (block-header-time parent)
-                                  (coin-chain-min-block-spacing
-                                    (node-config n)))
-                         bits: (block-header-bits parent)
-                         nonce: raw-word)))
-                (assert-equal 1 (node-ingest-headers n (list header)))
-                (assert-equal
-                  saving
-                  (coin-rank-tip-saving
-                    (node-status-snapshot-best-work (node-status n)))))))))
-      (let ((text (run-text (cons "status" args))))
-        (assert-true
-          (string-contains? text "tip-solution-bytes: 37"))
-        (assert-false (string-contains? text "tip-quality"))
-        (assert-false (string-contains? text "aggregate-q"))))))
 
 (test-group "sigilcoin private testnet"
   (test "status and puzzle run through both testnet selectors"
@@ -1047,7 +1003,7 @@
 
 (define %height-one-spec
   (cli-puzzle %regtest-genesis-hash 1 coin-genesis-complexity))
-(define %height-one-source (puzzle-spec-hidden-source %height-one-spec))
+(define %height-one-source (puzzle-spec-par-solution %height-one-spec))
 (define (work-args) (fresh-args))
 
 ;; Find one canonical height-one complexity drawing a requested constraint.
@@ -1069,9 +1025,8 @@
   (cond ((= ci 1) "(lambda(x)1)")
         ((= ci 2) "(lambda(x)'x)")
         ((= ci 3) "(lambda(x)x)")
-        ((= ci 4)
-         "(lambda(x)(list(car x)(cdr x)(length x)(reverse x)(null? x)))")
-        ((= ci 5) "(lambda(x)(map(lambda(y)y)x))")
+        ((= ci 4) "(lambda(x)(+ - * = <))")
+        ((= ci 5) "(lambda(x)(lambda(y)y))")
         ((= ci 6) "(lambda(x)10)")
         (else "(lambda(x)x)")))
 
@@ -1085,15 +1040,43 @@
                     (puzzle-spec-examples
                       (cli-puzzle %regtest-genesis-hash 1
                                   coin-genesis-complexity)))
-      (assert-equal (puzzle-spec-table-solution %height-one-spec)
-                    (cdr (assq 'fallback report)))))
+      (assert-equal (puzzle-spec-par-solution %height-one-spec)
+                    (cdr (assq 'par-witness report)))
+      (assert-equal (puzzle-spec-par %height-one-spec)
+                    (cdr (assq 'par-witness-length report)))
+      (assert-false (assq 'fallback-score report))))
+
+  (test "solution report exposes validity and resources, not a rank"
+    (let ((report (cli-solution-report %height-one-spec
+                                       %height-one-source)))
+      (assert-equal #t (cdr (assq 'ok report)))
+      (assert-equal (coin-solution-length %height-one-source)
+                    (cdr (assq 'length report)))
+      (assert-true (>= (cdr (assq 'cells report)) 0))
+      (assert-true (>= (cdr (assq 'steps report)) 0))
+      (assert-false (assq 'word report))
+      (assert-false (assq 'quality report))))
 
   (test "command prints sole puzzle shape"
-    (let ((text (run-text (cons "puzzle" (work-args)))))
+    (let* ((text (run-text (cons "puzzle" (work-args))))
+           (par (puzzle-spec-par %height-one-spec)))
       (assert-true (string-contains? text "complexity: 128"))
       (assert-true (string-contains? text "constraint:"))
       (assert-true (string-contains? text "examples:"))
-      (assert-true (string-contains? text "ONE-ARGUMENT function"))))
+      (assert-true (string-contains? text "ONE-ARGUMENT function"))
+      (assert-true (string-contains? text "guaranteed-valid"))
+      (assert-true (string-contains? text "lottery-bonus: 0"))
+      (assert-true (string-contains? text "lottery-multiplier: 1"))
+      (assert-true (string-contains? text "lottery-expected-rolls: 4096"))
+      (assert-true
+        (string-contains?
+          text
+          (string-append
+            "lottery-target: "
+            (number->string
+              (coin-lottery-target coin-genesis-complexity par par)))))
+      (assert-false (string-contains? text "fallback-score:"))
+      (assert-false (string-contains? text "rank: shorter"))))
 
   (test "complexity preview validates its input"
     (assert-true (string-contains?
@@ -1117,9 +1100,45 @@
            (text (cdr result))
            (subsidy (coin-block-reward 1))
            (minted (quotient (* 4 subsidy) 5))
-           (unminted (- subsidy minted)))
+           (unminted (- subsidy minted))
+           (header (block-header-field b))
+           (par (puzzle-spec-par %height-one-spec))
+           (solution-length (string-length %height-one-source))
+           (target (coin-lottery-target coin-genesis-complexity
+                                        par solution-length))
+           (encoded-length
+             (coin-bits-solution-length (block-header-bits header)))
+           (roll (block-header-work-value header)))
       (assert-true (block? b))
       (assert-equal 1 (tip-height args))
+      (assert-true (coin-ok? encoded-length))
+      (assert-equal solution-length (coin-result-value encoded-length))
+      (assert-true
+        (coin-lottery-valid? roll coin-genesis-complexity
+                             par solution-length))
+      (assert-true (string-contains? text "solution-valid: yes"))
+      (assert-true (string-contains? text "memory:"))
+      (assert-true (string-contains? text "steps:"))
+      (assert-true (string-contains? text "lottery-bonus: 0"))
+      (assert-true (string-contains? text "lottery-multiplier: 1"))
+      (assert-true (string-contains? text "lottery-expected-rolls: 4096"))
+      (assert-true
+        (string-contains?
+          text
+          (string-append "qualifying-nonce: "
+                         (number->string (block-header-nonce header)))))
+      (assert-true
+        (string-contains?
+          text (string-append "qualifying-target: "
+                              (number->string target))))
+      (assert-true
+        (string-contains?
+          text (string-append "block-id: " (block-header-id header))))
+      (assert-true
+        (string-contains?
+          text (string-append "block-roll: " (number->string roll))))
+      (assert-false (string-contains? text "fallback-score:"))
+      (assert-false (string-contains? text "outranks-fallback:"))
       (assert-true (string-contains? text "examples-reproduced:"))
       (assert-true (string-contains? text "payout: role=producer"))
       (assert-true
@@ -1135,12 +1154,52 @@
                       (car (block-transactions b))))
       (assert-true (string-contains? text "submitted: yes"))))
 
-  (test "fallback submits when source omitted"
-    (let ((args (work-args)))
-      (assert-true (block? (run-value
-                             (append (list "mine" "--address" %payout-address)
-                                     args))))
+  (test "guaranteed par witness submits when source is omitted"
+    (let* ((args (work-args))
+           (result
+             (run (append (list "mine" "--address" %payout-address) args)))
+           (b (car result))
+           (text (cdr result))
+           (payload
+             (coin-result-value (coin-block-coinbase-payload b))))
+      (assert-true (block? b))
+      (assert-equal
+        (string->utf8 (puzzle-spec-par-solution %height-one-spec))
+        (coin-coinbase-payload-solution payload))
+      (assert-true
+        (string-contains?
+          text
+          (string-append "solution-length: "
+                         (number->string
+                           (puzzle-spec-par %height-one-spec)))))
+      (assert-true (string-contains? text "within-par: yes"))
+      (assert-true
+        (string-contains? text "valid at-par work is still lottery-gated"))
+      (assert-true (string-contains? text "lottery-expected-rolls: 4096"))
+      (assert-true (string-contains? text "submitted: yes"))
       (assert-equal 1 (tip-height args))))
+
+  (test "explicit semantic padding over par is rejected with useful advice"
+    (let* ((args (work-args))
+           (witness (puzzle-spec-par-solution %height-one-spec))
+           (padded (string-append "(if #f #f " witness ")"))
+           (message
+             (failure-message
+               (append (list "mine" "--solution" padded) args))))
+      (assert-true (> (string-length padded)
+                      (puzzle-spec-par %height-one-spec)))
+      (assert-true (string-contains? message "solution-over-par"))
+      (assert-true
+        (string-contains?
+          message
+          (string-append "par is "
+                         (number->string
+                           (puzzle-spec-par %height-one-spec))
+                         " bytes")))
+      (assert-true
+        (string-contains? message
+                          "Omit --solution to submit the guaranteed par witness"))
+      (assert-equal 0 (tip-height args))))
 
   (test "wrong arity and mismatch are actionable"
     (assert-true (string-contains?
@@ -1341,9 +1400,6 @@
 (if %native-secp256k1?
   (begin
 
-    ;; Fixed key 4 derives deterministic personalized work.
-    (define %share-key (make-bytevector 32 4))
-    (define %share-pubkey (wallet-public-key %share-key))
     (define %share-context
       (coin-coop-context
         parent-prev-hash: %regtest-genesis-hash
@@ -1351,7 +1407,6 @@
         complexity: coin-genesis-complexity
         spec: %height-one-spec
         commits: '()))
-    (define %share-spec (coin-share-puzzle %share-context %share-pubkey))
 
     ;; The only generated-fixture shortcut broadens the exact reserved anchor
     ;; predicate after proving every ordinary input is non-string.
@@ -1370,23 +1425,39 @@
           ((string? (car (car pairs))) #f)
           (else (loop (cdr pairs))))))
 
-    (define (semantic-share-source)
-      (let* ((source (puzzle-spec-hidden-source %share-spec))
+    (define (semantic-share-source spec)
+      (let* ((source (puzzle-spec-hidden-source spec))
              (candidate
-               (and (ordinary-inputs-non-string? %share-spec)
+               (and (ordinary-inputs-non-string? spec)
                     (= 1 (string-count source %generated-anchor-predicate))
                     (string-replace source %generated-anchor-predicate
                                     %semantic-anchor-predicate)))
              (checked
                (and candidate
-                    (coin-check-share-solution/spec %share-spec candidate))))
-        (if (and candidate
-                 (< (string-length candidate) (puzzle-spec-par %share-spec))
-                 (coin-ok? checked))
-            candidate
-            (error "test-cli: personalized task has no semantic candidate"))))
+                    (coin-check-share-solution/spec spec candidate))))
+        (and candidate
+             (< (string-length candidate) (puzzle-spec-par spec))
+             (coin-ok? checked)
+             candidate)))
 
-    (define %share-source (semantic-share-source))
+    ;; Genesis changed with the producer par witness, so derive a fresh,
+    ;; deterministic personalized fixture instead of pinning one lucky key.
+    (define %share-fixture
+      (let loop ((secret-byte 1))
+        (when (> secret-byte 199)
+          (error "test-cli: personalized task has no semantic candidate"))
+        (let* ((key (make-bytevector 32 secret-byte))
+               (pubkey (wallet-public-key key))
+               (spec (coin-share-puzzle %share-context pubkey))
+               (source (semantic-share-source spec)))
+          (if source
+              (list key pubkey spec source)
+              (loop (+ secret-byte 1))))))
+
+    (define %share-key (list-ref %share-fixture 0))
+    (define %share-pubkey (list-ref %share-fixture 1))
+    (define %share-spec (list-ref %share-fixture 2))
+    (define %share-source (list-ref %share-fixture 3))
     (define %share-anchor
       (puzzle-print-value
         (cdr (car (reverse (puzzle-spec-examples %share-spec))))))
@@ -1530,13 +1601,14 @@
                (result (run (append (list "mine" "--share" "--solution"
                                           %share-source)
                                     args)))
-               (score (car result))
+               (report (car result))
                (mine-text (cdr result)))
           (assert-true (string-contains? puzzle-text
                                          "personalized-pubkey:"))
           (assert-true (string-contains? puzzle-text %share-anchor))
           (assert-true (string-contains? mine-text "share-eligible: yes"))
-          (assert-true (> (cdr (assq 'quality score)) 0))))
+          (assert-true (> (cdr (assq 'contribution report)) 0))
+          (assert-false (string-contains? mine-text "score:"))))
 
       (test "consensus decodes and verifies the emitted blinded reveal"
         (let* ((args (fixed-share-args))
@@ -1551,7 +1623,7 @@
                  (context (height-one-share-context
                             (list (cli-commit-record-commitment record))))
                  (validated (coin-check-shares context #u8() (list share)))
-                 (quality (coin-share-quality context share)))
+                 (contribution (coin-share-quality context share)))
             (assert-true (coin-share? share))
             (assert-true (coin-ok? validated))
             (assert-equal coin-share-blind-bytes
@@ -1562,10 +1634,10 @@
             (assert-equal (cli-commit-record-commitment record)
                           (coin-share-commitment context share))
             (assert-true (coin-share-signature-ok? context share))
-            (assert-true (<= 1 quality 4))
+            (assert-true (<= 1 contribution 4))
             (assert-true (string-contains?
-                           text (string-append "quality: "
-                                               (number->string quality))))
+                           text (string-append "contribution: "
+                                               (number->string contribution))))
             (assert-true (not (string-contains? text "blind:")))
             (assert-true (not (string-contains? text secret-hex))))))
 
@@ -1615,7 +1687,9 @@
                                   (complexity
                                     (coin-required-complexity headers height))
                                   (b (coin-build-coop-block
-                                       parent height complexity #f (list share)
+                                       parent height complexity
+                                       #f
+                                       (list share)
                                        "selected reveal" producer-script
                                        (+ (block-header-time
                                             (block-header-field parent))
@@ -2026,7 +2100,7 @@
                             (coin-share-commitment context
                                                    explicit-share))))))
 
-      (test "equal scores break deterministically on commitment bytes"
+      (test "equal contributions break canonically on commitment bytes"
         (let* ((args (fixed-share-args))
                (a (commit-solution args %share-source))
                (b (commit-solution args %share-source))

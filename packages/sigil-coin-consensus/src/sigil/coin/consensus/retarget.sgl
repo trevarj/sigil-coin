@@ -32,14 +32,12 @@
 ;;; window is ever used: the first retarget is at `H = 16` over the full
 ;;; window of heights 0..15, genesis included, which has a well-defined par.
 ;;;
-;;; The upper clamp on `f` is unreachable and kept anyway. `median(m)` lives
-;;; in [-1000, 1000], so `f` before clamping lives in [-100, 1900] and only
-;;; the LOWER clamp ever fires. That lower clamp is load-bearing: without it
-;;; a window of miners who all missed par by more than 65% would drive `f`
-;;; to zero or negative and collapse `C` in one step. The 4000 is written
-;;; because the specification freezes the clamp as Bitcoin's symmetric
-;;; 0.25x..4x, and a bound that is currently slack is cheaper to keep than
-;;; to re-derive if the margin domain ever widens.
+;;; `coin-margin` remains total over every positive source length, including
+;;; provisional header claims, so its mathematical range stays [-1000, 1000].
+;;; Body-validated producer histories now occupy [0, 1000] because over-par
+;;; solutions are invalid. The symmetric 0.25x..4x factor clamp remains frozen
+;;; for hostile/header-first inputs and keeps the public adjustment function
+;;; total without creating a second retarget formula.
 
 (define-library (sigil coin consensus retarget)
   (import (sigil math)
@@ -71,6 +69,7 @@
     coin-bits-prefix
     coin-bits-encode
     coin-bits-decode
+    coin-bits-solution-length
     coin-check-bits)
 
   (begin
@@ -135,9 +134,10 @@
 
     ;;; One block's relative margin in milli-units.
     ;;;
-    ;;; Positive means the accepted solution beat par; negative means it
-    ;;; missed. Clamped to [-1000, 1000], so a solution many times longer
-    ;;; than par cannot dominate the window's median on its own.
+    ;;; Positive means the solution beat par, zero means it met par, and
+    ;;; negative represents an over-par candidate that producer body validation
+    ;;; rejects. Values remain clamped to [-1000, 1000] for total handling of
+    ;;; provisional and hostile inputs.
     ;;;
     ;;; ```scheme
     ;;; (coin-margin 100 90)  ; => 100
@@ -274,69 +274,69 @@
     ;; The `bits` codec
     ;; ============================================================
 
-    ;;; The frozen high half of `bits`.
+    ;;; Fixed high prefix of the consensus `bits` layout.
     ;;;
-    ;;; Chosen so the whole value stays at or below `0x207fffff`, which is
-    ;;; the max-target compact number any Bitcoin-side reader of the seam
-    ;;; already tolerates. No proof of work runs anywhere in SigilCoin, so
-    ;;; repurposing the field cannot accidentally impose real hashing.
-    (define coin-bits-prefix #x207f0000)
+    ;;; Under mask `#xffe00000`, bits 20..12 encode `L-1` and bits 11..0
+    ;;; encode `C`:
+    ;;;
+    ;;;   #x20600000 | ((L - 1) << 12) | C
+    (define coin-bits-prefix #x20600000)
+    (define %coin-bits-prefix-mask #xffe00000)
+    (define %coin-bits-length-mask #x1ff)
 
-    ;;; Encode a complexity as the header's `bits` field.
-    ;;;
-    ;;; ```scheme
-    ;;; (coin-bits-encode 128) ; => 543883392
-    ;;; ```
-    (define (coin-bits-encode complexity)
-      (: integer? -> integer?)
+    (define (require-solution-length who length)
+      (if (not (and (number? length) (exact? length) (integer? length)
+                    (<= 1 length) (<= length 512)))
+          (error (string-append who ": solution length out of range")))
+      length)
+
+    ;;; Encode complexity and producer solution length in the header.
+    (define (coin-bits-encode complexity length)
+      (: integer? integer? -> integer?)
       (require-complexity "coin-bits-encode" complexity)
-      (bitwise-ior coin-bits-prefix complexity))
+      (require-solution-length "coin-bits-encode" length)
+      (bitwise-ior coin-bits-prefix
+                   (arithmetic-shift (- length 1) 12)
+                   complexity))
 
-    ;;; Decode a header's `bits` field to a complexity.
-    ;;;
-    ;;; Total: never raises, whatever the header carries. Rejection reasons
-    ;;; are `malformed-header` (not a 32-bit unsigned integer at all),
-    ;;; `bits-prefix`, `bits-reserved-nonzero` and `complexity-range`. On
-    ;;; success the value is `C`.
-    ;;;
-    ;;; ```scheme
-    ;;; (coin-result-value (coin-bits-decode #x207f0080)) ; => 128
-    ;;; (coin-result-reason (coin-bits-decode #x207fffff))
-    ;;; ; => bits-reserved-nonzero
-    ;;; ```
-    (define (coin-bits-decode bits)
-      (: any? -> coin-result?)
+    ;; Check the canonical field shape once for both projections.
+    (define (checked-bits bits)
       (cond
         ((not (and (number? bits) (exact? bits) (integer? bits)
                    (<= 0 bits) (< bits #x100000000)))
          (coin-error 'malformed-header
                      "bits is not a 32-bit unsigned integer"))
         ((not (= coin-bits-prefix
-                 (bitwise-and bits #xffff0000)))
+                 (bitwise-and bits %coin-bits-prefix-mask)))
          (coin-error 'bits-prefix "bits does not carry the canonical prefix"))
-        ((not (= 0 (bitwise-and bits #xf000)))
-         (coin-error 'bits-reserved-nonzero
-                     "the reserved bits 15:12 are not zero"))
         (else
           (let ((complexity (bitwise-and bits #xfff)))
             (if (or (< complexity coin-complexity-min)
                     (> complexity coin-complexity-max))
                 (coin-error 'complexity-range "complexity is out of range")
-                (coin-ok complexity))))))
+                (coin-ok bits))))))
 
-    ;;; Check a header's `bits` against the complexity the validator derived
-    ;;; from the parent chain.
-    ;;;
-    ;;; `C` is never miner-chosen. Encoding it in the header at all is for
-    ;;; headers-first sync — a node ranking headers needs `C` to derive the
-    ;;; puzzle — and this check is what keeps the field honest: the derived
-    ;;; value wins, always, and disagreement is `complexity-mismatch`.
-    ;;;
-    ;;; ```scheme
-    ;;; (coin-ok? (coin-check-bits #x207f0080 128))          ; => #t
-    ;;; (coin-result-reason (coin-check-bits #x207f0080 129))
-    ;;; ; => complexity-mismatch
-    ;;; ```
+    ;;; Decode a canonical header's `bits` field to complexity `C`.
+    (define (coin-bits-decode bits)
+      (: any? -> coin-result?)
+      (let ((checked (checked-bits bits)))
+        (if (coin-failed? checked)
+            checked
+            (coin-ok (bitwise-and bits #xfff)))))
+
+    ;;; Decode a canonical header's `bits` field to solution length `L`.
+    (define (coin-bits-solution-length bits)
+      (: any? -> coin-result?)
+      (let ((checked (checked-bits bits)))
+        (if (coin-failed? checked)
+            checked
+            (coin-ok
+              (+ 1
+                 (bitwise-and
+                   (arithmetic-shift bits -12)
+                   %coin-bits-length-mask))))))
+
+    ;;; Check the encoded complexity against the parent-derived value.
     (define (coin-check-bits bits expected)
       (: any? integer? -> coin-result?)
       (require-complexity "coin-check-bits" expected)

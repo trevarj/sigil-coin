@@ -341,11 +341,17 @@
 
     (define (hex bytes) (hex-encode bytes))
 
-    ;; A 32-bit score word, printed the way it is compared: unsigned, wide,
-    ;; lower is better. Zero-padded so two words line up in a terminal.
-    (define (score-word->string w)
-      (let ((digits (number->string w 16)))
-        (string-append "0x" (string-pad digits 8 #\0))))
+    (define (print-lottery complexity par length)
+      (let ((target (coin-lottery-target complexity par length)))
+        (println "lottery-bonus: ~a" (coin-lottery-bonus par length))
+        (println "lottery-multiplier: ~a"
+                 (coin-lottery-multiplier par length))
+        (println "lottery-target: ~a" target)
+        (println "lottery-expected-rolls: ~a"
+                 (coin-lottery-expected-rolls complexity par length))
+        (println "lottery-rule: valid at-par work is still lottery-gated; every byte saved doubles nonce odds, up to eight bytes (256x).")
+        target))
+
 
     ;;; Everything a command needs for one puzzle height.
     (define (coin-puzzle-context n args)
@@ -385,8 +391,7 @@
     (define (coin-puzzle-report/spec previous-hash height complexity spec)
       (let* ((ci (puzzle-spec-constraint spec))
              (d (coin-spec-builtin-cap spec))
-             (fallback (puzzle-spec-table-solution spec))
-             (score (cli-score-report spec fallback 0)))
+             (par-witness (puzzle-spec-par-solution spec)))
         (list (cons 'height height)
               (cons 'parent (hex (reverse-bytevector previous-hash)))
               (cons 'seed (hex (coin-puzzle-seed previous-hash
@@ -400,9 +405,8 @@
               (cons 'k (puzzle-spec-k spec))
               (cons 'examples (cli-example-lines spec))
               (cons 'par (puzzle-spec-par spec))
-              (cons 'fallback fallback)
-              (cons 'fallback-length (string-length fallback))
-              (cons 'fallback-score (cdr (assq 'word score)))
+              (cons 'par-witness par-witness)
+              (cons 'par-witness-length (coin-solution-length par-witness))
               (cons 'reward (coin-block-reward height)))))
 
     (define (coin-puzzle-report previous-hash height complexity)
@@ -413,9 +417,8 @@
 
     ;;; Print a  puzzle report in the CLI's `key: value` form.
     ;;;
-    ;;; The order is the order a miner reads it in: what the pairs are, what
-    ;;; today's rule is, what beating the field costs, and finally the
-    ;;; fallback that guarantees the height is solvable at all.
+    ;;; The order is the order a miner reads it in: examples, today's rule,
+    ;;; the guaranteed-valid par witness, then the nonce lottery it enters.
     ;;;
     ;;; ```scheme
     ;;; (coin-print-puzzle (coin-puzzle-report parent-hash 1 128))
@@ -441,13 +444,17 @@
       (println "max-solution-bytes: ~a" coin-max-solution-bytes)
       (println "reward: ~a SGL"
                (cli-daviwils->sgl (report-ref report 'reward)))
-      (println "fallback-length: ~a" (report-ref report 'fallback-length))
-      (println "fallback-score: ~a"
-               (score-word->string (report-ref report 'fallback-score)))
-      (println "fallback: ~a" (report-ref report 'fallback))
+      (println "par-witness-length: ~a"
+               (report-ref report 'par-witness-length))
+      (println "par-witness: ~a" (report-ref report 'par-witness))
+      (println "par-witness-validity: guaranteed-valid; nonce lottery still required")
       (println "solve: write a ONE-ARGUMENT function reproducing every pair above, then `sigilcoin mine~a --solution '<source>'`."
                (if (assq 'personalized-pubkey report) " --share" ""))
-      (println "rank: shorter wins; ties break on memory, then steps. Share quality is authenticated for reporting and payouts, not ranking.")
+      (if (assq 'personalized-pubkey report)
+          (println "share-rule: a share must be strictly shorter than its personalized par; savings determine contribution.")
+          (print-lottery (report-ref report 'complexity)
+                         (report-ref report 'par)
+                         (report-ref report 'par-witness-length)))
       report)
 
     ;;; Show the  puzzle for the next block, or for `--height`.
@@ -482,32 +489,27 @@
     ;; `mine`, `commit`, `reveal` — refuses the same solution for the same
     ;; reason with the same words, because a miner should not have to learn
     ;; three vocabularies for one rule.
-    (define (require-solves who spec height solution score)
-      (when (not (cdr (assq 'ok score)))
+    (define (require-solves who spec height solution report)
+      (when (not (cdr (assq 'ok report)))
         (error (string-append
                  who
                  ": that solution does not solve height "
                  (number->string height)
                  " — "
                  (cli-solution-advice spec
-                                         (cdr (assq 'reason score))
-                                         (cdr (assq 'detail score))
-                                         solution))))
-      score)
+                                      (cdr (assq 'reason report))
+                                      (cdr (assq 'detail report))
+                                      solution))))
+      report)
 
-    (define (print-score score par)
-      (let ((length (cdr (assq 'length score))))
+    (define (print-resources report par)
+      (let ((length (cdr (assq 'length report))))
+        (println "solution-valid: yes")
         (println "solution-length: ~a" length)
         (println "par: ~a" par)
-        (println "beats-par: ~a" (if (< length par) "yes" "no"))
-        (println "memory: ~a cells (bucket ~a)"
-                 (cdr (assq 'cells score))
-                 (cdr (assq 'memory-bucket score)))
-        (println "steps: ~a (bucket ~a)"
-                 (cdr (assq 'steps score))
-                 (cdr (assq 'step-bucket score)))
-        (println "quality: ~a" (cdr (assq 'quality score)))
-        (println "score: ~a" (score-word->string (cdr (assq 'word score))))))
+        (println "within-par: ~a" (if (<= length par) "yes" "no"))
+        (println "memory: ~a cells" (cdr (assq 'cells report)))
+        (println "steps: ~a" (cdr (assq 'steps report)))))
 
     (define (record-for-context? record context)
       (and (= (cli-commit-record-height record)
@@ -793,13 +795,13 @@
         (and (pair? rows)
              (block-parse (hex-decode (row-ref (car rows) "block_hex"))))))
 
-    ;; Assemble a cooperative candidate from the reports verified during
-    ;; reveal selection. This deliberately bypasses the validating high-level
-    ;; builder so mempool size probes do not execute every share program again.
-    (define (build-verified-coop-block
-              parent height complexity solution shares contributions
+    ;; Assemble an unmined candidate only for exact serialized-size probes.
+    ;; The header grinder is called once after transaction selection, so its
+    ;; nonce search never runs for discarded mempool candidates.
+    (define (build-block-prototype
+              parent height complexity length solution shares contributions
               commitments graffiti producer-script carrier-script time
-              txs fees score-word)
+              txs fees)
       (let* ((coinbase
                (coin-mining-coinbase/coop
                  height solution shares contributions commitments graffiti
@@ -813,8 +815,8 @@
               merkle-root: (merkle-root
                              (map transaction-txid transactions))
               time: time
-              bits: (coin-bits-encode complexity)
-              nonce: score-word)
+              bits: (coin-bits-encode complexity length)
+              nonce: 0)
           transactions: transactions)))
 
 
@@ -985,14 +987,15 @@
                    (spec (if share?
                              (coin-share-puzzle coop pubkey)
                              (report-ref context 'spec)))
-                   (fallback (puzzle-spec-table-solution spec))
-                   (solution (cli-arg args "--solution" fallback))
-                   (preliminary
+                   (par-witness (puzzle-spec-par-solution spec))
+                   (solution (cli-arg args "--solution" par-witness))
+                   (report
                      (require-solves "mine" spec height solution
-                                     (cli-score-report spec solution 0)))
-                   (under-par? (< (cdr (assq 'length preliminary))
-                                  (puzzle-spec-par spec)))
-                   (preview-quality
+                                     (cli-solution-report spec solution)))
+                   (length (report-ref report 'length))
+                   (par (puzzle-spec-par spec))
+                   (under-par? (< length par))
+                   (preview-contribution
                      (if (and share? under-par?)
                          (list-ref
                            (require-share-solution
@@ -1002,11 +1005,7 @@
                            3)
                          0)))
               (if share?
-                  (let ((score (if (= preview-quality 0)
-                                   preliminary
-                                   (cli-score-report
-                                     spec solution preview-quality)))
-                        (baseline (cli-score-report spec fallback 0)))
+                  (begin
                     (println "height: ~a" height)
                     (println "personalized-pubkey: ~a" (hex pubkey))
                     (println "complexity: ~a"
@@ -1017,19 +1016,12 @@
                                (coin-spec-builtin-cap spec)))
                     (println "examples-reproduced: ~a of ~a"
                              (puzzle-spec-k spec) (puzzle-spec-k spec))
-                    (print-score score (puzzle-spec-par spec))
-                    (println "fallback-score: ~a"
-                             (score-word->string
-                               (cdr (assq 'word baseline))))
-                    (println "outranks-fallback: ~a"
-                             (if (coin-score-better?
-                                   (cdr (assq 'word score))
-                                   (cdr (assq 'word baseline)))
-                                 "yes" "no"))
+                    (print-resources report par)
+                    (println "contribution: ~a" preview-contribution)
                     (println "share-eligible: ~a"
                              (if under-par? "yes" "no"))
                     (println "submitted: no")
-                    score)
+                    (cons (cons 'contribution preview-contribution) report))
                   (let* ((address (cli-arg args "--address" #f))
                          (graffiti (cli-arg args "--graffiti" ""))
                          (payout (if address
@@ -1038,6 +1030,7 @@
                                      (wallet-script-pubkey
                                        (wallet-key data-dir))))
                          (parent (report-ref context 'parent))
+                         (complexity (report-ref context 'complexity))
                          (spacing (coin-chain-min-block-spacing
                                     (node-config n)))
                          (max-future-drift
@@ -1089,81 +1082,75 @@
                          (quality (list-ref share-validation 3))
                          (carrier-script
                            (and (pair? shares)
-                                (coin-carrier-script parent-block)))
-                         (score (if (= quality 0)
-                                    preliminary
-                                    (cli-score-report spec solution quality)))
-                         (baseline (cli-score-report spec fallback 0)))
+                                (coin-carrier-script parent-block))))
                     (when (> (bytevector-length (string->utf8 graffiti))
                              coin-max-graffiti-bytes)
                       (error "--graffiti: text exceeds consensus byte cap"))
                     (println "height: ~a" height)
-                    (println "complexity: ~a"
-                             (report-ref context 'complexity))
+                    (println "complexity: ~a" complexity)
                     (println "constraint: ~a"
                              (cli-constraint-detail
                                (puzzle-spec-constraint spec)
                                (coin-spec-builtin-cap spec)))
                     (println "examples-reproduced: ~a of ~a"
                              (puzzle-spec-k spec) (puzzle-spec-k spec))
-                    (print-score score (puzzle-spec-par spec))
-                    (println "fallback-score: ~a"
-                             (score-word->string
-                               (cdr (assq 'word baseline))))
-                    (println "outranks-fallback: ~a"
-                             (if (coin-score-better?
-                                   (cdr (assq 'word score))
-                                   (cdr (assq 'word baseline)))
-                                 "yes" "no"))
-                    (when origin
-                      (println "relay: ~a" origin)
-                      (println "relay-commitments: ~a"
-                               (length (list-ref relay-values 0)))
-                      (println "relay-reveals: ~a"
-                               (length (list-ref relay-values 1))))
-                    (print-contributions
-                      commitments (cdr commit-selection)
-                      shares contributions share-rejected quality)
-                    (let* ((build
-                             (lambda (txs fees)
-                               (if (null? shares)
-                                   (coin-build-block
-                                     parent height
-                                     (report-ref context 'complexity)
-                                     solution graffiti payout time
-                                     txs fees commitments)
-                                   (build-verified-coop-block
-                                     parent height
-                                     (report-ref context 'complexity)
-                                     solution shares contributions commitments
-                                     graffiti payout carrier-script time
-                                     txs fees (cdr (assq 'word score))))))
-                           (selected (coin-select-block-transactions
-                                      n height build))
-                           (b (build (car selected) (cdr selected)))
-                           (size (coin-block-size b))
-                           (header (block-header-field b)))
-                      (unless (and size (<= size coin-max-block-bytes))
-                        (error (string-append
-                                 "mine: block is "
-                                 (number->string (or size -1))
-                                 " bytes; consensus cap is "
-                                 (number->string coin-max-block-bytes))))
-                      (node-ingest-headers n (list header))
-                      (node-store-block n b)
-                      (unless (= 1 (node-validate-blocks n))
-                        (error (string-append
-                                 "mine: node refused block — "
-                                 (node-status-snapshot-sync-last-error
-                                   (node-status n)))))
-                      (println "block: ~a" (block-header-id header))
-                      (println "block-bytes: ~a" size)
-                      (println "transactions: ~a"
-                               (length (car selected)))
-                      (print-payouts b height (cdr selected)
-                                     shares contributions)
-                      (println "submitted: yes")
-                      b))))))))
+                    (print-resources report par)
+                    (let ((target (print-lottery complexity par length)))
+                      (when origin
+                        (println "relay: ~a" origin)
+                        (println "relay-commitments: ~a"
+                                 (length (list-ref relay-values 0)))
+                        (println "relay-reveals: ~a"
+                                 (length (list-ref relay-values 1))))
+                      (print-contributions
+                        commitments (cdr commit-selection)
+                        shares contributions share-rejected quality)
+                      (flush-output-port (current-output-port))
+                      (let* ((build
+                               (lambda (txs fees)
+                                 (build-block-prototype
+                                   parent height complexity length solution
+                                   shares contributions commitments graffiti
+                                   payout carrier-script time txs fees)))
+                             (selected
+                               (coin-select-block-transactions n height build))
+                             (prototype
+                               (build (car selected) (cdr selected)))
+                             (size (coin-block-size prototype)))
+                        (unless (and size (<= size coin-max-block-bytes))
+                          (error (string-append
+                                   "mine: block is "
+                                   (number->string (or size -1))
+                                   " bytes; consensus cap is "
+                                   (number->string coin-max-block-bytes))))
+                        (let* ((header
+                                 (coin-mine-header
+                                   (block-header-field prototype) par))
+                               (b
+                                 (block
+                                   header-field: header
+                                   transactions:
+                                     (block-transactions prototype))))
+                          (node-ingest-headers n (list header))
+                          (node-store-block n b)
+                          (unless (= 1 (node-validate-blocks n))
+                            (error (string-append
+                                     "mine: node refused block — "
+                                     (node-status-snapshot-sync-last-error
+                                       (node-status n)))))
+                          (println "qualifying-nonce: ~a"
+                                   (block-header-nonce header))
+                          (println "qualifying-target: ~a" target)
+                          (println "block-id: ~a" (block-header-id header))
+                          (println "block-roll: ~a"
+                                   (block-header-work-value header))
+                          (println "block-bytes: ~a" size)
+                          (println "transactions: ~a"
+                                   (length (car selected)))
+                          (print-payouts b height (cdr selected)
+                                         shares contributions)
+                          (println "submitted: yes")
+                          b))))))))))
 
     ;; ============================================================
     ;; Commit and reveal
@@ -1215,9 +1202,7 @@
               ". Run `sigilcoin puzzle --share` for your co-op task;"
               " co-op work must solve that pubkey-personalized puzzle and be strictly"
               " under its par.")))
-        (let* ((quality (list-ref (coin-result-value checked) 1))
-               (score (cli-score-report spec solution quality)))
-          (list coop share spec quality score))))
+        (list coop share spec (list-ref (coin-result-value checked) 1))))
 
     (define (commit-context args n pubkey)
       (let* ((context (coin-puzzle-context n args))
@@ -1282,8 +1267,7 @@
                               data-dir height parent-hash complexity pubkey))
                    (commitments (cli-sort-bytes
                                   (map cli-commit-record-commitment
-                                       records)))
-                   (score (list-ref checked 4)))
+                                       records))))
               ;; Consensus encoder is also the local canonicality check.
               (coin-commits-encode commitments)
               (println "height: ~a" height)
@@ -1291,10 +1275,8 @@
               (println "parent: ~a" (hex (reverse-bytevector parent-hash)))
               (println "personalized-par: ~a"
                        (puzzle-spec-par (list-ref checked 2)))
-              (println "solution-length: ~a" (string-length solution))
-              (println "quality: ~a" (list-ref checked 3))
-              (println "score: ~a"
-                       (score-word->string (cdr (assq 'word score))))
+              (println "solution-length: ~a" (coin-solution-length solution))
+              (println "contribution: ~a" (list-ref checked 3))
               (println "commitment: ~a" (hex commitment))
               (println "stored-candidates: ~a" (length records))
               (println "commits-push: ~a"
@@ -1314,7 +1296,7 @@
                  (error "reveal: --commitment must be exactly 32 bytes of hexadecimal"))
                bytes))))
 
-    ;; Return `(record share score quality)` for a valid stored candidate.
+    ;; Return `(record share contribution)` for a valid stored candidate.
     (define (assess-record context pubkey record)
       (guard (e (#t #f))
         (and (equal? pubkey (cli-commit-record-pubkey record))
@@ -1333,17 +1315,17 @@
                     (let* ((coop (share-context context '()))
                            (spec (coin-share-puzzle coop pubkey))
                            (checked (require-share-solution
-                                      "reveal" coop pubkey blind solution spec))
-                           (share (list-ref checked 1))
-                           (quality (list-ref checked 3))
-                           (score (list-ref checked 4)))
-                      (list record share score quality)))))))
+                                      "reveal" coop pubkey blind solution spec)))
+                      (list record (list-ref checked 1)
+                            (list-ref checked 3))))))))
 
+    ;; Prefer the work worth the larger payout contribution. Exact ties use
+    ;; canonical commitment bytes so local choice never depends on file order.
     (define (candidate-better? a b)
-      (let ((aw (cdr (assq 'word (list-ref a 2))))
-            (bw (cdr (assq 'word (list-ref b 2)))))
-        (or (coin-score-better? aw bw)
-            (and (= aw bw)
+      (let ((ac (list-ref a 2))
+            (bc (list-ref b 2)))
+        (or (> ac bc)
+            (and (= ac bc)
                  (cli-bytes<?
                    (cli-commit-record-commitment (car a))
                    (cli-commit-record-commitment (car b)))))))
@@ -1854,9 +1836,9 @@
                            (coin-check-shares verified-context #u8() (list back))))
                     (unless (coin-ok? verified)
                       (error "reveal: consensus rejected the emitted share"))
-                    (unless (= (list-ref candidate 3)
+                    (unless (= (list-ref candidate 2)
                                (coin-share-quality verified-context back))
-                      (error "reveal: emitted share quality changed")))
+                      (error "reveal: emitted share contribution changed")))
                   (println "height: ~a" height)
                   (println "reveal-in: ~a" (+ height 1))
                   (println "parent: ~a" (hex (reverse-bytevector parent-hash)))
@@ -1870,10 +1852,7 @@
                            (bytevector-length (coin-share-solution share)))
                   (println "solution: ~a"
                            (cli-commit-record-solution record))
-                  (println "quality: ~a" (list-ref candidate 3))
-                  (println "score: ~a"
-                           (score-word->string
-                             (cdr (assq 'word (list-ref candidate 2)))))
+                  (println "contribution: ~a" (list-ref candidate 2))
                   (println "share: ~a" (hex share-bytes))
                   (println "shares-push: ~a" (hex push))
                   (println "next: hand this share to the producer of block ~a."

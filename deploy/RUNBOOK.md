@@ -239,40 +239,19 @@ sudo -u sigilcoin sigilcoin status --chain sigilcoin-main --data-dir /var/lib/si
 there is no socket unit and no proxy in front of it.
 
 A node that has done nothing but open a fresh mainnet database reports the
-current coherent placeholder genesis:
+current generated genesis at height 0 with no peers, mempool entries, pending
+blocks, or issued supply. Compare its internal `best-hash` and reversed display
+id with the all-network output from `deploy/genesis-constants.sgl`; never use a
+pre-lottery pasted value.
 
-```
-chain: sigilcoin-main
-best-height: 0
-best-hash: edf1ae51f078002fdcb7b30a1a4f9ad7e86ac6cd1a8fceba3e5a459731331516
-best-work: 16909427814348142080
-best-header-time: 1785542400
-headers: 1
-blocks: 0
-validated-blocks: 0
-best-block-height: 0
-best-block-hash: edf1ae51f078002fdcb7b30a1a4f9ad7e86ac6cd1a8fceba3e5a459731331516
-mempool: 0
-peers: 0
-peer-successes: 0
-peer-failures: 0
-pending-blocks: 0
-sync-stage: idle
-sync-last-error:
-tip-solution-bytes: 86
-next-height: 1
-next-reward: 1.00000000 SGL
-issued-supply: 0.00000000 SGL
-scheduled-supply-cap: 0.00000000 SGL
-max-supply: 143029.99991970 SGL
-```
-
-`best-hash` is the internal byte order. The display id humans quote is
-`1615333197455a3ebace8f1acdc66ae8d79a4f1a0ab3b7dc2f0078f051aef1ed`.
-Both are current coherent placeholders derived from genesis quote
-`Sigil - Practical Symbolic Power`; mainnet timestamp remains non-final until
-launch day. Generated-witness tightening changed this genesis, so an older
-database is not compatible with the current placeholder. See `../LAUNCH.md`.
+`best-work` is equal-unit chain work, not accumulated hash difficulty or a
+projected program rank. Genesis carries the generated at-par candidate,
+encodes its length and `C` in `bits`, and uses a searched uint32 nonce whose
+full-header `HASH256` roll meets the lottery target. Producer solutions require
+`L <= par`; shares require `L < personalized_par`. The header-layout/lottery
+cutover changes genesis, so earlier chain state is incompatible. Mainnet's
+timestamp and resulting constants remain non-final until launch day. See
+`../LAUNCH.md`.
 
 Creating the node's own address writes the wallet key:
 
@@ -367,9 +346,7 @@ traffic, not errors. `p2p-read-envelope: payload too large` on the same line
 is a malformed peer being rejected — also normal, and also not a fault of the
 seed.
 
-`tip-solution-bytes` comes from the persisted projected rank word.
-Authenticated share quality was erased from persisted rank and cannot be
-reconstructed by status. `next-reward` is the next **scheduled subsidy**, not
+`next-reward` is the next **scheduled subsidy**, not
 an exact coinbase payout: a solo block mints `floor(4*S/5)+F`, while a
 cooperative block mints `S+F`, targets 10% for verified shares and 5% for the
 parent carrier, and sends fees and integer residuals to the producer. These
@@ -499,9 +476,10 @@ is unremarkable. Three days is not.
 
 Work through it in this order:
 
-1. **Is anyone mining?** Nothing forces a block to exist. On a chain this
-   small, "stalled" usually means the humans stopped playing, and no
-   operational action fixes that.
+1. **Is anyone mining?** Nothing forces a block to exist. The generated par
+   witness is an eligible program, but a producer must still find a qualifying
+   full-header nonce roll. On a chain this small, "stalled" usually means the
+   humans stopped playing, and no operational action fixes that.
 2. **Are peers reachable?**
    `sigilcoin peers test HOST:PORT --chain sigilcoin-main --data-dir /var/lib/sigilcoin`,
    then check `peer-failures` in `status`.
@@ -519,13 +497,13 @@ Work through it in this order:
 
 ### Reorgs
 
-A reorg here is routine, not an incident. Fork choice is: greater height wins;
-at equal height, lower projected rank `(L, MB, SB)` wins. Equal-height,
-equal-rank blocks are incomparable, so the incumbent remains the tip and
-first-seen wins locally. Authenticated `Q`, raw score-word differences, and
-block hash do not break that tie. Nodes can briefly retain different siblings;
-a child must link the selected incumbent and explicitly settles its height
-against later siblings.
+A reorg here is routine, not an incident. Every accepted block contributes one
+unit. A child already observed on the selected incumbent settles that height;
+otherwise greater validated height wins, and same-height siblings retain the
+first valid arrival. Program length, evaluator cost, share contribution,
+nonce, and block hash do not break the tie. Nodes can briefly retain different
+siblings; a child must link the selected incumbent and explicitly settles its
+height against later siblings.
 
 What that means operationally:
 

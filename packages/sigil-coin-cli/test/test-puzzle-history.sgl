@@ -55,25 +55,33 @@
       (error "test-puzzle-history: generated header has invalid bits"))
     (coin-result-value decoded)))
 
-(define (build-block n history height hidden? label)
+(define (build-block n history height label)
   (let* ((parent (last-of history))
          (complexity (coin-required-complexity history height))
          (solution
-           (and hidden?
-                (puzzle-spec-hidden-source
-                  (coin-puzzle-for
-                    (block-header-hash parent) height complexity)))))
-    (coin-build-block
-      parent height complexity solution label %payout
-      (+ (block-header-time parent)
-         (coin-chain-min-block-spacing (node-config n))))))
+           (puzzle-spec-par-solution
+             (coin-puzzle-for
+               (block-header-hash parent) height complexity)))
+         (b
+           (coin-build-block
+             parent height complexity solution label %payout
+             (+ (block-header-time parent)
+                (coin-chain-min-block-spacing (node-config n)))))
+         (encoded-length
+           (coin-bits-solution-length
+             (block-header-bits (block-header-field b)))))
+    (unless (and (coin-ok? encoded-length)
+                 (= (coin-solution-length solution)
+                    (coin-result-value encoded-length)))
+      (error "test-puzzle-history: builder encoded the wrong solution length"))
+    b))
 
-(define (extend-validated n history target hidden? label)
+(define (extend-validated n history target label)
   (let loop ((headers history))
     (let ((height (length headers)))
       (if (> height target)
           headers
-          (let* ((b (build-block n headers height hidden? label))
+          (let* ((b (build-block n headers height label))
                  (header (block-header-field b)))
             (unless (= 1 (node-ingest-headers n (list header)))
               (error "test-puzzle-history: header was not ingested"))
@@ -90,7 +98,7 @@
     (let ((height (length headers)))
       (if (> height target)
           headers
-          (let* ((b (build-block n headers height #f label))
+          (let* ((b (build-block n headers height label))
                  (header (block-header-field b)))
             (unless (= 1 (node-ingest-headers n (list header)))
               (error "test-puzzle-history: branch header was not ingested"))
@@ -113,9 +121,10 @@
            (args (list "--regtest" "--data-dir" dir))
            (n (node-open sigilcoin-regtest-chain dir))
            (genesis (chain-config-genesis-header (node-config n)))
-           ;; Hidden canonical programs and table-program fork blocks produce
-           ;; different second-window score margins.
-           (canonical (extend-validated n (list genesis) 32 #t "canonical"))
+           ;; The branches are hash-distinct and every automatic nonce winner
+           ;; uses its at-par witness, so both retarget margin windows stay zero
+           ;; while this fixture checks exact ancestry.
+           (canonical (extend-validated n (list genesis) 32 "canonical"))
            (old-h32 (list-ref canonical 32)))
       (assert-equal 32
                     (node-status-snapshot-best-block-height (node-status n)))
@@ -156,7 +165,7 @@
           ;; A taller header without its body may lead header sync, but cannot
           ;; change validated puzzle ancestry.
           (let ((ghost (block-header-field
-                         (build-block n fork 34 #t "bodyless"))))
+                         (build-block n fork 34 "bodyless"))))
             (assert-equal 1 (node-ingest-headers n (list ghost)))
             (assert-equal 34
                           (node-status-snapshot-best-height (node-status n)))

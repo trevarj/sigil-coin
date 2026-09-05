@@ -500,14 +500,34 @@
         shares)
       pool-producer-candidate<?)))
 
-(define (pool-padded-solution parent height complexity)
-  (string-append
-    "(if #f \"padding\" "
-    (puzzle-spec-hidden-source
-      (coin-puzzle-for (block-header-hash parent) height complexity))
-    ")"))
+
+(define (pool-assert-lottery block)
+  (let* ((header (block-header-field block))
+         (complexity-result (coin-bits-decode (block-header-bits header)))
+         (length-result
+           (coin-bits-solution-length (block-header-bits header)))
+         (payload-result (coin-block-coinbase-payload block)))
+    (assert-true (coin-ok? complexity-result))
+    (assert-true (coin-ok? length-result))
+    (assert-true (coin-ok? payload-result))
+    (let* ((complexity (coin-result-value complexity-result))
+           (length (coin-result-value length-result))
+           (payload (coin-result-value payload-result))
+           (height (coin-coinbase-payload-height payload))
+           (solution (coin-coinbase-payload-solution payload))
+           (par
+             (puzzle-spec-par
+               (coin-puzzle-for
+                 (block-header-previous-block header) height complexity))))
+      (assert-equal length (bytevector-length solution))
+      (assert-true
+        (coin-lottery-valid?
+          (block-header-work-value header) complexity par length))))
+  block)
+
 
 (define (pool-submit-block! n block)
+  (pool-assert-lottery block)
   (node-ingest-headers n (list (block-header-field block)))
   (node-store-block n block)
   (unless (= 1 (node-validate-blocks n))
@@ -517,6 +537,25 @@
                (block-header-id (block-header-field block))
                " "
                (node-status-snapshot-sync-last-error status)))))
+  block)
+
+;; Valid siblings are first-seen in node fork choice. This relay projection
+;; fixture deliberately moves between such bodies, so store the canonical
+;; builder's sibling as validated before selecting it in metadata.
+(define (pool-store-validated-sibling! n block)
+  (pool-assert-lottery block)
+  (unless (= 1
+             (node-ingest-headers n (list (block-header-field block))))
+    (error "test-pool: sibling header was not ingested"))
+  (node-store-block n block)
+  (unless
+    (sqlite-run
+      (node-db n)
+      "UPDATE blocks SET status = ?, validated = 1, last_error = ? WHERE hash = ?"
+      "valid"
+      ""
+      (hex-encode (block-header-hash (block-header-field block))))
+    (error "test-pool: sibling body could not be marked validated"))
   block)
 
 (define (pool-activate-tip! chain data-dir header height)
@@ -693,7 +732,8 @@
              (genesis (chain-config-genesis-header chain))
              (block
                (coin-build-block
-                 genesis height complexity #f
+                 genesis height complexity
+                 #f
                  "post-persist race" %pool-script
                  (+ (block-header-time genesis)
                     (coin-chain-min-block-spacing (node-config n)))))
@@ -736,7 +776,8 @@
              (time-one (+ (block-header-time genesis) spacing))
              (prototype
                (coin-build-block
-                 genesis height complexity #f
+                 genesis height complexity
+                 #f
                  "prototype" %pool-script time-one))
              (share-context (coin-parent-context prototype))
              (fixtures (pool-share-fixtures 3 share-context))
@@ -812,14 +853,12 @@
         (let* ((missed-one
                  (coin-build-block
                    genesis height complexity
-                   (pool-padded-solution genesis height complexity)
+                   #f
                    "commitment omitted" %pool-script time-one))
                (committed-one
                  (coin-build-block
                    genesis height complexity
-                   (puzzle-spec-hidden-source
-                     (coin-puzzle-for
-                       (block-header-hash genesis) height complexity))
+                   #f
                    "commitment included" %pool-script time-one
                    '() 0 all-commitments)))
           (pool-submit-block! n missed-one)
@@ -828,12 +867,11 @@
             (assert-equal
               (block-header-id (block-header-field missed-one))
               (field status 'commit_block_id)))
-          ;; The shorter canonical producer solution wins this unsettled
-          ;; sibling reorg; status follows its exact COMMITS body.
-          (pool-submit-block! n committed-one)
-          (assert-equal
-            (block-header-hash (block-header-field committed-one))
-            (block-header-hash (node-best-header n)))
+          ;; Siblings are first-seen, so select the second validated body
+          ;; explicitly and prove status follows its exact COMMITS body.
+          (pool-store-validated-sibling! n committed-one)
+          (pool-activate-tip!
+            chain data-dir (block-header-field committed-one) height)
           (let ((status (pool-status service primary-commitment)))
             (assert-equal "revealable" (field status 'status))
             (assert-equal
@@ -949,39 +987,31 @@
                            (block-header-field committed-one)
                            next-height
                            next-complexity
-                           (pool-padded-solution
-                             (block-header-field committed-one)
-                             next-height
-                             next-complexity)
+                           #f
                            "reveal omitted" %pool-script time-two))
                        (included-two
                          (coin-build-coop-block
                            committed-one
                            next-height
                            next-complexity
-                           (puzzle-spec-hidden-source
-                             (coin-puzzle-for
-                               (block-header-hash
-                                 (block-header-field committed-one))
-                               next-height
-                               next-complexity))
+                           #f
                            shares
                            "reveal included"
                            %pool-script
                            time-two)))
-                  (pool-submit-block! n missed-two)
+                  (pool-store-validated-sibling! n missed-two)
+                  (pool-activate-tip!
+                    chain data-dir (block-header-field missed-two) next-height)
                   (assert-equal
                     "reveal-missed"
                     (field
                       (pool-status service primary-commitment)
                       'status))
-                  ;; The shorter producer solution replaces the unsettled
-                  ;; omitted sibling, and exact share/payout membership makes
-                  ;; the receipt included.
-                  (pool-submit-block! n included-two)
-                  (assert-equal
-                    (block-header-hash (block-header-field included-two))
-                    (block-header-hash (node-best-header n)))
+                  ;; Select the other validated sibling; exact share and payout
+                  ;; membership makes the receipt included.
+                  (pool-store-validated-sibling! n included-two)
+                  (pool-activate-tip!
+                    chain data-dir (block-header-field included-two) next-height)
                   (let ((status
                           (pool-status service primary-commitment)))
                     (assert-equal "included" (field status 'status))

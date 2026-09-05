@@ -13,7 +13,6 @@
           (sigil coin consensus))
   (export
     explorer-complexity
-    explorer-score
     explorer-seed
     explorer-puzzle
     explorer-puzzle-view
@@ -34,18 +33,6 @@
         (let ((decoded (coin-bits-decode bits)))
           (and (coin-ok? decoded) (coin-result-value decoded)))))
 
-    ;;; Flatten a header score as `(L MB SB Q)`, or `#f` when malformed.
-    ;;; `Q` is aggregate personalized-share quality, never raw reveal count.
-    (define (explorer-score nonce)
-      (: any? -> any?)
-      (guard (e (#t #f))
-        (let ((checked (coin-score-check nonce)))
-          (and (coin-ok? checked)
-               (let ((score (coin-result-value checked)))
-                 (list (coin-score-length score)
-                       (coin-score-memory score)
-                       (coin-score-steps score)
-                       (coin-score-quality score)))))))
 
     ;;; Derive a puzzle seed as lowercase hex, or `#f` for bad input.
     (define (explorer-seed parent-hash height complexity)

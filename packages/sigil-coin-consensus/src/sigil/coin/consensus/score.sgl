@@ -1,87 +1,43 @@
-;;; (sigil coin consensus score) — the 32-bit composite score word
+;;; (sigil coin consensus score) — exact program-golf lottery arithmetic
 ;;;
-;;; The header's `W` commits the tuple `(L, MB, SB, 15-Q)` and packs it into
-;;; the header's `nonce`:
+;;; A block wins when its 256-bit header hash, interpreted as the Bitcoin
+;;; little-endian work integer, is at most
 ;;;
-;;;   bit  31              22 21     15 14      8 7    4 3    0
-;;;       +------------------+---------+---------+------+------+
-;;;       |      L - 1       |   MB    |   SB    |15-Q  | 0000 |
-;;;       +------------------+---------+---------+------+------+
-;;;          10 bits           7 bits    7 bits   4 bits 4 bits
+;;;   min(2^255 - 1,
+;;;       (floor(2^256 / (32 * C)) * 2^min(max(par - L, 0), 8)) - 1).
 ;;;
-;;;   L   producer solution length, 1..512, stored biased by one so 512
-;;;       fits ten bits
-;;;   MB  bucket of the cells the producer's solution charged
-;;;   SB  bucket of the steps it spent
-;;;   Q   aggregate verified share quality, 0..15, stored as `15-Q`
-;;;
-;;; Fork choice does not compare `W` directly. `coin-score-rank-word`
-;;; projects it to
-;;;
-;;;   rank(W) = W & 0xffffff0f
-;;;
-;;; which clears exactly the `15-Q` nibble. `Q` remains authenticated by the
-;;; raw header word, checked against the body, decoded for reporting, and
-;;; available to payouts, but it cannot change which sibling wins.
-;;;
-;;; WHY UNSIGNED `<` IS THE PROJECTED RANKING ORDER. After projection, the
-;;; ranking fields are laid out most-significant-first in fixed-width slots
-;;; that their domains cannot overflow: `L-1` in 0..511 fits 10 bits and both
-;;; buckets in 0..127 fit 7. A packing of disjoint fixed-width fields is
-;;; exactly the base-2^width positional numeral of the tuple, so unsigned
-;;; comparison of projected words is lexicographic comparison of `(L,MB,SB)`.
-;;; The low nibble remains reserved zero: every bit of raw `W` is still
-;;; derived from the block body, so the header carries no free entropy and
-;;; there is no nonce to grind.
-;;;
-;;; THE BUCKETED VALUE IS THE CONSENSUS VALUE. Fork choice compares projected
-;;; words and never body integers, so two solutions in one `(L, MB, SB)` class
-;;; are exactly tied regardless of aggregate quality. Precision loss is
-;;; deliberate: there is no second, finer order to keep consistent with.
-;;;
-;;; The bucketing is integer-only — six buckets per octave, ~12.2%
-;;; resolution — because a floating-point log would be a divergence risk
-;;; across hosts for a number every node must agree on to the bit.
+;;; Thus an at-par solution wins once per 32*C rolls, up to integer rounding,
+;;; and every saved byte doubles its chance through the eighth saved byte.
+;;; All consensus arithmetic is exact integer arithmetic.
 
 (define-library (sigil coin consensus score)
-  (import (sigil struct)
-          (sigil math)
-          (sigil coin consensus result)
-          (sigil coin consensus rules))
+  (import (sigil math))
   (export
-    ;; Bucketing
+    ;; Resource reporting (not header consensus).
     coin-bucket7
     coin-max-bucket
 
-    ;; The word
-    coin-score
-    coin-score?
-    coin-score-length
-    coin-score-memory
-    coin-score-steps
-    coin-score-quality
-    coin-score-encode
-    coin-score-pack
-    coin-score-decode
-    coin-score-valid?
-    coin-score-check
-    coin-max-score-word
-
-    ;; Ranking
-    coin-score-rank-word
-    coin-score-compare
-    coin-score-better?)
+    ;; Lottery parameters and arithmetic.
+    coin-lottery-work-factor
+    coin-lottery-max-bonus
+    coin-lottery-max-integer
+    coin-lottery-target-ceiling
+    coin-lottery-bonus
+    coin-lottery-multiplier
+    coin-lottery-target
+    coin-lottery-expected-rolls
+    coin-lottery-valid?)
 
   (begin
 
     ;; ============================================================
-    ;; Bucketing
+    ;; Resource reporting
     ;; ============================================================
 
     ;; floor(1000 * 2^(i/6)) for i in 0..5, frozen as exact integers.
     (define %thresholds '(1000 1122 1260 1414 1587 1782))
 
-    ;;; Largest bucket index the 7-bit fields hold.
+    ;;; Largest bucket index the reporting helper returns.
     (define coin-max-bucket 127)
 
     (define (require-count who x)
@@ -89,245 +45,95 @@
           (error (string-append who ": expected a non-negative integer")))
       x)
 
-    ;; floor(log2 x) + 1 for x >= 1, by shifting. No logarithm, no float.
     (define (bit-length x)
-      (let loop ((n x) (b 0))
-        (if (= n 0) b (loop (arithmetic-shift n -1) (+ b 1)))))
+      (let loop ((n x) (bits 0))
+        (if (= n 0)
+            bits
+            (loop (arithmetic-shift n -1) (+ bits 1)))))
 
-    ;;; Bucket a resource count into 7 bits at six buckets per octave.
-    ;;;
-    ;;; `bucket7(0) = 0`; otherwise the octave is `floor(log2 x)` and the
-    ;;; position within it is how many of the six frozen thresholds `x`
-    ;;; has passed. Monotone non-decreasing, exact-integer arithmetic only.
-    ;;;
-    ;;; ```scheme
-    ;;; (coin-bucket7 0)      ; => 0
-    ;;; (coin-bucket7 1)      ; => 1
-    ;;; (coin-bucket7 2)      ; => 7
-    ;;; (coin-bucket7 300)    ; => 50
-    ;;; (coin-bucket7 340)    ; => 51
-    ;;; (coin-bucket7 100000) ; => 100
-    ;;; (coin-bucket7 200000) ; => 106
-    ;;; ```
+    ;;; Bucket a resource count at six buckets per octave.
+    ;;; This remains a reporting helper; no bucket is committed in a header or
+    ;;; consulted by block validity or fork choice.
     (define (coin-bucket7 x)
       (: integer? -> integer?)
       (require-count "coin-bucket7" x)
       (if (= x 0)
           0
-          (let* ((kk (- (bit-length x) 1))
+          (let* ((octave (- (bit-length x) 1))
                  (scaled (* 1000 x))
                  (passed
-                   (let loop ((ts %thresholds) (n 0))
+                   (let loop ((thresholds %thresholds) (count 0))
                      (cond
-                       ((null? ts) n)
-                       ((<= (arithmetic-shift (car ts) kk) scaled)
-                        (loop (cdr ts) (+ n 1)))
-                       (else n)))))
-            (min coin-max-bucket (+ 1 (* 6 kk) (- passed 1))))))
+                       ((null? thresholds) count)
+                       ((<= (arithmetic-shift (car thresholds) octave) scaled)
+                        (loop (cdr thresholds) (+ count 1)))
+                       (else count)))))
+            (min coin-max-bucket
+                 (+ 1 (* 6 octave) (- passed 1))))))
 
     ;; ============================================================
-    ;; The word
+    ;; Lottery
     ;; ============================================================
 
-    (define %length-shift 22)
-    (define %memory-shift 15)
-    (define %steps-shift 8)
-    (define %quality-shift 4)
-    (define %length-mask #x3ff)
-    (define %bucket-mask #x7f)
-    (define %nibble-mask #xf)
+    ;;; Baseline expected work per unit of puzzle complexity.
+    (define coin-lottery-work-factor 32)
 
-    ;;; One more than the largest legal score word: the word is a 32-bit
-    ;;; unsigned integer.
-    (define coin-max-score-word #x100000000)
+    ;;; Most saved bytes that improve lottery odds.
+    (define coin-lottery-max-bonus 8)
 
-    ;;; A decoded score word.
-    ;;;
-    ;;; `length` is the producer's solution length in bytes, `memory` and
-    ;;; `steps` are BUCKET indices rather than raw counts — the raw numbers
-    ;;; are not recoverable and are not consensus — and `quality` is `Q`,
-    ;;; decoded back from the stored `15-Q`.
-    ;;;
-    ;;; ```scheme
-    ;;; (coin-score-length (coin-score-decode
-    ;;;                         (coin-score-encode 25 80 300 0)))
-    ;;; ; => 25
-    ;;; ```
-    (define-struct coin-score
-      (length)
-      (memory)
-      (steps)
-      (quality))
+    (define %lottery-outcomes (arithmetic-shift 1 256))
 
-    (define (require-range who what x lo hi)
-      (if (not (and (number? x) (exact? x) (integer? x)
-                    (<= lo x) (<= x hi)))
-          (error (string-append who ": " what " out of range")))
+    ;;; Largest 256-bit unsigned header-hash roll.
+    (define coin-lottery-max-integer (- %lottery-outcomes 1))
+
+    ;;; Effective targets are capped at one half of the uint256 range.
+    (define coin-lottery-target-ceiling
+      (- (arithmetic-shift 1 255) 1))
+
+    (define (require-positive who what x)
+      (if (not (and (number? x) (exact? x) (integer? x) (> x 0)))
+          (error (string-append who ": " what " must be a positive integer")))
       x)
 
-    ;;; Pack already-bucketed fields into a score word.
-    ;;;
-    ;;; `length` is 1..512, `memory` and `steps` are bucket indices 0..127,
-    ;;; and `quality` is `Q` in 0..15. Raises on anything outside those
-    ;;; domains: every caller packs values it has already validated, so an
-    ;;; out-of-range field is a node bug and must not be mistaken for a bad
-    ;;; block. Use `coin-score-check` for words that came off the wire.
-    ;;;
-    ;;; ```scheme
-    ;;; (coin-score-pack 1 0 0 15) ; => 0
-    ;;; ```
-    (define (coin-score-pack length memory steps quality)
-      (: integer? integer? integer? integer? -> integer?)
-      (require-range "coin-score-pack" "length" length
-                     1 coin-max-solution-bytes)
-      (require-range "coin-score-pack" "memory bucket" memory
-                     0 coin-max-bucket)
-      (require-range "coin-score-pack" "step bucket" steps
-                     0 coin-max-bucket)
-      (require-range "coin-score-pack" "aggregate quality" quality 0 15)
-      (bitwise-ior
-        (arithmetic-shift (- length 1) %length-shift)
-        (arithmetic-shift memory %memory-shift)
-        (arithmetic-shift steps %steps-shift)
-        (arithmetic-shift (- 15 quality) %quality-shift)))
-
-    ;;; Compute the score word from a validated body.
-    ;;;
-    ;;; `cells` and `steps` are the raw counts one machine charged while
-    ;;; running the producer's solution against all `k` examples; they are
-    ;;; bucketed here, and only the buckets reach the header.
-    ;;;
-    ;;; ```scheme
-    ;;; (coin-score-quality (coin-score-decode
-    ;;;                          (coin-score-encode 40 80 300 12)))
-    ;;; ; => 12
-    ;;; ```
-    (define (coin-score-encode length cells steps quality)
-      (: integer? integer? integer? integer? -> integer?)
-      (require-count "coin-score-encode" cells)
-      (require-count "coin-score-encode" steps)
-      (coin-score-pack length
-                          (coin-bucket7 cells)
-                          (coin-bucket7 steps)
-                          quality))
-
-    ;;; True when `w` is a legal score word: a 32-bit unsigned integer whose
-    ;;; low nibble is zero. Every 4-bit `15-Q` value is legal.
-    ;;;
-    ;;; ```scheme
-    ;;; (coin-score-valid? (coin-score-pack 1 0 0 0)) ; => #t
-    ;;; (coin-score-valid? 1)                            ; => #f
-    ;;; ```
-    (define (coin-score-valid? w)
-      (: any? -> boolean?)
-      (and (number? w) (exact? w) (integer? w)
-           (<= 0 w) (< w coin-max-score-word)
-           (= 0 (bitwise-and w %nibble-mask))))
-
-    ;;; Unpack a legal score word.
-    ;;;
-    ;;; Raises on an illegal word; `coin-score-check` is the gate for
-    ;;; anything that came off the wire.
-    ;;;
-    ;;; ```scheme
-    ;;; (coin-score-steps (coin-score-decode
-    ;;;                        (coin-score-pack 10 20 30 2)))
-    ;;; ; => 30
-    ;;; ```
-    (define (coin-score-decode w)
-      (: integer? -> coin-score?)
-      (if (not (coin-score-valid? w))
-          (error "coin-score-decode: not a legal score word"))
-      (coin-score
-        length: (+ 1 (bitwise-and (arithmetic-shift w (- %length-shift))
-                                  %length-mask))
-        memory: (bitwise-and (arithmetic-shift w (- %memory-shift))
-                             %bucket-mask)
-        steps: (bitwise-and (arithmetic-shift w (- %steps-shift))
-                            %bucket-mask)
-        quality: (- 15
-                    (bitwise-and (arithmetic-shift w (- %quality-shift))
-                                 %nibble-mask))))
-
-    ;;; Check a score word read out of a header.
-    ;;;
-    ;;; Total: never raises, whatever the header carries. Rejection reasons
-    ;;; are `malformed-header` (not a 32-bit unsigned integer at all),
-    ;;; `score-reserved-nonzero` (the low nibble is not zero). On success
-    ;;; the value is the decoded `coin-score`.
-    ;;;
-    ;;; This is a header-level field-range check only. Whether the word
-    ;;; describes the block it rides in is `score-mismatch`, and is decided
-    ;;; by recomputing the word from the validated body.
-    ;;;
-    ;;; ```scheme
-    ;;; (coin-result-reason (coin-score-check 1))
-    ;;; ; => score-reserved-nonzero
-    ;;; ```
-    (define (coin-score-check w)
-      (: any? -> coin-result?)
-      (cond
-        ((not (and (number? w) (exact? w) (integer? w)
-                   (<= 0 w) (< w coin-max-score-word)))
-         (coin-error 'malformed-header
-                     "score word is not a 32-bit unsigned integer"))
-        ((not (= 0 (bitwise-and w %nibble-mask)))
-         (coin-error 'score-reserved-nonzero
-                     "the reserved low nibble is not zero"))
-        (else (coin-ok (coin-score-decode w)))))
-
-    ;; ============================================================
-    ;; Ranking
-    ;; ============================================================
-
-    ;;; Project a legal score word onto the fork-choice rank word.
-    ;;;
-    ;;; This clears only bits 7..4, which carry `15-Q`; all producer fields
-    ;;; and the reserved low nibble are preserved. Raises unless `w` is a
-    ;;; legal score word, exactly as `coin-score-compare` does.
-    ;;;
-    ;;; ```scheme
-    ;;; (coin-score-rank-word (coin-score-pack 24 50 51 3))
-    ;;; ; => (coin-score-pack 24 50 51 15)
-    ;;; ```
-    (define (coin-score-rank-word w)
-      (: integer? -> integer?)
-      (if (not (coin-score-valid? w))
-          (error "coin-score-rank-word: not a legal score word"))
-      (bitwise-and w #xffffff0f))
-
-    ;;; Rank two score words by their projected producer fields. Lower is
-    ;;; better.
-    ;;;
-    ;;; Returns -1 when `a` is the better block, 1 when `b` is, and 0 when
-    ;;; their `(L, MB, SB)` fields are equal. Raw words that differ only in
-    ;;; authenticated aggregate quality are therefore incomparable, and fork
-    ;;; choice keeps the incumbent tip.
-    ;;;
-    ;;; Both inputs must be legal score words. Comparison projects them first,
-    ;;; then performs plain unsigned comparison; see the module header for why
-    ;;; that equals lexicographic order on `(L, MB, SB)`.
-    ;;;
-    ;;; ```scheme
-    ;;; (coin-score-compare (coin-score-pack 24 50 51 0)
-    ;;;                     (coin-score-pack 24 50 51 15))
-    ;;; ; => 0
-    ;;; ```
-    (define (coin-score-compare a b)
+    ;;; Number of solution bytes rewarded by the lottery, capped at eight.
+    (define (coin-lottery-bonus par length)
       (: integer? integer? -> integer?)
-      (let ((a-rank (coin-score-rank-word a))
-            (b-rank (coin-score-rank-word b)))
-        (cond ((< a-rank b-rank) -1)
-              ((> a-rank b-rank) 1)
-              (else 0))))
+      (require-positive "coin-lottery-bonus" "par" par)
+      (require-positive "coin-lottery-bonus" "solution length" length)
+      (min coin-lottery-max-bonus (max 0 (- par length))))
 
-    ;;; True when `a` strictly outranks `b`.
-    ;;;
-    ;;; ```scheme
-    ;;; (coin-score-better? (coin-score-pack 24 0 0 0)
-    ;;;                        (coin-score-pack 24 0 0 1))
-    ;;; ; => #f
-    ;;; ```
-    (define (coin-score-better? a b)
-      (: integer? integer? -> boolean?)
-      (< (coin-score-compare a b) 0))))
+    ;;; Exact odds multiplier earned by a solution length.
+    (define (coin-lottery-multiplier par length)
+      (: integer? integer? -> integer?)
+      (arithmetic-shift 1 (coin-lottery-bonus par length)))
+
+    ;;; Inclusive uint256 target for `(C, par, L)`.
+    (define (coin-lottery-target complexity par length)
+      (: integer? integer? integer? -> integer?)
+      (require-positive "coin-lottery-target" "complexity" complexity)
+      (let* ((base-plus-one
+               (quotient %lottery-outcomes
+                         (* coin-lottery-work-factor complexity)))
+             (effective
+               (- (* base-plus-one
+                     (coin-lottery-multiplier par length))
+                  1)))
+        (min coin-lottery-target-ceiling effective)))
+
+    ;;; Expected rolls rounded up to the next integer.
+    (define (coin-lottery-expected-rolls complexity par length)
+      (: integer? integer? integer? -> integer?)
+      (let ((winning-rolls
+              (+ (coin-lottery-target complexity par length) 1)))
+        (quotient (+ %lottery-outcomes winning-rolls -1)
+                  winning-rolls)))
+
+    ;;; Whether an integer uint256 hash roll wins the lottery.
+    (define (coin-lottery-valid? roll complexity par length)
+      (: any? integer? integer? integer? -> boolean?)
+      (and (number? roll)
+           (exact? roll)
+           (integer? roll)
+           (<= 0 roll)
+           (<= roll coin-lottery-max-integer)
+           (<= roll (coin-lottery-target complexity par length))))))

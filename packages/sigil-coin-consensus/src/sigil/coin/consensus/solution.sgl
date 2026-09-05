@@ -5,6 +5,7 @@
 
 (define-library (sigil coin consensus solution)
   (import (sigil math)
+          (sigil io)
           (sigil coin puzzle)
           (sigil coin puzzle constraints)
           (sigil coin puzzle generator)
@@ -20,11 +21,11 @@
     ;; `puzzle-parse` accepts both, and a node reading a block always has
     ;; bytes; strings are accepted so tests and miners can pass source text.
     ;; The length is the SOURCE length in either shape, which is what the
-    ;; cap and the score word's `L` field both mean.
+    ;; cap and header `bits` field both mean.
     (define (source-length solution)
       (if (bytevector? solution)
           (bytevector-length solution)
-          (string-length solution)))
+          (bytevector-length (string->utf8 solution))))
 
     ;;; Length of a candidate solution in bytes, or `#f` when it is neither
     ;;; bytes nor a string.
@@ -82,27 +83,26 @@
 
     ;;; Check a candidate solution against an already-derived puzzle.
     ;;;
-    ;;; On success the value is the `puzzle-report`, whose `steps` and
-    ;;; `cells` are what the score word buckets and whose `value` is the
-    ;;; procedure itself. Returning the report rather than a fresh record
-    ;;; keeps one definition of "what running this solution cost", and lets
-    ;;; share validation reuse it without recomputing resource totals.
+    ;;; On success the value is the `puzzle-report`. Returning the report
+    ;;; lets share validation reuse exact evaluator results without rerunning
+    ;;; examples.
     ;;;
-    ;;; `puzzle-spec-par` is NOT a bound here. Par is the shortest solution
-    ;;; the generator happens to know, an upper bound on the true optimum
-    ;;; and often a loose one; shorter solutions are legal, expected, and
-    ;;; the whole point of the game. Par's only role is the retarget signal.
+    ;;; `puzzle-spec-par` is the producer validity ceiling. It is the length
+    ;;; of the shortest witness the generator verified, so accepting equality
+    ;;; preserves a public liveness solution while refusing weaker programs.
+    ;;; Par remains only an upper bound on the true optimum: shorter solutions
+    ;;; are legal, expected, and the point of the game.
     ;;;
     ;;; Rejection reasons are `solution-malformed`, `solution-oversize`,
-    ;;; `constraint-violated`, `solution-parse-failed`,
+    ;;; `solution-over-par`, `constraint-violated`, `solution-parse-failed`,
     ;;; `solution-eval-failed`, `solution-not-a-procedure`,
-    ;;; `solution-mismatch` and `internal-error`. Details name the
-    ;;; interpreter kind, the constraint or the failing example index, and
-    ;;; are advisory: two nodes may print different details for the same
+    ;;; `solution-mismatch` and `internal-error`. Details name the interpreter
+    ;;; kind, constraint, length limit or failing example index. They are
+    ;;; advisory: two nodes may print different details for the same
     ;;; rejection and still agree on the chain.
     ;;;
     ;;; ```scheme
-    ;;; (coin-ok? (coin-check-solution spec (puzzle-spec-table-solution spec)))
+    ;;; (coin-ok? (coin-check-solution spec (puzzle-spec-par-solution spec)))
     ;;; ; => #t
     ;;; (coin-result-reason (coin-check-solution spec "car"))
     ;;; ; => solution-mismatch
@@ -121,6 +121,9 @@
            (coin-error 'solution-oversize "solution exceeds the byte cap"))
           ((= 0 (source-length solution))
            (coin-error 'solution-malformed "solution is empty"))
+          ((> (source-length solution) (puzzle-spec-par spec))
+           (coin-error 'solution-over-par
+                       "solution is longer than puzzle par"))
           (else
             (let ((ci (puzzle-spec-constraint spec))
                   (d (coin-spec-builtin-cap spec)))

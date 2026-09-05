@@ -15,17 +15,19 @@ commit, push, or deploy unless an operator runs it.
 
 ## Public testnet reset boundary
 
-The configured public testnet starts from a new genesis:
+The configured public testnet starts from a new genesis marker
+`SigilCoin public testnet reset - 2026-09-02` at timestamp `1788307200`
+(`2026-09-02T00:00:00Z`). Its display/internal hashes come from the
+all-network constants generated with the current lottery header rules.
 
-- marker `SigilCoin public testnet reset - 2026-09-02`,
-- timestamp `1788307200` (`2026-09-02T00:00:00Z`),
-- display id
-  `15447f3226699f537969cbea4b493bbbe25a4d856832bf28bce3e7df579e6ddc`.
-
-This is not an activation on the previous chain. Old public-testnet databases,
-history, and backups of that state are incompatible; old-chain balances do not
-carry over. The `d3 7a 91 c5` magic is intentionally unchanged, so a successful
-frame handshake does not prove that a peer has the reset genesis.
+This is not an activation on the previous chain. Producer `L <= par`, the
+`bits` encoding of `L` and `C`, and the searched full-header nonce lottery all
+change genesis; shares retain `L < personalized_par`. The selected at-par
+witness guarantees an eligible producer candidate, not an immediate block.
+Old public-testnet databases, history, and backups are incompatible and
+old-chain balances do not carry over. The `d3 7a 91 c5` magic is intentionally
+unchanged, so a successful frame handshake does not prove that a peer has the
+reset genesis.
 
 Deployment scripts never delete operator data. Before deploying a reset to a
 host that ran an older testnet, stop every chain and pool database user, take
@@ -380,20 +382,25 @@ SIGIL_IMAGE="$rollback_image" docker compose --env-file .env \
 ```
 
 An image rollback does not migrate or restore either state directory. The
-chain database, pool schema, and genesis must all be compatible. Never roll a
-reset service back onto previous-testnet state; if compatibility is uncertain,
-preserve both current directories and restore a matching pair into empty
-locations. An incident or testnet success does not authorize a mainnet push or
-deployment.
+chain database, pool schema, consensus rules, and genesis must all be
+compatible. In particular, state from before the producer-length `bits` and
+nonce-lottery genesis cutover requires a fresh matching chain state; never open
+it with the cutover binary.
+If compatibility is uncertain, preserve both current directories and restore
+a matching pair into empty locations. An incident or testnet success does not
+authorize a mainnet push or deployment.
 
 ## Mainnet placeholder
 
 Mainnet uses port `19444`, separate state, and loopback explorer port `8081`.
 The co-op relay service and public pool hostname are testnet-only; mainnet
 Compose is unchanged and has no pool. Mainnet's coherent placeholder genesis
-was regenerated with the tightened witness source, but its launch timestamp and
-resulting final constants remain non-final. Both helper scripts and every
-container refuse mainnet unless the operator sets exactly `ALLOW_MAINNET=yes`.
+uses the generated par candidate, commits its length and complexity in `bits`,
+and searches the uint32 nonce against the full-header target. The header
+lottery cutover changed it, so older chain state is incompatible. Its launch
+timestamp and resulting final constants remain non-final. Both helper scripts
+and every container refuse mainnet unless the operator sets exactly
+`ALLOW_MAINNET=yes`.
 
 ```sh
 ALLOW_MAINNET=yes MODE=mainnet bash deploy/scripts/run-local.sh

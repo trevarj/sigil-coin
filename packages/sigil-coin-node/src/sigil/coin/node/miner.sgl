@@ -11,9 +11,10 @@
           (sigil coin node rules)
           (sigil coin node body))
   (export
-    coin-table-solution
+    coin-par-solution
     coin-mining-coinbase
     coin-mining-coinbase/coop
+    coin-mine-header
     coin-build-block
     coin-build-coop-block)
 
@@ -30,12 +31,12 @@
             (else
              (error (string-append who ": expected a string or bytevector")))))
 
-    ;;; Return producer table solution for one canonical puzzle.
-    (define (coin-table-solution previous-hash height complexity)
+    ;;; Return the generated par-length witness for one canonical puzzle.
+    (define (coin-par-solution previous-hash height complexity)
       (: bytevector? integer? integer? -> bytevector?)
       (coin-mining-bytes
-        "coin-table-solution"
-        (puzzle-spec-table-solution
+        "coin-par-solution"
+        (puzzle-spec-par-solution
           (coin-node-puzzle previous-hash height complexity))))
 
     (define (require-fees who fees)
@@ -99,40 +100,78 @@
         (require-fees "coin-mining-coinbase"
                       (optional-argument maybe-fees 0 0))))
 
-    (define (score-or-raise previous-hash height complexity solution quality)
-      (let ((scored (coin-score-for-solution previous-hash height complexity
-                                                solution quality)))
-        (if (coin-failed? scored)
+    (define (solution-shape-or-raise previous-hash height complexity solution)
+      (let* ((spec (coin-node-puzzle previous-hash height complexity))
+             (checked (coin-check-solution spec solution)))
+        (if (coin-failed? checked)
             (error (string-append
                      "coin-build-block: solution rejected ("
-                     (symbol->string (coin-result-reason scored))
+                     (symbol->string (coin-result-reason checked))
                      ")"))
-            (coin-result-value scored))))
+            (cons (coin-solution-length solution)
+                  (puzzle-spec-par spec)))))
+
+    (define (decoded-or-raise who result)
+      (if (coin-failed? result)
+          (error (string-append
+                   who
+                   ": "
+                   (symbol->string (coin-result-reason result))))
+          (coin-result-value result)))
+
+    ;;; Search the full uint32 nonce range for a qualifying finalized header.
+    ;;;
+    ;;; `header` must already carry its final merkle root and encoded `C/L`.
+    ;;; The target is computed once; only the 80-byte header changes per roll.
+    (define (coin-mine-header header par)
+      (: block-header? integer? -> block-header?)
+      (if (not (block-header? header))
+          (error "coin-mine-header: expected a block header"))
+      (let* ((complexity
+               (decoded-or-raise
+                 "coin-mine-header"
+                 (coin-bits-decode (block-header-bits header))))
+             (length
+               (decoded-or-raise
+                 "coin-mine-header"
+                 (coin-bits-solution-length (block-header-bits header))))
+             (target (coin-lottery-target complexity par length)))
+        (if (> length par)
+            (error "coin-mine-header: solution length exceeds par"))
+        (let loop ((nonce 0))
+          (let ((candidate (block-header header nonce: nonce)))
+            (cond
+              ((<= (block-header-work-value candidate) target) candidate)
+              ((= nonce #xffffffff)
+               (error "coin-mine-header: nonce range exhausted"))
+              (else (loop (+ nonce 1))))))))
 
     (define (build parent-header height complexity solution shares contributions
                    commitments graffiti producer-script carrier-script time txs
-                   fees quality)
+                   fees)
       (let* ((parent-hash (block-header-hash parent-header))
              (solution-bytes
                (coin-mining-bytes
                  "coin-build-block solution"
                  (or solution
-                     (coin-table-solution parent-hash height complexity))))
-             (score (score-or-raise parent-hash height complexity
-                                    solution-bytes quality))
+                     (coin-par-solution parent-hash height complexity))))
+             (shape (solution-shape-or-raise
+                      parent-hash height complexity solution-bytes))
+             (length (car shape))
+             (par (cdr shape))
              (coinbase (coin-mining-coinbase/coop
                          height solution-bytes shares contributions commitments
                          graffiti producer-script carrier-script fees))
-             (transactions (cons coinbase txs)))
-        (block header-field:
-                 (block-header version: coin-header-version
-                               previous-block: parent-hash
-                               merkle-root: (merkle-root
-                                              (map transaction-txid
-                                                   transactions))
-                               time: time
-                               bits: (coin-bits-encode complexity)
-                               nonce: score)
+             (transactions (cons coinbase txs))
+             (header
+               (block-header
+                 version: coin-header-version
+                 previous-block: parent-hash
+                 merkle-root: (merkle-root (map transaction-txid transactions))
+                 time: time
+                 bits: (coin-bits-encode complexity length)
+                 nonce: 0)))
+        (block header-field: (coin-mine-header header par)
                transactions: transactions)))
 
     ;;; Build a producer-only block. Optional values are transactions, fees,
@@ -153,7 +192,7 @@
         (if (not (list? commitments))
             (error "coin-build-block: expected commitments"))
         (build parent-header height complexity solution '() '() commitments
-               graffiti script-pubkey #f time txs fees 0)))
+               graffiti script-pubkey #f time txs fees)))
 
     ;;; Build a co-op block revealing personalized shares committed by parent.
     ;;; Optional values are transactions, fees, then this block's commitments.
@@ -173,7 +212,7 @@
              (producer (coin-mining-bytes
                          "coin-build-coop-block solution"
                          (or solution
-                             (coin-table-solution
+                             (coin-par-solution
                                (block-header-hash parent-header)
                                height complexity))))
              (payload (coin-coinbase-payload
@@ -195,14 +234,13 @@
         (if (not (list? commitments))
             (error "coin-build-coop-block: expected commitments"))
         (let* ((accepted (coin-result-value checked))
-               ;; Both Q and payouts consume the reports cached by the one
-               ;; full share-validation pass above.
+               ;; Payouts consume the reports cached by the one full
+               ;; share-validation pass above.
                (contributions
                  (map (lambda (share)
                         (coin-share-quality context share))
                       accepted))
-               (quality (coin-quality contributions))
                (carrier (coin-carrier-script parent-block)))
           (build parent-header height complexity producer accepted contributions
-                 commitments graffiti producer-script carrier time txs fees
-                 quality))))))
+                 commitments graffiti producer-script carrier time txs
+                 fees))))))

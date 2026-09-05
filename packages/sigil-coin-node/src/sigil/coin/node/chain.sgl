@@ -84,7 +84,10 @@
 
     ;;; Bitcoin-shaped parameters used by shared transaction validation.
     (define sigilcoin-consensus-params
-      (consensus-params pow-limit-bits: (coin-bits-encode coin-complexity-max)
+      (consensus-params
+        pow-limit-bits: (coin-bits-encode
+                          coin-complexity-max
+                          coin-max-solution-bytes)
                         target-spacing: coin-target-block-spacing
                         target-timespan: coin-target-block-spacing
                         retarget-interval: #xffffffff

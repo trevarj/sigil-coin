@@ -6,7 +6,7 @@
 ;;;
 ;;; ```scheme
 ;;; (define spec (cli-puzzle parent-hash 1 128))
-;;; (cli-score-report spec "car" 0)
+;;; (cli-solution-report spec "car")
 ;;; ```
 
 (define-library (sigil coin cli support)
@@ -33,8 +33,8 @@
     cli-constraint-detail
     cli-example-lines
 
-    ;; Checking and scoring a candidate
-    cli-score-report
+    ;; Checking a candidate
+    cli-solution-report
     cli-mismatch-actual
     cli-solution-advice
 
@@ -163,43 +163,30 @@
                         out)))))
 
     ;; ============================================================
-    ;; Checking and scoring
+    ;; Checking a candidate
     ;; ============================================================
 
-    ;;; Check a candidate and, on success, report what it would score.
+    ;;; Check a candidate and report its validity and resource use.
     ;;;
-    ;;; Returns an alist. `ok` is `#t` or `#f`; on success it carries
-    ;;; `length`, `cells`, `steps`, the two 7-bit buckets and the 32-bit
-    ;;; score word `W` the header would claim, and on failure it carries the
-    ;;; consensus `reason` and `detail`.
-    ;;;
-    ;;; `quality` is aggregate verified share quality `Q`, not share count.
-    ;;; Producer previews pass zero; stored personalized candidates pass
-    ;;; their consensus contribution so selection uses the real score word.
+    ;;; On success the alist carries the exact source `length`, evaluator
+    ;;; `cells`, and evaluator `steps`. These are useful diagnostics, not a
+    ;;; block rank: only solution length changes the nonce lottery odds.
     ;;;
     ;;; ```scheme
-    ;;; (cdr (assq 'ok (cli-score-report spec "car" 0))) ; => #f
+    ;;; (cdr (assq 'ok (cli-solution-report spec "car"))) ; => #f
     ;;; ```
-    (define (cli-score-report spec solution quality)
-      (: puzzle-spec? any? integer? -> list?)
+    (define (cli-solution-report spec solution)
+      (: puzzle-spec? any? -> list?)
       (let ((checked (coin-check-solution spec solution)))
         (if (coin-failed? checked)
             (list (cons 'ok #f)
                   (cons 'reason (coin-result-reason checked))
                   (cons 'detail (coin-result-detail checked)))
-            (let* ((report (coin-result-value checked))
-                   (length (coin-solution-length solution))
-                   (cells (puzzle-report-cells report))
-                   (steps (puzzle-report-steps report)))
+            (let ((report (coin-result-value checked)))
               (list (cons 'ok #t)
-                    (cons 'length length)
-                    (cons 'cells cells)
-                    (cons 'steps steps)
-                    (cons 'memory-bucket (coin-bucket7 cells))
-                    (cons 'step-bucket (coin-bucket7 steps))
-                    (cons 'quality quality)
-                    (cons 'word (coin-score-encode length cells steps
-                                                      quality)))))))
+                    (cons 'length (coin-solution-length solution))
+                    (cons 'cells (puzzle-report-cells report))
+                    (cons 'steps (puzzle-report-steps report)))))))
 
     ;;; What a mismatching solution actually produced for one example.
     ;;;
@@ -294,14 +281,23 @@
                                      (coin-spec-builtin-cap spec))
              ". The constraint rotates with the seed, so it is the same for"
              " everyone at this height and is knowable before you start."))
+          ((eq? reason 'solution-over-par)
+           (string-append
+             "it is "
+             (number->string (or (coin-solution-length solution) 0))
+             " bytes, but this puzzle's par is "
+             (number->string (puzzle-spec-par spec))
+             " bytes (`solution-over-par`). Producer solutions cannot exceed"
+             " par. Omit --solution to submit the guaranteed par witness, or"
+             " shorten the program."))
           ((eq? reason 'solution-oversize)
            (string-append
              "it is "
              (number->string (or (coin-solution-length solution) 0))
              " bytes, and the cap is "
              (number->string coin-max-solution-bytes)
-             " bytes. The cap is consensus, not policy; the guaranteed"
-             " fallback in `sigilcoin puzzle` always fits inside it."))
+             " bytes. The cap is consensus, not policy; the guaranteed par"
+             " witness in `sigilcoin puzzle` always fits inside it."))
           ((eq? reason 'solution-malformed)
            "it is empty or not text. Pass the program source with --solution.")
           ((eq? reason 'solution-parse-failed)

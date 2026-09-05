@@ -171,11 +171,33 @@
               time: %genesis-time))))
 
       (define (header-valid? history header height arrival complexity)
-        (and
-          (coin-ok?
-            (coin-validate-header-context history header arrival %spacing %drift))
-          (coin-ok? (coin-check-bits (block-header-bits header) complexity))
-          (= height (length history))))
+        (let* ((length-result
+                 (coin-bits-solution-length (block-header-bits header)))
+               (spec
+                 (coin-node-puzzle
+                   (block-header-previous-block header) height complexity)))
+          (and
+            (coin-ok?
+              (coin-validate-header-context
+                history header arrival %spacing %drift))
+            (coin-ok? (coin-check-bits (block-header-bits header) complexity))
+            (coin-ok? length-result)
+            (<= (coin-result-value length-result)
+                (puzzle-spec-par spec))
+            (coin-lottery-valid?
+              (block-header-work-value header)
+              complexity
+              (puzzle-spec-par spec)
+              (coin-result-value length-result))
+            (= height (length history)))))
+
+      (define (strategy-fork-candidate actor height arrival header)
+        (coin-fork-candidate
+          actor
+          height
+          arrival
+          (block-header-hash header)
+          (block-header-previous-block header)))
 
       ;; Full body connection is the authoritative production check. The helper
       ;; also checks the contextual header fields the body connector intentionally
@@ -408,10 +430,11 @@
 
       (define %strategy-header
         '(key_pool strategy candidates_evaluated candidates_available
-          commitments_selected reveals_selected original_q copy_q
-          original_score_word copy_score_word original_rank_word copy_rank_word
-          legacy_quality_rule_would_replace canonical_copy_replaces
-          canonical_copy_replaces_post_child original_arrival_clock
+          commitments_selected reveals_selected
+          original_share_quality copy_share_quality
+          original_nonce copy_nonce original_claimed_length copy_claimed_length
+          quality_only_copy_would_replace copy_replaces_before_child
+          copy_replaces_after_child original_arrival_clock
           pre_child_copy_arrival_clock child_height child_arrival_clock
           post_child_copy_arrival_clock child_observed settled_actor
           original_solver_capture_permille reveal_inclusion_permille
@@ -463,7 +486,7 @@
                (complexity
                  (coin-required-complexity parent-headers %attack-height))
                (producer-solution
-                 (coin-table-solution
+                 (coin-par-solution
                    (block-header-hash parent-header)
                    %attack-height
                    complexity))
@@ -520,19 +543,25 @@
                        %pre-child-copy-arrival))
                    (original-header (block-header-field original))
                    (copy-header (block-header-field copy))
-                   (original-word (block-header-nonce original-header))
-                   (copy-word (block-header-nonce copy-header))
-                   (original-q
-                     (coin-score-quality (coin-score-decode original-word)))
-                   (copy-q
-                     (coin-score-quality (coin-score-decode copy-word)))
+                   (original-nonce (block-header-nonce original-header))
+                   (copy-nonce (block-header-nonce copy-header))
+                   (original-length-result
+                     (coin-bits-solution-length
+                       (block-header-bits original-header)))
+                   (copy-length-result
+                     (coin-bits-solution-length
+                       (block-header-bits copy-header)))
+                   (original-length (coin-result-value original-length-result))
+                   (copy-length (coin-result-value copy-length-result))
+                   (original-q 0)
+                   (copy-q quality)
                    (pre-fork
                      (coin-run-fork-observer
                        (list
-                         (coin-fork-candidate
+                         (strategy-fork-candidate
                            "original-solver" %attack-height
                            %original-arrival original-header)
-                         (coin-fork-candidate
+                         (strategy-fork-candidate
                            "attacker-copy-pre-child" %attack-height
                            %pre-child-copy-arrival copy-header))))
                    (pre-selected (ref pre-fork 'selected)))
@@ -564,26 +593,26 @@
                      (full-fork
                        (coin-run-fork-observer
                          (list
-                           (coin-fork-candidate
+                           (strategy-fork-candidate
                              "original-solver" %attack-height
                              %original-arrival original-header)
-                           (coin-fork-candidate
+                           (strategy-fork-candidate
                              "attacker-copy-pre-child" %attack-height
                              %pre-child-copy-arrival copy-header)
-                           (coin-fork-candidate
+                           (strategy-fork-candidate
                              "original-child" %child-height
                              %child-arrival (block-header-field child))
-                           (coin-fork-candidate
+                           (strategy-fork-candidate
                              "attacker-copy-post-child" %attack-height
                              %post-child-copy-arrival copy-header))))
                      (selected (ref full-fork 'selected))
-                     (canonical-pre
+                     (pre-replaced
                        (not (string=? "original-solver"
                                       (coin-fork-candidate-actor pre-selected))))
-                     (canonical-post
+                     (post-replaced
                        (not (string=? "original-solver"
                                       (coin-fork-candidate-actor selected))))
-                     (legacy (> copy-q original-q))
+                     (quality-only (> copy-q original-q))
                      (original-values (output-values original))
                      (copy-values (output-values copy))
                      (copy-producer (car copy-values))
@@ -609,16 +638,17 @@
                 ;; invariant assertions; construction is not accepted on trust.
                 (need (and copy-utxos child-utxos) "connected branch state missing")
                 (need (= quality copy-q)
-                      "fully verified share quality did not authenticate header Q")
-                (need (= 0 original-q) "original no-share block did not carry Q0")
-                (need (= (coin-score-rank-word original-word)
-                         (coin-score-rank-word copy-word))
-                      "copy changed projected producer rank")
-                (need (= 0 (coin-score-compare original-word copy-word))
-                      "copy did not tie original under production comparator")
-                (need (not canonical-pre)
+                      "fully verified share quality changed")
+                (need (= 0 original-q)
+                      "original no-share block did not derive Q0")
+                (need (= (coin-solution-length producer-solution)
+                         original-length)
+                      "original bits did not claim its solution length")
+                (need (= original-length copy-length)
+                      "copy changed the claimed producer solution length")
+                (need (not pre-replaced)
                       "copy replaced original before child")
-                (need (not canonical-post)
+                (need (not post-replaced)
                       "copy replaced original after child")
                 (need (ref full-fork 'settled?)
                       "strategy height was not settled by explicit child")
@@ -640,13 +670,13 @@
                   (length accepted)
                   original-q
                   copy-q
-                  original-word
-                  copy-word
-                  (coin-score-rank-word original-word)
-                  (coin-score-rank-word copy-word)
-                  legacy
-                  canonical-pre
-                  canonical-post
+                  original-nonce
+                  copy-nonce
+                  original-length
+                  copy-length
+                  quality-only
+                  pre-replaced
+                  post-replaced
                   %original-arrival
                   %pre-child-copy-arrival
                   %child-height
@@ -688,10 +718,10 @@
                         (cons (strategy-row (car pools) (car strategies))
                               rows))))))))
 
-      (define %canonical-pre-index 13)
-      (define %canonical-post-index 14)
+      (define %pre-replacement-index 13)
+      (define %post-replacement-index 14)
       (define %capture-index 22)
-      (define %legacy-index 12)
+      (define %quality-only-index 12)
 
       (define %matrix-check
         (begin
@@ -699,9 +729,9 @@
                 "strategy matrix must have exactly twenty-one rows")
           (for-each
             (lambda (row)
-              (need (not (list-ref row %canonical-pre-index))
+              (need (not (list-ref row %pre-replacement-index))
                     "a strategy row replaced before child")
-              (need (not (list-ref row %canonical-post-index))
+              (need (not (list-ref row %post-replacement-index))
                     "a strategy row replaced after child")
               (need (= 1000 (list-ref row %capture-index))
                     "original-solver capture was not 1000 permille"))
@@ -758,12 +788,12 @@
                 (candidate-member? candidate %largest-revealed))))
           %candidates))
 
-      (define %historical-replacements
+      (define %quality-only-replacements
         (let loop ((rows %strategy-rows) (count 0))
           (if (null? rows)
               count
               (loop (cdr rows)
-                    (if (list-ref (car rows) %legacy-index)
+                    (if (list-ref (car rows) %quality-only-index)
                         (+ count 1)
                         count)))))
 
@@ -789,20 +819,20 @@
                                 (length %available-candidates)))))
           (matrix .
             ((rows . ,(length %strategy-rows))
-             (legacy_quality_rule_would_replace_rows . ,%historical-replacements)
-             (canonical_pre_child_replacements . 0)
-             (canonical_post_child_replacements . 0)
+             (quality_only_copy_advantage_rows . ,%quality-only-replacements)
+             (first_seen_pre_child_replacements . 0)
+             (settled_post_child_replacements . 0)
              (original_solver_capture_permille_min . 1000)
              (settlement . "explicit accepted child")))
-          (scope . "frozen deterministic copy-and-attach experiment; legacy quality replacement is counterfactual")))
+          (scope . "frozen deterministic copy-and-attach experiment under first-seen sibling selection")))
 
       (define %summary
         (string-append
           (format "Strategic mining: 21 rows over key pools 0..1024; ~a/~a semantic candidates available.\n"
                   (length %available-candidates) (length %candidates))
-          (format "Legacy quality counterfactual would replace in ~a rows; canonical pre/post-child replacements: 0/0.\n"
-                  %historical-replacements)
-          "Copy-and-attach is blocked by rank projection; settlement is child-observed, never timeout-based.\n"))
+          (format "Quality-only counterfactual would replace in ~a rows; first-seen pre/post-child replacements: 0/0.\n"
+                  %quality-only-replacements)
+          "Copy-and-attach cannot displace the first observed sibling; settlement is child-observed, never timeout-based.\n"))
 
       (define %payout-candidates
         (list-sort candidate-pubkey-before? %largest-revealed))

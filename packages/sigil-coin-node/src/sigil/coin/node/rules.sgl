@@ -1,14 +1,14 @@
 ;;; (sigil coin node rules) — header acceptance and fork choice
 ;;;
 ;;; Header `version` is pinned to 5. `bits` carries chain-derived complexity
-;;; as `0x207F0000 | C`; `nonce` carries the raw composite score word `W`.
-;;; Header acceptance verifies linkage, pacing, score shape and exact required
-;;; `C`.
+;;; and claimed producer length; `nonce` is free lottery entropy. Acceptance
+;;; verifies linkage and pacing before deriving the puzzle, then requires
+;;; `L <= par` and the little-endian uint256 header hash to meet its exact
+;;; golf-weighted target.
 ;;;
-;;; Fork choice ranks height first, then lower `rank(W)`, which clears the
-;;; authenticated `Q` nibble. Equal projected ranks never displace the
-;;; incumbent. One bounded correctness-neutral puzzle cache amortizes
-;;; deterministic derivation.
+;;; Every accepted header contributes one unit. Outgrown candidates remain
+;;; settled, taller live chains win, and equal-height siblings stay first-seen.
+;;; Neither nonce nor block hash is a tie-break.
 
 (define-library (sigil coin node rules)
   (import (sigil math)
@@ -19,9 +19,8 @@
   (export
     ;; Header fields
     coin-header-version
-    coin-header-score
-    coin-header-score-ok?
     coin-header-complexity
+    coin-header-solution-length
 
     ;; The puzzle cache
     coin-node-puzzle-cache
@@ -33,12 +32,7 @@
     coin-window-margins
     coin-required-complexity
 
-    ;; The ranking key
-    coin-rank-base
-    coin-score-saving
-    coin-rank-encode
-    coin-rank-accumulated
-    coin-rank-tip-saving
+    ;; Equal-unit chain selection
     coin-chain-work
     coin-better-chain?
 
@@ -56,33 +50,17 @@
     ;;; satisfies all buried deployment floors active from genesis.
     (define coin-header-version 5)
 
-    ;;; The composite score word a header claims, read out of `nonce`.
-    ;;;
-    ;;; ```scheme
-    ;;; (coin-header-score header) ; => the 32-bit word W
-    ;;; ```
-    (define (coin-header-score header)
-      (: block-header? -> integer?)
-      (block-header-nonce header))
-
-    ;;; Whether a header's score word passes the field-range check: a 32-bit
-    ;;; unsigned integer with low nibble zero; every `15-Q` nibble is legal.
-    ;;;
-    ;;; This is a range check only. Whether the word describes the block it
-    ;;; rides in is `score-mismatch`, decided by the body rules.
-    ;;;
-    ;;; ```scheme
-    ;;; (coin-header-score-ok? 1) ; => #f
-    ;;; ```
-    (define (coin-header-score-ok? w)
-      (: any? -> boolean?)
-      (coin-ok? (coin-score-check w)))
+    ;;; The producer solution length a header claims in `bits`.
+    (define (coin-header-solution-length header)
+      (: any? -> coin-result?)
+      (if (not (block-header? header))
+          (coin-error 'malformed-header "expected a block header")
+          (coin-bits-solution-length (block-header-bits header))))
 
     ;;; The complexity a header's `bits` claims, as a `coin-result`.
     ;;;
-    ;;; Total: rejection reasons are `malformed-header`, `bits-prefix`,
-    ;;; `bits-reserved-nonzero` and `complexity-range`.
-    ;;;
+    ;;; Total: rejection reasons are `malformed-header`, `bits-prefix` and
+    ;;; `complexity-range`.
     ;;; ```scheme
     ;;; (coin-result-value (coin-header-complexity header)) ; => 128
     ;;; ```
@@ -154,10 +132,10 @@
 
     ;; The accepted solution length a stored header commits to.
     (define (stored-length header)
-      (let ((checked (coin-score-check (coin-header-score header))))
-        (if (coin-failed? checked)
-            (error "coin-required-complexity: a stored header has an illegal score")
-            (coin-score-length (coin-result-value checked)))))
+      (let ((decoded (coin-header-solution-length header)))
+        (if (coin-failed? decoded)
+            (error "coin-required-complexity: a stored header has illegal bits")
+            (coin-result-value decoded))))
 
     ;;; The height of the header that would extend `previous-headers`.
     ;;;
@@ -178,9 +156,9 @@
     ;;; first: one per height in `height-16 .. height-1`.
     ;;;
     ;;; `par_i` is derived — through the cache, so a synced node pays
-    ;;; nothing it has not already paid — and `L_i` is read from header `i`'s
-    ;;; own score word. Both are pure functions of the branch, which is why
-    ;;; a reorg recomputes `C` from the new branch's own blocks.
+    ;;; nothing it has not already paid — and `L_i` is decoded from header
+    ;;; `i`'s bits. Both are pure functions of the branch, so a reorg
+    ;;; recomputes `C` from that branch's own blocks.
     ;;;
     ;;; ```scheme
     ;;; (length (coin-window-margins headers 16)) ; => 16
@@ -238,94 +216,23 @@
                    (coin-window-margins previous-headers height))))))
 
     ;; ============================================================
-    ;; The ranking key
+    ;; Equal-unit chain selection
     ;; ============================================================
 
-    ;;; Base of the two-digit ranking key: `2^32 + 1`.
+    ;;; Accumulated work of the chain ending at `header`.
     ;;;
-    ;;; The low digit is a saving in 0..2^32, which needs a base of at least
-    ;;; `2^32 + 1`, and that is exactly this.
-    (define coin-rank-base (+ coin-max-score-word 1))
-
-    ;;; Rank saving of a block whose header claims `w`: a lower projected
-    ;;; word is a larger saving.
-    ;;;
-    ;;; The projection clears `Q` before subtraction, so persisted work cannot
-    ;;; reintroduce a quality tie-break that direct comparison removed. An
-    ;;; illegal raw word scores 0, the reserved value, because no such block
-    ;;; can be valid; `accept?` refuses to store a header carrying one.
-    ;;;
-    ;;; ```scheme
-    ;;; (coin-score-saving 0) ; => 4294967296
-    ;;; (coin-score-saving 1) ; => 0
-    ;;; ```
-    (define (coin-score-saving w)
-      (: any? -> integer?)
-      (if (coin-score-valid? w)
-          (- coin-max-score-word (coin-score-rank-word w))
-          0))
-
-    ;;; Pack an accumulated total and a tip saving into the ranking key.
-    (define (coin-rank-encode accumulated tip-saving)
-      (: integer? integer? -> integer?)
-      (+ (* accumulated coin-rank-base) tip-saving))
-
-    ;;; The accumulated total inside a ranking key.
-    (define (coin-rank-accumulated work)
-      (: integer? -> integer?)
-      (quotient work coin-rank-base))
-
-    ;;; The tip's own saving inside a ranking key.
-    (define (coin-rank-tip-saving work)
-      (: integer? -> integer?)
-      (remainder work coin-rank-base))
-
-    ;;; Accumulated ranking key of the chain ending at `header`.
-    ;;;
-    ;;; `b` is the validated body when the node has one and `#f` during
-    ;;; headers-first sync; it is accepted to satisfy the seam and
-    ;;; deliberately IGNORED. The projected rank is derived entirely from raw
-    ;;; `W` committed in the header. That makes the provisional value at
-    ;;; header ingest and the settled value after body validation identical
-    ;;; while keeping authenticated `Q` out of persisted rank.
-    ;;;
-    ;;; ```scheme
-    ;;; (coin-rank-tip-saving (coin-chain-work header #f 0))
-    ;;; ; => 2^32 minus the projected rank word
-    ;;; ```
+    ;;; Header acceptance has already proved that each stored header won its
+    ;;; lottery. Every winner contributes exactly one unit; the body and the
+    ;;; particular nonce do not affect persistence or fork choice.
     (define (coin-chain-work header b previous-work)
       (: any? any? integer? -> integer?)
-      (let* ((saving (if (block-header? header)
-                         (coin-score-saving (coin-header-score header))
-                         0))
-             ;; A header `accept?` would refuse still has to rank as
-             ;; something; one is the least any legal block contributes.
-             (contribution (if (= 0 saving) 1 saving)))
-        (coin-rank-encode (+ (coin-rank-accumulated previous-work)
-                                contribution)
-                             saving)))
+      (+ previous-work 1))
 
-    ;;; Whether `candidate` strictly outranks `incumbent` as the chain tip.
+    ;;; Whether `candidate` strictly outranks the incumbent chain tip.
     ;;;
-    ;;; §5.7, in order: live beats settled, taller wins, lower projected score
-    ;;; rank wins, otherwise the incumbent keeps the tip. There is no fourth
-    ;;; rule — the hash tie-break is deleted from consensus — so siblings in
-    ;;; one `(L, MB, SB)` class are incomparable and selection is first-seen
-    ;;; even when their raw `W` and authenticated `Q` differ.
-    ;;;
-    ;;; This is a strict weak ordering: it is irreflexive and asymmetric, and
-    ;;; incomparability is transitive because two candidates are incomparable
-    ;;; exactly when `(height, rank(W))` is equal.
-    ;;;
-    ;;; SETTLED MEANS OUTGROWN. `extended?` is set by `sigil-bitcoin` as
-    ;;; `height <` the tallest stored header height, so a height any taller
-    ;;; header has grown past is settled on every branch. This also protects a
-    ;;; revealed share: publishing a reveal for puzzle `P` requires a block at
-    ;;; height `P+1`, which settles height `P` against a thief.
-    ;;;
-    ;;; ```scheme
-    ;;; (coin-better-chain? taller shorter) ; => #t
-    ;;; ```
+    ;;; An outgrown candidate cannot reopen a settled height. Among live
+    ;;; candidates, greater height wins and equal height remains first-seen.
+    ;;; There is deliberately no work, solution, nonce or hash tie-break.
     (define (coin-better-chain? candidate incumbent)
       (: chain-candidate? chain-candidate? -> boolean?)
       (let ((candidate-extended? (chain-candidate-extended? candidate))
@@ -336,14 +243,6 @@
           ((and candidate-extended? (not incumbent-extended?)) #f)
           ((and incumbent-extended? (not candidate-extended?)) #t)
           ((> candidate-height incumbent-height) #t)
-          ((< candidate-height incumbent-height) #f)
-          ;; Same height: the better projected score rank wins. A larger
-          ;; saving is a lower `rank(W)`, so this is decidable the moment both
-          ;; raw header words are stored.
-          ((> (coin-rank-tip-saving (chain-candidate-work candidate))
-              (coin-rank-tip-saving (chain-candidate-work incumbent)))
-           #t)
-          ;; Equal, or worse: the incumbent keeps the tip. First-seen.
           (else #f))))
 
     ;; ============================================================
@@ -353,15 +252,11 @@
     (define (current-unix-second)
       (exact (floor (current-second))))
 
-    ;;; Whether `header` may extend `previous-headers` under chain pacing policy.
+    ;;; Whether `header` may extend `previous-headers` under chain policy.
     ;;;
-    ;;; The order is cost. Version and the score word's field ranges are
-    ;;; `O(1)`. The context check — linkage, spacing floor, median time past,
-    ;;; future drift — is next, and it is what establishes that
-    ;;; `previous-headers` really is this header's chain. Only then does the
-    ;;; complexity derivation run, because at a retarget height it reads 16
-    ;;; heights' worth of par and a header flood must not be able to force
-    ;;; that work on an unlinked header.
+    ;;; The order is cost: fixed fields, linkage/pacing, parent-derived
+    ;;; complexity, then puzzle derivation and one header hash. The encoded
+    ;;; length must not exceed par; the body later proves that claim exact.
     ;;;
     ;;; Total: any argument, however hostile, yields a boolean.
     ;;;
@@ -392,22 +287,34 @@
                (block-header? header)
                (list? previous-headers)
                (= coin-header-version (block-header-version header))
-               ;; The word only has to be a legal word here. Whether it is a
-               ;; TRUE claim is a body rule, checked by `coin-connect-block`.
-               (coin-header-score-ok? (coin-header-score header))
                (coin-ok? (coin-validate-header-context previous-headers
                                                           header
                                                           (current-unix-second)
                                                           min-spacing
                                                           max-future-drift))
-               ;; `C` is derived from the parent chain and the header must
-               ;; agree with it exactly.
-               (coin-ok?
-                 (coin-check-bits
-                   (block-header-bits header)
-                   (coin-required-complexity
-                     previous-headers
-                     (coin-header-height previous-headers))))))))
+               (let* ((height (coin-header-height previous-headers))
+                      (required
+                        (coin-required-complexity previous-headers height))
+                      (complexity
+                        (coin-check-bits (block-header-bits header) required))
+                      (length
+                        (coin-header-solution-length header)))
+                 (and (coin-ok? complexity)
+                      (coin-ok? length)
+                      (let* ((c (coin-result-value complexity))
+                             (l (coin-result-value length))
+                             (par
+                               (puzzle-spec-par
+                                 (coin-node-puzzle
+                                   (block-header-previous-block header)
+                                   height
+                                   c))))
+                        (and (<= l par)
+                             (coin-lottery-valid?
+                               (block-header-work-value header)
+                               c
+                               par
+                               l)))))))))
 
     ;;; Build canonical header rules for a chain's spacing and drift policy.
     ;;;

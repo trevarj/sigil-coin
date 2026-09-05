@@ -1,52 +1,14 @@
-;;; (sigil coin consensus fork-choice) — ranking blocks
+;;; (sigil coin consensus fork-choice) — height, then first-seen
 ;;;
-;;; The block key is `key(b) = (height(b), rank(W(b)))`, ordered as (§5.6):
-;;;
-;;;   b1 < b2  iff  height(b1) > height(b2)
-;;;                 or (height(b1) = height(b2)
-;;;                     and rank(W(b1)) < rank(W(b2)))
-;;;
-;;; where "<" means "is the better tip". Height dominates, so this is
-;;; longest-chain first; the projected rank only decides between siblings.
-;;;
-;;; AUTHENTICATED QUALITY IS RANK-INERT. Raw `W` packs
-;;; `(L-1, MB, SB, 15-Q)`, but `coin-score-rank-word` clears the `15-Q`
-;;; nibble before comparison. Unsigned `<` on the projected word is therefore
-;;; lexicographic `<` on `(L, MB, SB)`. `Q` remains committed, body-checked,
-;;; decoded, and available to payout and reporting code; it cannot buy rank.
-;;;
-;;; STRICT WEAK ORDERING. Let
-;;; `f(b) = (-height(b), rank(W(b)))` in Z x Z under lexicographic order.
-;;; That is a strict total order on the projected keys, so:
-;;;
-;;;   irreflexive               lexicographic `<` on a total order is
-;;;   asymmetric                  irreflexive and asymmetric
-;;;   transitive                inherited
-;;;   incomparability is        `b1` and `b2` are incomparable iff
-;;;     transitive                `f(b1) = f(b2)`, and equality is an
-;;;                               equivalence relation
-;;;
-;;; This is exactly a strict weak ordering. Its equivalence classes are
-;;; "same height, same `(L, MB, SB)`"; raw score words may differ in `Q`.
-;;;
-;;; THERE IS NO BLOCK-HASH TIE-BREAK, AND ONE MUST NOT BE ADDED.
-;;; A thief can copy the producer's published solution and attach shares
-;;; committed in the parent, producing a different authenticated `Q` and raw
-;;; `W`. Rank projection still makes that sibling incomparable with the
-;;; original. `coin-replaces-tip?` answers `#f`, and first-seen retains the
-;;; incumbent instead of rewarding the copy.
-;;;
-;;; Equal projected keys are order-dependent across nodes, as Bitcoin's
-;;; equal-work siblings are. Once a child links to the incumbent, that height
-;;; is settled and later siblings cannot displace it.
+;;; Every accepted block contributes one unit. A taller chain wins; equal
+;;; heights are tied and the incumbent remains selected. Neither solution
+;;; length, lottery roll, nonce nor block hash breaks a sibling tie.
 
 (define-library (sigil coin consensus fork-choice)
-  (import (sigil math)
-          (sigil coin consensus score))
+  (import (sigil math))
   (export
     coin-block-compare
-    coin-better-block?
-    coin-replaces-tip?)
+    coin-better-block?)
 
   (begin
 
@@ -56,53 +18,17 @@
           (error (string-append who ": height out of range")))
       height)
 
-    ;;; Rank two blocks by `key = (height, rank(W))`. Lower is the better tip.
-    ;;;
-    ;;; Returns -1 when the first block is better, 1 when the second is, and
-    ;;; 0 when the two are INCOMPARABLE — same height and same projected
-    ;;; `(L, MB, SB)` rank — in which case the caller keeps its incumbent.
-    ;;;
-    ;;; ```scheme
-    ;;; (coin-block-compare 2 (coin-score-pack 25 0 0 0)
-    ;;;                     1 (coin-score-pack 24 0 0 0)) ; => -1
-    ;;; ```
-    (define (coin-block-compare a-height a-score b-height b-score)
-      (: integer? integer? integer? integer? -> integer?)
+    ;;; Compare two chain heights. Lower means the first is better.
+    (define (coin-block-compare a-height b-height)
+      (: integer? integer? -> integer?)
       (require-height "coin-block-compare" a-height)
       (require-height "coin-block-compare" b-height)
       (cond
         ((> a-height b-height) -1)
         ((< a-height b-height) 1)
-        (else (coin-score-compare a-score b-score))))
+        (else 0)))
 
-    ;;; True when the first block strictly outranks the second.
-    ;;;
-    ;;; ```scheme
-    ;;; (coin-better-block? 1 40 1 48) ; => #t
-    ;;; ```
-    (define (coin-better-block? a-height a-score b-height b-score)
-      (: integer? integer? integer? integer? -> boolean?)
-      (< (coin-block-compare a-height a-score b-height b-score) 0))
-
-    ;;; True when a sibling should displace the current tip (§5.7).
-    ;;;
-    ;;; `tip-extended?` is whether a child already builds on the tip. Once
-    ;;; one does, the height is settled and no sibling displaces it however
-    ;;; good its projected rank; before that, a STRICTLY lower projected word
-    ;;; wins and an equal one does not.
-    ;;;
-    ;;; That hysteresis also protects a revealed share (§7.5). A reveal for
-    ;;; puzzle `P` is published in a block at height `P+1`, so by the time a
-    ;;; thief can read it, height `P` has already been extended by the block
-    ;;; that carried it. No sibling of `P` can take it back.
-    ;;;
-    ;;; ```scheme
-    ;;; (coin-replaces-tip? (coin-score-pack 25 0 0 0) #f
-    ;;;                     (coin-score-pack 24 0 0 0)) ; => #t
-    ;;; (coin-replaces-tip? (coin-score-pack 25 0 0 0) #t
-    ;;;                     (coin-score-pack 24 0 0 0)) ; => #f
-    ;;; ```
-    (define (coin-replaces-tip? tip-score tip-extended? candidate-score)
-      (: integer? boolean? integer? -> boolean?)
-      (and (not tip-extended?)
-           (coin-score-better? candidate-score tip-score)))))
+    ;;; Whether the first height strictly outranks the second.
+    (define (coin-better-block? a-height b-height)
+      (: integer? integer? -> boolean?)
+      (< (coin-block-compare a-height b-height) 0))))

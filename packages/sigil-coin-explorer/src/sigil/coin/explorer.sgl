@@ -7,10 +7,10 @@
 ;;;   (sigil coin explorer render)  escaping, HTML pages, JSON bodies
 ;;;   (sigil coin explorer server)  routing and the HTTP/1.1 front door
 ;;;
-;;; SigilCoin is mined by writing the shortest program that solves the day's
-;;; puzzle, so the explorer's job is social rather than financial: who won
-;;; today, how many bytes did it take them, and what did they quote from
-;;; `#systemcrafters` while doing it.
+;;; SigilCoin producers golf a daily puzzle, then search a nonce lottery whose
+;;; odds double for each byte saved below par (up to the consensus cap). The
+;;; explorer shows the qualifying roll, published program, and direct co-op
+;;; payouts while keeping fork choice separate from lottery odds.
 ;;;
 ;;; Two rules shape the whole package:
 ;;;
@@ -86,11 +86,14 @@
     explorer-block-constraint-text
     explorer-block-k
     explorer-block-examples
-    explorer-block-score-word
-    explorer-block-score-length
-    explorer-block-score-memory
-    explorer-block-score-steps
-    explorer-block-score-quality
+    explorer-block-nonce
+    explorer-block-claimed-length
+    explorer-block-lottery-roll
+    explorer-block-lottery-target
+    explorer-block-lottery-bonus
+    explorer-block-lottery-multiplier
+    explorer-block-lottery-expected-rolls
+    explorer-block-share-quality
     explorer-block-share-count
     explorer-block-shares
     explorer-block-commit-count

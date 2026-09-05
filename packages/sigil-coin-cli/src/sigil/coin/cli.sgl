@@ -61,7 +61,7 @@
     cli-constraint-rule
     cli-constraint-detail
     cli-example-lines
-    cli-score-report
+    cli-solution-report
     cli-mismatch-actual
     cli-solution-advice
     cli-commit-file
@@ -135,7 +135,7 @@
     ;;; ```
     (define (cli-usage)
       (: -> any?)
-      (println "sigilcoin — mine a blockchain by writing the shortest program")
+      (println "sigilcoin — mine with program golf and an automatic nonce lottery")
       (println "")
       (println "mining:")
       (println "  sigilcoin puzzle [--height N] [--share] [--complexity C] [CHAIN] [--data-dir DIR]")
@@ -152,14 +152,14 @@
       (println "  nothing about it is stored on chain. A valid solution is puzzle-lang")
       (println "  source that evaluates to a ONE-ARGUMENT function reproducing every pair")
       (println "  and obeying today's constraint. `sigilcoin puzzle` prints the pairs, the")
-      (println "  constraint in plain words, and a guaranteed fallback (a lookup table)")
-      (println "  that always solves the height — so the chain can never stall, and so")
-      (println "  there is always a baseline to beat.")
+      (println "  constraint in plain words, and a guaranteed par witness whose source")
+      (println "  is exactly par bytes. It always solves the height, but valid work at")
+      (println "  par is still lottery-gated: mining searches uint32 nonces automatically.")
       (println "")
-      (println "  Blocks are ranked by a composite score, lower is better: solution")
-      (println "  length first, then memory charged, then evaluator steps, then aggregate")
-      (println "  quality from verified co-op work. Length dominates, so the game is still")
-      (println "  golf — but of a function, not of a literal.")
+      (println "  Every byte saved below par doubles the chance that each nonce qualifies,")
+      (println "  up to an eight-byte (256x) bonus. Memory and evaluator steps are reported")
+      (println "  as resource diagnostics, not ranking fields. Each accepted block adds one")
+      (println "  unit of chain work; equal-height siblings remain first-seen.")
       (println "")
       (println "  commit/reveal is the two-phase way to be paid for a solution you did")
       (println "  not mine yourself. `commit` publishes a hash of your solution for")

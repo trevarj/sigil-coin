@@ -1,7 +1,7 @@
 ;;; (sigil coin consensus) — canonical SigilCoin consensus
 ;;;
-;;; Pure consensus rules for puzzle derivation, solution scoring, retargeting,
-;;; co-op shares, commit-reveal, coinbase payloads, fork choice and emission.
+;;; Pure consensus rules for puzzle derivation, solution verification, lottery
+;;; targeting, retargeting, co-op shares, coinbase payloads and emission.
 ;;; No database, network or clock exists here beyond values supplied by callers.
 
 (define-library (sigil coin consensus)
@@ -80,24 +80,18 @@
     coin-spec-builtin-cap
     coin-check-solution
 
-    ;; Score
+    ;; Resource reporting and block lottery
     coin-bucket7
     coin-max-bucket
-    coin-score
-    coin-score?
-    coin-score-length
-    coin-score-memory
-    coin-score-steps
-    coin-score-quality
-    coin-score-encode
-    coin-score-pack
-    coin-score-decode
-    coin-score-valid?
-    coin-score-check
-    coin-max-score-word
-    coin-score-rank-word
-    coin-score-compare
-    coin-score-better?
+    coin-lottery-work-factor
+    coin-lottery-max-bonus
+    coin-lottery-max-integer
+    coin-lottery-target-ceiling
+    coin-lottery-bonus
+    coin-lottery-multiplier
+    coin-lottery-target
+    coin-lottery-expected-rolls
+    coin-lottery-valid?
 
     ;; Retargeting
     coin-retarget-window
@@ -117,6 +111,7 @@
     coin-bits-prefix
     coin-bits-encode
     coin-bits-decode
+    coin-bits-solution-length
     coin-check-bits
 
     ;; Co-op shares, commit-reveal and payouts
@@ -191,8 +186,7 @@
 
     ;; Fork choice
     coin-block-compare
-    coin-better-block?
-    coin-replaces-tip?)
+    coin-better-block?)
 
   (begin
 
