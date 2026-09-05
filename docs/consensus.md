@@ -13,13 +13,13 @@
 3. **Co-op blocks.** Up to 8 signed shares ride in the coinbase alongside the
    producer's own solution. Each share solves a task personalized by its payout
    pubkey and receives a mandatory payout output.
-4. **Program-golf lottery.** `bits` commits to producer length `L` and
-   complexity `C`; the uint32 header nonce is searched automatically. A
-   full-header `HASH256` roll must meet the `C`-dependent target, and each byte
-   below par doubles the odds, up to eight bytes.
-5. **Margin retargeting.** Every 16 blocks, the median *relative* improvement
-   below par adjusts `C`. That moves grammar width, example count, constraint
-   tier, and the lottery base target, but never an evaluator cap.
+4. **Program-golf lottery.** Header `version` commits producer length `L` and
+   puzzle complexity `C`; `bits` carries the interval-retargeted compact base
+   target; the uint32 nonce is searched automatically. Each byte below par
+   doubles the accepted hash range, up to eight bytes.
+5. **Independent retargets.** Every 16 blocks, elapsed header time retargets
+   `bits` while median relative improvement below par adjusts puzzle complexity
+   `C`. Neither feedback signal controls the other.
 6. **Commit–reveal.** Commitments for puzzle `H` ride in block `H`; reveals and
    share payouts ride in block `H+1`.
 
@@ -58,16 +58,19 @@
 | `coin-max-graffiti-bytes` | 400 |
 | `coin-max-shares` | 8 |
 | `coin-max-commitments` | 16 |
-| `coin-min-block-spacing` | 72000 |
+| `coin-min-block-spacing` | 1 |
 | `coin-max-future-drift` | 7200 |
 | `coin-median-time-span` | 11 |
+| target retarget interval | 16 blocks |
+| target retarget timespan | 15 target spacings |
+| mainnet/testnet/regtest target spacing | 86400 / 3600 / 1 s |
+| mainnet/testnet/regtest pow-limit bits | `0x1e00ffff` / `0x1f00ffff` / `0x2000ffff` |
 | `coin-retarget-window` | 16 |
 | `coin-target-margin` | 100 milli-units |
-| lottery work factor | 32 |
 | lottery maximum bonus | 8 bytes |
 | lottery maximum integer | `2^256 - 1` |
 | lottery target ceiling | `2^255 - 1` |
-| header `version` | 5 |
+| header `version` prefix | `0x20600000` under `0xffe00000` |
 | coinbase scriptSig bytes | 8..6588 |
 
 The block-subsidy schedule, scheduled maximum, and coinbase maturity are
@@ -277,134 +280,114 @@ is not.
 
 ### 5.1 The header budget
 
-The serialized header remains Bitcoin's 80 bytes. SigilCoin gives three fields
-consensus-specific meanings:
+The serialized header remains Bitcoin's 80 bytes:
 
 | Field | Bits | Use |
 |---|---|---|
-| `version` | 32 | pinned to 5 |
-| `time` | 32 | real timestamp; MTP and drift rules unchanged |
-| `bits` | 32 | producer length `L` and complexity `C` |
+| `version` | 32 | producer length `L` and puzzle complexity `C` |
+| `time` | 32 | timestamp used by MTP, drift and target retarget |
+| `bits` | 32 | canonical Bitcoin compact base target |
 | `nonce` | 32 | uint32 lottery nonce |
 
 `previous-block` and `merkle-root` retain their Bitcoin meanings. The nonce is
 serialized as `u32le` and carries no score, rank, length, or share quality.
 
-### 5.2 `bits` layout
+### 5.2 `version` layout
 
 ```text
-bits = 0x20600000 | ((L - 1) << 12) | C
+version = 0x20600000 | ((L - 1) << 12) | C
 
-bits & 0xffe00000 = 0x20600000
-bits[20:12]       = L - 1       L in [1, 512]
-bits[11:0]        = C           C in [16, 4095]
+version & 0xffe00000 = 0x20600000
+version[20:12]       = L - 1       L in [1, 512]
+version[11:0]        = C           C in [16, 4095]
 ```
 
-`L` is the producer source length in bytes. A validator derives `C` from the
-parent chain and `par` from that puzzle, then requires the encoded `C` to match
-and `L <= par`. The field supports header-first validation without claiming
-anything about evaluator steps, allocations, shares, or payout quality.
+`L` is the producer source length in UTF-8 bytes. A validator derives `C` from
+the parent chain and `par` from that puzzle, then requires encoded `C` to match
+and `L <= par`. Full body validation later requires the actual source byte
+length to equal encoded `L`.
 
-`coin-bits-encode(complexity, length)` constructs this word.
-`coin-bits-decode` returns `C` as a `coin-result`, and
-`coin-bits-solution-length` returns `L` as a `coin-result`.
+`coin-version-encode`, `coin-version-decode`,
+`coin-version-solution-length`, and `coin-check-version` own this layout.
 
-### 5.3 Exact lottery target
+### 5.3 Chain-retargeted base target
 
-All arithmetic is over exact integers. Let:
+`bits` uses Bitcoin's canonical compact target codec. The required value is
+`next-required-bits(params, previous_headers)`:
+
+- genesis uses the chain's pow-limit bits;
+- non-boundary heights inherit their parent's bits;
+- every 16th height measures the 15 timestamp intervals across the preceding
+  16 headers;
+- the new target is `old_target * actual_timespan / target_timespan`;
+- actual timespan is clamped to `[target_timespan/4, 4*target_timespan]`;
+- the result cannot be easier than the chain's pow limit.
+
+Mainnet targets one day, public testnet one hour, and regtest one second. Their
+initial compact limits are respectively `0x1e00ffff`, `0x1f00ffff`, and
+`0x2000ffff`. The one-second parent timestamp floor is only a monotonicity
+guard; the retargeted lottery controls cadence.
+
+### 5.4 Golf-weighted effective target
+
+All arithmetic is exact integer arithmetic. Let:
 
 ```text
-U      = 2^256
-base   = floor(U / (32 * C)) - 1
-bonus  = min(max(par - L, 0), 8)
-mult   = 2^bonus
-target = min(2^255 - 1, (base + 1) * mult - 1)
+U         = 2^256
+base      = compact-target(bits)
+bonus     = min(max(par - L, 0), 8)
+mult      = 2^bonus
+effective = min(2^255 - 1, (base + 1) * mult - 1)
 ```
 
-The inclusive target gives `target + 1` winning values among the `2^256`
-possible hash rolls. The expected-rolls reporting value is
-`ceil(2^256 / (target + 1))`. The ceiling limits acceptance probability to
-one half even when low `C` and the full bonus would otherwise exceed it.
+The inclusive effective target gives `effective + 1` winning values among
+`2^256` possible rolls. Reported expected rolls is
+`ceil(U / (effective + 1))`. The ceiling keeps acceptance probability at or
+below one half.
 
-At `C = 128`, an at-par source has an expected 4096 nonce rolls. Each byte
-saved doubles its odds until the eight-byte cap: at `par - 8`, the expected
-count is 16. Further shortening remains valid and can matter to the 16-block
-margin retarget, but it does not increase this block's lottery multiplier.
+At the initial mainnet limit, par expects 16,777,473 rolls and `par - 8`
+expects 65,538. Public testnet expects 65,538 and 257; regtest expects 257 and
+2. Further shortening remains valid and still affects the independent
+complexity retarget, but does not increase this block's multiplier.
 
-The consensus facade exposes the direct names
-`coin-lottery-work-factor`, `coin-lottery-max-bonus`,
-`coin-lottery-max-integer`, `coin-lottery-target-ceiling`,
-`coin-lottery-bonus`, `coin-lottery-multiplier`,
-`coin-lottery-target`, `coin-lottery-expected-rolls`, and
-`coin-lottery-valid?`.
-
-### 5.4 Full-header nonce search
-
-For the canonical 80-byte header serialization, define:
+### 5.5 Full-header nonce search
 
 ```text
-roll = integer(HASH256(header))
+roll = integer_le(HASH256(header))
 ```
 
-where `HASH256` is double SHA-256 and `block-header-work-value` interprets its
-32-byte result as a little-endian unsigned 256-bit integer. Header acceptance
-requires `roll <= target`.
+Header acceptance requires `roll <= effective`. A builder validates the
+producer solution, finalizes the complete body and merkle root once, encodes
+`L/C` in `version`, writes the chain-required `bits`, then tries nonce values
+from `0` through `0xffffffff`. The first qualifying nonce is used. Exhaustion
+fails construction; the public par witness is a valid program, not an
+automatic winning block.
 
-A block builder validates the producer solution, finalizes the complete body
-and merkle root once, encodes `L` and `C` in `bits`, then tries nonce values
-from `0` through `0xffffffff`. The first qualifying nonce is used. If the
-range is exhausted, construction fails; the public par witness supplies a
-valid at-par program, not an automatic winning block.
+### 5.6 Header-first and body validation
 
-Shorter programs therefore receive more lottery tickets. They do not
-deterministically outrank siblings, and the numerically lower block hash does
-not win a fork.
+Header acceptance checks, in order:
 
-### 5.5 Header-to-body binding
+1. canonical `version` shape;
+2. linkage, one-second parent floor, MTP and future drift;
+3. encoded `C` against the parent-derived complexity;
+4. `bits` against the interval-derived compact base target;
+5. encoded `L <= par`;
+6. the full-header lottery roll.
 
-Header checks can derive `L`, `C`, `par`, the target, and the full-header roll
-without the body. Once the body arrives, validation runs the producer source
-against the puzzle and requires its actual byte length to equal the header's
-encoded `L`. A false length claim invalidates the block and its descendants.
+Body validation reruns the puzzle and requires actual UTF-8 source length to
+equal encoded `L`. A false claim invalidates the block and descendants.
 
-Share quality and contribution remain authenticated by signatures, validation,
-and coinbase payout shape. They are not header fields and never affect the
-lottery target or fork choice.
+### 5.7 Cumulative base-work fork choice
 
-### 5.6 Fork-choice order
+Each accepted header contributes Bitcoin's
+`floor((2^256)/(base_target + 1))` work derived from its compact base target.
+The golf multiplier changes admission probability but does not discount the
+credited work: verified program improvement substitutes for those hashes.
 
-Every accepted block contributes exactly one unit. Selection is:
-
-1. a child already observed on the selected incumbent settles that height
-   against later siblings;
-2. otherwise, greater validated height wins;
-3. at equal height, neither sibling replaces the other, so the first valid
-   arrival remains incumbent.
-
-There is no score, program-length, evaluator-cost, share-quality, nonce, or
-block-hash sibling tie-break. Arrival order is local rather than a hidden
-globally reproducible ordering; a valid child linking the selected incumbent
-makes the chain taller and converges selection.
-
-### 5.7 First-seen behavior and child settlement
-
-The first valid same-height arrival becomes incumbent. A later sibling cannot
-replace it merely by carrying a shorter program, a luckier nonce, more shares,
-or a lower displayed hash. A child at `height + 1` must link to the selected
-incumbent; once observed, it prevents later siblings at the parent's height
-from displacing that settled branch.
-
-Observers that receive different siblings first can temporarily retain
-different incumbents. The next accepted child, not deterministic sibling
-ranking, settles the height.
-
-### 5.8 Persisted chain work
-
-Persisted cumulative chain work is the count of accepted blocks: one unit per
-block. It therefore represents height, not accumulated hash difficulty or
-program-golf savings. Status may report the tip's encoded solution length
-directly from `bits`; it must not infer share quality, evaluator cost, or a
-historical rank from chain work.
+The candidate with greater cumulative base work wins. Equal work prefers
+greater height. An exact work-and-height tie retains the first-seen incumbent;
+solution length, share quality, nonce and raw block hash add no hidden
+tie-break. Persisted header replay preserves insertion order for that final tie.
 
 ## 6. Co-op shares
 
@@ -916,9 +899,9 @@ be shorter because it is the minimum of the two verified witnesses. A builder
 using that candidate must still search the header nonce and meet §5's target.
 
 Genesis uses the same par-witness selection, finalizes its body, and searches
-the same uint32 nonce lottery. Changes to witness selection, `bits` layout, or
-lottery rules change genesis; older chain state is incompatible and each
-network requires fresh state for its matching genesis.
+the same uint32 nonce lottery. Changes to witness selection, packed `version`,
+compact target `bits`, or lottery rules change genesis; older chain state is
+incompatible and each network requires fresh state for its matching genesis.
 
 ## 9. Retargeting
 
@@ -1140,13 +1123,13 @@ complexities and all eight constraints) measured 2117 steps for both the
 heaviest attempt and heaviest complete non-fallback derivation. The hard bounds,
 not the sample, govern consensus.
 
-Against 72000 s mainnet spacing the theoretical 74.3 s is about 0.1% duty.
+Against the 86400 s mainnet target cadence, the theoretical 74.3 s is about 0.1% validation duty.
 
 **Pre-validation gate (required).** A node MUST order body validation
 cheapest-first. The canonical order is:
 
-1. header acceptance: version, time, `bits` prefix, derived `C`, `L <= par`,
-   and full-header lottery roll,
+1. header acceptance: canonical version, timestamp context, derived `C`,
+   interval-required compact `bits`, `L <= par`, and full-header lottery roll,
 2. block size and merkle commitment,
 3. canonical coinbase payload and actual producer-source length equal to the
    header's encoded `L`,
@@ -1188,7 +1171,7 @@ into Bitcoin's connector, which is the only supported path.
 | `share-bad-pubkey`, `share-bad-signature`, `share-uncommitted`, `share-duplicate-solution`, `share-not-under-par` | share check | personalized task or binding failed |
 | `share-solution-*` | share check | solution rejection, prefixed for a share |
 | `coinbase-output-shape`, `coinbase-output-value` | payout validation | output count, scripts, or values differ |
-| `malformed-header`, `bits-prefix`, `complexity-range`, `complexity-mismatch` | header/`bits` check | malformed fields, invalid prefix or complexity, or encoded `C` differs from the parent-derived value |
+| `malformed-header`, `version-prefix`, `complexity-range`, `complexity-mismatch` | header/version check | malformed fields, invalid prefix or complexity, or encoded `C` differs from the parent-derived value |
 | `solution-length-mismatch` | body connection | encoded `L` differs from the validated solution byte length |
 | `height-mismatch`, `missing-coinbase`, `block-oversize`, `malformed-block` | block check | malformed block envelope or body |
 | `internal-error` | any check | implementation failure while validating |
@@ -1257,13 +1240,15 @@ unknown until the required two-host soak completes.
 The sole public rule surface is `(sigil coin consensus)`; node code consumes it
 through `(sigil coin node)`.
 
-- Mainnet uses version 5, magic `8f d1 c0 a5`, port 19444, and HRP `sgl`.
-  Its quote is `Sigil - Practical Symbolic Power`; timestamp `1785542400` and
-  every derived genesis constant remain launch placeholders until the operator
-  chooses the final timestamp and regenerates them together.
+- Mainnet uses the packed `0x20600000` version prefix, magic `8f d1 c0 a5`,
+  port 19444, and HRP `sgl`. Its quote is `Sigil - Practical Symbolic Power`;
+  timestamp `1785542400` and every derived genesis constant remain launch
+  placeholders until the operator chooses the final timestamp and regenerates
+  them together.
 - The reset public testnet keeps magic `d3 7a 91 c5`, port 19446, HRP `tsgl`,
-  one-hour minimum spacing, and five-minute future drift. Its quote is
-  `SigilCoin public testnet reset - 2026-09-02` and timestamp `1788307200`.
+  a one-hour target cadence, one-second parent floor, and five-minute future
+  drift. Its quote is `SigilCoin public testnet reset - 2026-09-02` and
+  timestamp `1788307200`.
   Previous public-testnet databases and history are incompatible; operators
   must archive or move the old directory themselves and initialize an empty
   one. Software does not delete it.
@@ -1271,8 +1256,8 @@ through `(sigil coin node)`.
   spacing.
 
 The all-network generator is the source of current display/internal genesis
-hashes. Par-witness selection, the `bits` layout, and searched lottery nonce
-all affect the serialized genesis header. Pre-cutover chain state is
+hashes. Par-witness selection, the packed `version`, compact target `bits`, and
+searched lottery nonce all affect the serialized genesis header. Pre-cutover
 incompatible and each network requires fresh matching state. A node validates
 genesis, not network magic alone.
 

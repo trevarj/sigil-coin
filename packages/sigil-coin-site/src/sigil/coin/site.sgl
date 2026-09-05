@@ -226,25 +226,25 @@
                           (layer "02" "Frozen puzzle machine"
                                  "A small Scheme subset with no I/O, mutation, floating point or host eval; one bounded machine checks every example.")
                           (layer "03" "Header nonce lottery"
-                                 "Bits commit producer length and complexity. The uint32 nonce is searched until full-header HASH256 meets the program-weighted target.")
-                          (layer "04" "Complexity and base-target retarget"
-                                 "Every 16 blocks, the median golf margin moves C; C changes the puzzle and inversely changes at-par lottery odds.")
+                                 "Version commits producer length and puzzle complexity. Bits is the interval-retargeted compact base target; the uint32 nonce is searched until full-header HASH256 meets the golf-weighted effective target.")
+                          (layer "04" "Independent retargets"
+                                 "Every 16 blocks, observed time moves the base target while median golf margin moves puzzle complexity C. Neither signal controls the other.")
                           (layer "05" "Co-op commit–reveal"
                                  "Producers require L ≤ par; up to 8 signed personalized shares require L < personalized par and split a 10% contribution pool."))
                     (list 'figure (attrs '(class "diagram reveal"))
                           (list 'img (attrs '(src "assets/score-fork.svg")
-                                            '(alt "Program savings weight nonce-lottery odds; accepted blocks have equal unit weight and same-height ties remain first-seen")))
-                          (list 'figcaption "Shorter improves lottery odds. Fork choice is settled, taller, then first-seen—never lowest hash.")))
+                                            '(alt "Program savings weight nonce-lottery odds; fork choice follows cumulative base work and exact ties remain first-seen")))
+                          (list 'figcaption "Shorter improves admission odds. Fork choice follows cumulative retargeted base work; exact ties remain first-seen.")))
               (list 'div (attrs '(class "exact-grid reveal"))
                     (list 'details
                           (list 'summary "Header and lottery target")
-                          (list 'p "Bits use prefix 0x20600000 under mask 0xffe00000, with L−1 in bits 20..12 and C in bits 11..0. The base target is floor(2^256/(32C))−1; each of at most eight saved bytes doubles the odds, capped at 2^255−1. At C=128, expect 4096 rolls at par or 16 at par−8."))
+                          (list 'p "Version uses prefix 0x20600000 under mask 0xffe00000, with L−1 in bits 20..12 and C in bits 11..0. Header bits is a Bitcoin compact base target retargeted every 16 blocks from elapsed time. Up to eight saved bytes double the accepted outcome count, capped at 2^255−1. The initial mainnet target expects about 16.8 million rolls at par or 65.5 thousand at par−8."))
                     (list 'details
                           (list 'summary "Fork choice")
-                          (list 'p "Every accepted block contributes one unit. An observed child settles its parent; otherwise taller wins, and same-height siblings retain the first valid arrival. Length, shares, nonce and block hash do not break the tie."))
+                          (list 'p "Each accepted block adds work derived from its compact base target. The chain with more cumulative base work wins; equal work prefers greater height, and an exact tie retains the first valid arrival."))
                     (list 'details
                           (list 'summary "Retarget")
-                          (list 'p "Every 16 blocks, the median relative golf margin adjusts C, changing grammar width, examples, constraint tier and the lottery base target. Validator caps never move."))
+                          (list 'p "Every 16 blocks, elapsed timestamps retarget bits with a 4× clamp. Separately, median relative golf margin adjusts C, changing grammar width, examples and constraint tier. Validator caps never move.")))
                     (list 'details
                           (list 'summary "Payout and issuance")
                           (list 'p "Solo pays floor(4S/5)+fees and leaves the reserve unminted. With shares, canonical outputs divide floor(S/10) by verified contributions 1–4, pay the parent floor(S/20), retain zero-value required outputs, and send fees and integer residuals to the producer."))))
@@ -324,7 +324,7 @@
                   (link %github "Source")
                   (link %whitepaper "Whitepaper")
                   (link %consensus "Consensus")
-                  (link %explorer "Explorer"))))))
+                  (link %explorer "Explorer")))))
 
     ;;; Render the deterministic HTML document.
     ;;;

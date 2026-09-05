@@ -383,9 +383,9 @@ SIGIL_IMAGE="$rollback_image" docker compose --env-file .env \
 
 An image rollback does not migrate or restore either state directory. The
 chain database, pool schema, consensus rules, and genesis must all be
-compatible. In particular, state from before the producer-length `bits` and
-nonce-lottery genesis cutover requires a fresh matching chain state; never open
-it with the cutover binary.
+compatible. In particular, state from before the packed `version`, compact
+target `bits`, and nonce-lottery genesis cutover requires a fresh matching chain
+state; never open it with the cutover binary.
 If compatibility is uncertain, preserve both current directories and restore
 a matching pair into empty locations. An incident or testnet success does not
 authorize a mainnet push or deployment.
@@ -395,9 +395,10 @@ authorize a mainnet push or deployment.
 Mainnet uses port `19444`, separate state, and loopback explorer port `8081`.
 The co-op relay service and public pool hostname are testnet-only; mainnet
 Compose is unchanged and has no pool. Mainnet's coherent placeholder genesis
-uses the generated par candidate, commits its length and complexity in `bits`,
-and searches the uint32 nonce against the full-header target. The header
-lottery cutover changed it, so older chain state is incompatible. Its launch
+uses the generated par candidate, commits its length and complexity in
+`version`, carries the compact base target in `bits`, and searches the uint32
+nonce against the effective full-header target. The header lottery cutover
+changed it, so older chain state is incompatible. Its launch
 timestamp and resulting final constants remain non-final. Both helper scripts
 and every container refuse mainnet unless the operator sets exactly
 `ALLOW_MAINNET=yes`.

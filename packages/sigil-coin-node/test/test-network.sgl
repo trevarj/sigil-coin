@@ -439,8 +439,12 @@
                (parent (car (reverse headers)))
                (height (length headers))
                (complexity (coin-required-complexity headers height))
+               (bits
+                 (coin-required-bits
+                   (chain-config-consensus-params (node-config n))
+                   headers))
                (b (coin-build-block
-                    parent height complexity #f "two-node" payout
+                    parent height complexity bits #f "two-node" payout
                     (coin-next-block-time parent
                                           coin-regtest-min-block-spacing))))
           (unless (= 1 (submit n b))
@@ -497,6 +501,7 @@
   (coin-build-block parent
                     height
                     complexity
+                    (block-header-bits parent)
                     solution
                     graffiti
                     payout
@@ -516,8 +521,8 @@
            (at-16 (list-ref blocks 15))
            (complexity-16
              (coin-result-value
-               (coin-bits-decode
-                 (block-header-bits (block-header-field at-16)))))
+               (coin-version-decode
+                 (block-header-version (block-header-field at-16)))))
            (endpoint (open-endpoint))
            (port (car endpoint))
            (listener (cdr endpoint)))
@@ -548,8 +553,8 @@
         (assert-equal (solo-issued-supply 16) (utxo-total b))
         (assert-equal complexity-16
                       (coin-result-value
-                        (coin-bits-decode
-                          (block-header-bits
+                        (coin-version-decode
+                          (block-header-version
                             (list-ref (validated-headers b) 16)))))
         (assert-equal "" (last-error b))
         (node-close b))
@@ -599,7 +604,9 @@
 ;; ============================================================
 
 (define %genesis-block
-  (coin-genesis-block coin-regtest-genesis-quote coin-regtest-genesis-time))
+  (coin-genesis-block coin-regtest-genesis-quote coin-regtest-genesis-time
+                      coin-regtest-pow-limit-bits
+                      coin-regtest-genesis-nonce-constant))
 (define %genesis-header (block-header-field %genesis-block))
 
 ;; A personalized source can broaden only its exact reserved-string branch.
@@ -693,14 +700,15 @@
          (par (puzzle-spec-par
                 (coin-node-puzzle previous height complexity)))
          (header
-           (block-header version: coin-header-version
-                         previous-block: previous
-                         merkle-root: (merkle-root
-                                        (list (transaction-txid coinbase)))
-                         time: (coin-next-block-time
-                                 parent coin-regtest-min-block-spacing)
-                         bits: (coin-bits-encode complexity length)
-                         nonce: 0)))
+           (block-header
+             version: (coin-version-encode complexity length)
+             previous-block: previous
+             merkle-root: (merkle-root
+                            (list (transaction-txid coinbase)))
+             time: (coin-next-block-time
+                     parent coin-regtest-min-block-spacing)
+             bits: (block-header-bits parent)
+             nonce: 0)))
     (block header-field: (coin-mine-header header par)
            transactions: (list coinbase))))
 
@@ -773,7 +781,7 @@
     (node-close peer)))
 
 (when %native-secp256k1?
-  (test-group "sigilcoin Q-neutral copy-and-attach fork choice"
+  (test-group "sigilcoin copy-and-attach fork choice"
     (test "valid attached shares cannot replace first-seen or settled producer"
       (let* ((dir (fresh-dir))
              (validation-dir (fresh-dir))
@@ -781,16 +789,18 @@
              ;; commitment. The share context deliberately excludes H1's hash.
              (prototype
                (coin-build-block
-                 %genesis-header 1 coin-genesis-complexity #f "prototype"
-                 %elsewhere (+ coin-regtest-genesis-time 1)))
+                 %genesis-header 1 coin-genesis-complexity
+                 coin-regtest-pow-limit-bits
+                 #f "prototype" %elsewhere (+ coin-regtest-genesis-time 1)))
              (share
                (car (generated-shares 1 (coin-parent-context prototype))))
              (commitment
                (coin-share-commitment (coin-parent-context prototype) share))
              (parent
                (coin-build-block
-                 %genesis-header 1 coin-genesis-complexity #f "commit"
-                 %elsewhere (+ coin-regtest-genesis-time 1)
+                 %genesis-header 1 coin-genesis-complexity
+                 coin-regtest-pow-limit-bits
+                 #f "commit" %elsewhere (+ coin-regtest-genesis-time 1)
                  '() 0 (list commitment)))
              (parent-header (block-header-field parent))
              (height 2)
@@ -804,25 +814,29 @@
                   coin-regtest-min-block-spacing))
              (original
                (coin-build-block
-                 parent-header height coin-genesis-complexity solution
-                 "original solver" %elsewhere arrival))
+                 parent-header height coin-genesis-complexity
+                 coin-regtest-pow-limit-bits
+                 solution "original solver" %elsewhere arrival))
              (copy-before-child
                (coin-build-coop-block
-                 parent height coin-genesis-complexity solution (list share)
-                 "copy before child" %anyone arrival))
+                 parent height coin-genesis-complexity
+                 coin-regtest-pow-limit-bits
+                 solution (list share) "copy before child" %anyone arrival))
              (child
                (coin-build-block
                  (block-header-field original)
                  (+ height 1)
                  coin-genesis-complexity
+                 coin-regtest-pow-limit-bits
                  #f
                  "settling child"
                  %elsewhere
                  (+ arrival coin-regtest-min-block-spacing)))
              (copy-after-child
                (coin-build-coop-block
-                 parent height coin-genesis-complexity solution (list share)
-                 "copy after child" %anyone arrival))
+                 parent height coin-genesis-complexity
+                 coin-regtest-pow-limit-bits
+                 solution (list share) "copy after child" %anyone arrival))
              (original-header (block-header-field original))
              (copy-header (block-header-field copy-before-child))
              (par
@@ -855,13 +869,13 @@
         (assert-true
           (coin-lottery-valid?
             (block-header-work-value original-header)
-            coin-genesis-complexity
+            coin-regtest-pow-limit-bits
             par
             (coin-solution-length solution)))
         (assert-true
           (coin-lottery-valid?
             (block-header-work-value copy-header)
-            coin-genesis-complexity
+            coin-regtest-pow-limit-bits
             par
             (coin-solution-length solution)))
         (assert-equal (coin-chain-work original-header #f 2)
@@ -889,8 +903,9 @@
 
 ;; One canonical commit/reveal fixture shared by network acceptance tests.
 (define %coop-prototype
-  (coin-build-block %genesis-header 1 coin-genesis-complexity #f
-                    "prototype" %anyone
+  (coin-build-block %genesis-header 1 coin-genesis-complexity
+                    coin-regtest-pow-limit-bits
+                    #f "prototype" %anyone
                     (+ coin-regtest-genesis-time 1)))
 (define %coop-context (coin-parent-context %coop-prototype))
 (define %coop-shares
@@ -903,15 +918,18 @@
          %coop-shares)
     (lambda (x) x)))
 (define %coop-parent
-  (coin-build-block %genesis-header 1 coin-genesis-complexity #f
-                    "commit" %anyone
+  (coin-build-block %genesis-header 1 coin-genesis-complexity
+                    coin-regtest-pow-limit-bits
+                    #f "commit" %anyone
                     (+ coin-regtest-genesis-time 1)
                     '() 0 %coop-commits))
 (define %coop-child
   (and %native-secp256k1?
        (coin-build-coop-block
-         %coop-parent 2 coin-genesis-complexity #f %coop-shares
-         "reveal" %elsewhere (+ coin-regtest-genesis-time 2))))
+         %coop-parent 2 coin-genesis-complexity
+         coin-regtest-pow-limit-bits
+         #f %coop-shares "reveal" %elsewhere
+         (+ coin-regtest-genesis-time 2))))
 
 (when %native-secp256k1?
   (test-group "sigilcoin co-op over two processes"
@@ -1033,9 +1051,9 @@
                (coin-mine-header
                  (block-header
                    header
-                   bits: (coin-bits-encode
-                           coin-genesis-complexity
-                           (- length 1))
+                   version: (coin-version-encode
+                              coin-genesis-complexity
+                              (- length 1))
                    nonce: 0)
                  par))
              (bad (block %coop-child header-field: lying-header)))
@@ -1072,7 +1090,7 @@
         (assert-peer-rejects server bad peer-dir 0 "share")
         (node-close server)))))
 
-(test-group "sigilcoin equal-unit header fork choice"
+(test-group "sigilcoin equal-base-work header fork choice"
   (test "distinct qualifying siblings keep the first-seen header"
     (let* ((dir-a (fresh-dir))
            (dir-b (fresh-dir))
@@ -1083,16 +1101,16 @@
            (par (puzzle-spec-par
                   (coin-node-puzzle
                     previous 2 coin-genesis-complexity)))
-           (bits (coin-bits-encode coin-genesis-complexity par))
+           (version (coin-version-encode coin-genesis-complexity par))
            (incumbent
              (coin-mine-header
                (block-header
-                 version: coin-header-version
+                 version: version
                  previous-block: previous
                  merkle-root: (make-bytevector 32 8)
                  time: (coin-next-block-time
                          parent coin-regtest-min-block-spacing)
-                 bits: bits
+                 bits: (block-header-bits parent)
                  nonce: 0)
                par))
            (challenger
@@ -1182,7 +1200,10 @@
                  ;; Empty share set still exercises canonical co-op builder
                  ;; path and transaction/fee accounting.
                  (payment (coin-build-coop-block
-                            parent 2 complexity #f '() "wallet payment"
+                            parent 2 complexity
+                            (coin-required-bits
+                              sigilcoin-regtest-consensus-params history)
+                            #f '() "wallet payment"
                             wallet-script
                             (coin-next-block-time
                               (block-header-field parent)
@@ -1258,7 +1279,10 @@
              (history (validated-headers a))
              (complexity (coin-required-complexity history 2))
              (payment (coin-build-block
-                        parent 2 complexity #f "payment" %anyone
+                        parent 2 complexity
+                        (coin-required-bits
+                          sigilcoin-regtest-consensus-params history)
+                        #f "payment" %anyone
                         (coin-next-block-time
                           parent coin-regtest-min-block-spacing)
                         (list transfer) 0)))
@@ -1319,6 +1343,8 @@
                (block-header-field original-h1)
                2
                (coin-required-complexity history 2)
+               (coin-required-bits
+                 sigilcoin-regtest-consensus-params history)
                #f
                "maturity-one spend"
                %anyone
@@ -1396,6 +1422,7 @@
                        (block-header-hash %genesis-header) 1 complexity))
                (b (coin-build-block
                     %genesis-header 1 complexity
+                    coin-regtest-pow-limit-bits
                     (puzzle-spec-hidden-source* spec)
                     (symbol->string (puzzle-constraint-name* ci))
                     %elsewhere (+ coin-regtest-genesis-time 1)))
@@ -1411,7 +1438,7 @@
           (assert-true
             (coin-lottery-valid?
               (block-header-work-value header)
-              complexity
+              coin-regtest-pow-limit-bits
               (puzzle-spec-par spec)
               (coin-result-value length)))))
       '(0 1 2 3 4 5 6 7))))
@@ -1448,7 +1475,7 @@
              (coin-mine-header
                (block-header
                  header
-                 bits: (coin-bits-encode coin-genesis-complexity 1)
+                 version: (coin-version-encode coin-genesis-complexity 1)
                  nonce: 0)
                par))
            (liar

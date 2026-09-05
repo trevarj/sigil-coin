@@ -13,9 +13,10 @@ the operator chooses launch day. Seed, explorer, and public-testnet pool
 hostnames are in tree; the pool is not a mainnet service. See
 [Decisions still owed](#decisions-still-owed-by-the-operator) for what is left.
 
-The producer-length `bits` layout and nonce-lottery cutover change every
-generated genesis header and hash. Chain state created under the earlier rules
-is incompatible; each network starts from fresh state for its matching genesis.
+The packed producer-length `version`, compact target `bits`, and nonce-lottery
+cutover change every generated genesis header and hash. Chain state created
+under the earlier rules is incompatible; each network starts from fresh state
+for its matching genesis.
 
 ---
 
@@ -104,8 +105,8 @@ the genesis hash: change one byte and every constant below changes.
 - [ ] Pick the quote. Ask the person quoted first — it is going in an
       immutable coinbase forever.
 - [ ] Pick the genesis timestamp, UTC, in the recent past. It must be far
-      enough back that genesis, and a first block 20 hours later, both clear
-      the 7200-second future-drift rule on any node with a sane clock.
+      enough back that genesis and a first block one second later clear the
+      7200-second future-drift rule on any node with a sane clock.
 - [ ] On launch day, edit `coin-genesis-quote` and `coin-genesis-time` in
       `packages/sigil-coin-node/src/sigil/coin/node/chain.sgl`, then run the
       canonical all-network generator from the repository root:
@@ -120,8 +121,8 @@ the genesis hash: change one byte and every constant below changes.
 
       Record the current coherent provisional mainnet quote, timestamp,
       80-byte header hex, internal hash, and display id emitted by that run.
-      Never reuse values generated before the producer-length `bits` and
-      nonce-lottery cutover.
+      Never reuse values generated before the packed `version`, compact target,
+      and nonce-lottery cutover.
 
 - [x] Check `quote-bytes` against the 400-byte graffiti cap. 32 bytes used,
       368 to spare. It is a BYTE
@@ -178,19 +179,23 @@ should be in the same place the code is.
       par (`L <= par`) and 512 bytes; shares must be strictly below their
       personalized par (`L < personalized_par`); graffiti is at most 400 bytes,
       blocks at most 16384 bytes, and puzzles contain at most 8 example pairs.
-      `bits = 0x20600000 | ((L-1)<<12) | C`; the builder finalizes the body and
-      merkle root once, then searches nonce `0..0xffffffff`. The little-endian
-      integer from full-header `HASH256` must not exceed
-      `min(2^255-1, floor(2^256/(32*C))*2^min(max(par-L,0),8)-1)`. At `C=128`, par
-      expects 4096 rolls and `par-8` expects 16. Block spacing is at least
-      72000 seconds with 7200 seconds of future drift. SigilCoin coinbase
-      maturity is 1 block; the bundled mainnet wallet waits six confirmations.
-- [ ] Fork choice, stated plainly: each accepted block contributes one unit.
-      An observed child settles its parent against late siblings; otherwise a
-      taller validated chain wins, and equal-height siblings retain the first
-      valid arrival. Solution length, evaluator cost, shares, nonce, and block
-      hash never break a sibling tie. Shorter programs improve lottery odds;
-      they do not deterministically outrank accepted blocks.
+      `version = 0x20600000 | ((L-1)<<12) | C`; `bits` is the canonical compact
+      base target. The builder finalizes the body and merkle root once, then
+      searches nonce `0..0xffffffff`. The full-header roll must not exceed
+      `min(2^255-1,(compact-target(bits)+1)*2^min(max(par-L,0),8)-1)`.
+      Mainnet begins at `0x1e00ffff`: about 16,777,473 rolls at par or 65,538
+      at `par-8`. Every 16 blocks, the preceding 15 timestamp intervals
+      retarget bits with a 0.25x..4x clamp toward one block per day. The
+      one-second parent floor only keeps timestamps monotone; future drift is
+      7200 seconds. Coinbase maturity is 1; the mainnet wallet waits six.
+- [ ] Fork choice, stated plainly: greater cumulative compact-target base work
+      wins; equal work prefers greater height; an exact work-and-height tie
+      retains the first valid arrival. Golf savings change admission odds, not
+      credited chain work.
+- [ ] Benchmark the release miner on both launch hosts. If initial at-par or
+      `par-8` solve time is materially outside the intended bootstrap window,
+      change `coin-main-pow-limit-bits`, regenerate all genesis constants, and
+      restart the soak from fresh state.
 
 Anyone can check the internal hash with `sigilcoin status` on a fresh data
 directory and reproduce header, hash, and display id with
@@ -321,15 +326,14 @@ Do not begin this soak until every checkbox in
 preserved evidence. Public testnet completion does not replace this mainnet-rules
 soak. Run it before step 5, not after.
 
-Run mainnet rules — `--chain sigilcoin-main`, not regtest, so the real 20
-hour spacing floor and the real genesis are in play — on two machines, on
-different networks, for **at least 14 days**. Fourteen days is long enough to
-observe daily pacing, disconnect/reconnect behavior, hard-kill recovery,
-commit/reveal across several heights and independent agreement through normal
-operator churn. At roughly one block a day it remains inside the 30-block
-warmup and cannot approach the 730-block halving; those boundaries are covered
-by deterministic consensus tests and accelerated regtest/simulation, not by
-pretending a two-week soak reaches them.
+Run mainnet rules — `--chain sigilcoin-main`, not regtest — on two machines on
+different networks for **at least 21 days**. The test must cross height 16 so
+the first timestamp-driven base-target retarget and independent golf-margin
+complexity retarget both execute. Observe target cadence, cumulative-work fork
+choice, disconnect/reconnect behavior, hard-kill recovery, commit/reveal, and
+independent agreement through normal operator churn. At roughly one block per
+day it remains inside the 30-block warmup and cannot approach the 730-block
+halving; accelerated tests cover those later boundaries.
 
 What to run:
 

@@ -1,25 +1,19 @@
-;;; (sigil coin consensus rules) — size and pacing
+;;; (sigil coin consensus rules) — size and timestamp context
 ;;;
-;;; SigilCoin blocks are small and slow. A block serializes to at most
-;;; `coin-max-block-bytes`, and consecutive headers must be at least
-;;; `coin-min-block-spacing` seconds apart — 20 hours, under a one-per-day
-;;; cadence, which leaves room for a solution to be found and propagated
-;;; without letting a miner sprint a private chain forward.
+;;; SigilCoin blocks serialize to at most `coin-max-block-bytes`. The nonce
+;;; lottery and its interval-retargeted base target control cadence; the
+;;; one-second parent floor only keeps rapid local mining timestamps monotone.
 ;;;
-;;; The spacing floor and future-drift allowance are chain policy. Mainnet
-;;; uses `coin-min-block-spacing` and `coin-max-future-drift`; other chains
-;;; pass both values to `coin-validate-header-context`. This package stays
-;;; pure and knows only those compatible mainnet defaults.
+;;; The spacing floor and future-drift allowance are chain policy. Mainnet uses
+;;; `coin-min-block-spacing` and `coin-max-future-drift`; other chains pass both
+;;; values to `coin-validate-header-context`.
 ;;;
-;;; Alongside spacing and drift, the usual Bitcoin median-time rule applies:
-;;; a header's time must exceed the median of the last
-;;; `coin-median-time-span` headers.
+;;; The usual Bitcoin median-time rule also applies: a header's time must exceed
+;;; the median of the last `coin-median-time-span` headers.
 ;;;
-;;; Both are implemented here rather than imported: `sigil-bitcoin-consensus`
-;;; supplies header linkage, serialization and proof-of-work helpers, but no
-;;; median-time-past or future-drift check, so there is nothing to reuse.
-;;;
-;;; Every check is total and returns a `coin-result`.
+;;; These checks live here because `sigil-bitcoin-consensus` supplies linkage,
+;;; target and proof-of-work helpers but no median-time-past or future-drift
+;;; policy. Every check is total and returns a `coin-result`.
 
 (define-library (sigil coin consensus rules)
   (import (sigil math)
@@ -66,9 +60,9 @@
     ;;; Shared evaluator fuel cap.
     (define coin-max-fuel puzzle-max-fuel)
 
-    ;;; Minimum seconds between a header and its parent on mainnet: 20 hours.
-    ;;; This is the default floor; a chain config may supply its own.
-    (define coin-min-block-spacing 72000)
+    ;;; Minimum seconds between a header and its parent: one second.
+    ;;; Mining difficulty, not this monotonicity floor, controls cadence.
+    (define coin-min-block-spacing 1)
 
     ;;; Maximum seconds a header's time may lead the validating clock.
     (define coin-max-future-drift 7200)

@@ -13,8 +13,7 @@
           (sigil coin consensus score)
           (sigil coin consensus retarget)
           (sigil coin consensus shares)
-          (sigil coin consensus coinbase)
-          (sigil coin consensus fork-choice))
+          (sigil coin consensus coinbase))
   (export
     ;; Package metadata
     consensus-package-version
@@ -83,7 +82,6 @@
     ;; Resource reporting and block lottery
     coin-bucket7
     coin-max-bucket
-    coin-lottery-work-factor
     coin-lottery-max-bonus
     coin-lottery-max-integer
     coin-lottery-target-ceiling
@@ -108,11 +106,11 @@
     coin-next-complexity
     coin-complexity-for
     coin-complexity-at
-    coin-bits-prefix
-    coin-bits-encode
-    coin-bits-decode
-    coin-bits-solution-length
-    coin-check-bits
+    coin-version-prefix
+    coin-version-encode
+    coin-version-decode
+    coin-version-solution-length
+    coin-check-version
 
     ;; Co-op shares, commit-reveal and payouts
     coin-share-pubkey-bytes
@@ -183,10 +181,8 @@
     coin-block-coinbase-payload
     coin-carrier-script
     coin-check-coop
+  )
 
-    ;; Fork choice
-    coin-block-compare
-    coin-better-block?)
 
   (begin
 

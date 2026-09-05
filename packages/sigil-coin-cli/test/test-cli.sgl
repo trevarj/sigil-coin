@@ -138,8 +138,12 @@
                         (reverse out)
                         (loop (+ h 1)
                               (cons (coin-header-at-height n h) out)))))
-         (complexity (coin-required-complexity headers height)))
-    (coin-build-block parent height complexity #f graffiti script
+         (complexity (coin-required-complexity headers height))
+         (bits
+           (coin-required-bits
+             (chain-config-consensus-params (node-config n))
+             headers)))
+    (coin-build-block parent height complexity bits #f graffiti script
                       (+ (block-header-time parent)
                          (coin-chain-min-block-spacing (node-config n))))))
 
@@ -708,7 +712,7 @@
                      (run-text (cons "puzzle" shortcut))
                      "height: 1"))))
 
-  (test "testnet mine accepts tsgl and keeps launch pacing intact"
+  (test "testnet mine accepts tsgl without a spacing throttle"
     (let ((args (fresh-testnet-args)))
       (assert-true (string-starts-with? %testnet-payout-address "tsgl1"))
       (assert-true (string-contains?
@@ -716,9 +720,9 @@
                        (append (list "mine" "--address" %payout-address)
                                args))
                      "tsgl1"))
-      ;; Before the scheduled testnet launch, a valid payout reaches the
-      ;; timestamp guard and is correctly held there. Once launch spacing is
-      ;; satisfiable, the same test mines and validates the block end to end.
+      ;; Before the scheduled testnet launch, the timestamp guard still holds
+      ;; mining. After launch, cadence comes from the nonce target rather than
+      ;; an artificial one-hour parent-spacing floor.
       (let* ((command (append (list "mine"
                                     "--address" %testnet-payout-address)
                               args))
@@ -727,15 +731,10 @@
             (begin
               (assert-true (string-contains? message "too early"))
               (assert-equal 0 (tip-height args)))
-            ;; `failure-message` already mined H1. H2 must now be held for
-            ;; the one-hour floor: five minutes of drift cannot bridge it.
             (begin
               (assert-equal 1 (tip-height args))
-              (let ((h2-message (failure-message command)))
-                (assert-true (string-contains? h2-message "too early"))
-                (assert-true (string-contains? h2-message
-                                               "300-second future-drift"))
-                (assert-equal 1 (tip-height args)))))))))
+              (assert-false (failure-message command))
+              (assert-equal 2 (tip-height args))))))))
 
 (test-group "sigilcoin peers"
   (test "peers are added, listed and removed on the SigilCoin chain"
@@ -1033,7 +1032,8 @@
 (test-group "sigilcoin puzzle"
   (test "report is consensus derivation"
     (let ((report (coin-puzzle-report %regtest-genesis-hash 1
-                                      coin-genesis-complexity)))
+                                      coin-genesis-complexity
+                                      coin-regtest-pow-limit-bits)))
       (assert-equal 1 (cdr (assq 'height report)))
       (assert-equal coin-genesis-complexity (cdr (assq 'complexity report)))
       (assert-equal (puzzle-spec-examples %height-one-spec)
@@ -1067,14 +1067,15 @@
       (assert-true (string-contains? text "guaranteed-valid"))
       (assert-true (string-contains? text "lottery-bonus: 0"))
       (assert-true (string-contains? text "lottery-multiplier: 1"))
-      (assert-true (string-contains? text "lottery-expected-rolls: 4096"))
+      (assert-true (string-contains? text "lottery-expected-rolls: 257"))
       (assert-true
         (string-contains?
           text
           (string-append
             "lottery-target: "
             (number->string
-              (coin-lottery-target coin-genesis-complexity par par)))))
+              (coin-lottery-target
+                coin-regtest-pow-limit-bits par par)))))
       (assert-false (string-contains? text "fallback-score:"))
       (assert-false (string-contains? text "rank: shorter"))))
 
@@ -1104,24 +1105,25 @@
            (header (block-header-field b))
            (par (puzzle-spec-par %height-one-spec))
            (solution-length (string-length %height-one-source))
-           (target (coin-lottery-target coin-genesis-complexity
+           (target (coin-lottery-target (block-header-bits header)
                                         par solution-length))
            (encoded-length
-             (coin-bits-solution-length (block-header-bits header)))
+             (coin-version-solution-length
+               (block-header-version header)))
            (roll (block-header-work-value header)))
       (assert-true (block? b))
       (assert-equal 1 (tip-height args))
       (assert-true (coin-ok? encoded-length))
       (assert-equal solution-length (coin-result-value encoded-length))
       (assert-true
-        (coin-lottery-valid? roll coin-genesis-complexity
+        (coin-lottery-valid? roll (block-header-bits header)
                              par solution-length))
       (assert-true (string-contains? text "solution-valid: yes"))
       (assert-true (string-contains? text "memory:"))
       (assert-true (string-contains? text "steps:"))
       (assert-true (string-contains? text "lottery-bonus: 0"))
       (assert-true (string-contains? text "lottery-multiplier: 1"))
-      (assert-true (string-contains? text "lottery-expected-rolls: 4096"))
+      (assert-true (string-contains? text "lottery-expected-rolls: 257"))
       (assert-true
         (string-contains?
           text
@@ -1175,7 +1177,7 @@
       (assert-true (string-contains? text "within-par: yes"))
       (assert-true
         (string-contains? text "valid at-par work is still lottery-gated"))
-      (assert-true (string-contains? text "lottery-expected-rolls: 4096"))
+      (assert-true (string-contains? text "lottery-expected-rolls: 257"))
       (assert-true (string-contains? text "submitted: yes"))
       (assert-equal 1 (tip-height args))))
 
@@ -1686,8 +1688,13 @@
                                           (coin-header-at-height n 1)))
                                   (complexity
                                     (coin-required-complexity headers height))
+                                  (bits
+                                    (coin-required-bits
+                                      (chain-config-consensus-params
+                                        (node-config n))
+                                      headers))
                                   (b (coin-build-coop-block
-                                       parent height complexity
+                                       parent height complexity bits
                                        #f
                                        (list share)
                                        "selected reveal" producer-script

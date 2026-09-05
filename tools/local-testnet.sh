@@ -795,7 +795,10 @@ jq -e --arg id "$block_h101" --arg contributor "$address_d" \
    .lottery.roll == $id and
    (.lottery.nonce >= 0 and .lottery.nonce < 4294967296) and
    (.lottery.claimed_length >= 1 and .lottery.claimed_length <= 512) and
+   .lottery.base_bits == 536936447 and
+   (.lottery.base_target | test("^[0-9a-f]{64}$")) and
    (.lottery.target | test("^[0-9a-f]{64}$")) and
+   (.lottery.chain_work | test("^[1-9][0-9]*$")) and
    .lottery.expected_rolls >= 1 and
    any(.outputs[]; .role == "share" and .address == $contributor and .value > 0) and
    any(.outputs[]; .role == "carrier" and .address == $producer and .value > 0)' \

@@ -102,6 +102,9 @@
 
     ;; Canonical blocks
     explorer-block-complexity
+    explorer-block-bits
+    explorer-block-base-target
+    explorer-block-chain-work
     explorer-block-constraint
     explorer-block-constraint-text
     explorer-block-k
@@ -434,7 +437,8 @@
             value
             default)))
 
-    (define %header-columns "hash, prev_hash, height, time, header_hex")
+    (define %header-columns
+      "hash, prev_hash, height, time, work, header_hex")
 
     (define (header-row store hash-text)
       (query-row store
@@ -487,6 +491,9 @@
       (size default: #f)
       (problem default: #f)
       (complexity default: #f)
+      (bits default: #f)
+      (base-target default: #f)
+      (chain-work default: #f)
       (constraint default: #f)
       (constraint-text default: #f)
       (k default: #f)
@@ -651,7 +658,7 @@
                     (parent-prev (and row (hex-decode (row-ref row 'prev_hash))))
                     (complexity (and header
                                      (explorer-complexity
-                                       (block-header-bits header))))
+                                       (block-header-version header))))
                     (spec (and complexity
                                (explorer-puzzle parent-prev
                                                    (- height 1)
@@ -880,8 +887,9 @@
     (define (canonical-fields store base header parsed parent-hash detail?)
       (let* ((height (explorer-block-height base))
              (bits (block-header-bits header))
-             (complexity-result (coin-bits-decode bits))
-             (length-result (coin-bits-solution-length bits))
+             (version (block-header-version header))
+             (complexity-result (coin-version-decode version))
+             (length-result (coin-version-solution-length version))
              (complexity (and (coin-ok? complexity-result)
                               (coin-result-value complexity-result)))
              (claimed-length (and (coin-ok? length-result)
@@ -936,9 +944,9 @@
              (par (and view (car view)))
              (length-used (and solution (bytevector-length solution)))
              (lottery-target
-               (and complexity par claimed-length
+               (and par claimed-length
                     (guard (e (#t #f))
-                      (coin-lottery-target complexity par claimed-length))))
+                      (coin-lottery-target bits par claimed-length))))
              (lottery-bonus
                (and par claimed-length
                     (guard (e (#t #f))
@@ -948,20 +956,18 @@
                     (guard (e (#t #f))
                       (coin-lottery-multiplier par claimed-length))))
              (lottery-expected-rolls
-               (and complexity par claimed-length
+               (and par claimed-length
                     (guard (e (#t #f))
-                      (coin-lottery-expected-rolls
-                        complexity par claimed-length))))
+                      (coin-lottery-expected-rolls bits par claimed-length))))
              (roll-value (guard (e (#t #f))
                            (block-header-work-value header)))
              (lottery-valid?
                (and (number? roll-value)
-                    complexity
                     par
                     claimed-length
                     (guard (e (#t #f))
                       (coin-lottery-valid?
-                        roll-value complexity par claimed-length))))
+                        roll-value bits par claimed-length))))
              (share-quality
                (and detail?
                     contributions
@@ -1026,6 +1032,9 @@
                       (coin-result-reason commits-result))
                      (else #f))
           complexity: complexity
+          bits: bits
+          base-target: (guard (e (#t #f)) (compact-target->integer bits))
+          chain-work: (explorer-block-chain-work base)
           constraint: (and view (car (cdr view)))
           constraint-text: (and view (car (cdr (cdr view))))
           k: (and view (car (cdr (cdr (cdr view)))))
@@ -1095,6 +1104,9 @@
                      id: (hash-text->id hash-text)
                      hash-text: hash-text
                      time: time
+                     chain-work:
+                       (let ((text (row-ref hrow 'work)))
+                         (and (string? text) (string->number text)))
                      parent-id: (and (string? prev-text)
                                      (hash-text->id prev-text))
                      reward: (guard (e (#t 0)) (coin-block-reward height))
@@ -1120,6 +1132,7 @@
         hash-text: (explorer-block-hash-text b)
         time: (explorer-block-time b)
         parent-id: (explorer-block-parent-id b)
+        chain-work: (explorer-block-chain-work b)
         reward: (explorer-block-reward b)
         problem: reason))
 
@@ -1194,7 +1207,7 @@
              (tip-header (and tip-row (row-header tip-row)))
              (complexity (and tip-header
                               (explorer-complexity
-                                (block-header-bits tip-header))))
+                                (block-header-version tip-header))))
              (next-complexity
                (and complexity
                     (explorer-next-complexity

@@ -1,9 +1,9 @@
 ;;; Print every canonical genesis value from the configured quote and timestamp.
 ;;;
-;;; Launch-critical constants must all come from this tool. It rebuilds the
-;;; mainnet, reset public-testnet, and regtest coinbases from current source and
-;;; prints the serialized coinbase, merkle root, nonce, header, hash, and display
-;;; id which move together whenever the generated witness changes.
+;;; Launch-critical constants must all come from this tool. It mines the
+;;; mainnet, reset public-testnet and regtest genesis templates from current
+;;; source, then prints the coinbase, merkle root, compact base target, nonce,
+;;; header, hash and display id that move together.
 ;;;
 ;;; Run from the repository root:
 ;;;
@@ -27,15 +27,19 @@
         (sigil coin node chain))
 
 (define %genesis-inputs
-  (list (list "mainnet" coin-genesis-quote coin-genesis-time)
-        (list "testnet" coin-testnet-genesis-quote coin-testnet-genesis-time)
-        (list "regtest" coin-regtest-genesis-quote coin-regtest-genesis-time)))
+  (list (list "mainnet" coin-genesis-quote coin-genesis-time
+              coin-main-pow-limit-bits)
+        (list "testnet" coin-testnet-genesis-quote coin-testnet-genesis-time
+              coin-testnet-pow-limit-bits)
+        (list "regtest" coin-regtest-genesis-quote coin-regtest-genesis-time
+              coin-regtest-pow-limit-bits)))
 
 (define (print-genesis input)
   (let* ((name (car input))
          (quote (cadr input))
          (time (caddr input))
-         (built (coin-genesis-block quote time))
+         (bits (list-ref input 3))
+         (built (coin-mine-genesis quote time bits))
          (coinbase (car (block-transactions built)))
          (header (block-header-field built))
          (hash (block-header-hash header)))
@@ -46,6 +50,7 @@
     ;; are byte limits.
     (println "quote-bytes: ~a" (bytevector-length (string->utf8 quote)))
     (println "time: ~a" time)
+    (println "bits: 0x~a" (number->string bits 16))
     (println "coinbase-hex: ~a"
              (hex-encode (transaction-serialize coinbase)))
     (println "merkle-root: ~a"

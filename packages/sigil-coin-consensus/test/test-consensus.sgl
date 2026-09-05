@@ -84,11 +84,11 @@
     (if (>= i n) acc (loop (+ i 1) (cons x acc)))))
 
 (define (header-at previous time)
-  (block-header version: 5
+  (block-header version: (coin-version-encode 128 24)
                 previous-block: previous
                 merkle-root: %zero32
                 time: time
-                bits: (coin-bits-encode 128 24)
+                bits: #x207fffff
                 nonce: 0))
 
 (define (chain-of n start)
@@ -118,8 +118,8 @@
     (assert-equal puzzle-max-source-bytes coin-max-solution-bytes)
     (assert-equal puzzle-max-fuel coin-max-fuel))
 
-  (test "the pacing rules are frozen"
-    (assert-equal 72000 coin-min-block-spacing)
+  (test "the timestamp rules are frozen"
+    (assert-equal 1 coin-min-block-spacing)
     (assert-equal 7200 coin-max-future-drift)
     (assert-equal 11 coin-median-time-span))
 
@@ -137,7 +137,7 @@
                             (+ (block-header-time tip)
                                coin-min-block-spacing)))
            (close (header-at (block-header-hash tip)
-                             (+ (block-header-time tip) 1))))
+                             (block-header-time tip))))
       (assert-true (coin-ok? (coin-validate-header-context
                                chain good now)))
       (assert-equal 'insufficient-spacing
@@ -145,7 +145,7 @@
                       (coin-validate-header-context chain close now)))
       ;; Spacing-only callers retain the mainnet drift default.
       (assert-true (coin-ok? (coin-validate-header-context
-                               chain close now 1)))))
+                               chain good now 1)))))
 
   (test "future drift is inclusive at the exact chain-policy boundary"
     (let* ((now 2000000)
@@ -651,22 +651,22 @@
                                    (bytevector-length source)))))))
 
 (test-group "sigil-coin program-golf lottery"
-  (test "constants and exact target examples are frozen"
-    (assert-equal 32 coin-lottery-work-factor)
+  (test "constants and compact-target examples are frozen"
     (assert-equal 8 coin-lottery-max-bonus)
     (assert-equal (- (arithmetic-shift 1 256) 1)
                   coin-lottery-max-integer)
     (assert-equal (- (arithmetic-shift 1 255) 1)
                   coin-lottery-target-ceiling)
-    ;; C=128 at par: floor(2^256 / 4096) winning integers.
-    (assert-equal (- (arithmetic-shift 1 244) 1)
-                  (coin-lottery-target 128 100 100))
-    (assert-equal (- (arithmetic-shift 1 245) 1)
-                  (coin-lottery-target 128 100 99))
-    (assert-equal (- (arithmetic-shift 1 252) 1)
-                  (coin-lottery-target 128 100 92)))
+    (assert-equal 16777473
+                  (coin-lottery-expected-rolls #x1e00ffff 100 100))
+    (assert-equal 65538
+                  (coin-lottery-expected-rolls #x1e00ffff 100 92))
+    (assert-equal 257
+                  (coin-lottery-expected-rolls #x2000ffff 100 100))
+    (assert-equal 2
+                  (coin-lottery-expected-rolls #x2000ffff 100 92)))
 
-  (test "each saved byte doubles odds through the eighth"
+  (test "each saved byte doubles accepted outcomes through the eighth"
     (assert-equal 0 (coin-lottery-bonus 100 100))
     (assert-equal 1 (coin-lottery-bonus 100 99))
     (assert-equal 8 (coin-lottery-bonus 100 92))
@@ -675,51 +675,35 @@
     (assert-equal 2 (coin-lottery-multiplier 100 99))
     (assert-equal 256 (coin-lottery-multiplier 100 92))
     (assert-equal
-      (* 2 (+ 1 (coin-lottery-target 128 100 100)))
-      (+ 1 (coin-lottery-target 128 100 99))))
-
-  (test "expected rolls are exact integers rounded up"
-    (assert-equal 4096 (coin-lottery-expected-rolls 128 100 100))
-    (assert-equal 2048 (coin-lottery-expected-rolls 128 100 99))
-    (assert-equal 16 (coin-lottery-expected-rolls 128 100 92))
-    ;; 127 does not divide 2^256, so the honest rounded-up display is 4065.
-    (assert-equal 4065 (coin-lottery-expected-rolls 127 100 100)))
+      (* 2 (+ 1 (coin-lottery-target #x1e00ffff 100 100)))
+      (+ 1 (coin-lottery-target #x1e00ffff 100 99))))
 
   (test "the target ceiling prevents certainty"
     (assert-equal coin-lottery-target-ceiling
-                  (coin-lottery-target 16 100 92))
+                  (coin-lottery-target #x2000ffff 100 92))
     (assert-equal coin-lottery-target-ceiling
-                  (coin-lottery-target 16 100 1))
-    (assert-equal 2 (coin-lottery-expected-rolls 16 100 92)))
+                  (coin-lottery-target #x2000ffff 100 1)))
 
   (test "target comparison is inclusive and rejects non-uint256 rolls"
-    (let ((target (coin-lottery-target 128 100 100)))
-      (assert-true (coin-lottery-valid? target 128 100 100))
-      (assert-false (coin-lottery-valid? (+ target 1) 128 100 100))
-      (assert-false (coin-lottery-valid? -1 128 100 100))
+    (let ((target (coin-lottery-target #x1e00ffff 100 100)))
+      (assert-true
+        (coin-lottery-valid? target #x1e00ffff 100 100))
+      (assert-false
+        (coin-lottery-valid? (+ target 1) #x1e00ffff 100 100))
+      (assert-false
+        (coin-lottery-valid? -1 #x1e00ffff 100 100))
       (assert-false
         (coin-lottery-valid?
-          (+ coin-lottery-max-integer 1) 128 100 100))
-      (assert-false (coin-lottery-valid? "0" 128 100 100))))
+          (+ coin-lottery-max-integer 1) #x1e00ffff 100 100))
+      (assert-false
+        (coin-lottery-valid? "0" #x1e00ffff 100 100))))
 
-  (test "lottery parameters reject inexact or non-positive values"
+  (test "lottery parameters reject malformed compact targets and lengths"
     (assert-error (coin-lottery-target 0 100 100))
-    (assert-error (coin-lottery-target 128 0 1))
-    (assert-error (coin-lottery-target 128 100 0))
-    (assert-error (coin-lottery-target 128 100 1.0))))
+    (assert-error (coin-lottery-target #x1e00ffff 0 1))
+    (assert-error (coin-lottery-target #x1e00ffff 100 0))
+    (assert-error (coin-lottery-target #x1e00ffff 100 1.0))))
 
-(test-group "sigil-coin height-only fork choice"
-  (test "taller wins and equal height is first-seen"
-    (assert-equal -1 (coin-block-compare 2 1))
-    (assert-equal 1 (coin-block-compare 1 2))
-    (assert-equal 0 (coin-block-compare 2 2))
-    (assert-true (coin-better-block? 2 1))
-    (assert-false (coin-better-block? 2 2))
-    (assert-false (coin-better-block? 1 2)))
-
-  (test "height comparison rejects malformed heights"
-    (assert-error (coin-block-compare -1 0))
-    (assert-error (coin-better-block? 1.0 1))))
 
 ;; ============================================================
 ;; Retargeting (§9)
@@ -881,18 +865,18 @@
     (assert-error (coin-complexity-at -1 '()))))
 
 ;; ============================================================
-;; The `bits` codec (§5.2, §9.4)
+;; The header `version` codec (§5.2, §9.4)
 ;; ============================================================
 
-(test-group "sigil-coin canonical bits codec"
+(test-group "sigil-coin canonical version codec"
   (test "the frozen layout encodes L-1 above C"
-    (assert-equal #x20600000 coin-bits-prefix)
-    (assert-equal #x20600080 (coin-bits-encode 128 1))
-    (assert-equal #x20601080 (coin-bits-encode 128 2))
-    (assert-equal #x207ff080 (coin-bits-encode 128 512))
-    (assert-equal #x207fffff (coin-bits-encode 4095 512))
-    (assert-equal coin-bits-prefix
-                  (bitwise-and (coin-bits-encode 128 237)
+    (assert-equal #x20600000 coin-version-prefix)
+    (assert-equal #x20600080 (coin-version-encode 128 1))
+    (assert-equal #x20601080 (coin-version-encode 128 2))
+    (assert-equal #x207ff080 (coin-version-encode 128 512))
+    (assert-equal #x207fffff (coin-version-encode 4095 512))
+    (assert-equal coin-version-prefix
+                  (bitwise-and (coin-version-encode 128 237)
                                #xffe00000)))
 
   (test "both projections round-trip their full field domains"
@@ -901,7 +885,7 @@
         (cond
           ((> c 4095) #t)
           ((= c (coin-result-value
-                  (coin-bits-decode (coin-bits-encode c 237))))
+                  (coin-version-decode (coin-version-encode c 237))))
            (loop (+ c 1)))
           (else #f))))
     (assert-true
@@ -910,27 +894,27 @@
           ((> length 512) #t)
           ((= length
               (coin-result-value
-                (coin-bits-solution-length
-                  (coin-bits-encode 128 length))))
+                (coin-version-solution-length
+                  (coin-version-encode 128 length))))
            (loop (+ length 1)))
           (else #f)))))
 
-  (test "only the high prefix and complexity range constrain wire bits"
-    (assert-equal 'bits-prefix
-                  (coin-result-reason (coin-bits-decode #x1d00ffff)))
-    (assert-equal 'bits-prefix
-                  (coin-result-reason (coin-bits-decode #x20400080)))
+  (test "only the high prefix and complexity range constrain version"
+    (assert-equal 'version-prefix
+                  (coin-result-reason (coin-version-decode #x1d00ffff)))
+    (assert-equal 'version-prefix
+                  (coin-result-reason (coin-version-decode #x20400080)))
     (assert-equal 'complexity-range
-                  (coin-result-reason (coin-bits-decode #x20600000)))
+                  (coin-result-reason (coin-version-decode #x20600000)))
     (assert-equal 'complexity-range
-                  (coin-result-reason (coin-bits-decode #x2060000f))))
+                  (coin-result-reason (coin-version-decode #x2060000f))))
 
   (test "encoding rejects values that do not fit"
-    (assert-error (coin-bits-encode 15 1))
-    (assert-error (coin-bits-encode 4096 1))
-    (assert-error (coin-bits-encode 128 0))
-    (assert-error (coin-bits-encode 128 513))
-    (assert-error (coin-bits-encode 128 1.0)))
+    (assert-error (coin-version-encode 15 1))
+    (assert-error (coin-version-encode 4096 1))
+    (assert-error (coin-version-encode 128 0))
+    (assert-error (coin-version-encode 128 513))
+    (assert-error (coin-version-encode 128 1.0)))
 
   (test "non-uint32 values are malformed for either projection"
     (let ((hostile (list -1 4294967296 "0" '())))
@@ -939,28 +923,32 @@
           (cond
             ((null? xs) #t)
             ((and (eq? 'malformed-header
-                       (coin-result-reason (coin-bits-decode (car xs))))
+                       (coin-result-reason
+                         (coin-version-decode (car xs))))
                   (eq? 'malformed-header
                        (coin-result-reason
-                         (coin-bits-solution-length (car xs)))))
+                         (coin-version-solution-length (car xs)))))
              (loop (cdr xs)))
             (else #f))))))
 
   (test "the parent-derived complexity wins without changing L"
-    (let ((bits (coin-bits-encode 128 237)))
-      (assert-equal 128 (coin-result-value (coin-check-bits bits 128)))
+    (let ((version (coin-version-encode 128 237)))
+      (assert-equal 128
+                    (coin-result-value (coin-check-version version 128)))
       (assert-equal 237
-                    (coin-result-value (coin-bits-solution-length bits)))
+                    (coin-result-value
+                      (coin-version-solution-length version)))
       (assert-equal 'complexity-mismatch
-                    (coin-result-reason (coin-check-bits bits 129)))
-      (assert-error (coin-check-bits bits 15))))
+                    (coin-result-reason
+                      (coin-check-version version 129)))
+      (assert-error (coin-check-version version 15))))
 
-  (test "bits checking is total on hostile input"
+  (test "version checking is total on hostile input"
     (assert-true
       (let loop ((xs (list -1 0 "0" '() 4294967296
                            #x20400080 #x20600000)))
         (cond
           ((null? xs) #t)
-          ((coin-failed? (coin-check-bits (car xs) 128))
+          ((coin-failed? (coin-check-version (car xs) 128))
            (loop (cdr xs)))
           (else #f))))))

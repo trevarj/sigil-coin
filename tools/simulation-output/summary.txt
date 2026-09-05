@@ -3,10 +3,10 @@ SigilCoin schema-4 deterministic simulation
 Puzzles: 420 global + 8 forced-constraint rows.
 Global retries: 83/420 puzzles retried; max 3; fallbacks 0.
 Table bytes min/median/max: 65/114/297; par: 24/29/72.
-Personalized shares: 705/1024 deterministic keys have a semantic under-par candidate.
+Personalized shares: 702/1024 deterministic keys have a semantic under-par candidate.
 Payout matrix: 162 rows; solo mints 80% subsidy plus fees, cooperative blocks mint subsidy plus fees.
 Cooperative rows allocate a 10% contribution-weighted share pool and 5% carrier payout; producer receives fees and rounding residuals.
-Strategic mining: 21 rows over key pools 0..1024; 705/1024 semantic candidates available.
+Strategic mining: 21 rows over key pools 0..1024; 702/1024 semantic candidates available.
 Quality-only counterfactual would replace in 12 rows; first-seen pre/post-child replacements: 0/0.
 Copy-and-attach cannot displace the first observed sibling; settlement is child-observed, never timeout-based.
 Market observer: 12 mined heights plus height-13 sentinel; 12 explicit child settlements.

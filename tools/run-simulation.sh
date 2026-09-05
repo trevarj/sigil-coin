@@ -3,7 +3,7 @@ set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 out="$root/tools/simulation-output"
-expected="f8086b90e8e9284345af7409abc072fd49603fd87781c205fb98bbcabe4d074f"
+expected="d14b4bc9b49e14379f5c1b865a8dc734aa5ee84d961d6a68ea72c860ab8827dd"
 
 case "${1:-}" in
   ""|--check) ;;

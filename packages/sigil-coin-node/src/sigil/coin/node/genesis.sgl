@@ -1,24 +1,22 @@
-;;; (sigil coin node genesis) — the deterministic canonical genesis builder
+;;; (sigil coin node genesis) — deterministic canonical genesis construction
 ;;;
-;;; Genesis has no competition, but it obeys the same puzzle and nonce lottery
-;;; as every later block. Its solution, merkle root and bits are finalized,
-;;; then the uint32 nonce range is searched from zero. Quote and timestamp are
-;;; the only caller inputs, so anyone can reproduce each chain's genesis.
+;;; Genesis obeys the ordinary puzzle and nonce lottery. The configured chain
+;;; loads its checked-in nonce directly; `coin-mine-genesis` searches from zero
+;;; only when regenerating constants, so a strong mainnet launch target does not
+;;; make every process remine genesis at startup.
 ;;;
-;;; The solution is the generated par witness for the frozen genesis puzzle at
+;;; The solution is the generated par witness for frozen genesis complexity
 ;;; `C = 128`. The reward is zero and the sole output is an unspendable
 ;;; `OP_RETURN`, so there is no premine.
 ;;;
-;;; REGENERATING THE CONSTANTS IS ONE CALL:
-;;;
 ;;; ```scheme
-;;; (coin-genesis-header-hex coin-genesis-quote coin-genesis-time)
-;;; ; => the 160-character header hex to paste in below
+;;; (coin-genesis-header-hex coin-genesis-quote coin-genesis-time
+;;;                          coin-main-pow-limit-bits)
+;;; ; => the 160-character header hex to paste below
 ;;; ```
 ;;;
-;;; The constants are checked in rather than computed at load so they are
-;;; inspectable without running the generator, and a test rebuilds genesis
-;;; from the quote and asserts it reproduces them, so the two cannot drift.
+;;; Tests rebuild all three blocks and prove the checked-in headers, nonces and
+;;; display IDs remain one reproducible unit.
 
 (define-library (sigil coin node genesis)
   (import (sigil math)
@@ -36,14 +34,18 @@
           (sigil coin node miner))
   (export
     coin-genesis-complexity
-    coin-genesis-bits
+    coin-genesis-version
     coin-genesis-solution
     coin-genesis-script-pubkey
     coin-genesis-coinbase
     coin-genesis-block
+    coin-mine-genesis
     coin-genesis-header
     coin-genesis-hash
     coin-genesis-header-hex
+    coin-genesis-nonce-constant
+    coin-testnet-genesis-nonce-constant
+    coin-regtest-genesis-nonce-constant
     coin-genesis-header-constant
     coin-testnet-genesis-header-constant
     coin-regtest-genesis-header-constant
@@ -76,9 +78,9 @@
     (define coin-genesis-solution
       (coin-par-solution %zero32 0 coin-genesis-complexity))
 
-    ;;; The `bits` field commits both genesis complexity and solution length.
-    (define coin-genesis-bits
-      (coin-bits-encode
+    ;;; The `version` field commits genesis complexity and solution length.
+    (define coin-genesis-version
+      (coin-version-encode
         coin-genesis-complexity
         (coin-solution-length coin-genesis-solution)))
 
@@ -107,46 +109,52 @@
                                (string->utf8 quote-text)
                                coin-genesis-script-pubkey))
 
-    ;;; Build the whole genesis block from `quote-text` and `time`.
-    ;;;
-    ;;; ```scheme
-    ;;; (block? (coin-genesis-block "hello" 1787788800)) ; => #t
-    ;;; ```
-    (define (coin-genesis-block quote-text time)
-      (: string? integer? -> block?)
+    ;; Build an unmined genesis block for an explicit compact target and nonce.
+    (define (coin-genesis-block quote-text time bits nonce)
+      (: string? integer? integer? integer? -> block?)
+      ;; Decode before construction so configured target mistakes fail at load.
+      (compact-target->integer bits)
       (let* ((coinbase (coin-genesis-coinbase quote-text))
              (root (merkle-root (list (transaction-txid coinbase))))
              (header
-               (block-header version: coin-header-version
+               (block-header version: coin-genesis-version
                              previous-block: %zero32
                              merkle-root: root
                              time: time
-                             bits: coin-genesis-bits
-                             nonce: 0)))
-        (block header-field: (coin-mine-header header %genesis-par)
-               transactions: (list coinbase))))
+                             bits: bits
+                             nonce: nonce)))
+        (block header-field: header transactions: (list coinbase))))
 
-    ;;; The genesis header for `quote-text` and `time`.
-    (define (coin-genesis-header quote-text time)
-      (: string? integer? -> block-header?)
-      (block-header-field (coin-genesis-block quote-text time)))
+    ;;; Search the genesis nonce from zero for an explicit compact base target.
+    (define (coin-mine-genesis quote-text time bits)
+      (: string? integer? integer? -> block?)
+      (let* ((base (coin-genesis-block quote-text time bits 0))
+             (header (coin-mine-header (block-header-field base)
+                                       %genesis-par)))
+        (block base header-field: header)))
 
-    ;;; The internal 32-byte genesis header hash.
-    (define (coin-genesis-hash quote-text time)
-      (: string? integer? -> bytevector?)
-      (block-header-hash (coin-genesis-header quote-text time)))
+    ;;; The genesis header for explicit configured fields.
+    (define (coin-genesis-header quote-text time bits nonce)
+      (: string? integer? integer? integer? -> block-header?)
+      (block-header-field (coin-genesis-block quote-text time bits nonce)))
 
-    ;;; The serialized genesis header as hex: the constant a chain config
-    ;;; stores. This is the whole regeneration procedure.
-    ;;;
-    ;;; ```scheme
-    ;;; (string-length (coin-genesis-header-hex "hello" 1787788800))
-    ;;; ; => 160
-    ;;; ```
-    (define (coin-genesis-header-hex quote-text time)
-      (: string? integer? -> string?)
+    ;;; The internal genesis header hash for explicit configured fields.
+    (define (coin-genesis-hash quote-text time bits nonce)
+      (: string? integer? integer? integer? -> bytevector?)
+      (block-header-hash (coin-genesis-header quote-text time bits nonce)))
+
+    ;;; Mine and serialize a genesis header for constant regeneration.
+    (define (coin-genesis-header-hex quote-text time bits)
+      (: string? integer? integer? -> string?)
       (hex-encode
-        (block-header-serialize (coin-genesis-header quote-text time))))
+        (block-header-serialize
+          (block-header-field (coin-mine-genesis quote-text time bits)))))
+
+    ;; Lowest qualifying nonces for the three configured genesis templates.
+    ;; Regenerate with `deploy/genesis-constants.sgl`.
+    (define coin-genesis-nonce-constant 22088811)
+    (define coin-testnet-genesis-nonce-constant 52822)
+    (define coin-regtest-genesis-nonce-constant 4)
 
     ;;; Serialized canonical mainnet genesis header, as hex.
     ;;;
@@ -154,28 +162,28 @@
     ;;; `(sigil coin node chain)`. The launch date replaces that timestamp
     ;;; later, which is one argument and one regenerated constant.
     (define coin-genesis-header-constant
-      "0500000000000000000000000000000000000000000000000000000000000000000000006f2fd2fcdd6310c40de5168f8d616a08059dd3de9e47aa5e3952995a04d11cb400376d6a8090612080150000")
+      "8090612000000000000000000000000000000000000000000000000000000000000000006f2fd2fcdd6310c40de5168f8d616a08059dd3de9e47aa5e3952995a04d11cb400376d6affff001e6b0c5101")
 
     ;;; Serialized canonical reset public-testnet genesis header, as hex.
     ;;;
     ;;; Built from `coin-testnet-genesis-quote` and
     ;;; `coin-testnet-genesis-time` in `(sigil coin node chain)`.
     (define coin-testnet-genesis-header-constant
-      "0500000000000000000000000000000000000000000000000000000000000000000000006612c27d5db9db080f8de1df3976d3a40820fc59c2045374fa0de010d9634c970067976a809061205c130000")
+      "8090612000000000000000000000000000000000000000000000000000000000000000006612c27d5db9db080f8de1df3976d3a40820fc59c2045374fa0de010d9634c970067976affff001f56ce0000")
 
     ;;; Serialized canonical regtest genesis header, as hex. Same provenance, from
     ;;; `coin-regtest-genesis-quote` and `coin-regtest-genesis-time`.
     (define coin-regtest-genesis-header-constant
-      "05000000000000000000000000000000000000000000000000000000000000000000000097d6c077c75903dc058e8670465dbb19772e13298225d74119a91781b0480d4a00b9556980906120b9040000")
+      "80906120000000000000000000000000000000000000000000000000000000000000000097d6c077c75903dc058e8670465dbb19772e13298225d74119a91781b0480d4a00b95569ffff002004000000")
 
     ;;; Display id (reversed hash) of the canonical mainnet genesis block.
     (define coin-genesis-id-constant
-      "00029d57f0d46da84252c28f76f2c43c14ae8eb3d33c94e7bfec8b1560836a2f")
+      "000000d40b0b8fa3eb5658c0a125070769b342f038167a1e01bceb3858955efa")
 
     ;;; Display id of the canonical reset public-testnet genesis block.
     (define coin-testnet-genesis-id-constant
-      "00037a476b26e373374bddd23068bfd0aecd13fb02e84b4a9ffaf465e774427e")
+      "0000d03c22fa7a33f6d163c769129c5223f09845ee9ffee7c436a63c5dd533e8")
 
     ;;; Display id of the canonical regtest genesis block.
     (define coin-regtest-genesis-id-constant
-      "000971b7792876bd8425732c79756a1ee3287c9436deee9226ac3a2fdb11f068")))
+      "00407bd359553ba46cc24822d0a800b0cf5b65deef3f981f7a971ebea647298a")))

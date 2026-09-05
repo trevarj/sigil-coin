@@ -1,9 +1,9 @@
 ;;; The explorer's rendering, driven against a real chain on disk.
 ;;;
 ;;; This file opens a real regtest database, then writes headers and bodies
-;;; into it exactly as a synced node would have: version 5 headers, bits that
-;;; encode both C and L, a uint32 nonce whose block-ID roll qualifies against
-;;; the consensus lottery target, five-push coinbases, and contribution-aware
+;;; into it exactly as a synced node would have: packed versions committing C
+;;; and L, compact target bits, and a uint32 nonce whose block-ID roll qualifies
+;;; against the consensus lottery target, plus five-push coinbases and
 ;;; coinbase outputs. Everything the explorer reads back is real bytes off a
 ;;; real SQLite file.
 ;;;
@@ -89,11 +89,11 @@
 ;; space exactly as a producer does.
 (define (qualifying-header template height)
   (let* ((complexity-result
-           (coin-bits-decode (block-header-bits template)))
+           (coin-version-decode (block-header-version template)))
          (length-result
-           (coin-bits-solution-length (block-header-bits template))))
+           (coin-version-solution-length (block-header-version template))))
     (unless (and (coin-ok? complexity-result) (coin-ok? length-result))
-      (error "qualifying-header: malformed bits"))
+      (error "qualifying-header: malformed version"))
     (let* ((complexity (coin-result-value complexity-result))
            (length (coin-result-value length-result))
            (par
@@ -116,7 +116,7 @@
                       nonce: nonce)))
               (if (coin-lottery-valid?
                     (block-header-work-value candidate)
-                    complexity
+                    (block-header-bits candidate)
                     par
                     length)
                   candidate
@@ -189,12 +189,12 @@
          (transactions (list coinbase))
          (template
            (block-header
-             version: 5
+             version: (coin-version-encode
+                        complexity (bytevector-length solution-bytes))
              previous-block: parent-hash
              merkle-root: (merkle-root (map transaction-txid transactions))
              time: (+ (block-header-time parent-header) 1)
-             bits: (coin-bits-encode
-                     complexity (bytevector-length solution-bytes))
+             bits: (block-header-bits parent-header)
              nonce: 0)))
     (unless (puzzle-report-ok? report)
       (error (string-append "build-block: solution does not solve height "
@@ -573,7 +573,7 @@
               (assert-true
                 (coin-lottery-valid?
                   (block-header-work-value header)
-                  (explorer-block-complexity b)
+                  (block-header-bits header)
                   (explorer-block-par b)
                   (explorer-block-claimed-length b)))))
           (explorer-recent-blocks store 5)))))
@@ -887,8 +887,8 @@
                    (complexity (explorer-block-complexity b))
                    (par (explorer-block-par b))
                    (length (coin-result-value
-                             (coin-bits-solution-length
-                               (block-header-bits header)))))
+                             (coin-version-solution-length
+                               (block-header-version header)))))
               (assert-equal (block-header-nonce header)
                             (explorer-block-nonce b))
               (assert-equal length (explorer-block-claimed-length b))
@@ -897,20 +897,28 @@
               (assert-equal (block-header-work-value header)
                             (string->number
                               (explorer-block-lottery-roll b) 16))
-              (assert-equal (coin-lottery-target complexity par length)
-                            (explorer-block-lottery-target b))
+              (assert-equal (block-header-bits header)
+                            (explorer-block-bits b))
+              (assert-equal (block-header-target header)
+                            (explorer-block-base-target b))
+              (assert-true (number? (explorer-block-chain-work b)))
+              (assert-equal
+                (coin-lottery-target
+                  (block-header-bits header) par length)
+                (explorer-block-lottery-target b))
               (assert-equal (coin-lottery-bonus par length)
                             (explorer-block-lottery-bonus b))
               (assert-equal (coin-lottery-multiplier par length)
                             (explorer-block-lottery-multiplier b))
               (assert-equal
-                (coin-lottery-expected-rolls complexity par length)
+                (coin-lottery-expected-rolls
+                  (block-header-bits header) par length)
                 (explorer-block-lottery-expected-rolls b))
               (assert-true
                 (coin-lottery-valid?
                   (block-header-work-value header)
-                  complexity par length))
-              ;; A downloaded validated body proves the bits claim.
+                  (block-header-bits header) par length))
+              ;; A downloaded validated body proves the version length claim.
               (assert-equal (explorer-block-solution-length b)
                             (explorer-block-claimed-length b))))
           (list 3 7 %coop-height %tip-height)))))
@@ -924,9 +932,7 @@
                         (explorer-block-under-par b))
           (assert-equal (coin-margin (explorer-block-par b)
                                      (explorer-block-solution-length b))
-                        (explorer-block-margin b))
-          (assert-equal 4096
-                        (explorer-block-lottery-expected-rolls b))))))
+                        (explorer-block-margin b))))))
 
   (test "the block page presents qualification without sibling ranking"
     (let ((page (body-of "/block/7")))
@@ -939,7 +945,7 @@
       (assert-true (has? page "odds multiplier"))
       (assert-true (has? page "expected rolls"))
       (assert-true (has? page "qualifying"))
-      (assert-true (has? page "do not rank same-height siblings"))
+      (assert-true (has? page "Fork choice uses cumulative base work."))
       (assert-false (has? page "deterministic"))
       (assert-false (has? page "Producer score"))))
   (test "a margin reads as a signed percentage of par"
@@ -1520,7 +1526,15 @@
           (assert-equal (explorer-block-k b) (dict-get value "k"))
           (assert-equal (explorer-block-margin b) (dict-get value "margin"))
           (let* ((lottery (dict-get value "lottery"))
-                 (target (dict-get lottery "target")))
+                 (target (dict-get lottery "target"))
+                 (base-target (dict-get lottery "base_target")))
+            (assert-equal (explorer-block-bits b)
+                          (dict-get lottery "base_bits"))
+            (assert-true (canonical-target? base-target))
+            (assert-equal (explorer-block-base-target b)
+                          (string->number base-target 16))
+            (assert-equal (explorer-block-chain-work b)
+                          (string->number (dict-get lottery "chain_work")))
             (assert-equal (explorer-block-nonce b)
                           (dict-get lottery "nonce"))
             (assert-equal (explorer-block-claimed-length b)
@@ -1673,28 +1687,36 @@
             (assert-equal 1 (explorer-block-height pending))
             (assert-equal 'body-not-downloaded
                           (explorer-block-problem pending))
-            ;; The header alone carries C, claimed L, nonce and lottery odds.
+            ;; The header alone carries C, claimed L, nonce, target and odds.
             (let* ((length
                      (coin-result-value
-                       (coin-bits-solution-length
-                         (block-header-bits header))))
+                       (coin-version-solution-length
+                         (block-header-version header))))
                    (par (explorer-block-par pending)))
               (assert-equal complexity
                             (explorer-block-complexity pending))
               (assert-equal length
                             (explorer-block-claimed-length pending))
+              (assert-equal (block-header-bits header)
+                            (explorer-block-bits pending))
+              (assert-equal (block-header-target header)
+                            (explorer-block-base-target pending))
+              (assert-true (number? (explorer-block-chain-work pending)))
               (assert-equal (block-header-nonce header)
                             (explorer-block-nonce pending))
               (assert-equal (block-header-id header)
                             (explorer-block-lottery-roll pending))
-              (assert-equal (coin-lottery-target complexity par length)
-                            (explorer-block-lottery-target pending))
+              (assert-equal
+                (coin-lottery-target
+                  (block-header-bits header) par length)
+                (explorer-block-lottery-target pending))
               (assert-equal (coin-lottery-bonus par length)
                             (explorer-block-lottery-bonus pending))
               (assert-equal (coin-lottery-multiplier par length)
                             (explorer-block-lottery-multiplier pending))
               (assert-equal
-                (coin-lottery-expected-rolls complexity par length)
+                (coin-lottery-expected-rolls
+                  (block-header-bits header) par length)
                 (explorer-block-lottery-expected-rolls pending)))
             ;; No body source, execution result, payout or share metric is
             ;; invented from those header claims.
@@ -1760,12 +1782,12 @@
                   header-field:
                     (qualifying-header
                       (block-header
-                        version: 5
+                        version: (coin-version-encode 128 3)
                         previous-block: (block-header-hash genesis)
                         merkle-root: (merkle-root
                                        (list (transaction-txid coinbase)))
                         time: (+ 1 (block-header-time genesis))
-                        bits: (coin-bits-encode 128 3)
+                        bits: (block-header-bits genesis)
                         nonce: 0)
                       1)
                   transactions: (list coinbase)))
@@ -1843,12 +1865,12 @@
                   header-field:
                     (qualifying-header
                       (block-header
-                        version: 5
+                        version: (coin-version-encode 128 18)
                         previous-block: (block-header-hash genesis)
                         merkle-root: (merkle-root
                                        (list (transaction-txid coinbase)))
                         time: (+ 1 (block-header-time genesis))
-                        bits: (coin-bits-encode 128 18)
+                        bits: (block-header-bits genesis)
                         nonce: 0)
                       1)
                   transactions: (list coinbase)))

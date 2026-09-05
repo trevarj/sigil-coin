@@ -8,7 +8,6 @@
           (sigil coin node chain))
   (export
     node-package-version
-    coin-header-version
     coin-header-complexity
     coin-header-solution-length
     coin-node-puzzle-cache
@@ -17,6 +16,7 @@
     coin-header-height
     coin-window-margins
     coin-required-complexity
+    coin-required-bits
     coin-chain-work
     coin-better-chain?
     coin-accept-header?
@@ -33,14 +33,18 @@
     coin-mine-header
     coin-build-coop-block
     coin-genesis-complexity
-    coin-genesis-bits
+    coin-genesis-version
     coin-genesis-solution
     coin-genesis-script-pubkey
     coin-genesis-coinbase
     coin-genesis-block
+    coin-mine-genesis
     coin-genesis-header
     coin-genesis-hash
     coin-genesis-header-hex
+    coin-genesis-nonce-constant
+    coin-testnet-genesis-nonce-constant
+    coin-regtest-genesis-nonce-constant
     coin-genesis-header-constant
     coin-testnet-genesis-header-constant
     coin-regtest-genesis-header-constant
@@ -48,6 +52,11 @@
     coin-testnet-genesis-id-constant
     coin-regtest-genesis-id-constant
     coin-target-block-spacing
+    coin-testnet-target-block-spacing
+    coin-regtest-target-block-spacing
+    coin-main-pow-limit-bits
+    coin-testnet-pow-limit-bits
+    coin-regtest-pow-limit-bits
     coin-testnet-network-magic
     coin-testnet-min-block-spacing
     coin-regtest-min-block-spacing
@@ -64,7 +73,9 @@
     coin-testnet-genesis-time
     coin-regtest-genesis-quote
     coin-regtest-genesis-time
-    sigilcoin-consensus-params
+    sigilcoin-main-consensus-params
+    sigilcoin-testnet-consensus-params
+    sigilcoin-regtest-consensus-params
     sigilcoin-main-chain
     sigilcoin-testnet-chain
     sigilcoin-regtest-chain

@@ -279,14 +279,15 @@
 (define %burn (bytes-of #x6a))
 
 (define %test-header
-  (block-header version: 5
-                previous-block: %zero32
-                merkle-root: %zero32
-                time: 1
-                bits: (coin-bits-encode
-                        %complexity
-                        (bytevector-length (string->bytes %sol-a)))
-                nonce: 0))
+  (block-header
+    version: (coin-version-encode
+               %complexity
+               (bytevector-length (string->bytes %sol-a)))
+    previous-block: %zero32
+    merkle-root: %zero32
+    time: 1
+    bits: #x2000ffff
+    nonce: 0))
 
 (define (block-with txs)
   (block header-field: %test-header transactions: txs))
@@ -557,16 +558,17 @@
   (test "a block's coinbase payload decodes"
     (let* ((script (coin-coinbase-payload-encode
                      (simple-payload 3 (string->bytes %sol-a) #u8())))
-           (b (block header-field: (block-header version: 5
-                                                 previous-block: %zero32
-                                                 merkle-root: %zero32
-                                                 time: 1
-                                                 bits: (coin-bits-encode
-                                                         %complexity
-                                                         (bytevector-length
-                                                           (string->bytes
-                                                             %sol-a)))
-                                                 nonce: 0)
+           (b (block header-field:
+                      (block-header
+                        version: (coin-version-encode
+                                   %complexity
+                                   (bytevector-length
+                                     (string->bytes %sol-a)))
+                        previous-block: %zero32
+                        merkle-root: %zero32
+                        time: 1
+                        bits: #x2000ffff
+                        nonce: 0)
                      transactions: (list (coinbase-tx
                                            script
                                            (outs (list (cons 50 %burn))))))))
@@ -579,16 +581,17 @@
     (let* ((script (coin-coinbase-payload-encode
                      (simple-payload 3 (string->bytes %sol-a) #u8())))
            (paid (bytes-of #x00 #x14))
-           (b (block header-field: (block-header version: 5
-                                                 previous-block: %zero32
-                                                 merkle-root: %zero32
-                                                 time: 1
-                                                 bits: (coin-bits-encode
-                                                         %complexity
-                                                         (bytevector-length
-                                                           (string->bytes
-                                                             %sol-a)))
-                                                 nonce: 0)
+           (b (block header-field:
+                      (block-header
+                        version: (coin-version-encode
+                                   %complexity
+                                   (bytevector-length
+                                     (string->bytes %sol-a)))
+                        previous-block: %zero32
+                        merkle-root: %zero32
+                        time: 1
+                        bits: #x2000ffff
+                        nonce: 0)
                      transactions: (list (coinbase-tx
                                            script
                                            (outs (list (cons 50 paid)
@@ -1340,22 +1343,6 @@
           (coin-check-payout
             42 %subsidy %fees shares contributions %burn))))))
 
-;; ============================================================
-;; Height-only fork choice (§5.6, §5.7)
-;; ============================================================
-
-(test-group "fork choice: height and first-seen"
-  (test "taller wins and equal height retains the incumbent"
-    (assert-equal -1 (coin-block-compare 2 1))
-    (assert-equal 1 (coin-block-compare 1 2))
-    (assert-equal 0 (coin-block-compare 2 2))
-    (assert-true (coin-better-block? 2 1))
-    (assert-false (coin-better-block? 2 2))
-    (assert-false (coin-better-block? 1 2)))
-
-  (test "malformed heights raise"
-    (assert-error (coin-block-compare -1 0))
-    (assert-error (coin-better-block? 1.0 1))))
 
 ;; ============================================================
 ;; Share validation without a key
@@ -1887,7 +1874,7 @@
                         accepted))
                  (par (puzzle-spec-par %spec))
                  (solution-length (bytevector-length solution))
-                 (bits (coin-bits-encode %complexity solution-length))
+                 (bits #x2000ffff)
                  (honest-tx
                    (coinbase-tx
                      (coin-coinbase-payload-encode honest-body)
@@ -1904,7 +1891,9 @@
                      (let loop ((nonce 0))
                        (let ((header
                                (block-header
-                                 version: 5
+                                 version:
+                                   (coin-version-encode
+                                     %complexity solution-length)
                                  previous-block: %zero32
                                  merkle-root:
                                    (merkle-root
@@ -1914,7 +1903,7 @@
                                  nonce: nonce)))
                          (if (coin-lottery-valid?
                                (block-header-work-value header)
-                               %complexity par solution-length)
+                               bits par solution-length)
                              header
                              (loop (+ nonce 1)))))))
                  (honest-header (mine-header honest-tx))
@@ -1935,30 +1924,18 @@
             (assert-true
               (coin-lottery-valid?
                 (block-header-work-value honest-header)
-                %complexity par solution-length))
+                bits par solution-length))
             (assert-true
               (coin-lottery-valid?
                 (block-header-work-value copy-header)
-                %complexity par solution-length))
+                bits par solution-length))
             (assert-true
               (not (= (block-header-work-value honest-header)
                       (block-header-work-value copy-header))))
             (assert-equal
-              0 (coin-block-compare (+ %puzzle-height 1)
-                                    (+ %puzzle-height 1)))
-            (assert-false
-              (coin-better-block? (+ %puzzle-height 1)
-                                  (+ %puzzle-height 1)))))
+              (block-header-chain-work honest-header)
+              (block-header-chain-work copy-header))))
 
-        (test "a revealed share can extend but never replace its parent"
-          ;; The reveal is readable only in P+1. At equal height the
-          ;; incumbent stays selected; the next child wins by height alone.
-          (assert-false
-            (coin-better-block? (+ %puzzle-height 1)
-                                (+ %puzzle-height 1)))
-          (assert-true
-            (coin-better-block? (+ %puzzle-height 2)
-                                (+ %puzzle-height 1)))))
 
       (test-group "commit-reveal round trip"
         (test "a commitment made at H opens exactly once at H+1"
@@ -2055,4 +2032,4 @@
             (assert-equal 3 (length with-shares))
             (assert-equal 1 (length without))
             (assert-equal 250000000 (car (list-ref with-shares 2)))
-            (assert-equal %burn (cdr (list-ref with-shares 2))))))))
+            (assert-equal %burn (cdr (list-ref with-shares 2)))))))))

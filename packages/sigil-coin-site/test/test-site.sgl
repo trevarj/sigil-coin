@@ -65,9 +65,9 @@
     (for-each
       (lambda (text) (assert-true (has? %html text)))
       '("Bitcoin foundation" "Frozen puzzle machine" "Header nonce lottery"
-        "Complexity and base-target retarget" "Co-op commit–reveal"
-        "full-header HASH256" "4096 rolls at par or 16 at par−8"
-        "settled, taller, then first-seen"
+        "Independent retargets" "Co-op commit–reveal"
+        "full-header HASH256" "16.8 million rolls at par"
+        "cumulative retargeted base work"
         "https://usesigil.org"
         "https://github.com/trevarj/sigil-coin"
         "https://github.com/trevarj/sigil-coin/blob/HEAD/docs/consensus.md"
@@ -119,7 +119,8 @@
     (for-each
       (lambda (text) (assert-true (not (has? %html text))))
       '("Shortest valid program wins" "Composite score" "projected rank"
-        "Lower projected rank" "nonce carries a composite score"))
+        "Lower projected rank" "nonce carries a composite score"
+        "floor(2^256/(32C))" "Every accepted block contributes one unit"))
     (assert-true (not (has? %html "worth nothing")))
     (assert-true (not (has? %js "fetch(")))
     (assert-true (not (has? %js "XMLHttpRequest")))))
@@ -182,7 +183,7 @@
           (assert-true (not (has? svg " href=")))))
       '("mining.svg" "score-fork.svg" "ecosystem.svg"))))
 
-  (test "mining diagrams show lottery odds and first-seen forks"
+  (test "mining diagrams show lottery odds and cumulative work"
     (let ((mining (generated %a "assets/mining.svg"))
           (fork (generated %a "assets/score-fork.svg")))
       (for-each
@@ -191,7 +192,7 @@
           "Shorter improves odds"))
       (for-each
         (lambda (text) (assert-true (has? fork text)))
-        '("4096 expected" "16 expected" "FIRST SEEN" "equal unit weight"
-          "No length, share, nonce, or hash sibling tie-break"))))
+        '("~16.8M expected" "~65.5K expected" "Cumulative base work"
+          "More cumulative base work" "Golf bonus changes admission odds"))))
 
 (run-tests)

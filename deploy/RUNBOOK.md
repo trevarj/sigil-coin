@@ -244,14 +244,13 @@ blocks, or issued supply. Compare its internal `best-hash` and reversed display
 id with the all-network output from `deploy/genesis-constants.sgl`; never use a
 pre-lottery pasted value.
 
-`best-work` is equal-unit chain work, not accumulated hash difficulty or a
-projected program rank. Genesis carries the generated at-par candidate,
-encodes its length and `C` in `bits`, and uses a searched uint32 nonce whose
-full-header `HASH256` roll meets the lottery target. Producer solutions require
-`L <= par`; shares require `L < personalized_par`. The header-layout/lottery
-cutover changes genesis, so earlier chain state is incompatible. Mainnet's
-timestamp and resulting constants remain non-final until launch day. See
-`../LAUNCH.md`.
+`best-work` is cumulative compact-target base work, not height or a projected
+program rank. Genesis carries the generated at-par candidate, encodes length
+and `C` in `version`, carries its chain's compact base target in `bits`, and
+uses a searched uint32 nonce. Producer solutions require `L <= par`; shares
+require `L < personalized_par`. This header/target cutover changes genesis, so
+earlier state is incompatible. Mainnet's timestamp, initial target calibration,
+and resulting constants remain non-final until launch day. See `../LAUNCH.md`.
 
 Creating the node's own address writes the wallet key:
 
@@ -469,10 +468,11 @@ frozen puzzle or consensus rules is a fork.
 
 ## When the chain stalls
 
-Expected cadence is one block per day. The enforced rule is not the cadence
-but the floor: 72000 seconds (20 hours) minimum between blocks on mainnet,
-with a 7200-second future-drift allowance. Twenty-six hours without a block
-is unremarkable. Three days is not.
+Expected cadence is one block per day. This is a target, not a hard schedule:
+`bits` retargets every 16 blocks from the preceding 15 timestamp intervals,
+with a 4x clamp and `0x1e00ffff` easiest mainnet base target. The parent
+timestamp floor is one second and future drift is 7200 seconds. Twenty-six
+hours without a block is unremarkable. Three days warrants investigation.
 
 Work through it in this order:
 

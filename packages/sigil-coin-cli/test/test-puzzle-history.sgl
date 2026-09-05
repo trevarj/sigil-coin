@@ -52,24 +52,28 @@
 (define (complexity-of header)
   (let ((decoded (coin-header-complexity header)))
     (unless (coin-ok? decoded)
-      (error "test-puzzle-history: generated header has invalid bits"))
+      (error "test-puzzle-history: generated header has invalid version"))
     (coin-result-value decoded)))
 
 (define (build-block n history height label)
   (let* ((parent (last-of history))
          (complexity (coin-required-complexity history height))
+         (bits
+           (coin-required-bits
+             (chain-config-consensus-params (node-config n))
+             history))
          (solution
            (puzzle-spec-par-solution
              (coin-puzzle-for
                (block-header-hash parent) height complexity)))
          (b
            (coin-build-block
-             parent height complexity solution label %payout
+             parent height complexity bits solution label %payout
              (+ (block-header-time parent)
                 (coin-chain-min-block-spacing (node-config n)))))
          (encoded-length
-           (coin-bits-solution-length
-             (block-header-bits (block-header-field b)))))
+           (coin-version-solution-length
+             (block-header-version (block-header-field b)))))
     (unless (and (coin-ok? encoded-length)
                  (= (coin-solution-length solution)
                     (coin-result-value encoded-length)))
@@ -204,10 +208,10 @@
                 "header is missing")))))
       (node-close n)))
 
-  (test "invalid parent bits never fall back to genesis complexity"
+  (test "invalid parent version never falls back to genesis complexity"
     (assert-true
       (string-contains?
         (raised-message (lambda () (cli-complexity 0 #f)))
-        "invalid complexity bits"))))
+        "invalid complexity version"))))
 
 (run-tests)

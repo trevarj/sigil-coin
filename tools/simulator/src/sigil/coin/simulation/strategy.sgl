@@ -36,6 +36,21 @@
     (define %parent-height 31)
     (define %parent-clock 1800000000)
     (define %spacing 3600)
+    ;; ponytail: mirror regtest's frozen target fields without importing the
+    ;; full node runtime into this deterministic simulator.
+    (define %regtest-bits #x2000ffff)
+    (define %regtest-params
+      (consensus-params
+        pow-limit-bits: %regtest-bits
+        target-spacing: 1
+        target-timespan: 15
+        retarget-interval: 16
+        bip34-height: 0
+        bip66-height: 0
+        bip65-height: 0
+        csv-height: 0
+        segwit-height: 0
+        taproot-height: 0))
     (define %drift 300)
     (define %original-timestamp (+ %parent-clock %spacing))
     (define %original-arrival (- %original-timestamp %drift))
@@ -156,7 +171,10 @@
     (define (build-strategy-simulation)
       (define %genesis-time (- %parent-clock (* %parent-height %spacing)))
       (define %genesis-block
-        (coin-genesis-block "SigilCoin simulator strategy chain" %genesis-time))
+        (coin-mine-genesis
+          "SigilCoin simulator strategy chain"
+          %genesis-time
+          %regtest-bits))
       (define %funding-outpoint
         (outpoint txid: (scalar-bytes 424242) index: 0))
       (define %initial-utxos
@@ -172,7 +190,8 @@
 
       (define (header-valid? history header height arrival complexity)
         (let* ((length-result
-                 (coin-bits-solution-length (block-header-bits header)))
+                 (coin-version-solution-length
+                   (block-header-version header)))
                (spec
                  (coin-node-puzzle
                    (block-header-previous-block header) height complexity)))
@@ -180,13 +199,18 @@
             (coin-ok?
               (coin-validate-header-context
                 history header arrival %spacing %drift))
-            (coin-ok? (coin-check-bits (block-header-bits header) complexity))
+            (coin-ok?
+              (coin-check-version
+                (block-header-version header) complexity))
+            (= (block-header-bits header)
+               (coin-required-bits
+                 %regtest-params history))
             (coin-ok? length-result)
             (<= (coin-result-value length-result)
                 (puzzle-spec-par spec))
             (coin-lottery-valid?
               (block-header-work-value header)
-              complexity
+              (block-header-bits header)
               (puzzle-spec-par spec)
               (coin-result-value length-result))
             (= height (length history)))))
@@ -213,7 +237,7 @@
                 "a production block had a bad merkle root")
           (coin-connect-block
             coin-block-rules
-            bitcoin-regtest-consensus-params
+            %regtest-params
             height
             utxos
             candidate
@@ -232,10 +256,13 @@
                 (let* ((parent (last-of blocks))
                        (parent-header (last-of headers))
                        (complexity (coin-required-complexity headers height))
+                       (bits
+                         (coin-required-bits
+                           %regtest-params headers))
                        (timestamp (+ %genesis-time (* height %spacing)))
                        (candidate
                          (coin-build-block
-                           parent-header height complexity #f
+                           parent-header height complexity bits #f
                            "strategy-chain" %producer-script timestamp))
                        (updated
                          (connect-production-block
@@ -464,6 +491,8 @@
                    %height30-header
                    %parent-height
                    %parent-complexity
+                   (coin-required-bits
+                     %regtest-params %height30-headers)
                    #f
                    "strategy commitments"
                    %producer-script
@@ -485,6 +514,9 @@
                  (append %height30-headers (list parent-header)))
                (complexity
                  (coin-required-complexity parent-headers %attack-height))
+               (bits
+                 (coin-required-bits
+                   %regtest-params parent-headers))
                (producer-solution
                  (coin-par-solution
                    (block-header-hash parent-header)
@@ -505,6 +537,7 @@
                        parent-header
                        %attack-height
                        complexity
+                       bits
                        producer-solution
                        "original public solution"
                        %producer-script
@@ -516,6 +549,7 @@
                        parent
                        %attack-height
                        complexity
+                       bits
                        producer-solution
                        accepted
                        "copy and attach"
@@ -546,11 +580,11 @@
                    (original-nonce (block-header-nonce original-header))
                    (copy-nonce (block-header-nonce copy-header))
                    (original-length-result
-                     (coin-bits-solution-length
-                       (block-header-bits original-header)))
+                     (coin-version-solution-length
+                       (block-header-version original-header)))
                    (copy-length-result
-                     (coin-bits-solution-length
-                       (block-header-bits copy-header)))
+                     (coin-version-solution-length
+                       (block-header-version copy-header)))
                    (original-length (coin-result-value original-length-result))
                    (copy-length (coin-result-value copy-length-result))
                    (original-q 0)
@@ -572,11 +606,17 @@
                        (coin-required-complexity
                          (append parent-headers (list original-header))
                          %child-height))
+                     (child-headers
+                       (append parent-headers (list original-header)))
+                     (child-bits
+                       (coin-required-bits
+                         %regtest-params child-headers))
                      (child
                        (coin-build-block
                          original-header
                          %child-height
                          child-complexity
+                         child-bits
                          #f
                          "child settles original"
                          %producer-script
@@ -584,7 +624,7 @@
                      (child-utxos
                        (connect-production-block
                          original
-                         (append parent-headers (list original-header))
+                         child-headers
                          %child-height
                          child-complexity
                          original-utxos
@@ -643,7 +683,11 @@
                       "original no-share block did not derive Q0")
                 (need (= (coin-solution-length producer-solution)
                          original-length)
-                      "original bits did not claim its solution length")
+                      "original header length changed")
+                (need (= (coin-version-encode
+                           complexity original-length)
+                         (block-header-version original-header))
+                      "original version did not claim its solution length")
                 (need (= original-length copy-length)
                       "copy changed the claimed producer solution length")
                 (need (not pre-replaced)

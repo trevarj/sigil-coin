@@ -1,14 +1,14 @@
 ;;; (sigil coin node rules) — header acceptance and fork choice
 ;;;
-;;; Header `version` is pinned to 5. `bits` carries chain-derived complexity
-;;; and claimed producer length; `nonce` is free lottery entropy. Acceptance
-;;; verifies linkage and pacing before deriving the puzzle, then requires
-;;; `L <= par` and the little-endian uint256 header hash to meet its exact
-;;; golf-weighted target.
+;;; Header `version` commits chain-derived puzzle complexity and producer
+;;; length. `bits` is the chain-retargeted compact base target and `nonce` is
+;;; lottery entropy. Acceptance verifies linkage/timestamps, exact required
+;;; complexity and target, `L <= par`, then the golf-weighted full-header roll.
 ;;;
-;;; Every accepted header contributes one unit. Outgrown candidates remain
-;;; settled, taller live chains win, and equal-height siblings stay first-seen.
-;;; Neither nonce nor block hash is a tie-break.
+;;; Fork choice follows cumulative base work. The golf bonus substitutes
+;;; verified program work for hashes when admitting one block; it does not
+;;; discount that block's chain work. Exact accumulated-work and height ties
+;;; remain first-seen.
 
 (define-library (sigil coin node rules)
   (import (sigil math)
@@ -18,7 +18,6 @@
           (sigil coin consensus))
   (export
     ;; Header fields
-    coin-header-version
     coin-header-complexity
     coin-header-solution-length
 
@@ -31,8 +30,9 @@
     coin-header-height
     coin-window-margins
     coin-required-complexity
+    coin-required-bits
 
-    ;; Equal-unit chain selection
+    ;; Cumulative base-work chain selection
     coin-chain-work
     coin-better-chain?
 
@@ -43,32 +43,22 @@
   (begin
 
     ;; ============================================================
-    ;; Frozen header fields
+    ;; Header fields
     ;; ============================================================
 
-    ;;; The only block header version SigilCoin accepts. Version five
-    ;;; satisfies all buried deployment floors active from genesis.
-    (define coin-header-version 5)
-
-    ;;; The producer solution length a header claims in `bits`.
+    ;;; The producer solution length a header claims in `version`.
     (define (coin-header-solution-length header)
       (: any? -> coin-result?)
       (if (not (block-header? header))
           (coin-error 'malformed-header "expected a block header")
-          (coin-bits-solution-length (block-header-bits header))))
+          (coin-version-solution-length (block-header-version header))))
 
-    ;;; The complexity a header's `bits` claims, as a `coin-result`.
-    ;;;
-    ;;; Total: rejection reasons are `malformed-header`, `bits-prefix` and
-    ;;; `complexity-range`.
-    ;;; ```scheme
-    ;;; (coin-result-value (coin-header-complexity header)) ; => 128
-    ;;; ```
+    ;;; The puzzle complexity a header claims in `version`.
     (define (coin-header-complexity header)
       (: any? -> coin-result?)
       (if (not (block-header? header))
           (coin-error 'malformed-header "expected a block header")
-          (coin-bits-decode (block-header-bits header))))
+          (coin-version-decode (block-header-version header))))
 
     ;; ============================================================
     ;; The puzzle cache
@@ -123,18 +113,18 @@
 
     ;; The complexity a stored header carries, or a raise. Every header in
     ;; `previous-headers` has already passed `accept?`, so an undecodable
-    ;; `bits` there is a node bug rather than a bad block.
+    ;; `version` there is a node bug rather than a bad block.
     (define (stored-complexity header)
       (let ((decoded (coin-header-complexity header)))
         (if (coin-failed? decoded)
-            (error "coin-required-complexity: a stored header has illegal bits")
+            (error "coin-required-complexity: a stored header has illegal version")
             (coin-result-value decoded))))
 
     ;; The accepted solution length a stored header commits to.
     (define (stored-length header)
       (let ((decoded (coin-header-solution-length header)))
         (if (coin-failed? decoded)
-            (error "coin-required-complexity: a stored header has illegal bits")
+            (error "coin-required-complexity: a stored header has illegal version")
             (coin-result-value decoded))))
 
     ;;; The height of the header that would extend `previous-headers`.
@@ -155,9 +145,8 @@
     ;;; The 16 margins of the retarget window ending at `height`, oldest
     ;;; first: one per height in `height-16 .. height-1`.
     ;;;
-    ;;; `par_i` is derived — through the cache, so a synced node pays
-    ;;; nothing it has not already paid — and `L_i` is decoded from header
-    ;;; `i`'s bits. Both are pure functions of the branch, so a reorg
+    ;;; `par_i` is derived through the cache and `L_i` is decoded from header
+    ;;; `i`'s version. Both are pure functions of the branch, so a reorg
     ;;; recomputes `C` from that branch's own blocks.
     ;;;
     ;;; ```scheme
@@ -215,35 +204,35 @@
               (and (coin-retarget-height? height)
                    (coin-window-margins previous-headers height))))))
 
+    ;;; Compact base target required for the next header.
+    (define (coin-required-bits params previous-headers)
+      (: consensus-params? list? -> integer?)
+      (next-required-bits params previous-headers))
+
     ;; ============================================================
-    ;; Equal-unit chain selection
+    ;; Cumulative base-work chain selection
     ;; ============================================================
 
-    ;;; Accumulated work of the chain ending at `header`.
+    ;;; Accumulated base work of the chain ending at `header`.
     ;;;
-    ;;; Header acceptance has already proved that each stored header won its
-    ;;; lottery. Every winner contributes exactly one unit; the body and the
-    ;;; particular nonce do not affect persistence or fork choice.
+    ;;; A shorter solution widens admission odds, but every admitted block
+    ;;; contributes the work represented by its chain-required base target.
     (define (coin-chain-work header b previous-work)
-      (: any? any? integer? -> integer?)
-      (+ previous-work 1))
+      (: block-header? any? integer? -> integer?)
+      (+ previous-work (block-header-chain-work header)))
 
     ;;; Whether `candidate` strictly outranks the incumbent chain tip.
     ;;;
-    ;;; An outgrown candidate cannot reopen a settled height. Among live
-    ;;; candidates, greater height wins and equal height remains first-seen.
-    ;;; There is deliberately no work, solution, nonce or hash tie-break.
+    ;;; Greater accumulated base work wins; equal work prefers greater height.
+    ;;; An exact work-and-height tie retains the first-seen incumbent.
     (define (coin-better-chain? candidate incumbent)
       (: chain-candidate? chain-candidate? -> boolean?)
-      (let ((candidate-extended? (chain-candidate-extended? candidate))
-            (incumbent-extended? (chain-candidate-extended? incumbent))
-            (candidate-height (chain-candidate-height candidate))
-            (incumbent-height (chain-candidate-height incumbent)))
-        (cond
-          ((and candidate-extended? (not incumbent-extended?)) #f)
-          ((and incumbent-extended? (not candidate-extended?)) #t)
-          ((> candidate-height incumbent-height) #t)
-          (else #f))))
+      (let ((candidate-work (chain-candidate-work candidate))
+            (incumbent-work (chain-candidate-work incumbent)))
+        (or (> candidate-work incumbent-work)
+            (and (= candidate-work incumbent-work)
+                 (> (chain-candidate-height candidate)
+                    (chain-candidate-height incumbent))))))
 
     ;; ============================================================
     ;; Header acceptance
@@ -254,15 +243,11 @@
 
     ;;; Whether `header` may extend `previous-headers` under chain policy.
     ;;;
-    ;;; The order is cost: fixed fields, linkage/pacing, parent-derived
-    ;;; complexity, then puzzle derivation and one header hash. The encoded
-    ;;; length must not exceed par; the body later proves that claim exact.
+    ;;; The order is cost: version shape, linkage/timestamps, required
+    ;;; complexity and compact base target, then puzzle derivation and one
+    ;;; full-header hash. The body later proves the encoded length claim exact.
     ;;;
     ;;; Total: any argument, however hostile, yields a boolean.
-    ;;;
-    ;;; ```scheme
-    ;;; (coin-accept-header? params (list genesis) header 72000 7200)
-    ;;; ```
     (define (policy-seconds? value)
       (and (number? value) (exact? value) (integer? value) (>= value 0)))
 
@@ -286,21 +271,26 @@
           (and (policy-seconds? min-spacing)
                (block-header? header)
                (list? previous-headers)
-               (= coin-header-version (block-header-version header))
+               (coin-ok?
+                 (coin-version-decode (block-header-version header)))
                (coin-ok? (coin-validate-header-context previous-headers
                                                           header
                                                           (current-unix-second)
                                                           min-spacing
                                                           max-future-drift))
                (let* ((height (coin-header-height previous-headers))
-                      (required
+                      (required-complexity
                         (coin-required-complexity previous-headers height))
                       (complexity
-                        (coin-check-bits (block-header-bits header) required))
-                      (length
-                        (coin-header-solution-length header)))
+                        (coin-check-version
+                          (block-header-version header)
+                          required-complexity))
+                      (length (coin-header-solution-length header))
+                      (required-bits
+                        (coin-required-bits params previous-headers)))
                  (and (coin-ok? complexity)
                       (coin-ok? length)
+                      (= required-bits (block-header-bits header))
                       (let* ((c (coin-result-value complexity))
                              (l (coin-result-value length))
                              (par
@@ -312,17 +302,16 @@
                         (and (<= l par)
                              (coin-lottery-valid?
                                (block-header-work-value header)
-                               c
+                               required-bits
                                par
                                l)))))))))
 
-    ;;; Build canonical header rules for a chain's spacing and drift policy.
+    ;;; Build canonical header rules for a chain's timestamp policy.
     ;;;
-    ;;; Omitting `max-future-drift` preserves the historical API and applies
-    ;;; the mainnet `coin-max-future-drift` default.
+    ;;; Omitting `max-future-drift` applies the mainnet default.
     ;;;
     ;;; ```scheme
-    ;;; (header-rules? (coin-header-rules 72000 7200)) ; => #t
+    ;;; (header-rules? (coin-header-rules 1 7200)) ; => #t
     ;;; ```
     (define (coin-header-rules min-spacing . maybe-max-future-drift)
       (: integer? integer? ... -> header-rules?)

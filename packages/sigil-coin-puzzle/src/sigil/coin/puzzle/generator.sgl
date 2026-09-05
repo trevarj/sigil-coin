@@ -126,7 +126,7 @@
     ;;; Floor of the complexity parameter `C`.
     (define puzzle-complexity-min 16)
 
-    ;;; Ceiling of `C`; it lives in 12 bits of the header's `bits` field.
+    ;;; Ceiling of `C`; it lives in 12 bits of the header's `version` field.
     (define puzzle-complexity-max 4095)
 
     ;;; `C` at genesis: tier 0, `k = 3`, `w = 6` — a gentle launch.

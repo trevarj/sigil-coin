@@ -341,14 +341,16 @@
 
     (define (hex bytes) (hex-encode bytes))
 
-    (define (print-lottery complexity par length)
-      (let ((target (coin-lottery-target complexity par length)))
+    (define (print-lottery bits par length)
+      (let ((target (coin-lottery-target bits par length)))
+        (println "base-target-bits: 0x~a" (number->string bits 16))
+        (println "base-target: ~a" (compact-target->integer bits))
         (println "lottery-bonus: ~a" (coin-lottery-bonus par length))
         (println "lottery-multiplier: ~a"
                  (coin-lottery-multiplier par length))
         (println "lottery-target: ~a" target)
         (println "lottery-expected-rolls: ~a"
-                 (coin-lottery-expected-rolls complexity par length))
+                 (coin-lottery-expected-rolls bits par length))
         (println "lottery-rule: valid at-par work is still lottery-gated; every byte saved doubles nonce odds, up to eight bytes (256x).")
         target))
 
@@ -360,6 +362,7 @@
              (height (car where))
              (parent (cdr where))
              (parent-hash (block-header-hash parent))
+             (history (coin-canonical-history n parent height))
              (override-text (cli-arg args "--complexity" #f))
              (override (and override-text
                             (or (string->number override-text)
@@ -369,15 +372,18 @@
                                          override-text
                                          "\"")))))
              (complexity (if override
-                             (cli-complexity (block-header-bits parent)
+                             (cli-complexity (block-header-version parent)
                                              override)
-                             (coin-required-complexity
-                               (coin-canonical-history n parent height)
-                               height))))
+                             (coin-required-complexity history height)))
+             (bits
+               (coin-required-bits
+                 (chain-config-consensus-params (node-config n))
+                 history)))
         (list (cons 'height height)
               (cons 'parent parent)
               (cons 'parent-hash parent-hash)
               (cons 'complexity complexity)
+              (cons 'bits bits)
               (cons 'spec (coin-puzzle-for parent-hash height complexity)))))
 
     ;;; Everything `puzzle` reports about one  height, as an alist.
@@ -386,9 +392,9 @@
     ;;; rather than on a rendered block of text.
     ;;;
     ;;; ```scheme
-    ;;; (cdr (assq 'k (coin-puzzle-report parent-hash 1 128))) ; => 3
+    ;;; (cdr (assq 'k (coin-puzzle-report parent-hash 1 128 bits))) ; => 3
     ;;; ```
-    (define (coin-puzzle-report/spec previous-hash height complexity spec)
+    (define (coin-puzzle-report/spec previous-hash height complexity bits spec)
       (let* ((ci (puzzle-spec-constraint spec))
              (d (coin-spec-builtin-cap spec))
              (par-witness (puzzle-spec-par-solution spec)))
@@ -398,6 +404,7 @@
                                                     height
                                                     complexity)))
               (cons 'complexity complexity)
+              (cons 'bits bits)
               (cons 'tier (puzzle-complexity-tier complexity))
               (cons 'constraint ci)
               (cons 'constraint-name (puzzle-constraint-name ci))
@@ -409,10 +416,10 @@
               (cons 'par-witness-length (coin-solution-length par-witness))
               (cons 'reward (coin-block-reward height)))))
 
-    (define (coin-puzzle-report previous-hash height complexity)
-      (: bytevector? integer? integer? -> list?)
+    (define (coin-puzzle-report previous-hash height complexity bits)
+      (: bytevector? integer? integer? integer? -> list?)
       (coin-puzzle-report/spec
-        previous-hash height complexity
+        previous-hash height complexity bits
         (cli-puzzle previous-hash height complexity)))
 
     ;;; Print a  puzzle report in the CLI's `key: value` form.
@@ -421,7 +428,7 @@
     ;;; the guaranteed-valid par witness, then the nonce lottery it enters.
     ;;;
     ;;; ```scheme
-    ;;; (coin-print-puzzle (coin-puzzle-report parent-hash 1 128))
+    ;;; (coin-print-puzzle (coin-puzzle-report parent-hash 1 128 bits))
     ;;; ```
     (define (coin-print-puzzle report)
       (: list? -> any?)
@@ -452,7 +459,7 @@
                (if (assq 'personalized-pubkey report) " --share" ""))
       (if (assq 'personalized-pubkey report)
           (println "share-rule: a share must be strictly shorter than its personalized par; savings determine contribution.")
-          (print-lottery (report-ref report 'complexity)
+          (print-lottery (report-ref report 'bits)
                          (report-ref report 'par)
                          (report-ref report 'par-witness-length)))
       report)
@@ -479,6 +486,7 @@
                              (report-ref context 'parent-hash)
                              (report-ref context 'height)
                              (report-ref context 'complexity)
+                             (report-ref context 'bits)
                              spec)))
               (coin-print-puzzle
                 (if share?
@@ -799,7 +807,7 @@
     ;; The header grinder is called once after transaction selection, so its
     ;; nonce search never runs for discarded mempool candidates.
     (define (build-block-prototype
-              parent height complexity length solution shares contributions
+              parent height complexity bits length solution shares contributions
               commitments graffiti producer-script carrier-script time
               txs fees)
       (let* ((coinbase
@@ -810,12 +818,12 @@
         (block
           header-field:
             (block-header
-              version: coin-header-version
+              version: (coin-version-encode complexity length)
               previous-block: (block-header-hash parent)
               merkle-root: (merkle-root
                              (map transaction-txid transactions))
               time: time
-              bits: (coin-bits-encode complexity length)
+              bits: bits
               nonce: 0)
           transactions: transactions)))
 
@@ -1031,6 +1039,7 @@
                                        (wallet-key data-dir))))
                          (parent (report-ref context 'parent))
                          (complexity (report-ref context 'complexity))
+                         (bits (report-ref context 'bits))
                          (spacing (coin-chain-min-block-spacing
                                     (node-config n)))
                          (max-future-drift
@@ -1095,7 +1104,7 @@
                     (println "examples-reproduced: ~a of ~a"
                              (puzzle-spec-k spec) (puzzle-spec-k spec))
                     (print-resources report par)
-                    (let ((target (print-lottery complexity par length)))
+                    (let ((target (print-lottery bits par length)))
                       (when origin
                         (println "relay: ~a" origin)
                         (println "relay-commitments: ~a"
@@ -1109,7 +1118,7 @@
                       (let* ((build
                                (lambda (txs fees)
                                  (build-block-prototype
-                                   parent height complexity length solution
+                                   parent height complexity bits length solution
                                    shares contributions commitments graffiti
                                    payout carrier-script time txs fees)))
                              (selected
@@ -1465,6 +1474,7 @@
             (report-ref context 'parent-hash)
             (report-ref context 'height)
             (report-ref context 'complexity)
+            #f
             spec)))
       (display "solution> ")
       (flush-output-port (current-output-port))

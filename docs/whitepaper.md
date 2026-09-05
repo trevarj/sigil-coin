@@ -67,13 +67,12 @@ Inherited from `sigil-bitcoin`, unmodified:
 
 Changed for SigilCoin:
 
-- work admission: `HASH256` of the full header is checked against a target
-  weighted by puzzle complexity and program-golf savings;
-- header fields: `version` is pinned to 5, `bits` carries producer length and
-  complexity, and `nonce` is an automatically searched uint32 lottery nonce;
-- fork choice: each accepted block contributes one unit; settled branches,
-  greater height, then local first-seen arrival decide, with no sibling
-  score or hash tie-break.
+- work admission: full-header `HASH256` is checked against a compact,
+  interval-retargeted base target widened by program-golf savings;
+- header fields: `version` carries producer length and puzzle complexity,
+  `bits` carries the compact base target, and `nonce` is uint32 lottery entropy;
+- fork choice: cumulative base work, then height, then local first-seen arrival
+  on an exact tie. Program bonus changes admission odds, not credited work.
 
 Bitcoin's soft forks are all active from height 0. A new chain has no legacy
 to grandfather, so BIP34, BIP66, BIP65, CSV, segwit and taproot are on at
@@ -428,115 +427,115 @@ older chain state is incompatible.
 
 ### 7.1 What the header commits
 
-The header remains 80 bytes. `version` is pinned to 5. `bits` carries both
-producer length and puzzle complexity:
+The header remains 80 bytes. `version` carries producer length and puzzle
+complexity:
 
 ```text
-bits = 0x20600000 | ((L - 1) << 12) | C
-bits & 0xffe00000 = 0x20600000
+version = 0x20600000 | ((L - 1) << 12) | C
+version & 0xffe00000 = 0x20600000
 ```
 
 Bits 20..12 encode `L - 1` for lengths 1..512; bits 11..0 encode `C` in
-16..4095. A validator derives `C` and par from the parent, requires the encoded
-values to agree, and later requires the body program's actual byte length to
-equal `L`. The uint32 `nonce` is only lottery entropy. It contains no score,
-rank, evaluator cost, or share quality.
+16..4095. A validator derives `C` and par from the parent, requires encoded
+values to agree, and later requires the body program's UTF-8 byte length to
+equal `L`.
 
-### 7.2 How shorter programs improve odds
+Header `bits` has its ordinary Bitcoin role: a canonical compact base target.
+The uint32 `nonce` is lottery entropy. It contains no score, rank, evaluator
+cost, or share quality.
+
+### 7.2 Independent target retarget
+
+Each network defines a target spacing and easiest base target:
+
+| chain | target spacing | pow-limit bits |
+|---|---:|---:|
+| mainnet | 86400 s | `0x1e00ffff` |
+| public testnet | 3600 s | `0x1f00ffff` |
+| regtest | 1 s | `0x2000ffff` |
+
+Genesis uses the pow limit. Between boundaries a header inherits its parent's
+bits. Every 16 blocks, the 15 timestamp intervals across that window retarget:
+
+```text
+new_base = old_base * actual_timespan / target_timespan
+```
+
+Actual timespan is clamped to 0.25x..4x and the result cannot be easier than
+the network pow limit. MTP and future-drift rules constrain timestamps. The
+one-second parent floor only guarantees monotonic local timestamps; the target
+controls cadence.
+
+### 7.3 How shorter programs improve odds
 
 With exact integer arithmetic:
 
 ```text
-base target = floor(2^256 / (32*C)) - 1
-bonus       = min(max(par - L, 0), 8)
-multiplier  = 2^bonus
-target      = min(2^255 - 1, (base target + 1)*multiplier - 1)
+base       = compact-target(bits)
+bonus      = min(max(par - L, 0), 8)
+multiplier = 2^bonus
+effective  = min(2^255 - 1, (base + 1)*multiplier - 1)
 ```
 
 A `HASH256` roll of the full serialized header is interpreted as a
 little-endian unsigned 256-bit integer and accepted when it is at most
-`target`. At `C = 128`, an at-par source needs 4096 rolls on average. Each byte
-saved doubles the odds through the eighth byte, where the expected count is
-16. The ceiling keeps acceptance probability at or below one half.
+`effective`. At the initial mainnet limit, par expects 16,777,473 rolls and
+`par - 8` expects 65,538. Public testnet expects 65,538 and 257; regtest
+expects 257 and 2. The ceiling keeps acceptance probability at or below half.
 
 This is a lottery weighted by program-golf savings, not a deterministic
-shortest-program auction. Saving a ninth byte can still move the 16-block
-margin retarget but gives no additional per-block multiplier.
+shortest-program auction. Saving a ninth byte can still move the independent
+puzzle-complexity retarget but gives no additional per-block multiplier.
 
-### 7.3 Automatic nonce search and body binding
+### 7.4 Automatic nonce search and body binding
 
-The builder validates the chosen producer program, finalizes the full body and
-merkle root once, then tries nonce values from 0 through `0xffffffff`. The
-first qualifying full-header roll is used. If none qualifies, construction
-fails. The public par witness supplies a valid at-par candidate, not a block by
-itself.
+The builder validates the chosen program, finalizes the body and merkle root
+once, writes the encoded version and chain-required bits, then tries nonce
+values from 0 through `0xffffffff`. The first qualifying roll is used.
 
-Header-first validation can check prefix, `L`, derived `C`, par, and the hash
-target. Body validation then runs the program and checks actual length equals
-the encoded `L`; a false claim invalidates that block and its descendants.
+Header-first validation checks version, derived `C`, par, required compact
+bits, and the effective target. Body validation runs the program and checks
+actual length equals encoded `L`; a false claim invalidates the branch.
 
-### 7.4 Equal-unit fork choice and settlement
+### 7.5 Cumulative base-work fork choice
 
-Every accepted block contributes one unit. A child already observed on the
-selected incumbent settles that height against later siblings; otherwise a
-taller validated chain wins. At equal height, neither sibling replaces the
-other, so the first valid arrival remains incumbent.
+Every accepted header contributes work derived from its compact base target.
+The golf multiplier substitutes verified program improvement for hashes during
+admission, so it does not discount the block's credited base work.
 
-There is no program-length, evaluator-cost, share-quality, nonce, or block-hash
-sibling tie-break. Shortening improves the chance that a header qualifies; it
-does not let a later sibling deterministically displace one already accepted.
-Different observers can briefly retain different first-seen siblings, and a
-valid child linking the selected incumbent settles the height.
+Greater cumulative base work wins. Equal work prefers greater height. An exact
+work-and-height tie retains the first valid arrival. Length, share quality,
+nonce and raw block hash add no further tie-break.
 
-## 8. Difficulty
+## 8. Puzzle complexity
 
-Difficulty begins with the complexity parameter `C`, carried with producer
-length in `bits` as
-`0x20600000 | ((L - 1) << 12) | C`. `C` is never miner-chosen: a validator
-derives it from the parent chain and requires an exact match. `C` changes the
-puzzle and inversely changes the lottery base target
-`floor(2^256 / (32*C)) - 1`.
+Puzzle complexity `C` is carried with producer length in `version`. It is
+never miner-chosen: a validator derives it from parent history and requires an
+exact match. `C` changes grammar width, example count and constraint tier; it
+does not set the compact mining target.
 
 ### 8.1 The signal
 
-Per block, the *relative* margin between par and what the miner achieved, in
-milli-units:
+Per block, the relative margin between par and achieved length, in milli-units:
 
+```text
+m_i = clamp(floor(1000 * (par_i - L_i) / par_i), -1000, 1000)
 ```
-m_i = clamp( floor(1000 * (par_i - L_i) / par_i), -1000, 1000 )
-```
-
-Relative, because par varies by puzzle: an absolute "beat par by N bytes"
-threshold would reward the same proportional improvement differently at
-different heights. Consensus already requires `L_i <= par_i`, so valid margins
-are non-negative. Division still floors toward negative infinity as the
-general arithmetic rule.
 
 ### 8.2 The adjustment
 
-Every 16 blocks, over the full window of the preceding 16 heights:
+Every 16 blocks:
 
-```
-m_med = upper median of the 16 margins (sorted, index 8)
+```text
+m_med = upper median of the 16 margins
 f     = clamp(1000 + m_med - 100, 250, 4000)
 C'    = clamp(floor(C * f / 1000), 16, 4095)
 ```
 
-The target margin is 100 milli-units: the median accepted solution 10% under
-par. A median above that raises `C`; below, it lowers it. Because the lottery
-base target is `floor(2^256/(32*C))-1`, the same adjustment also lowers or
-raises at-par nonce odds for the next epoch. The frozen clamp is Bitcoin's
-symmetric 0.25x..4x per window, although valid producer lengths put the raw
-factor in `[0.9, 1.899]`.
-
-A median, not a mean: the result is always one of the observed values, so no
-rounding rule is needed and no single outlier moves it. Sixteen blocks is
-about 13 days at mainnet spacing; Bitcoin's 2016 would be 4.6 years at
-one block a day, which is not feedback.
-
-`C(0) = 128`. The first retarget is at height 16 over the complete window
-0 through 15, including genesis, whose par is well defined. A reorg recomputes
-`C` from the new branch's own 16 blocks.
+The target margin is 100 milli-units: median work 10% under par. This retarget
+is independent of the timestamp-driven compact target. A median avoids
+outliers and floating point. `C(0) = 128`; the first adjustment is height 16
+over heights 0..15, and reorgs recompute it from their own history.
 
 ### 8.3 What difficulty cannot do
 
@@ -798,10 +797,11 @@ Worst case per block, at the frozen caps:
 | transactions | Bitcoin's existing cost |
 
 At about 5.5 microseconds per puzzle-language step, the uncached ceiling is
-roughly 74.3 seconds, about 0.1% of the 72000-second spacing floor. The global
-puzzle is cached across sibling blocks at one height; personalized share specs
-are derived once and reused within each block validation. Typical evaluator
-cost is around 1.65 ms: measured puzzles used roughly 300 steps and 80 cells.
+roughly 74.3 seconds, about 0.1% of the 86400-second mainnet target cadence.
+The global puzzle is cached across sibling blocks at one height; personalized
+share specs are derived once and reused within each block validation. Typical
+evaluator cost is around 1.65 ms: measured puzzles used roughly 300 steps and
+80 cells.
 
 Two rules keep that bound real.
 
@@ -841,8 +841,8 @@ SigilCoin rules record travels in the chain config's extensions, so nothing in
 `sigil-bitcoin` needs to know what a puzzle is. Headers-first sync, block relay,
 and peer management remain Bitcoin-shaped. State is SQLite in a data
 directory. Three chains ship: mainnet on port 19444; reset public testnet on
-19446 with one-hour minimum spacing and five-minute future drift; and
-disposable regtest on 19445 with one-second spacing.
+19446 with one-hour target cadence, one-second parent floor, and five-minute
+future drift; and disposable regtest on 19445 with one-second spacing.
 
 The reset public testnet begins at a new genesis marked
 `SigilCoin public testnet reset - 2026-09-02` at timestamp `1788307200`.
@@ -964,10 +964,9 @@ observed.
 
 **The producer's own program can be copied.** It is revealed in the block that
 claims it and cannot be committed in advance. A copier gets the same length
-bonus and target but must search a different full header. A later qualifying
-sibling still cannot replace the first-seen incumbent; a child linking that
-incumbent settles the height. Before the child, different observers can receive
-valid siblings in different orders.
+bonus but must search a different full header. At equal cumulative base work
+and height, the first-seen incumbent remains; extending either branch adds base
+work and resolves the fork normally.
 
 **The payout policy is a guess.** Solo minting targets 80%. Cooperative blocks
 target 85% for the producer, divide 10% by contributions, pay 5% to the parent
@@ -975,16 +974,15 @@ carrier, and route fees and integer residuals to the producer. Tests prove
 shape, conservation, and binding, but no public co-op network has tested these
 incentives. Changing them after launch is a hard fork.
 
-**The retarget window of 16 is short.** The margin distribution is
-heavy-tailed — most blocks do not beat par at all — so a 16-sample median can
-jump, and `C` could oscillate inside the 4x clamp. Sixteen was chosen because
-a young chain needs feedback more than it needs stability. A 32-block window
-is the fix if it oscillates.
+**The retarget windows are short.** Both base target and puzzle complexity
+adjust every 16 blocks. The target uses a 4x timespan clamp; `C` uses a median
+margin and its own clamp. A young chain gets prompt feedback, but timestamp
+noise and heavy-tailed golf margins can still oscillate. A longer window is the
+boring upgrade if public measurements show instability.
 
-**Fork choice is first-seen at equal height.** Every accepted block contributes
-one unit, so no solution, nonce, or hash orders siblings. The incumbent depends
-on arrival order and converges when a child arrives; a node syncing from
-scratch may briefly retain a different same-height sibling.
+**Exact-work fork ties are first-seen.** Cumulative compact-target work decides
+first, then height. Only an exact work-and-height tie depends on arrival order;
+extending a branch adds work and resolves that tie.
 
 **The chain has never run on a public network.** The four-role regtest drill
 uses three full nodes, a node-free contributor, a loopback relay, and an
@@ -993,29 +991,28 @@ network conditions — reorg frequency, sync under load, node health over weeks 
 remains untested. A 14-day two-host soak on mainnet rules is a launch
 precondition, not a nice-to-have.
 
-**The security model is "nobody is trying".** There is no economic weight
-behind the chain and no defence that assumes there is. A participant who
-wanted to disrupt it could mine every block, or spend real money on nothing at
-all. The chain's protection is that it is worth nothing, which is exactly as
-robust as it sounds.
+**Hash security is uncalibrated.** Mainnet starts at compact bits
+`0x1e00ffff`, about 16.8 million at-par rolls before golf bonus. The target
+then follows observed block intervals, but no public benchmark establishes the
+initial rate or resistance to specialized SHA-256 hardware. A two-host soak and
+published miner benchmark must calibrate the launch constant before valuable
+balances exist.
 
 ---
 
 ## 15. Implementation status
 
-The source tree implements the canonical design end to end: tight generated
-witnesses and deterministic par-witness selection; producer `L <= par` and
-share `L < personalized_par` validation; exact lottery targets and automatic
-uint32 nonce search over full-header `HASH256`; equal-unit, taller-chain,
-first-seen fork choice; seed derivation and bounded cache; contribution-aware
-co-op payouts; durable-parent node validation; CLI
-puzzle/mine/commit/reveal/contribute/relay; branch-aware issued supply; and a
-read-only, escaped explorer.
+The source tree implements the canonical design end to end: generated
+par-witnesses; producer `L <= par` and share `L < personalized_par`; compact
+base targets retargeted from 16-block timestamp windows; the eight-byte
+program-golf multiplier; automatic uint32 full-header nonce search; cumulative
+base-work fork choice; seed derivation and bounded cache; contribution-aware
+co-op payouts; durable-parent validation; CLI mining/contribution/relay; and a
+read-only escaped explorer.
 
-Mainnet's timestamp and derived constants remain explicitly non-final until
-the operator chooses launch day. Par-witness selection, the header `bits`
-layout, and the lottery nonce all affect genesis. Chain state from before this
-cutover is incompatible and each network requires fresh matching genesis.
+Mainnet's timestamp and genesis constants remain non-final until launch.
+Version encoding, per-network target limits and lottery nonces all affect
+genesis. State from before this cutover is incompatible.
 
 ## 16. Constants
 
@@ -1041,20 +1038,22 @@ cutover is incompatible and each network requires fresh matching genesis.
 | constraints | 8, tiers `(0)`, `(0 1 3 5)`, `(1 2 4 6 7)` |
 | builtin cap `D` | 6, or 4 at tier 2 |
 | complexity `C` | 16..4095, genesis 128 |
-| retarget window | 16 blocks, target margin 100 milli-units |
-| retarget clamp | 0.25x .. 4x per window |
-| lottery work factor / max bonus | 32 / 8 bytes |
+| complexity retarget | 16 blocks, target margin 100 milli-units |
+| target retarget | 16 headers / 15 intervals, 0.25x..4x clamp |
+| target spacing main/test/reg | 86400 / 3600 / 1 seconds |
+| pow-limit bits main/test/reg | `0x1e00ffff` / `0x1f00ffff` / `0x2000ffff` |
+| lottery max bonus | 8 bytes |
 | lottery maximum integer / target ceiling | `2^256 - 1` / `2^255 - 1` |
-| header version | 5 |
-| `bits` | prefix/mask `0x20600000` / `0xffe00000`; `L-1` in 20..12, `C` in 11..0 |
+| header version | prefix/mask `0x20600000` / `0xffe00000`; `L-1` in 20..12, `C` in 11..0 |
+| `bits` | canonical compact base target |
 | `nonce` | automatically searched uint32 lottery nonce |
-| fork choice | settled, taller, then first-seen; one unit per block |
+| fork choice | cumulative base work, then height, then first-seen exact tie |
 | max shares / commitments | 8 / 16 |
 | payout | solo `floor(4*S/5)+F`; cooperative 10% weighted shares, 5% carrier, producer residual |
 | coinbase scriptSig | 8 .. 6588 bytes |
 | graffiti cap | 400 bytes |
 | block size cap | 16384 bytes |
-| block spacing floor | 72000 seconds; target 86400 |
+| parent timestamp floor | 1 second |
 | future drift / median time span | 7200 seconds / 11 blocks |
 | coinbase maturity | 1 block |
 | daviwils per SGL | 100000000 |

@@ -503,9 +503,10 @@
 
 (define (pool-assert-lottery block)
   (let* ((header (block-header-field block))
-         (complexity-result (coin-bits-decode (block-header-bits header)))
+         (complexity-result
+           (coin-version-decode (block-header-version header)))
          (length-result
-           (coin-bits-solution-length (block-header-bits header)))
+           (coin-version-solution-length (block-header-version header)))
          (payload-result (coin-block-coinbase-payload block)))
     (assert-true (coin-ok? complexity-result))
     (assert-true (coin-ok? length-result))
@@ -522,7 +523,8 @@
       (assert-equal length (bytevector-length solution))
       (assert-true
         (coin-lottery-valid?
-          (block-header-work-value header) complexity par length))))
+          (block-header-work-value header)
+          (block-header-bits header) par length))))
   block)
 
 
@@ -732,7 +734,7 @@
              (genesis (chain-config-genesis-header chain))
              (block
                (coin-build-block
-                 genesis height complexity
+                 genesis height complexity coin-regtest-pow-limit-bits
                  #f
                  "post-persist race" %pool-script
                  (+ (block-header-time genesis)
@@ -776,7 +778,7 @@
              (time-one (+ (block-header-time genesis) spacing))
              (prototype
                (coin-build-block
-                 genesis height complexity
+                 genesis height complexity coin-regtest-pow-limit-bits
                  #f
                  "prototype" %pool-script time-one))
              (share-context (coin-parent-context prototype))
@@ -852,12 +854,12 @@
         (set! service (relay-service-open chain data-dir state-dir))
         (let* ((missed-one
                  (coin-build-block
-                   genesis height complexity
+                   genesis height complexity coin-regtest-pow-limit-bits
                    #f
                    "commitment omitted" %pool-script time-one))
                (committed-one
                  (coin-build-block
-                   genesis height complexity
+                   genesis height complexity coin-regtest-pow-limit-bits
                    #f
                    "commitment included" %pool-script time-one
                    '() 0 all-commitments)))
@@ -987,6 +989,7 @@
                            (block-header-field committed-one)
                            next-height
                            next-complexity
+                           coin-regtest-pow-limit-bits
                            #f
                            "reveal omitted" %pool-script time-two))
                        (included-two
@@ -994,6 +997,7 @@
                            committed-one
                            next-height
                            next-complexity
+                           coin-regtest-pow-limit-bits
                            #f
                            shares
                            "reveal included"

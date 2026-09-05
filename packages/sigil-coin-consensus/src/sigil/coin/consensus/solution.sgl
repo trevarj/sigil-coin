@@ -21,7 +21,7 @@
     ;; `puzzle-parse` accepts both, and a node reading a block always has
     ;; bytes; strings are accepted so tests and miners can pass source text.
     ;; The length is the SOURCE length in either shape, which is what the
-    ;; cap and header `bits` field both mean.
+    ;; cap and header `version` field both mean.
     (define (source-length solution)
       (if (bytevector? solution)
           (bytevector-length solution)

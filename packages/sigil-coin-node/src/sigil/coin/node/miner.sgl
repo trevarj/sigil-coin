@@ -121,21 +121,21 @@
 
     ;;; Search the full uint32 nonce range for a qualifying finalized header.
     ;;;
-    ;;; `header` must already carry its final merkle root and encoded `C/L`.
-    ;;; The target is computed once; only the 80-byte header changes per roll.
+    ;;; `header` must already carry its final merkle root, version claim and
+    ;;; chain-required compact base target. The effective target is computed
+    ;;; once; only the 80-byte header nonce changes per roll.
     (define (coin-mine-header header par)
       (: block-header? integer? -> block-header?)
       (if (not (block-header? header))
           (error "coin-mine-header: expected a block header"))
-      (let* ((complexity
+      (let* ((length
                (decoded-or-raise
                  "coin-mine-header"
-                 (coin-bits-decode (block-header-bits header))))
-             (length
-               (decoded-or-raise
-                 "coin-mine-header"
-                 (coin-bits-solution-length (block-header-bits header))))
-             (target (coin-lottery-target complexity par length)))
+                 (coin-version-solution-length
+                   (block-header-version header))))
+             (target
+               (coin-lottery-target
+                 (block-header-bits header) par length)))
         (if (> length par)
             (error "coin-mine-header: solution length exceeds par"))
         (let loop ((nonce 0))
@@ -146,9 +146,9 @@
                (error "coin-mine-header: nonce range exhausted"))
               (else (loop (+ nonce 1))))))))
 
-    (define (build parent-header height complexity solution shares contributions
-                   commitments graffiti producer-script carrier-script time txs
-                   fees)
+    (define (build parent-header height complexity bits solution shares
+                   contributions commitments graffiti producer-script
+                   carrier-script time txs fees)
       (let* ((parent-hash (block-header-hash parent-header))
              (solution-bytes
                (coin-mining-bytes
@@ -165,22 +165,22 @@
              (transactions (cons coinbase txs))
              (header
                (block-header
-                 version: coin-header-version
+                 version: (coin-version-encode complexity length)
                  previous-block: parent-hash
                  merkle-root: (merkle-root (map transaction-txid transactions))
                  time: time
-                 bits: (coin-bits-encode complexity length)
+                 bits: bits
                  nonce: 0)))
         (block header-field: (coin-mine-header header par)
                transactions: transactions)))
 
     ;;; Build a producer-only block. Optional values are transactions, fees,
     ;;; then commitments for this height's future shares.
-    (define (coin-build-block parent-header height complexity solution
+    (define (coin-build-block parent-header height complexity bits solution
                                  graffiti script-pubkey time
                                  . maybe-transactions)
-      (: block-header? integer? integer? any? any? bytevector? integer? list?
-         integer? list? ... -> block?)
+      (: block-header? integer? integer? integer? any? any? bytevector? integer?
+         list? integer? list? ... -> block?)
       (if (not (block-header? parent-header))
           (error "coin-build-block: expected parent header"))
       (let ((txs (optional-argument maybe-transactions 0 '()))
@@ -191,16 +191,16 @@
             (error "coin-build-block: expected transactions"))
         (if (not (list? commitments))
             (error "coin-build-block: expected commitments"))
-        (build parent-header height complexity solution '() '() commitments
+        (build parent-header height complexity bits solution '() '() commitments
                graffiti script-pubkey #f time txs fees)))
 
     ;;; Build a co-op block revealing personalized shares committed by parent.
     ;;; Optional values are transactions, fees, then this block's commitments.
-    (define (coin-build-coop-block parent-block height complexity solution
+    (define (coin-build-coop-block parent-block height complexity bits solution
                                       shares graffiti producer-script time
                                       . maybe-transactions)
-      (: block? integer? integer? any? list? any? bytevector? integer? list?
-         integer? list? ... -> block?)
+      (: block? integer? integer? integer? any? list? any? bytevector? integer?
+         list? integer? list? ... -> block?)
       (if (not (block? parent-block))
           (error "coin-build-coop-block: expected parent block"))
       (let* ((parent-header (block-header-field parent-block))
@@ -241,6 +241,6 @@
                         (coin-share-quality context share))
                       accepted))
                (carrier (coin-carrier-script parent-block)))
-          (build parent-header height complexity producer accepted contributions
-                 commitments graffiti producer-script carrier time txs
-                 fees))))))
+          (build parent-header height complexity bits producer accepted
+                 contributions commitments graffiti producer-script carrier
+                 time txs fees))))))

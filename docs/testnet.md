@@ -18,24 +18,22 @@ because a testnet gate passed.
 - Genesis marker: `SigilCoin public testnet reset - 2026-09-02`.
 - Genesis timestamp: `1788307200` (`2026-09-02T00:00:00Z`).
 - Genesis hashes: use the all-network constants generated from this reset
-  marker, timestamp, lottery `bits` layout, and searched nonce; pre-lottery
-  hashes are incompatible.
-- Minimum spacing: one hour.
+  marker, timestamp, compact pow limit and searched nonce; older hashes are
+  incompatible.
+- Target cadence: one hour. The one-second parent floor only keeps timestamps
+  monotone; it does not schedule blocks.
 - Maximum future drift: five minutes.
 - Producer validity: `L <= par`; shares require `L < personalized_par`.
-  The generated par witness is an eligible producer candidate, not a block by
-  itself.
-- Header `bits`:
-  `0x20600000 | ((L - 1) << 12) | C`, with mask `0xffe00000`, `L - 1` in
-  bits 20..12, and `C` in bits 11..0.
-- Lottery: search the uint32 nonce automatically and accept only when the
-  little-endian integer from full-header `HASH256` is at most
-  `min(2^255-1, floor(2^256/(32*C))*2^min(max(par-L,0),8)-1)`.
-- At `C = 128`: 4096 expected rolls at par; each saved byte doubles the odds
-  through eight bytes, for 16 expected rolls at `par - 8`.
-- Fork choice: one unit per accepted block; settled branch, taller chain, then
-  first-seen same-height arrival. No program, contribution, nonce, or hash
-  sibling tie-break.
+  The generated par witness is an eligible producer candidate, not a block.
+- Header `version`:
+  `0x20600000 | ((L - 1) << 12) | C`, with mask `0xffe00000`.
+- Header `bits`: canonical compact base target, initially `0x1f00ffff` and
+  retargeted every 16 blocks from the preceding 15 timestamp intervals.
+- Lottery: the effective target is
+  `min(2^255-1,(compact-target(bits)+1)*2^min(max(par-L,0),8)-1)`.
+- Initial odds: 65,538 expected rolls at par and 257 at `par - 8`.
+- Fork choice: cumulative base work, then height, then first-seen on an exact
+  tie. The golf bonus changes admission odds, not credited work.
 - Explorer: `https://explorer.testnet.sigilcoin.lol` through Caddy to the
   container's loopback-only `127.0.0.1:8080` mapping.
 - Co-op relay: `https://pool.testnet.sigilcoin.lol` through Caddy to the
@@ -43,18 +41,17 @@ because a testnet gate passed.
   public-testnet convenience service, not a consensus service or a mainnet pool.
 - Exercise duration: 30 consecutive days, with day-7 and day-30 gates.
 
-One hour is the network's target operating cadence and enforced minimum block
-spacing. A header may lead a validating clock by at most five minutes, so that
-allowance cannot make an immediate successor legal; the CLI waits until the
-one-hour floor is within the drift window. This is not a participation schedule.
+One hour is the network's target operating cadence, enforced by the retargeted
+base target rather than a spacing throttle. The parent timestamp floor is one
+second and a header may lead a validating clock by at most five minutes.
 Community miners are not assigned slots, are not required to remain online, and
 must not mine catch-up bursts.
 
 ## Reset cutover
 
 This public testnet is a genesis reset, not a height activation. Producer
-`L <= par`, the new `bits` encoding, and the full-header nonce lottery all
-change genesis. The chain starts at height 0 from the marker and timestamp
+`L <= par`, the packed `version`, retargeted compact `bits`, and the full-header
+nonce lottery all change genesis. The chain starts at height 0 from the marker
 above, using fresh chain state. Heights from the previous public testnet are
 not canonical on the reset chain. Old chain and relay databases, histories,
 and backups are incompatible. An archived wallet key may still be a valid key
@@ -421,8 +418,9 @@ volunteer's missed hour as an incident or impose a participation roster.
 
 Complete these before day 7 and repeat representative cases before day 30:
 
-- Retarget: capture H15, H16, and H17 puzzle complexity, lottery base target,
-  and historical queries; the first 16-block boundary must agree across nodes.
+- Retargets: capture H15, H16, and H17 puzzle complexity, compact base target,
+  cumulative base work, and historical queries. Both independent 16-block
+  boundaries must agree across nodes.
 - Maturity: show the H1 coinbase cannot be spent in H1 and is selectable for
   H2, then send a small amount between disposable `tsgl1...` wallets.
 - Co-op: use the node-free watcher to carry a commitment at H and its
@@ -591,13 +589,12 @@ control.
 
 The public testnet exercise completes only when:
 
-- it operated for 30 consecutive days with the one-hour cadence used as a
-  network target, not an enforced community participation schedule;
+- it operated for 30 consecutive days with one hour as the target cadence;
 - seed and independent nodes finish on the same reset-genesis canonical tip,
-  validated body count, next complexity and lottery base target, branch-aware
-  issued supply, and UTXO-derived balances;
-- every observed complexity/base-target retarget and the one-block maturity
-  boundary are correct;
+  validated body count, next complexity, compact base target, cumulative work,
+  branch-aware issued supply, and UTXO-derived balances;
+- every observed complexity and timestamp-target retarget plus the one-block
+  maturity boundary is correct;
 - at least two node-free commit/reveal/co-op cycles from distinct periods
   produce valid contributions, direct contributor outputs spendable in the
   following block, and contribution-weighted 10%/5% payouts without custody or

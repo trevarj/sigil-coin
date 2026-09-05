@@ -82,6 +82,9 @@
 
     ;; Store: blocks, canonical
     explorer-block-complexity
+    explorer-block-bits
+    explorer-block-base-target
+    explorer-block-chain-work
     explorer-block-constraint
     explorer-block-constraint-text
     explorer-block-k

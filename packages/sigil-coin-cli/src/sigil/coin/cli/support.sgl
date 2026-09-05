@@ -61,13 +61,13 @@
 
     ;;; The complexity `C` a puzzle at `height` is generated at.
     ;;;
-    ;;; `C` is read from the parent header's canonical `bits` field.
+    ;;; `C` is read from the parent header's canonical `version` field.
     ;;; `override` is only for previewing another configured complexity.
     ;;;
     ;;; ```scheme
-    ;;; (cli-complexity parent #f) ; => 128
+    ;;; (cli-complexity parent-version #f) ; => 128
     ;;; ```
-    (define (cli-complexity parent-bits override)
+    (define (cli-complexity parent-version override)
       (: any? any? -> integer?)
       (if override
           (begin
@@ -83,10 +83,10 @@
                        (number->string coin-complexity-max)
                        "].")))
             override)
-          (let ((decoded (coin-bits-decode parent-bits)))
+          (let ((decoded (coin-version-decode parent-version)))
             (if (coin-ok? decoded)
                 (coin-result-value decoded)
-                (error "puzzle: parent header has invalid complexity bits")))))
+                (error "puzzle: parent header has invalid complexity version")))))
 
     ;;; Derive the program-by-example puzzle for a height.
     ;;;

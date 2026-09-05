@@ -149,7 +149,9 @@
     (and (secp256k1-seckey-verify? (make-bytevector 32 1)) #t)))
 
 (define %genesis-block
-  (coin-genesis-block coin-regtest-genesis-quote coin-regtest-genesis-time))
+  (coin-genesis-block coin-regtest-genesis-quote coin-regtest-genesis-time
+                      coin-regtest-pow-limit-bits
+                      coin-regtest-genesis-nonce-constant))
 (define %genesis-header (block-header-field %genesis-block))
 (define %spacing coin-regtest-min-block-spacing)
 
@@ -159,6 +161,7 @@
   (coin-build-block %genesis-header
                     1
                     coin-genesis-complexity
+                    coin-regtest-pow-limit-bits
                     #f
                     "/producer/ prototype"
                     %script-a
@@ -202,6 +205,7 @@
   (coin-build-block %genesis-header
                     1
                     coin-genesis-complexity
+                    coin-regtest-pow-limit-bits
                     #f
                     "/producer/ commitments"
                     %script-a
@@ -215,6 +219,7 @@
          %producer-block
          2
          coin-genesis-complexity
+         coin-regtest-pow-limit-bits
          #f
          %shares
          %hostile-graffiti
@@ -282,12 +287,13 @@
           (assert-equal (explorer-block-solution-length b) length)
           (assert-equal (block-header-nonce header)
                         (explorer-block-nonce b))
-          (assert-equal (coin-lottery-target complexity par length)
-                        (explorer-block-lottery-target b))
+          (assert-equal
+            (coin-lottery-target (block-header-bits header) par length)
+            (explorer-block-lottery-target b))
           (assert-true
             (coin-lottery-valid?
               (block-header-work-value header)
-              complexity par length))))))
+              (block-header-bits header) par length))))))
 
   (test "summary reports actual solo plus cooperative issuance"
     (let ((issued (+ (coinbase-total %producer-block)
@@ -417,6 +423,7 @@
                parent-header
                2
                coin-genesis-complexity
+               coin-regtest-pow-limit-bits
                #f
                "/solo-reorg/ sibling"
                %script-b
@@ -426,6 +433,7 @@
                (block-header-field solo-sibling)
                3
                coin-genesis-complexity
+               coin-regtest-pow-limit-bits
                #f
                "/solo-reorg/ child"
                %script-b

@@ -1,7 +1,7 @@
-;;; (sigil coin consensus retarget) — margin retargeting and the `bits` codec
+;;; (sigil coin consensus retarget) — margin retargeting and `version` codec
 ;;;
 ;;; The chain carries a 12-bit complexity parameter `C` in the header's
-;;; `bits` field and retargets it every 16 blocks on the median
+;;; `version` field and retargets it every 16 blocks on the median
 ;;; RELATIVE margin between par and what miners actually achieved.
 ;;;
 ;;;   m_i = clamp( floor(1000 * (par_i - L_i) / par_i), -1000, 1000 )
@@ -65,12 +65,12 @@
     coin-complexity-for
     coin-complexity-at
 
-    ;; `bits` codec
-    coin-bits-prefix
-    coin-bits-encode
-    coin-bits-decode
-    coin-bits-solution-length
-    coin-check-bits)
+    ;; Header `version` codec
+    coin-version-prefix
+    coin-version-encode
+    coin-version-decode
+    coin-version-solution-length
+    coin-check-version)
 
   (begin
 
@@ -79,9 +79,8 @@
     ;; ============================================================
 
     ;;; Blocks per retarget window: heights `H-16 .. H-1`.
-    ;;;
-    ;;; ~13 days at mainnet spacing. Bitcoin's 2016 would be 4.6 years at
-    ;;; 20-hour spacing, which is not feedback.
+    ;;; Sixteen days at mainnet's target cadence: short enough for a young
+    ;;; chain's program difficulty to react without coupling it to hash rate.
     (define coin-retarget-window 16)
 
     ;;; The margin the retarget aims for, in milli-units: 10.0% under par.
@@ -99,7 +98,7 @@
     ;;; Floor of `C`. Still a real puzzle: tier 0, `k = 3`, `w = 6`.
     (define coin-complexity-min puzzle-complexity-min)
 
-    ;;; Ceiling of `C`: it lives in 12 bits of `bits`.
+    ;;; Ceiling of `C`: it lives in 12 bits of `version`.
     (define coin-complexity-max puzzle-complexity-max)
 
     ;;; `C` at genesis, and throughout the first, partial window.
@@ -271,18 +270,18 @@
           (else (loop (cdr xs) (+ i 1) (cons (car xs) acc))))))
 
     ;; ============================================================
-    ;; The `bits` codec
+    ;; The header `version` codec
     ;; ============================================================
 
-    ;;; Fixed high prefix of the consensus `bits` layout.
+    ;;; Fixed high prefix of the consensus `version` layout.
     ;;;
     ;;; Under mask `#xffe00000`, bits 20..12 encode `L-1` and bits 11..0
     ;;; encode `C`:
     ;;;
     ;;;   #x20600000 | ((L - 1) << 12) | C
-    (define coin-bits-prefix #x20600000)
-    (define %coin-bits-prefix-mask #xffe00000)
-    (define %coin-bits-length-mask #x1ff)
+    (define coin-version-prefix #x20600000)
+    (define %coin-version-prefix-mask #xffe00000)
+    (define %coin-version-length-mask #x1ff)
 
     (define (require-solution-length who length)
       (if (not (and (number? length) (exact? length) (integer? length)
@@ -290,60 +289,61 @@
           (error (string-append who ": solution length out of range")))
       length)
 
-    ;;; Encode complexity and producer solution length in the header.
-    (define (coin-bits-encode complexity length)
+    ;;; Encode complexity and producer solution length in header `version`.
+    (define (coin-version-encode complexity length)
       (: integer? integer? -> integer?)
-      (require-complexity "coin-bits-encode" complexity)
-      (require-solution-length "coin-bits-encode" length)
-      (bitwise-ior coin-bits-prefix
+      (require-complexity "coin-version-encode" complexity)
+      (require-solution-length "coin-version-encode" length)
+      (bitwise-ior coin-version-prefix
                    (arithmetic-shift (- length 1) 12)
                    complexity))
 
     ;; Check the canonical field shape once for both projections.
-    (define (checked-bits bits)
+    (define (checked-version version)
       (cond
-        ((not (and (number? bits) (exact? bits) (integer? bits)
-                   (<= 0 bits) (< bits #x100000000)))
+        ((not (and (number? version) (exact? version) (integer? version)
+                   (<= 0 version) (< version #x100000000)))
          (coin-error 'malformed-header
-                     "bits is not a 32-bit unsigned integer"))
-        ((not (= coin-bits-prefix
-                 (bitwise-and bits %coin-bits-prefix-mask)))
-         (coin-error 'bits-prefix "bits does not carry the canonical prefix"))
+                     "version is not a 32-bit unsigned integer"))
+        ((not (= coin-version-prefix
+                 (bitwise-and version %coin-version-prefix-mask)))
+         (coin-error 'version-prefix
+                     "version does not carry the canonical prefix"))
         (else
-          (let ((complexity (bitwise-and bits #xfff)))
+          (let ((complexity (bitwise-and version #xfff)))
             (if (or (< complexity coin-complexity-min)
                     (> complexity coin-complexity-max))
                 (coin-error 'complexity-range "complexity is out of range")
-                (coin-ok bits))))))
+                (coin-ok version))))))
 
-    ;;; Decode a canonical header's `bits` field to complexity `C`.
-    (define (coin-bits-decode bits)
+    ;;; Decode a canonical header `version` to complexity `C`.
+    (define (coin-version-decode version)
       (: any? -> coin-result?)
-      (let ((checked (checked-bits bits)))
+      (let ((checked (checked-version version)))
         (if (coin-failed? checked)
             checked
-            (coin-ok (bitwise-and bits #xfff)))))
+            (coin-ok (bitwise-and version #xfff)))))
 
-    ;;; Decode a canonical header's `bits` field to solution length `L`.
-    (define (coin-bits-solution-length bits)
+    ;;; Decode a canonical header `version` to solution length `L`.
+    (define (coin-version-solution-length version)
       (: any? -> coin-result?)
-      (let ((checked (checked-bits bits)))
+      (let ((checked (checked-version version)))
         (if (coin-failed? checked)
             checked
             (coin-ok
               (+ 1
                  (bitwise-and
-                   (arithmetic-shift bits -12)
-                   %coin-bits-length-mask))))))
+                   (arithmetic-shift version -12)
+                   %coin-version-length-mask))))))
 
-    ;;; Check the encoded complexity against the parent-derived value.
-    (define (coin-check-bits bits expected)
+    ;;; Check encoded complexity against the parent-derived value.
+    (define (coin-check-version version expected)
       (: any? integer? -> coin-result?)
-      (require-complexity "coin-check-bits" expected)
-      (let ((decoded (coin-bits-decode bits)))
+      (require-complexity "coin-check-version" expected)
+      (let ((decoded (coin-version-decode version)))
         (cond
           ((coin-failed? decoded) decoded)
           ((not (= expected (coin-result-value decoded)))
            (coin-error 'complexity-mismatch
-                       "bits disagrees with the derived complexity"))
+                       "version disagrees with the derived complexity"))
           (else decoded))))))

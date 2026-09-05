@@ -325,16 +325,15 @@
       (unless (block-merkle-root-valid? b)
         (error "coin-connect-block: invalid-merkle-root"))
       (let* ((header (block-header-field b)))
-        (unless (= coin-header-version (block-header-version header))
-          (error "coin-connect-block: wrong-version"))
-        ;; Header acceptance binds complexity and lottery qualification to
-        ;; chain history. Body validation proves the encoded length claim.
+        ;; Header acceptance binds version complexity/length and the
+        ;; chain-retargeted lottery target to history. Body validation proves
+        ;; the encoded length claim.
         (let* ((complexity (require-coin-ok
-                             "coin-connect-block: bits"
+                             "coin-connect-block: version"
                              (coin-header-complexity header)))
                (claimed-length
                  (require-coin-ok
-                   "coin-connect-block: bits"
+                   "coin-connect-block: version"
                    (coin-header-solution-length header))))
           (let* ((prepared-result
                    (prepare-block-claims parent-block height b))

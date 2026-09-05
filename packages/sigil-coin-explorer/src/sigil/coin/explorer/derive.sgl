@@ -26,11 +26,11 @@
 
   (begin
 
-    ;;; Decode complexity `C` from a canonical bits field, or `#f` when malformed.
-    (define (explorer-complexity bits)
+    ;;; Decode complexity `C` from canonical header `version`, or `#f`.
+    (define (explorer-complexity version)
       (: any? -> any?)
       (guard (e (#t #f))
-        (let ((decoded (coin-bits-decode bits)))
+        (let ((decoded (coin-version-decode version)))
           (and (coin-ok? decoded) (coin-result-value decoded)))))
 
 

@@ -39,18 +39,18 @@ JSON key is `strategic_mining`.
 ## Production seams
 
 The experiment calls the production generator, validators,
-`coin-bits-encode`, `coin-bits-solution-length`,
+`coin-version-encode`, `coin-version-solution-length`,
+`next-required-bits`, `block-header-chain-work`,
 `coin-lottery-bonus`, `coin-lottery-multiplier`,
 `coin-lottery-target`, `coin-lottery-expected-rolls`,
-`coin-lottery-valid?`, `coin-mine-header`, the height-only
-`coin-block-compare`, payout planner, builders, connector, header-context
-checks, reward schedule, cumulative scheduled cap, and secp256k1
-signing/verification.
+`coin-lottery-valid?`, `coin-mine-header`, payout planner, builders,
+connector, header-context checks, reward schedule, cumulative scheduled cap,
+and secp256k1 signing/verification.
 
-Signed share records pass through `coin-check-shares`; contributions come from
-`coin-share-quality`; payouts come from `coin-payout-plan`. Every qualifying
-block contributes one unit, so fork scenarios exercise height, first-seen
-arrival, and explicit child settlement rather than a simulator-local score.
+Signed shares pass through `coin-check-shares`; contributions come from
+`coin-share-quality`; payouts come from `coin-payout-plan`. Strategy siblings
+use the same base target and therefore tie on work at one height; their explicit
+child adds cumulative work. The simulator does not invent a second fork score.
 
 ## Puzzle and share sweep
 
@@ -178,10 +178,11 @@ The artifacts demonstrate deterministic production behavior for the selected
 inputs:
 
 - generated witnesses are tight executable producer candidates;
-- full-header nonce rolls are checked against the exact program-weighted target;
+- full-header rolls are checked against compact, golf-weighted targets;
+- target bits and cumulative base work use production arithmetic;
 - payout floors and issuance accounting are reproducible;
-- attached share quality does not change equal-unit sibling selection;
-- same-height selection is first-seen and settlement is child-observed.
+- attached share quality does not change equal-work sibling selection;
+- exact work-and-height ties remain first-seen until a child adds work.
 
 They do not establish economic equilibrium, participant independence,
 real-world propagation, mempool policy quality, or resistance to a determined

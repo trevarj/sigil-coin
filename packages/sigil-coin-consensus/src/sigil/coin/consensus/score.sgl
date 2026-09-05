@@ -1,24 +1,25 @@
 ;;; (sigil coin consensus score) — exact program-golf lottery arithmetic
 ;;;
-;;; A block wins when its 256-bit header hash, interpreted as the Bitcoin
-;;; little-endian work integer, is at most
+;;; `bits` is the chain-retargeted Bitcoin compact base target. A block wins
+;;; when its full 256-bit header hash, interpreted as Bitcoin's little-endian
+;;; work integer, is at most
 ;;;
 ;;;   min(2^255 - 1,
-;;;       (floor(2^256 / (32 * C)) * 2^min(max(par - L, 0), 8)) - 1).
+;;;       ((compact-target(bits) + 1)
+;;;        * 2^min(max(par - L, 0), 8)) - 1).
 ;;;
-;;; Thus an at-par solution wins once per 32*C rolls, up to integer rounding,
-;;; and every saved byte doubles its chance through the eighth saved byte.
-;;; All consensus arithmetic is exact integer arithmetic.
+;;; Every saved byte therefore doubles the accepted outcome count through the
+;;; eighth saved byte. All consensus arithmetic is exact integer arithmetic.
 
 (define-library (sigil coin consensus score)
-  (import (sigil math))
+  (import (sigil math)
+          (sigil bitcoin consensus))
   (export
     ;; Resource reporting (not header consensus).
     coin-bucket7
     coin-max-bucket
 
     ;; Lottery parameters and arithmetic.
-    coin-lottery-work-factor
     coin-lottery-max-bonus
     coin-lottery-max-integer
     coin-lottery-target-ceiling
@@ -75,9 +76,6 @@
     ;; Lottery
     ;; ============================================================
 
-    ;;; Baseline expected work per unit of puzzle complexity.
-    (define coin-lottery-work-factor 32)
-
     ;;; Most saved bytes that improve lottery odds.
     (define coin-lottery-max-bonus 8)
 
@@ -107,13 +105,10 @@
       (: integer? integer? -> integer?)
       (arithmetic-shift 1 (coin-lottery-bonus par length)))
 
-    ;;; Inclusive uint256 target for `(C, par, L)`.
-    (define (coin-lottery-target complexity par length)
+    ;;; Inclusive uint256 target for compact base `bits`, par and length.
+    (define (coin-lottery-target bits par length)
       (: integer? integer? integer? -> integer?)
-      (require-positive "coin-lottery-target" "complexity" complexity)
-      (let* ((base-plus-one
-               (quotient %lottery-outcomes
-                         (* coin-lottery-work-factor complexity)))
+      (let* ((base-plus-one (+ (compact-target->integer bits) 1))
              (effective
                (- (* base-plus-one
                      (coin-lottery-multiplier par length))
@@ -121,19 +116,19 @@
         (min coin-lottery-target-ceiling effective)))
 
     ;;; Expected rolls rounded up to the next integer.
-    (define (coin-lottery-expected-rolls complexity par length)
+    (define (coin-lottery-expected-rolls bits par length)
       (: integer? integer? integer? -> integer?)
       (let ((winning-rolls
-              (+ (coin-lottery-target complexity par length) 1)))
+              (+ (coin-lottery-target bits par length) 1)))
         (quotient (+ %lottery-outcomes winning-rolls -1)
                   winning-rolls)))
 
     ;;; Whether an integer uint256 hash roll wins the lottery.
-    (define (coin-lottery-valid? roll complexity par length)
+    (define (coin-lottery-valid? roll bits par length)
       (: any? integer? integer? integer? -> boolean?)
       (and (number? roll)
            (exact? roll)
            (integer? roll)
            (<= 0 roll)
            (<= roll coin-lottery-max-integer)
-           (<= roll (coin-lottery-target complexity par length))))))
+           (<= roll (coin-lottery-target bits par length))))))

@@ -658,10 +658,10 @@
           (list
             "<section class=\"panel content-panel\"><h2>Nonce lottery</h2>"
             "<p class=\"q\">The block ID is the header's 256-bit roll. A"
-            " header qualifies when that roll is at or below its target."
-            " Each byte saved below par doubles the odds, up to eight bytes."
-            " Every qualifying block counts once; length, nonce and roll do"
-            " not rank same-height siblings.</p>"
+            " header qualifies when that roll is at or below the effective"
+            " target. The chain retargets the compact base target from block"
+            " intervals; each byte saved below par doubles admission odds,"
+            " up to eight bytes. Fork choice uses cumulative base work.</p>"
             (table-wrap
               (join
                 (list
@@ -711,7 +711,35 @@
                         (optional-number
                           (explorer-block-claimed-length b))
                         " bytes")
-                      "<span class=\"q\">encoded in header bits</span>"))
+                      "<span class=\"q\">encoded in header version</span>"))
+                  "</tr><tr>"
+                  (rows
+                    (list
+                      "compact base target"
+                      (let ((bits (explorer-block-bits b)))
+                        (if (number? bits)
+                            (string-append (number->string bits) " ("
+                                           (hex-word bits) ")")
+                            "&mdash;"))
+                      "<span class=\"q\">retargeted from canonical block intervals</span>"))
+                  "</tr><tr>"
+                  (rows
+                    (list
+                      "base target"
+                      (let ((base (lottery-target-hex
+                                    (explorer-block-base-target b))))
+                        (if base
+                            (string-append
+                              "<span class=\"hash-cell mono\">0x"
+                              (explorer-escape base) "</span>")
+                            "&mdash;"))
+                      "<span class=\"q\">determines cumulative chain work</span>"))
+                  "</tr><tr>"
+                  (rows
+                    (list
+                      "cumulative base work"
+                      (optional-number (explorer-block-chain-work b))
+                      "<span class=\"q\">fork-choice weight through this block</span>"))
                   "</tr><tr>"
                   (rows
                     (list
@@ -1634,6 +1662,15 @@
         (cons "examples" (map example-alist (explorer-block-examples b)))
         (cons "lottery"
               (list
+                (cons "base_bits"
+                      (json-number (explorer-block-bits b)))
+                (cons "base_target"
+                      (or (lottery-target-hex
+                            (explorer-block-base-target b))
+                          'null))
+                (cons "chain_work"
+                      (let ((work (explorer-block-chain-work b)))
+                        (if (number? work) (number->string work) 'null)))
                 (cons "nonce"
                       (json-number (explorer-block-nonce b)))
                 (cons "claimed_length"
