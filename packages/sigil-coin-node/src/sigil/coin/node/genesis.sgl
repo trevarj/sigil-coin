@@ -152,7 +152,7 @@
 
     ;; Lowest qualifying nonces for the three configured genesis templates.
     ;; Regenerate with `deploy/genesis-constants.sgl`.
-    (define coin-genesis-nonce-constant 22088811)
+    (define coin-genesis-nonce-constant 434733157)
     (define coin-testnet-genesis-nonce-constant 52822)
     (define coin-regtest-genesis-nonce-constant 4)
 
@@ -162,7 +162,7 @@
     ;;; `(sigil coin node chain)`. The launch date replaces that timestamp
     ;;; later, which is one argument and one regenerated constant.
     (define coin-genesis-header-constant
-      "8090612000000000000000000000000000000000000000000000000000000000000000006f2fd2fcdd6310c40de5168f8d616a08059dd3de9e47aa5e3952995a04d11cb400376d6affff001e6b0c5101")
+      "8090612000000000000000000000000000000000000000000000000000000000000000006f2fd2fcdd6310c40de5168f8d616a08059dd3de9e47aa5e3952995a04d11cb400d4a26af1d8021d6580e919")
 
     ;;; Serialized canonical reset public-testnet genesis header, as hex.
     ;;;
@@ -178,7 +178,7 @@
 
     ;;; Display id (reversed hash) of the canonical mainnet genesis block.
     (define coin-genesis-id-constant
-      "000000d40b0b8fa3eb5658c0a125070769b342f038167a1e01bceb3858955efa")
+      "000000026a3f4bfbb09e5efb21d6609ce1aa5f16a0784f1652eae75c1a0df8cf")
 
     ;;; Display id of the canonical reset public-testnet genesis block.
     (define coin-testnet-genesis-id-constant

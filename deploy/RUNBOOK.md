@@ -470,7 +470,7 @@ frozen puzzle or consensus rules is a fork.
 
 Expected cadence is one block per day. This is a target, not a hard schedule:
 `bits` retargets every 16 blocks from the preceding 15 timestamp intervals,
-with a 4x clamp and `0x1e00ffff` easiest mainnet base target. The parent
+with a 4x clamp and `0x1d02d8f1` easiest mainnet base target. The parent
 timestamp floor is one second and future drift is 7200 seconds. Twenty-six
 hours without a block is unremarkable. Three days warrants investigation.
 

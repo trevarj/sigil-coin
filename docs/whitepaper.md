@@ -450,7 +450,7 @@ Each network defines a target spacing and easiest base target:
 
 | chain | target spacing | pow-limit bits |
 |---|---:|---:|
-| mainnet | 86400 s | `0x1e00ffff` |
+| mainnet | 86400 s | `0x1d02d8f1` |
 | public testnet | 3600 s | `0x1f00ffff` |
 | regtest | 1 s | `0x2000ffff` |
 
@@ -479,8 +479,8 @@ effective  = min(2^255 - 1, (base + 1)*multiplier - 1)
 
 A `HASH256` roll of the full serialized header is interpreted as a
 little-endian unsigned 256-bit integer and accepted when it is at most
-`effective`. At the initial mainnet limit, par expects 16,777,473 rolls and
-`par - 8` expects 65,538. Public testnet expects 65,538 and 257; regtest
+`effective`. At the initial mainnet limit, par expects 1,508,367,639 rolls and
+`par - 8` expects 5,892,062. Public testnet expects 65,538 and 257; regtest
 expects 257 and 2. The ceiling keeps acceptance probability at or below half.
 
 This is a lottery weighted by program-golf savings, not a deterministic
@@ -984,19 +984,17 @@ boring upgrade if public measurements show instability.
 first, then height. Only an exact work-and-height tie depends on arrival order;
 extending a branch adds work and resolves that tie.
 
-**The chain has never run on a public network.** The four-role regtest drill
-uses three full nodes, a node-free contributor, a loopback relay, and an
-explorer on one machine. Every claim in this document about behavior under real
-network conditions — reorg frequency, sync under load, node health over weeks —
-remains untested. A 14-day two-host soak on mainnet rules is a launch
-precondition, not a nice-to-have.
+**Public-network duration is deliberately short.** The reset public testnet
+began on 2026-09-06. The compressed launch plan requires a 48-hour public gate
+through H17 and a 24-hour two-node rehearsal on mainnet rules. Automated local
+tests cover reorg, recovery, co-op, and boundary behavior, but weeks-long peer,
+resource, censorship, and database trends remain untested. Mainnet must
+therefore launch as experimental and low-value.
 
-**Hash security is uncalibrated.** Mainnet starts at compact bits
-`0x1e00ffff`, about 16.8 million at-par rolls before golf bonus. The target
-then follows observed block intervals, but no public benchmark establishes the
-initial rate or resistance to specialized SHA-256 hardware. A two-host soak and
-published miner benchmark must calibrate the launch constant before valuable
-balances exist.
+**Hash security uses the measured launch target.** Mainnet starts at compact
+bits `0x1d02d8f1`, about 1.51 billion at-par rolls before golf bonus: roughly
+24 hours on the faster measured launch host. No exchange, bridge, or valuable
+balance should depend on the compressed rehearsal.
 
 ---
 
@@ -1041,7 +1039,7 @@ genesis. State from before this cutover is incompatible.
 | complexity retarget | 16 blocks, target margin 100 milli-units |
 | target retarget | 16 headers / 15 intervals, 0.25x..4x clamp |
 | target spacing main/test/reg | 86400 / 3600 / 1 seconds |
-| pow-limit bits main/test/reg | `0x1e00ffff` / `0x1f00ffff` / `0x2000ffff` |
+| pow-limit bits main/test/reg | `0x1d02d8f1` / `0x1f00ffff` / `0x2000ffff` |
 | lottery max bonus | 8 bytes |
 | lottery maximum integer / target ceiling | `2^256 - 1` / `2^255 - 1` |
 | header version | prefix/mask `0x20600000` / `0xffe00000`; `L-1` in 20..12, `C` in 11..0 |

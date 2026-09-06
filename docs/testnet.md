@@ -1,8 +1,8 @@
 # Public testnet operator runbook
 
-This runbook covers the 30-day public `sigilcoin-testnet` exercise. The stable
-seed is a RackNerd host at `seed.testnet.sigilcoin.lol:19446`. Community nodes
-may join and leave without permission.
+This runbook covers the compressed 48-hour public `sigilcoin-testnet` gate
+starting at the reset on `2026-09-06T05:30:15Z`. The stable seed is a RackNerd
+host at `seed.testnet.sigilcoin.lol:19446`; community nodes may join and leave.
 
 Testnet coins are worthless. Never use a production key, address, seed phrase,
 wallet backup, or unrevealed production material on testnet. Do not promote
@@ -39,7 +39,7 @@ because a testnet gate passed.
 - Co-op relay: `https://pool.testnet.sigilcoin.lol` through Caddy to the
   container's loopback-only `127.0.0.1:8082` mapping. This is a non-custodial
   public-testnet convenience service, not a consensus service or a mainnet pool.
-- Exercise duration: 30 consecutive days, with day-7 and day-30 gates.
+- Exercise duration: 48 consecutive hours, ending no earlier than `2026-09-08T05:30:15Z`.
 
 One hour is the network's target operating cadence, enforced by the retargeted
 base target rather than a spacing throttle. The parent timestamp floor is one
@@ -394,8 +394,8 @@ least daily:
    expected rolls, validated bodies, next complexity and corresponding base
    target, peer successes/failures, last sync outcome, `issued-supply`, and
    `scheduled-supply-cap`.
-2. Compare the seed with at least one independently operated node at the same
-   height.
+2. Compare the seed with the separate observer process and database at the same
+   height. The compressed gate does not claim host-level independence.
 3. Probe DNS, public P2P, HTTPS explorer, pool `/healthz` and `/v1/context`, and
    confirm TCP/8080 and TCP/8082 remain private.
 4. Review listener, sync, pool, reverse-proxy, firewall, and kernel logs for
@@ -410,13 +410,18 @@ least daily:
 7. Check freshness of both chain and pool backups without printing or opening
    wallet or contribution material.
 
+On `racknerd-chi`, `sigilcoin-testnet-observer` continuously validates into
+`state/testnet-observer`. Cron runs `/srv/sigilcoin/collect-testnet-evidence.sh`
+at minute 7 each hour and writes hashed, sanitized snapshots below
+`/srv/sigilcoin/evidence/testnet/`; it records no wallet or contribution body.
+
 The seed operator targets roughly one accepted block per hour without catch-up
 mining. Community blocks may change the observed count, so do not treat a
 volunteer's missed hour as an incident or impose a participation roster.
 
 ## Consensus and interoperability evidence
 
-Complete these before day 7 and repeat representative cases before day 30:
+Complete these before the 48-hour gate closes:
 
 - Retargets: capture H15, H16, and H17 puzzle complexity, compact base target,
   cumulative base work, and historical queries. Both independent 16-block
@@ -553,7 +558,7 @@ A testnet outage is preferable to silently serving a divergent chain. Incident
 recovery does not authorize mainnet, deployment automation, a source push, or
 DNS changes.
 
-## Day-7 gate
+## 48-hour gate
 
 Continue only when all of these are evidenced:
 
@@ -585,36 +590,23 @@ Stop and preserve evidence for any unexplained tip disagreement, validation
 mismatch, database error, sustained resource growth, or loss of network
 control.
 
-## Day-30 gate
+## Completion gate
 
-The public testnet exercise completes only when:
+The compressed public testnet exercise completes only when:
 
-- it operated for 30 consecutive days with one hour as the target cadence;
-- seed and independent nodes finish on the same reset-genesis canonical tip,
-  validated body count, next complexity, compact base target, cumulative work,
+- it operated for 48 consecutive hours with one hour as the target cadence;
+- seed and an independent node agree on the reset-genesis canonical tip,
+  validated bodies, next complexity, compact base target, cumulative work,
   branch-aware issued supply, and UTXO-derived balances;
-- every observed complexity and timestamp-target retarget plus the one-block
-  maturity boundary is correct;
-- at least two node-free commit/reveal/co-op cycles from distinct periods
-  produce valid contributions, direct contributor outputs spendable in the
-  following block, and contribution-weighted 10%/5% payouts without custody or
-  inclusion promise;
-- repeated chain/status reorg, restart, hard-kill, matching reset-genesis
-  chain/pool backup, restore, upgrade, and rollback exercises recover without
-  manual database editing or wallet loss;
-- explorer HTML/JSON remains correct, read-only, TLS-only publicly, and
-  XSS-safe, with issued-supply and scheduled-maximum labels and port 8080
-  loopback-only;
-- pool health/context and receipt status remain branch-coherent and TLS-only
-  publicly, port 8082 stays loopback-only, first-16/R8 policy behaves as
-  documented, and logs/backups disclose no phase-one contributor secret;
-- censorship, authenticated Sybil slot filling, malformed/rate-limited traffic,
-  uptime, resources, and both databases' growth have a reviewed 30-day record
-  with no unresolved trend or incident;
-- bootstrap from `seed.testnet.sigilcoin.lol:19446` works for a fresh community
-  node without a hand-entered IP;
-- no production key or mainnet state entered the exercise.
+- H15, H16, and H17 prove both independent retargets and historical queries;
+- one node-free commit/reveal/co-op cycle produces a valid contribution, direct
+  contributor output, and contribution-weighted payout without custody;
+- restart, hard-kill, matching chain/pool backup, and restore exercises recover
+  without manual database editing or wallet loss;
+- explorer and pool remain correct, TLS-only publicly, loopback-only internally,
+  branch-coherent, and free of phase-one contributor secrets;
+- bootstrap works from `seed.testnet.sigilcoin.lol:19446` without a hand-entered
+  IP, and no production key or mainnet state entered the exercise.
 
-Archive only sanitized evidence. Passing day 30 is a prerequisite for the
-separate mainnet soak, not approval to launch, push, deploy mainnet, or reuse
-any testnet key or database.
+Archive only sanitized evidence. This compressed gate does not establish
+long-duration stability; mainnet must launch as experimental and low-value.

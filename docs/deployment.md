@@ -390,11 +390,11 @@ If compatibility is uncertain, preserve both current directories and restore
 a matching pair into empty locations. An incident or testnet success does not
 authorize a mainnet push or deployment.
 
-## Mainnet placeholder
+## Mainnet launch configuration
 
 Mainnet uses port `19444`, separate state, and loopback explorer port `8081`.
 The co-op relay service and public pool hostname are testnet-only; mainnet
-Compose is unchanged and has no pool. Mainnet's coherent placeholder genesis
+Compose has no pool. Mainnet's selected genesis
 uses the generated par candidate, commits its length and complexity in
 `version`, carries the compact base target in `bits`, and searches the uint32
 nonce against the effective full-header target. The header lottery cutover
@@ -410,5 +410,6 @@ ALLOW_MAINNET=yes MODE=mainnet REMOTE_HOST=host.example \
 ```
 
 These commands document the future safety gate; they are not launch approval.
-The public testnet must complete its day-30 gate before the separate mainnet
-soak can begin. See [testnet.md](testnet.md) and [LAUNCH.md](../LAUNCH.md).
+The public testnet must complete its 48-hour gate before the separate 24-hour
+private mainnet rehearsal. See [testnet.md](testnet.md) and
+[LAUNCH.md](../LAUNCH.md).

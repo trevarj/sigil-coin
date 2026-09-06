@@ -64,7 +64,7 @@
 | target retarget interval | 16 blocks |
 | target retarget timespan | 15 target spacings |
 | mainnet/testnet/regtest target spacing | 86400 / 3600 / 1 s |
-| mainnet/testnet/regtest pow-limit bits | `0x1e00ffff` / `0x1f00ffff` / `0x2000ffff` |
+| mainnet/testnet/regtest pow-limit bits | `0x1d02d8f1` / `0x1f00ffff` / `0x2000ffff` |
 | `coin-retarget-window` | 16 |
 | `coin-target-margin` | 100 milli-units |
 | lottery maximum bonus | 8 bytes |
@@ -324,7 +324,7 @@ length to equal encoded `L`.
 - the result cannot be easier than the chain's pow limit.
 
 Mainnet targets one day, public testnet one hour, and regtest one second. Their
-initial compact limits are respectively `0x1e00ffff`, `0x1f00ffff`, and
+initial compact limits are respectively `0x1d02d8f1`, `0x1f00ffff`, and
 `0x2000ffff`. The one-second parent timestamp floor is only a monotonicity
 guard; the retargeted lottery controls cadence.
 
@@ -345,9 +345,9 @@ The inclusive effective target gives `effective + 1` winning values among
 `ceil(U / (effective + 1))`. The ceiling keeps acceptance probability at or
 below one half.
 
-At the initial mainnet limit, par expects 16,777,473 rolls and `par - 8`
-expects 65,538. Public testnet expects 65,538 and 257; regtest expects 257 and
-2. Further shortening remains valid and still affects the independent
+At the initial mainnet limit, par expects 1,508,367,639 rolls and `par - 8`
+expects 5,892,062. Public testnet expects 65,538 and 257; regtest expects 257
+and 2. Further shortening remains valid and still affects the independent
 complexity retarget, but does not increase this block's multiplier.
 
 ### 5.5 Full-header nonce search
@@ -712,10 +712,10 @@ A share revealed in a block at height `H` solves puzzle `H-1`, and its
 commitment must appear in COMMITS of block `H-1`. Both are on the same branch by
 construction, since `H-1` is the validated parent.
 
-At mainnet spacing (20 h) a miner has the whole interval to solve puzzle `H`,
-publish a commitment for inclusion in block `H`, and reveal in `H+1`. At regtest
-spacing (1 s) the window is not humanly usable; regtest tests construct
-commitments and reveals directly.
+At mainnet target cadence (one day) a miner has the whole interval to solve
+puzzle `H`, publish a commitment for inclusion in block `H`, and reveal in
+`H+1`. At regtest cadence (1 s) the window is not humanly usable; regtest tests
+construct commitments and reveals directly.
 
 ### 7.3 Unrevealed commitments
 
@@ -815,7 +815,7 @@ the uint32 header nonce for a qualifying full-header lottery roll.
 ### 8.1 Public data available to a miner
 
 `prev_hash` (from the parent header), `H`, `C(H)` (derived, and committed in
-`bits`), hence `seed(H)`, hence the whole puzzle spec including the `k`
+`version`), hence `seed(H)`, hence the whole puzzle spec including the `k`
 input/output pairs and the constraint id. A miner runs the same generator every
 validator runs.
 
@@ -1228,10 +1228,10 @@ personalized puzzles. Contribution is capped at 4 per share for selection and
 payout, not fork-choice benefit; no rule proves distinct owners or makes key
 selection scarce.
 
-**6. Public-network behaviour is untested.**
-Only local loopback nodes have run. Reorg frequency, peer churn, sustained
-SQLite contention, hostile validation load and long-running resource use remain
-unknown until the required two-host soak completes.
+**6. Public-network duration is minimal.**
+The reset public testnet has run since 2026-09-06, but long-running reorg
+frequency, peer churn, SQLite contention, hostile validation load and resource
+growth remain unknown under the compressed experimental-launch schedule.
 
 ---
 
@@ -1242,9 +1242,8 @@ through `(sigil coin node)`.
 
 - Mainnet uses the packed `0x20600000` version prefix, magic `8f d1 c0 a5`,
   port 19444, and HRP `sgl`. Its quote is `Sigil - Practical Symbolic Power`;
-  timestamp `1785542400` and every derived genesis constant remain launch
-  placeholders until the operator chooses the final timestamp and regenerates
-  them together.
+  timestamp `1789056000`, compact limit `0x1d02d8f1`, and derived genesis
+  constants are selected for the 2026-09-10 experimental launch.
 - The reset public testnet keeps magic `d3 7a 91 c5`, port 19446, HRP `tsgl`,
   a one-hour target cadence, one-second parent floor, and five-minute future
   drift. Its quote is `SigilCoin public testnet reset - 2026-09-02` and

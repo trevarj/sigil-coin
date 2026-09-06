@@ -238,7 +238,7 @@
               (list 'div (attrs '(class "exact-grid reveal"))
                     (list 'details
                           (list 'summary "Header and lottery target")
-                          (list 'p "Version uses prefix 0x20600000 under mask 0xffe00000, with L−1 in bits 20..12 and C in bits 11..0. Header bits is a Bitcoin compact base target retargeted every 16 blocks from elapsed time. Up to eight saved bytes double the accepted outcome count, capped at 2^255−1. The initial mainnet target expects about 16.8 million rolls at par or 65.5 thousand at par−8."))
+                          (list 'p "Version uses prefix 0x20600000 under mask 0xffe00000, with L−1 in bits 20..12 and C in bits 11..0. Header bits is a Bitcoin compact base target retargeted every 16 blocks from elapsed time. Up to eight saved bytes double the accepted outcome count, capped at 2^255−1. The calibrated mainnet target expects about 1.51 billion rolls at par or 5.89 million at par−8."))
                     (list 'details
                           (list 'summary "Fork choice")
                           (list 'p "Each accepted block adds work derived from its compact base target. The chain with more cumulative base work wins; equal work prefers greater height, and an exact tie retains the first valid arrival."))

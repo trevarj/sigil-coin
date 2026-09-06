@@ -657,10 +657,10 @@
                   coin-lottery-max-integer)
     (assert-equal (- (arithmetic-shift 1 255) 1)
                   coin-lottery-target-ceiling)
-    (assert-equal 16777473
-                  (coin-lottery-expected-rolls #x1e00ffff 100 100))
-    (assert-equal 65538
-                  (coin-lottery-expected-rolls #x1e00ffff 100 92))
+    (assert-equal 1508367639
+                  (coin-lottery-expected-rolls #x1d02d8f1 100 100))
+    (assert-equal 5892062
+                  (coin-lottery-expected-rolls #x1d02d8f1 100 92))
     (assert-equal 257
                   (coin-lottery-expected-rolls #x2000ffff 100 100))
     (assert-equal 2
@@ -675,8 +675,8 @@
     (assert-equal 2 (coin-lottery-multiplier 100 99))
     (assert-equal 256 (coin-lottery-multiplier 100 92))
     (assert-equal
-      (* 2 (+ 1 (coin-lottery-target #x1e00ffff 100 100)))
-      (+ 1 (coin-lottery-target #x1e00ffff 100 99))))
+      (* 2 (+ 1 (coin-lottery-target #x1d02d8f1 100 100)))
+      (+ 1 (coin-lottery-target #x1d02d8f1 100 99))))
 
   (test "the target ceiling prevents certainty"
     (assert-equal coin-lottery-target-ceiling
@@ -685,24 +685,24 @@
                   (coin-lottery-target #x2000ffff 100 1)))
 
   (test "target comparison is inclusive and rejects non-uint256 rolls"
-    (let ((target (coin-lottery-target #x1e00ffff 100 100)))
+    (let ((target (coin-lottery-target #x1d02d8f1 100 100)))
       (assert-true
-        (coin-lottery-valid? target #x1e00ffff 100 100))
+        (coin-lottery-valid? target #x1d02d8f1 100 100))
       (assert-false
-        (coin-lottery-valid? (+ target 1) #x1e00ffff 100 100))
+        (coin-lottery-valid? (+ target 1) #x1d02d8f1 100 100))
       (assert-false
-        (coin-lottery-valid? -1 #x1e00ffff 100 100))
+        (coin-lottery-valid? -1 #x1d02d8f1 100 100))
       (assert-false
         (coin-lottery-valid?
-          (+ coin-lottery-max-integer 1) #x1e00ffff 100 100))
+          (+ coin-lottery-max-integer 1) #x1d02d8f1 100 100))
       (assert-false
-        (coin-lottery-valid? "0" #x1e00ffff 100 100))))
+        (coin-lottery-valid? "0" #x1d02d8f1 100 100))))
 
   (test "lottery parameters reject malformed compact targets and lengths"
     (assert-error (coin-lottery-target 0 100 100))
-    (assert-error (coin-lottery-target #x1e00ffff 0 1))
-    (assert-error (coin-lottery-target #x1e00ffff 100 0))
-    (assert-error (coin-lottery-target #x1e00ffff 100 1.0))))
+    (assert-error (coin-lottery-target #x1d02d8f1 0 1))
+    (assert-error (coin-lottery-target #x1d02d8f1 100 0))
+    (assert-error (coin-lottery-target #x1d02d8f1 100 1.0))))
 
 
 ;; ============================================================

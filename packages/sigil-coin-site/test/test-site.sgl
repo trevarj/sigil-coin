@@ -66,7 +66,7 @@
       (lambda (text) (assert-true (has? %html text)))
       '("Bitcoin foundation" "Frozen puzzle machine" "Header nonce lottery"
         "Independent retargets" "Co-op commit–reveal"
-        "full-header HASH256" "16.8 million rolls at par"
+        "full-header HASH256" "1.51 billion rolls at par"
         "cumulative retargeted base work"
         "https://usesigil.org"
         "https://github.com/trevarj/sigil-coin"
@@ -192,7 +192,7 @@
           "Shorter improves odds"))
       (for-each
         (lambda (text) (assert-true (has? fork text)))
-        '("~16.8M expected" "~65.5K expected" "Cumulative base work"
+        '("~1.51B expected" "~5.89M expected" "Cumulative base work"
           "More cumulative base work" "Golf bonus changes admission odds"))))
 
 (run-tests)

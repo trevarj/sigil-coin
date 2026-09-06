@@ -1001,6 +1001,20 @@
                       coin-testnet-genesis-nonce-constant)))
     (assert-equal coin-regtest-genesis-id-constant
                   (block-header-id %genesis))
+    (let* ((main (chain-config-genesis-header sigilcoin-main-chain))
+           (par (puzzle-spec-par
+                  (coin-puzzle-for %zero32 0 coin-genesis-complexity)))
+           (length (coin-result-value
+                     (coin-header-solution-length main))))
+      (assert-equal 1789056000 (block-header-time main))
+      (assert-equal #x1d02d8f1 (block-header-bits main))
+      (assert-equal 434733157 (block-header-nonce main))
+      (assert-true
+        (coin-lottery-valid?
+          (block-header-work-value main)
+          (block-header-bits main)
+          par
+          length)))
     (assert-true
       (not (equal?
              (coin-genesis-hash

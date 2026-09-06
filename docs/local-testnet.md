@@ -1,7 +1,7 @@
 # Local regtest drill
 
-This drill uses `sigilcoin-regtest` only. Mainnet genesis timestamp and derived
-constants remain non-final; nothing here approves or launches mainnet.
+This drill uses `sigilcoin-regtest` only. Mainnet genesis is selected separately;
+nothing here approves or launches mainnet.
 
 ## Prerequisites
 

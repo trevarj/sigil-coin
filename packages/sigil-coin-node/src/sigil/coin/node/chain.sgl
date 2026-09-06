@@ -1,8 +1,8 @@
 ;;; (sigil coin node chain) — live SigilCoin chain configs
 ;;;
 ;;; Mainnet, public testnet, and regtest run canonical program-by-example
-;;; consensus. Mainnet's timestamp remains placeholder data until operator
-;;; chooses launch day; changing it requires regenerating genesis constants.
+;;; consensus. Mainnet's final timestamp and calibrated target were selected
+;;; for the 2026-09-10 experimental launch.
 
 (define-library (sigil coin node chain)
   (import (sigil bitcoin consensus)
@@ -53,9 +53,9 @@
     ;;; Regtest target cadence: one second.
     (define coin-regtest-target-block-spacing 1)
 
-    ;;; Easiest compact base targets. These are calibration knobs: tighten the
-    ;;; mainnet value before launch if the public benchmark solves it too fast.
-    (define coin-main-pow-limit-bits #x1e00ffff)
+    ;;; Easiest compact base targets. Mainnet is calibrated to roughly one
+    ;;; at-par day on the faster measured launch host.
+    (define coin-main-pow-limit-bits #x1d02d8f1)
     (define coin-testnet-pow-limit-bits #x1f00ffff)
     (define coin-regtest-pow-limit-bits #x2000ffff)
 
@@ -81,9 +81,8 @@
     (define coin-genesis-quote
       "Sigil - Practical Symbolic Power")
 
-    ;;; Placeholder mainnet timestamp. Non-final until launch operator chooses
-    ;;; launch day and regenerates canonical genesis constants.
-    (define coin-genesis-time 1785542400)
+    ;;; Final mainnet timestamp: 2026-09-10T16:00:00Z.
+    (define coin-genesis-time 1789056000)
 
     ;;; Canonical reset public-testnet genesis quote.
     (define coin-testnet-genesis-quote
