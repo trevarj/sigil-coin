@@ -178,7 +178,7 @@
                           (list 'strong "par − 5")
                           (list 'span "32× LOTTERY ODDS"))
                     (list 'img (attrs '(src "assets/mining.svg")
-                                      '(alt "Mining flow: derive a puzzle, verify an eligible program, then search uint32 nonces until the full-header hash meets its target")))))
+                                      '(alt "Mining flow: derive a puzzle, verify an eligible program, then search the block cursor until the full-header hash meets its target")))))
             (list
               'section (attrs '(id "how") '(class "section-shell section-block"))
               (list 'div (attrs '(class "section-heading reveal"))
@@ -197,7 +197,7 @@
                           (list 'p "Nodes rerun the program under fixed fuel, memory, string and depth caps."))
                     (list 'article (attrs '(class "flow-card reveal"))
                           (list 'b "04") (list 'h3 "Mine")
-                          (list 'p "Finalize the block, then search uint32 nonces until its full-header HASH256 roll meets the length-weighted target."))))
+                          (list 'p "Finalize the block, then search its coinbase lock-time and header nonce until the full-header HASH256 roll meets the length-weighted target."))))
             (list
               'section (attrs '(id "fundamentals")
                               '(class "section-shell section-block"))
@@ -226,7 +226,7 @@
                           (layer "02" "Frozen puzzle machine"
                                  "A small Scheme subset with no I/O, mutation, floating point or host eval; one bounded machine checks every example.")
                           (layer "03" "Header nonce lottery"
-                                 "Version commits producer length and puzzle complexity. Bits is the interval-retargeted compact base target; the uint32 nonce is searched until full-header HASH256 meets the golf-weighted effective target.")
+                                 "Version commits producer length and puzzle complexity. Bits is the interval-retargeted compact base target; the coinbase lock-time and header nonce are searched until full-header HASH256 meets the golf-weighted effective target.")
                           (layer "04" "Independent retargets"
                                  "Every 16 blocks, observed time moves the base target while median golf margin moves puzzle complexity C. Neither signal controls the other.")
                           (layer "05" "Co-op commit–reveal"
@@ -238,7 +238,7 @@
               (list 'div (attrs '(class "exact-grid reveal"))
                     (list 'details
                           (list 'summary "Header and lottery target")
-                          (list 'p "Version uses prefix 0x20600000 under mask 0xffe00000, with L−1 in bits 20..12 and C in bits 11..0. Header bits is a Bitcoin compact base target retargeted every 16 blocks from elapsed time. Up to eight saved bytes double the accepted outcome count, capped at 2^255−1. The calibrated mainnet target expects about 1.51 billion rolls at par or 5.89 million at par−8."))
+                          (list 'p "Version uses prefix 0x20600000 under mask 0xffe00000, with L−1 in bits 20..12 and C in bits 11..0. Header bits is a Bitcoin compact base target retargeted every 16 blocks from elapsed time. Up to eight saved bytes double the accepted outcome count, capped at 2^255−1. The calibrated mainnet target expects about 25.10 billion rolls at par or 98.04 million at par−8."))
                     (list 'details
                           (list 'summary "Fork choice")
                           (list 'p "Each accepted block adds work derived from its compact base target. The chain with more cumulative base work wins; equal work prefers greater height, and an exact tie retains the first valid arrival."))
@@ -285,7 +285,7 @@
                           "Download and validate headers and blocks from the configured public seed."
                           '("sigilcoin sync"))
                     (step "4" "Solve and submit"
-                          "Use a valid program no longer than par. Saving bytes improves lottery odds; the miner finalizes the body and searches the header nonce automatically."
+                          "Use a valid program no longer than par. Saving bytes improves lottery odds; the miner searches the block cursor automatically."
                           '("sigilcoin puzzle"
                             "sigilcoin mine --solution '(lambda(x)...)'"))
                     (list 'article (attrs '(class "prompt-card reveal"))

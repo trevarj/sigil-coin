@@ -149,9 +149,11 @@
     (and (secp256k1-seckey-verify? (make-bytevector 32 1)) #t)))
 
 (define %genesis-block
-  (coin-genesis-block coin-regtest-genesis-quote coin-regtest-genesis-time
-                      coin-regtest-pow-limit-bits
-                      coin-regtest-genesis-nonce-constant))
+  (coin-genesis-block
+    coin-regtest-genesis-quote coin-regtest-genesis-time
+    coin-regtest-pow-limit-bits
+    coin-regtest-genesis-coinbase-lock-time-constant
+    coin-regtest-genesis-nonce-constant))
 (define %genesis-header (block-header-field %genesis-block))
 (define %spacing coin-regtest-min-block-spacing)
 

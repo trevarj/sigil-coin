@@ -85,8 +85,8 @@
 (define (as-bytes value)
   (if (bytevector? value) value (string->utf8 value)))
 
-;; Finalize every non-nonce header field once, then search the uint32 nonce
-;; space exactly as a producer does.
+;; This easy regtest fixture always finds a hit in its first nonce range, so it
+;; can keep every other header field fixed while exercising explorer behavior.
 (define (qualifying-header template height)
   (let* ((complexity-result
            (coin-version-decode (block-header-version template)))
@@ -1216,6 +1216,29 @@
                 (assert-equal (or (explorer-block-margin (car bs)) 'null)
                               (dict-get (car rows) "margin"))
                 (loop (cdr bs) (cdr rows)))))))))
+
+  (test "the first retarget includes the genesis header margin"
+    (let* ((path (explorer-db-path sigilcoin-regtest-chain %dir))
+           (tip-15
+             (hex-encode
+               (block-header-hash (block-header-field (block-at 15)))))
+           (tip
+             (hex-encode
+               (block-header-hash
+                 (block-header-field (block-at %tip-height)))))
+           (db (sqlite-open path)))
+      (set-tip! db tip-15 15)
+      (sqlite-close db)
+      (let ((summary
+              (with-store
+                (lambda (store) (explorer-chain-summary store)))))
+        (let ((restore (sqlite-open path)))
+          (set-tip! restore tip %tip-height)
+          (sqlite-close restore))
+        (assert-equal %late-complexity
+                      (explorer-summary-next-complexity summary))
+        (assert-equal 16
+                      (explorer-summary-next-retarget-height summary)))))
 
   (test "the next complexity is the retarget rule's own answer"
     (with-store

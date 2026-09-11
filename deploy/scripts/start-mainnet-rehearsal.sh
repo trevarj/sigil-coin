@@ -28,6 +28,7 @@ docker network inspect sigilcoin-main-rehearsal >/dev/null 2>&1 ||
 
 common=(
   --user 1000:1000
+  --init
   --read-only
   --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m
   --cap-drop ALL
@@ -40,7 +41,7 @@ common=(
   -e ALLOW_MAINNET=yes
   -e DATA_DIR=/var/lib/sigilcoin
 )
-image=${SIGIL_IMAGE:-sigilcoin-rehearsal:pre-calibration}
+image=${SIGIL_IMAGE:-sigilcoin-rehearsal:pre-calibration-optimized}
 
 docker run --rm "${common[@]}" \
   -v "$state_a:/var/lib/sigilcoin" \

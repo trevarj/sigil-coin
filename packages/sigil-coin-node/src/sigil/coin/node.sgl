@@ -31,6 +31,7 @@
     coin-mining-coinbase/coop
     coin-build-block
     coin-mine-header
+    coin-mine-block
     coin-build-coop-block
     coin-genesis-complexity
     coin-genesis-version
@@ -42,6 +43,9 @@
     coin-genesis-header
     coin-genesis-hash
     coin-genesis-header-hex
+    coin-genesis-coinbase-lock-time-constant
+    coin-testnet-genesis-coinbase-lock-time-constant
+    coin-regtest-genesis-coinbase-lock-time-constant
     coin-genesis-nonce-constant
     coin-testnet-genesis-nonce-constant
     coin-regtest-genesis-nonce-constant

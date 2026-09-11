@@ -1112,6 +1112,9 @@
                (block-header-version header)))
            (roll (block-header-work-value header)))
       (assert-true (block? b))
+      (assert-equal
+        0
+        (transaction-lock-time (car (block-transactions b))))
       (assert-equal 1 (tip-height args))
       (assert-true (coin-ok? encoded-length))
       (assert-equal solution-length (coin-result-value encoded-length))
@@ -1129,6 +1132,8 @@
           text
           (string-append "qualifying-nonce: "
                          (number->string (block-header-nonce header)))))
+      (assert-true
+        (string-contains? text "coinbase-lock-time: 0"))
       (assert-true
         (string-contains?
           text (string-append "qualifying-target: "

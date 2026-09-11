@@ -247,10 +247,11 @@ pre-lottery pasted value.
 `best-work` is cumulative compact-target base work, not height or a projected
 program rank. Genesis carries the generated at-par candidate, encodes length
 and `C` in `version`, carries its chain's compact base target in `bits`, and
-uses a searched uint32 nonce. Producer solutions require `L <= par`; shares
-require `L < personalized_par`. This header/target cutover changes genesis, so
-earlier state is incompatible. Mainnet's timestamp, initial target calibration,
-and resulting constants remain non-final until launch day. See `../LAUNCH.md`.
+uses a searched coinbase-lock-time/header-nonce cursor. Producer solutions
+require `L <= par`; shares require `L < personalized_par`. This cursor and
+target cutover changes genesis, so earlier state is incompatible. Mainnet's
+final genesis cursor is coinbase lock-time `6`, header nonce `3129183091`.
+See `../LAUNCH.md` for the exhaustive first-hit proof and published hash.
 
 Creating the node's own address writes the wallet key:
 
@@ -470,7 +471,7 @@ frozen puzzle or consensus rules is a fork.
 
 Expected cadence is one block per day. This is a target, not a hard schedule:
 `bits` retargets every 16 blocks from the preceding 15 timestamp intervals,
-with a 4x clamp and `0x1d02d8f1` easiest mainnet base target. The parent
+with a 4x clamp and `0x1c2bcf04` easiest mainnet base target. The parent
 timestamp floor is one second and future drift is 7200 seconds. Twenty-six
 hours without a block is unremarkable. Three days warrants investigation.
 

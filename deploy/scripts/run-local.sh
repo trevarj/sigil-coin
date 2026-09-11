@@ -17,8 +17,9 @@ Environment:
   P2P_BIND=127.0.0.1         loopback unless an exposure mode is acknowledged
   REMOTE_PEER_IP=IPv4        required only for peer-ip-allowlisted mode
   TESTNET_EXPOSURE_ACK=       empty, peer-ip-allowlisted, or public-testnet-approved
+  MAINNET_EXPOSURE_ACK=       empty or public-mainnet-approved
   P2P_PORT=19446|19444       selected by mode
-  EXPLORER_PORT=8080         explorer remains on 127.0.0.1
+  EXPLORER_PORT=8080|8081    defaults to 8080 testnet, 8081 mainnet
   SYNC_INTERVAL=60           seconds between bounded sync passes
 
 Mainnet additionally requires ALLOW_MAINNET=yes.
@@ -45,6 +46,7 @@ case $MODE in
   testnet)
     chain_args=(--testnet)
     default_port=19446
+    default_explorer_port=8080
     ;;
   mainnet)
     if [[ $allow_mainnet != yes ]]; then
@@ -53,6 +55,7 @@ case $MODE in
     fi
     chain_args=()
     default_port=19444
+    default_explorer_port=8081
     ;;
   *) printf 'MODE must be testnet or mainnet\n' >&2; exit 64 ;;
 esac
@@ -105,6 +108,30 @@ if [[ $MODE == testnet ]]; then
       esac
       ;;
   esac
+else
+  exposure_ack=${MAINNET_EXPOSURE_ACK:-}
+  case $P2P_BIND in
+    127.*)
+      is_ipv4 "$P2P_BIND" || { printf 'invalid loopback mainnet P2P bind\n' >&2; exit 64; }
+      [[ -z $exposure_ack ]] || {
+        printf 'MAINNET_EXPOSURE_ACK must be empty for a loopback mainnet P2P bind\n' >&2
+        exit 64
+      }
+      ;;
+    ::1)
+      [[ -z $exposure_ack ]] || {
+        printf 'MAINNET_EXPOSURE_ACK must be empty for a loopback mainnet P2P bind\n' >&2
+        exit 64
+      }
+      ;;
+    *)
+      is_ipv4 "$P2P_BIND" || { printf 'non-loopback mainnet P2P bind must be an IPv4 literal\n' >&2; exit 64; }
+      [[ $exposure_ack == public-mainnet-approved ]] || {
+        printf 'non-loopback mainnet P2P requires MAINNET_EXPOSURE_ACK=public-mainnet-approved exactly\n' >&2
+        exit 64
+      }
+      ;;
+  esac
 fi
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -138,7 +165,7 @@ DATA_DIR=${DATA_DIR:-$root/deploy/state/local-$MODE}
 LOG_DIR=${LOG_DIR:-$root/deploy/logs/local-$MODE}
 RUN_DIR=${RUN_DIR:-$root/deploy/run/local-$MODE}
 P2P_PORT=${P2P_PORT:-$default_port}
-EXPLORER_PORT=${EXPLORER_PORT:-8080}
+EXPLORER_PORT=${EXPLORER_PORT:-$default_explorer_port}
 SYNC_INTERVAL=${SYNC_INTERVAL:-60}
 
 umask 0027

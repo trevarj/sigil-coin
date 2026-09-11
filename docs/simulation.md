@@ -75,8 +75,9 @@ artifact records:
 For each ordinary puzzle, the shorter verified hidden/table witness (hidden on
 ties) is a producer candidate of length exactly `par`; consensus accepts
 producer lengths `L <= par` and rejects longer sources. A builder must still
-search the uint32 nonce for a qualifying full-header roll. The personalized
-candidate sweep below retains the stricter share rule `L < personalized_par`.
+search the coinbase-lock-time/header-nonce cursor for a qualifying full-header
+roll. The personalized candidate sweep below retains the stricter share rule
+`L < personalized_par`.
 
 Personalized candidates are derived semantically, never by deleting whitespace.
 Every ordinary example input must be non-string; the exact tight anchor

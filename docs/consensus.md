@@ -15,8 +15,8 @@
    pubkey and receives a mandatory payout output.
 4. **Program-golf lottery.** Header `version` commits producer length `L` and
    puzzle complexity `C`; `bits` carries the interval-retargeted compact base
-   target; the uint32 nonce is searched automatically. Each byte below par
-   doubles the accepted hash range, up to eight bytes.
+   target; the coinbase lock-time and header nonce are searched automatically.
+   Each byte below par doubles the accepted hash range, up to eight bytes.
 5. **Independent retargets.** Every 16 blocks, elapsed header time retargets
    `bits` while median relative improvement below par adjusts puzzle complexity
    `C`. Neither feedback signal controls the other.
@@ -64,7 +64,7 @@
 | target retarget interval | 16 blocks |
 | target retarget timespan | 15 target spacings |
 | mainnet/testnet/regtest target spacing | 86400 / 3600 / 1 s |
-| mainnet/testnet/regtest pow-limit bits | `0x1d02d8f1` / `0x1f00ffff` / `0x2000ffff` |
+| mainnet/testnet/regtest pow-limit bits | `0x1c2bcf04` / `0x1f00ffff` / `0x2000ffff` |
 | `coin-retarget-window` | 16 |
 | `coin-target-margin` | 100 milli-units |
 | lottery maximum bonus | 8 bytes |
@@ -324,7 +324,7 @@ length to equal encoded `L`.
 - the result cannot be easier than the chain's pow limit.
 
 Mainnet targets one day, public testnet one hour, and regtest one second. Their
-initial compact limits are respectively `0x1d02d8f1`, `0x1f00ffff`, and
+initial compact limits are respectively `0x1c2bcf04`, `0x1f00ffff`, and
 `0x2000ffff`. The one-second parent timestamp floor is only a monotonicity
 guard; the retargeted lottery controls cadence.
 
@@ -345,8 +345,8 @@ The inclusive effective target gives `effective + 1` winning values among
 `ceil(U / (effective + 1))`. The ceiling keeps acceptance probability at or
 below one half.
 
-At the initial mainnet limit, par expects 1,508,367,639 rolls and `par - 8`
-expects 5,892,062. Public testnet expects 65,538 and 257; regtest expects 257
+At the initial mainnet limit, par expects 25,098,045,881 rolls and `par - 8`
+expects 98,039,242. Public testnet expects 65,538 and 257; regtest expects 257
 and 2. Further shortening remains valid and still affects the independent
 complexity retarget, but does not increase this block's multiplier.
 
@@ -357,11 +357,13 @@ roll = integer_le(HASH256(header))
 ```
 
 Header acceptance requires `roll <= effective`. A builder validates the
-producer solution, finalizes the complete body and merkle root once, encodes
-`L/C` in `version`, writes the chain-required `bits`, then tries nonce values
-from `0` through `0xffffffff`. The first qualifying nonce is used. Exhaustion
-fails construction; the public par witness is a valid program, not an
-automatic winning block.
+producer solution, finalizes the body, encodes `L/C` in `version`, and writes
+the chain-required `bits`. It searches the header nonce from its current value
+through `0xffffffff`; on exhaustion it increments the coinbase transaction's
+final `lock-time`, rebuilds its txid and the merkle root, resets the nonce to
+zero, and continues. The first qualifying lexicographic `(lock-time, nonce)`
+pair is used. Exhausting both uint32 fields fails construction; the public par
+witness is a valid program, not an automatic winning block.
 
 ### 5.6 Header-first and body validation
 
@@ -810,7 +812,7 @@ implementation exposes no mainnet pool.
 **Claim.** For every height, every constraint `ci`, and every complexity `C`,
 there is a consensus-valid solution of length exactly `par` that any producer
 can construct mechanically from public data. The producer must still search
-the uint32 header nonce for a qualifying full-header lottery roll.
+the block cursor for a qualifying full-header lottery roll.
 
 ### 8.1 Public data available to a miner
 
@@ -896,12 +898,13 @@ ties) as the par witness. Every published puzzle therefore has a mechanically
 available producer candidate of length exactly `par`. The table bound is 400
 bytes globally or 443 bytes when personalized at the frozen `k=8`; `par` may
 be shorter because it is the minimum of the two verified witnesses. A builder
-using that candidate must still search the header nonce and meet §5's target.
+using that candidate must still search the block cursor and meet §5's target.
 
-Genesis uses the same par-witness selection, finalizes its body, and searches
-the same uint32 nonce lottery. Changes to witness selection, packed `version`,
-compact target `bits`, or lottery rules change genesis; older chain state is
-incompatible and each network requires fresh state for its matching genesis.
+Genesis uses the same par-witness selection and the same lexicographic
+coinbase-lock-time/header-nonce lottery. Changes to witness selection, packed
+`version`, compact target `bits`, or lottery rules change genesis; older chain
+state is incompatible and each network requires fresh state for its matching
+genesis.
 
 ## 9. Retargeting
 
@@ -1242,8 +1245,11 @@ through `(sigil coin node)`.
 
 - Mainnet uses the packed `0x20600000` version prefix, magic `8f d1 c0 a5`,
   port 19444, and HRP `sgl`. Its quote is `Sigil - Practical Symbolic Power`;
-  timestamp `1789056000`, compact limit `0x1d02d8f1`, and derived genesis
-  constants are selected for the 2026-09-10 experimental launch.
+  timestamp `1789228800`, compact limit `0x1c2bcf04`, and derived genesis
+  constants are selected for the 2026-09-12 experimental launch.
+  Its first genesis cursor is coinbase lock-time `6`, header nonce
+  `3129183091`; display id
+  `000000000b25af1072272ae97b606d64b340fc8f61f78f04c3e794025832b969`.
 - The reset public testnet keeps magic `d3 7a 91 c5`, port 19446, HRP `tsgl`,
   a one-hour target cadence, one-second parent floor, and five-minute future
   drift. Its quote is `SigilCoin public testnet reset - 2026-09-02` and

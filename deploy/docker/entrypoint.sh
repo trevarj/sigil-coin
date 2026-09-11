@@ -97,6 +97,37 @@ check_testnet_exposure() {
   esac
 }
 
+check_mainnet_exposure() {
+  [ "$chain" = mainnet ] || return 0
+  host_bind=${HOST_P2P_BIND:-127.0.0.1}
+  exposure_ack=${MAINNET_EXPOSURE_ACK:-}
+  case "$host_bind" in
+    127.*)
+      is_ipv4 "$host_bind" || { echo "invalid loopback mainnet P2P bind" >&2; exit 64; }
+      [ -z "$exposure_ack" ] || {
+        echo "refusing loopback mainnet P2P bind: MAINNET_EXPOSURE_ACK must be empty" >&2
+        exit 64
+      }
+      ;;
+    ::1)
+      [ -z "$exposure_ack" ] || {
+        echo "refusing loopback mainnet P2P bind: MAINNET_EXPOSURE_ACK must be empty" >&2
+        exit 64
+      }
+      ;;
+    *)
+      is_ipv4 "$host_bind" || {
+        echo "non-loopback mainnet P2P bind must be an IPv4 literal" >&2
+        exit 64
+      }
+      [ "$exposure_ack" = public-mainnet-approved ] || {
+        echo "refusing non-loopback mainnet P2P bind: set MAINNET_EXPOSURE_ACK=public-mainnet-approved exactly" >&2
+        exit 64
+      }
+      ;;
+  esac
+}
+
 secure_node_state() {
   umask 0027
   if [ -h "$data_dir" ]; then
@@ -137,6 +168,7 @@ secure_node_state() {
 case "$service_mode" in
   listener)
     check_testnet_exposure
+    check_mainnet_exposure
     secure_node_state
     set -- "$coin" listen \
       --bind "${LISTEN_BIND:-0.0.0.0}" \
@@ -233,6 +265,20 @@ case "$service_mode" in
     ;;
 
   cli)
+    case "${1:-}" in
+      listen|relay)
+        echo "refusing server command through cli mode; use its guarded service mode" >&2
+        exit 64
+        ;;
+    esac
+    for argument do
+      case "$argument" in
+        --|--chain|--chain=*|--testnet|--regtest)
+          echo "refusing chain override through cli mode; set CHAIN on the container" >&2
+          exit 64
+          ;;
+      esac
+    done
     secure_node_state
     set -- "$coin" "$@"
     if [ -n "$chain_flag" ]; then set -- "$@" "$chain_flag"; fi

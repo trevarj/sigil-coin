@@ -1,9 +1,8 @@
 ;;; Print every canonical genesis value from the configured quote and timestamp.
 ;;;
-;;; Launch-critical constants must all come from this tool. It mines the
 ;;; mainnet, reset public-testnet and regtest genesis templates from current
-;;; source, then prints the coinbase, merkle root, compact base target, nonce,
-;;; header, hash and display id that move together.
+;;; source, then prints the coinbase, outer lock-time, compact base target,
+;;; header nonce, header, hash, and display id that move together.
 ;;;
 ;;; Run from the repository root:
 ;;;
@@ -55,6 +54,7 @@
              (hex-encode (transaction-serialize coinbase)))
     (println "merkle-root: ~a"
              (hex-encode (block-header-merkle-root header)))
+    (println "coinbase-lock-time: ~a" (transaction-lock-time coinbase))
     (println "nonce: ~a" (block-header-nonce header))
     (println "header-hex: ~a" (hex-encode (block-header-serialize header)))
     (println "hash: ~a" (hex-encode hash))

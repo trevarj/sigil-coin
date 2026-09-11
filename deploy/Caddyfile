@@ -1,3 +1,7 @@
+explorer.sigilcoin.lol {
+	respond 404
+}
+
 explorer.testnet.sigilcoin.lol {
 	encode zstd gzip
 

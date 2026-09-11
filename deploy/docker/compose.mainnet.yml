@@ -45,13 +45,15 @@ services:
     environment:
       <<: *mainnet-environment
       LISTEN_BIND: 0.0.0.0
+      HOST_P2P_BIND: ${MAINNET_P2P_BIND:-127.0.0.1}
+      MAINNET_EXPOSURE_ACK: ${MAINNET_EXPOSURE_ACK:-}
       P2P_PORT: "19444"
       ACCEPT_TIMEOUT_MS: ${ACCEPT_TIMEOUT_MS:-60000}
       READ_TIMEOUT_MS: ${READ_TIMEOUT_MS:-10000}
       MAX_STEPS: ${MAX_STEPS:-4096}
       MAX_TX: ${MAX_TX:-256}
     ports:
-      - "${MAINNET_P2P_BIND:-0.0.0.0}:${MAINNET_P2P_PORT:-19444}:19444/tcp"
+      - "${MAINNET_P2P_BIND:-127.0.0.1}:${MAINNET_P2P_PORT:-19444}:19444/tcp"
     volumes:
       - type: bind
         source: ${SIGIL_MAINNET_STATE_DIR:-./state/mainnet}
@@ -83,6 +85,7 @@ services:
 
   explorer:
     <<: *sigilcoin-service
+    profiles: ["mainnet-explorer"]
     user: "${EXPLORER_UID:-1001}:${SIGIL_GID:-1000}"
     command: ["explorer"]
     pids_limit: 64
@@ -99,7 +102,7 @@ services:
       EXPLORER_HOST: 0.0.0.0
       EXPLORER_PORT: "8080"
     ports:
-      - "${MAINNET_EXPLORER_BIND:-127.0.0.1}:${MAINNET_EXPLORER_PORT:-8081}:8080/tcp"
+      - "127.0.0.1:8081:8080/tcp"
     depends_on:
       sync:
         condition: service_healthy

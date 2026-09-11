@@ -48,9 +48,11 @@
 
 ;; The regtest genesis: a real canonical block, and the parent every test builds on.
 (define %genesis-block
-  (coin-genesis-block coin-regtest-genesis-quote coin-regtest-genesis-time
-                      coin-regtest-pow-limit-bits
-                      coin-regtest-genesis-nonce-constant))
+  (coin-genesis-block
+    coin-regtest-genesis-quote coin-regtest-genesis-time
+    coin-regtest-pow-limit-bits
+    coin-regtest-genesis-coinbase-lock-time-constant
+    coin-regtest-genesis-nonce-constant))
 (define %genesis (block-header-field %genesis-block))
 (define %genesis-hash (block-header-hash %genesis))
 (define %genesis-time (block-header-time %genesis))
@@ -227,6 +229,19 @@
                                           (car maybe-nonce)))))
     (block b header-field: header transactions: transactions)))
 
+(define (with-mining-cursor b lock-time nonce)
+  (block-with-coinbase
+    b
+    (transaction (car (block-transactions b)) lock-time: lock-time)
+    nonce))
+
+(define (qualifying-header? header par)
+  (coin-lottery-valid?
+    (block-header-work-value header)
+    (block-header-bits header)
+    par
+    (coin-result-value (coin-header-solution-length header))))
+
 ;; ============================================================
 ;; Header fields and lottery
 ;; ============================================================
@@ -300,17 +315,221 @@
                                   coin-genesis-complexity))
            (par (puzzle-spec-par spec))
            (base (block-header %header1 nonce: #xffffffff))
-           (mined (coin-mine-header base par)))
+           (mined (coin-mine-header base par))
+           (prototype
+             (block %block1
+                    header-field: (block-header %header1 nonce: 0)))
+           (mined-block (coin-mine-block prototype par))
+           (stale
+             (block
+               prototype
+               header-field:
+                 (block-header
+                   (block-header-field prototype)
+                   merkle-root: %zero32)))
+           (repaired (coin-mine-block stale par)))
       (assert-equal (block-header-nonce %header1)
                     (block-header-nonce mined))
       (assert-equal (block-header-merkle-root %header1)
                     (block-header-merkle-root mined))
+      (assert-true (qualifying-header? mined par))
+      (assert-equal
+        (block-serialize
+          (block prototype header-field: mined))
+        (block-serialize mined-block))
+      (assert-equal (block-serialize mined-block)
+                    (block-serialize repaired))))
+
+  (test "the block grinder rolls the coinbase cursor and returns its body"
+    (let* ((spec (coin-node-puzzle %genesis-hash
+                                  1
+                                  coin-genesis-complexity))
+           (par (puzzle-spec-par spec))
+           (extra
+             (transaction
+               version: 2
+               inputs:
+                 (list
+                   (txin
+                     previous-output:
+                       (outpoint txid: (hash-of 99) index: 3)
+                     script-sig: #u8(#x51)
+                     sequence: #xfffffffe
+                     witness: '()))
+               outputs: (list (txout value: 7 script-pubkey: %payout))
+               lock-time: 11))
+           (transactions
+             (append (block-transactions %block1) (list extra)))
+           (base
+             (block
+               %block1
+               header-field:
+                 (block-header
+                   %header1
+                   merkle-root:
+                     (merkle-root (map transaction-txid transactions))
+                   nonce: 0)
+               transactions: transactions))
+           (pair
+             (let find ((lock-time 0))
+               (if (= #xffffffff lock-time)
+                   (error "test-node: no rollover fixture found"))
+               (let ((prototype
+                       (with-mining-cursor
+                         base lock-time #xffffffff))
+                     (next
+                       (with-mining-cursor base (+ lock-time 1) 0)))
+                 (if (and
+                       (not
+                         (qualifying-header?
+                           (block-header-field prototype) par))
+                       (qualifying-header?
+                         (block-header-field next) par))
+                     (cons prototype next)
+                     (find (+ lock-time 1))))))
+           (prototype (car pair))
+           (expected (cdr pair))
+           (mined (coin-mine-block prototype par))
+           (prototype-header (block-header-field prototype))
+           (mined-header (block-header-field mined))
+           (prototype-transactions (block-transactions prototype))
+           (mined-transactions (block-transactions mined))
+           (prototype-coinbase (car prototype-transactions))
+           (mined-coinbase (car mined-transactions)))
+      (assert-equal #xffffffff
+                    (block-header-nonce prototype-header))
+      (assert-false (qualifying-header? prototype-header par))
       (assert-true
-        (coin-lottery-valid?
-          (block-header-work-value mined)
-          (block-header-bits mined)
-          par
-          (coin-result-value (coin-header-solution-length mined))))))
+        (qualifying-header? (block-header-field expected) par))
+      (assert-equal
+        (+ 1 (transaction-lock-time prototype-coinbase))
+        (transaction-lock-time mined-coinbase))
+      (assert-equal 0 (block-header-nonce mined-header))
+      (assert-equal (block-serialize expected) (block-serialize mined))
+      (assert-equal 80
+                    (bytevector-length
+                      (block-header-serialize mined-header)))
+      (assert-equal (block-header-version prototype-header)
+                    (block-header-version mined-header))
+      (assert-equal (block-header-previous-block prototype-header)
+                    (block-header-previous-block mined-header))
+      (assert-equal (block-header-time prototype-header)
+                    (block-header-time mined-header))
+      (assert-equal (block-header-bits prototype-header)
+                    (block-header-bits mined-header))
+      (assert-false
+        (equal? (block-header-merkle-root prototype-header)
+                (block-header-merkle-root mined-header)))
+      (assert-equal
+        (merkle-root (map transaction-txid mined-transactions))
+        (block-header-merkle-root mined-header))
+      (assert-true (block-merkle-root-valid? mined))
+      (assert-equal
+        (bytevector-length (block-serialize prototype))
+        (bytevector-length (block-serialize mined)))
+      (assert-equal
+        (transaction-serialize prototype-coinbase)
+        (transaction-serialize
+          (transaction
+            mined-coinbase
+            lock-time: (transaction-lock-time prototype-coinbase))))
+      (assert-equal
+        (map transaction-serialize (cdr prototype-transactions))
+        (map transaction-serialize (cdr mined-transactions)))))
+
+  (test "the block grinder cannot wrap the terminal cursor"
+    (let* ((spec (coin-node-puzzle %genesis-hash
+                                  1
+                                  coin-genesis-complexity))
+           (par (puzzle-spec-par spec))
+           (terminal
+             (with-mining-cursor %block1 #xffffffff #xffffffff))
+           (miss
+             (let find ((time (block-header-time
+                                (block-header-field terminal))))
+               (if (> time #xffffffff)
+                   (error "test-node: no terminal miss found"))
+               (let* ((header
+                        (block-header
+                          (block-header-field terminal)
+                          time: time))
+                      (candidate
+                        (block terminal header-field: header)))
+                 (if (qualifying-header? header par)
+                     (find (+ time 1))
+                     candidate)))))
+      (assert-equal #xffffffff
+                    (transaction-lock-time
+                      (car (block-transactions miss))))
+      (assert-equal #xffffffff
+                    (block-header-nonce (block-header-field miss)))
+      (assert-false
+        (qualifying-header? (block-header-field miss) par))
+      (assert-true (block-merkle-root-valid? miss))
+      (assert-true
+        (raises-containing?
+          (lambda () (coin-mine-block miss par))
+          "coin-mine-block: search space exhausted"))))
+
+  (test "the block grinder validates its coinbase cursor first"
+    (let* ((spec (coin-node-puzzle %genesis-hash
+                                  1
+                                  coin-genesis-complexity))
+           (par (puzzle-spec-par spec))
+           (coinbase (car (block-transactions %block1)))
+           (input (car (transaction-inputs coinbase)))
+           (ordinary
+             (transaction
+               coinbase
+               inputs:
+                 (list
+                   (txin
+                     input
+                     previous-output:
+                       (outpoint txid: (hash-of 23) index: 0)))))
+           (non-final
+             (transaction
+               coinbase
+               inputs: (list (txin input sequence: 0))))
+           (bad-lock
+             (block
+               %block1
+               transactions:
+                 (cons
+                   (transaction coinbase lock-time: -1)
+                   (cdr (block-transactions %block1)))))
+           (bad-nonce
+             (block
+               %block1
+               header-field: (block-header %header1 nonce: -1))))
+      (assert-false (coinbase-transaction? ordinary))
+      (assert-true (coinbase-transaction? non-final))
+      (assert-true
+        (raises-containing?
+          (lambda () (coin-mine-block 42 par))
+          "coin-mine-block: expected a block"))
+      (assert-true
+        (raises-containing?
+          (lambda ()
+            (coin-mine-block
+              (block-with-coinbase %block1 ordinary)
+              par))
+          "coin-mine-block: expected a coinbase first transaction"))
+      (assert-true
+        (raises-containing?
+          (lambda ()
+            (coin-mine-block
+              (block-with-coinbase %block1 non-final)
+              par))
+          "coin-mine-block: expected final coinbase sequence"))
+      (assert-true
+        (raises-containing?
+          (lambda () (coin-mine-block bad-lock par))
+          "coin-mine-block: expected uint32 coinbase lock-time"))
+      (assert-true
+        (raises-containing?
+          (lambda () (coin-mine-block bad-nonce par))
+          "coin-mine-block: expected uint32 header nonce"))))
 
   (test "a header cannot claim an over-par producer length"
     (let* ((spec (coin-node-puzzle %genesis-hash
@@ -958,8 +1177,9 @@
       (hex-encode
         (block-header-serialize
           (coin-genesis-header
-            coin-genesis-quote coin-genesis-time
-            coin-main-pow-limit-bits coin-genesis-nonce-constant))))
+            coin-genesis-quote coin-genesis-time coin-main-pow-limit-bits
+            coin-genesis-coinbase-lock-time-constant
+            coin-genesis-nonce-constant))))
     (assert-equal
       coin-testnet-genesis-header-constant
       (hex-encode
@@ -967,6 +1187,7 @@
           (coin-genesis-header
             coin-testnet-genesis-quote coin-testnet-genesis-time
             coin-testnet-pow-limit-bits
+            coin-testnet-genesis-coinbase-lock-time-constant
             coin-testnet-genesis-nonce-constant))))
     ;; Regtest's 257 expected rolls keep the search path directly covered.
     (assert-equal coin-regtest-genesis-header-constant
@@ -992,23 +1213,34 @@
                   (block-header-id
                     (coin-genesis-header
                       coin-genesis-quote coin-genesis-time
-                      coin-main-pow-limit-bits coin-genesis-nonce-constant)))
+                      coin-main-pow-limit-bits
+                      coin-genesis-coinbase-lock-time-constant
+                      coin-genesis-nonce-constant)))
     (assert-equal coin-testnet-genesis-id-constant
                   (block-header-id
                     (coin-genesis-header
                       coin-testnet-genesis-quote coin-testnet-genesis-time
                       coin-testnet-pow-limit-bits
+                      coin-testnet-genesis-coinbase-lock-time-constant
                       coin-testnet-genesis-nonce-constant)))
     (assert-equal coin-regtest-genesis-id-constant
                   (block-header-id %genesis))
-    (let* ((main (chain-config-genesis-header sigilcoin-main-chain))
+    (let* ((main-block
+             (coin-genesis-block
+               coin-genesis-quote coin-genesis-time coin-main-pow-limit-bits
+               coin-genesis-coinbase-lock-time-constant
+               coin-genesis-nonce-constant))
+           (main (block-header-field main-block))
            (par (puzzle-spec-par
                   (coin-puzzle-for %zero32 0 coin-genesis-complexity)))
            (length (coin-result-value
                      (coin-header-solution-length main))))
-      (assert-equal 1789056000 (block-header-time main))
-      (assert-equal #x1d02d8f1 (block-header-bits main))
-      (assert-equal 434733157 (block-header-nonce main))
+      (assert-equal 1789228800 (block-header-time main))
+      (assert-equal #x1c2bcf04 (block-header-bits main))
+      (assert-equal 6
+                    (transaction-lock-time
+                      (car (block-transactions main-block))))
+      (assert-equal 3129183091 (block-header-nonce main))
       (assert-true
         (coin-lottery-valid?
           (block-header-work-value main)
@@ -1019,18 +1251,26 @@
       (not (equal?
              (coin-genesis-hash
                coin-genesis-quote coin-genesis-time
-               coin-main-pow-limit-bits coin-genesis-nonce-constant)
+               coin-main-pow-limit-bits
+               coin-genesis-coinbase-lock-time-constant
+               coin-genesis-nonce-constant)
              (coin-genesis-hash
                "something else" coin-genesis-time
-               coin-main-pow-limit-bits coin-genesis-nonce-constant))))
+               coin-main-pow-limit-bits
+               coin-genesis-coinbase-lock-time-constant
+               coin-genesis-nonce-constant))))
     (assert-true
       (not (equal?
              (coin-genesis-hash
                coin-genesis-quote coin-genesis-time
-               coin-main-pow-limit-bits coin-genesis-nonce-constant)
+               coin-main-pow-limit-bits
+               coin-genesis-coinbase-lock-time-constant
+               coin-genesis-nonce-constant)
              (coin-genesis-hash
                coin-genesis-quote (+ 1 coin-genesis-time)
-               coin-main-pow-limit-bits coin-genesis-nonce-constant)))))
+               coin-main-pow-limit-bits
+               coin-genesis-coinbase-lock-time-constant
+               coin-genesis-nonce-constant)))))
 
   (test "the header fields are frozen and lottery-qualified"
     (let* ((spec (coin-puzzle-for %zero32 0 coin-genesis-complexity))
@@ -1642,6 +1882,7 @@
              (coin-genesis-block
                coin-testnet-genesis-quote coin-testnet-genesis-time
                coin-testnet-pow-limit-bits
+               coin-testnet-genesis-coinbase-lock-time-constant
                coin-testnet-genesis-nonce-constant))
            (header (block-header-field built))
            (coinbase (car (block-transactions built)))
@@ -1784,6 +2025,7 @@
              (coin-genesis-header
                coin-testnet-genesis-quote coin-testnet-genesis-time
                coin-testnet-pow-limit-bits
+               coin-testnet-genesis-coinbase-lock-time-constant
                coin-testnet-genesis-nonce-constant))
            (good-block
              (coin-build-block
@@ -1821,6 +2063,7 @@
              (coin-genesis-block
                coin-testnet-genesis-quote coin-testnet-genesis-time
                coin-testnet-pow-limit-bits
+               coin-testnet-genesis-coinbase-lock-time-constant
                coin-testnet-genesis-nonce-constant))
            (genesis (block-header-field genesis-block))
            (h1 (coin-build-block

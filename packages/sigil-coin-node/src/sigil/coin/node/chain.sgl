@@ -1,8 +1,7 @@
 ;;; (sigil coin node chain) — live SigilCoin chain configs
 ;;;
 ;;; Mainnet, public testnet, and regtest run canonical program-by-example
-;;; consensus. Mainnet's final timestamp and calibrated target were selected
-;;; for the 2026-09-10 experimental launch.
+;;; consensus. Mainnet is calibrated for the postponed 2026-09-12 launch.
 
 (define-library (sigil coin node chain)
   (import (sigil bitcoin consensus)
@@ -53,9 +52,9 @@
     ;;; Regtest target cadence: one second.
     (define coin-regtest-target-block-spacing 1)
 
-    ;;; Easiest compact base targets. Mainnet is calibrated to roughly one
-    ;;; at-par day on the faster measured launch host.
-    (define coin-main-pow-limit-bits #x1d02d8f1)
+    ;;; Easiest compact base targets. Mainnet uses the faster measured
+    ;;; serialized-header miner rate of 290,487 rolls/s for one at-par day.
+    (define coin-main-pow-limit-bits #x1c2bcf04)
     (define coin-testnet-pow-limit-bits #x1f00ffff)
     (define coin-regtest-pow-limit-bits #x2000ffff)
 
@@ -81,8 +80,8 @@
     (define coin-genesis-quote
       "Sigil - Practical Symbolic Power")
 
-    ;;; Final mainnet timestamp: 2026-09-10T16:00:00Z.
-    (define coin-genesis-time 1789056000)
+    ;;; Mainnet timestamp: 2026-09-12T16:00:00Z.
+    (define coin-genesis-time 1789228800)
 
     ;;; Canonical reset public-testnet genesis quote.
     (define coin-testnet-genesis-quote
@@ -220,23 +219,26 @@
                                     hrp wallet-coinbase-maturity))))
 
     (define %main-genesis
-      (coin-genesis-block coin-genesis-quote coin-genesis-time
-                          coin-main-pow-limit-bits
-                          coin-genesis-nonce-constant))
+      (coin-genesis-block
+        coin-genesis-quote coin-genesis-time coin-main-pow-limit-bits
+        coin-genesis-coinbase-lock-time-constant
+        coin-genesis-nonce-constant))
 
     (define %testnet-genesis
-      (coin-genesis-block coin-testnet-genesis-quote
-                          coin-testnet-genesis-time
-                          coin-testnet-pow-limit-bits
-                          coin-testnet-genesis-nonce-constant))
+      (coin-genesis-block
+        coin-testnet-genesis-quote coin-testnet-genesis-time
+        coin-testnet-pow-limit-bits
+        coin-testnet-genesis-coinbase-lock-time-constant
+        coin-testnet-genesis-nonce-constant))
 
     (define %regtest-genesis
-      (coin-genesis-block coin-regtest-genesis-quote
-                          coin-regtest-genesis-time
-                          coin-regtest-pow-limit-bits
-                          coin-regtest-genesis-nonce-constant))
+      (coin-genesis-block
+        coin-regtest-genesis-quote coin-regtest-genesis-time
+        coin-regtest-pow-limit-bits
+        coin-regtest-genesis-coinbase-lock-time-constant
+        coin-regtest-genesis-nonce-constant))
 
-    ;;; Main SigilCoin network. Genesis timestamp remains non-final.
+    ;;; Main SigilCoin network.
     (define sigilcoin-main-chain
       (config "sigilcoin-main"
               "sigilcoin-main"

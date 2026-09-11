@@ -417,11 +417,11 @@ checker, and keep it only if it is strictly shorter than par. A specification
 with an ordinary string input has no such candidate.
 
 Genesis carries the generated par witness of the frozen genesis puzzle,
-choosing the hidden source on a tie. Its body and merkle root are finalized,
-then its uint32 nonce is searched under the same lottery rule. Its reward is
-zero and its single output is an unspendable `OP_RETURN`: no premine. Changes
-to witness selection, header encoding, or lottery rules change genesis, so
-older chain state is incompatible.
+choosing the hidden source on a tie. It searches the same lexicographic
+coinbase-lock-time/header-nonce cursor as ordinary blocks. Its reward is zero
+and its single output is an unspendable `OP_RETURN`: no premine. Changes to
+witness selection, header encoding, or lottery rules change genesis, so older
+chain state is incompatible.
 
 ## 7. The program-golf lottery and fork choice
 
@@ -450,7 +450,7 @@ Each network defines a target spacing and easiest base target:
 
 | chain | target spacing | pow-limit bits |
 |---|---:|---:|
-| mainnet | 86400 s | `0x1d02d8f1` |
+| mainnet | 86400 s | `0x1c2bcf04` |
 | public testnet | 3600 s | `0x1f00ffff` |
 | regtest | 1 s | `0x2000ffff` |
 
@@ -479,9 +479,10 @@ effective  = min(2^255 - 1, (base + 1)*multiplier - 1)
 
 A `HASH256` roll of the full serialized header is interpreted as a
 little-endian unsigned 256-bit integer and accepted when it is at most
-`effective`. At the initial mainnet limit, par expects 1,508,367,639 rolls and
-`par - 8` expects 5,892,062. Public testnet expects 65,538 and 257; regtest
-expects 257 and 2. The ceiling keeps acceptance probability at or below half.
+`effective`. At the initial mainnet limit, par expects 25,098,045,881 rolls
+and `par - 8` expects 98,039,242. Public testnet expects 65,538 and 257;
+regtest expects 257 and 2. The ceiling keeps acceptance probability at or
+below half.
 
 This is a lottery weighted by program-golf savings, not a deterministic
 shortest-program auction. Saving a ninth byte can still move the independent
@@ -489,9 +490,12 @@ puzzle-complexity retarget but gives no additional per-block multiplier.
 
 ### 7.4 Automatic nonce search and body binding
 
-The builder validates the chosen program, finalizes the body and merkle root
-once, writes the encoded version and chain-required bits, then tries nonce
-values from 0 through `0xffffffff`. The first qualifying roll is used.
+The builder validates the chosen program, finalizes the body, writes the
+encoded version and chain-required bits, then searches the header nonce from
+its current value through `0xffffffff`. If that range has no hit, it increments
+the coinbase transaction's final `lock-time`, rebuilds its txid and the merkle
+root, resets the nonce to zero, and continues. The first qualifying
+lexicographic `(lock-time, nonce)` pair is used.
 
 Header-first validation checks version, derived `C`, par, required compact
 bits, and the effective target. Body validation runs the program and checks
@@ -992,7 +996,7 @@ resource, censorship, and database trends remain untested. Mainnet must
 therefore launch as experimental and low-value.
 
 **Hash security uses the measured launch target.** Mainnet starts at compact
-bits `0x1d02d8f1`, about 1.51 billion at-par rolls before golf bonus: roughly
+bits `0x1c2bcf04`, about 25.10 billion at-par rolls before golf bonus: roughly
 24 hours on the faster measured launch host. No exchange, bridge, or valuable
 balance should depend on the compressed rehearsal.
 
@@ -1003,14 +1007,15 @@ balance should depend on the compressed rehearsal.
 The source tree implements the canonical design end to end: generated
 par-witnesses; producer `L <= par` and share `L < personalized_par`; compact
 base targets retargeted from 16-block timestamp windows; the eight-byte
-program-golf multiplier; automatic uint32 full-header nonce search; cumulative
-base-work fork choice; seed derivation and bounded cache; contribution-aware
-co-op payouts; durable-parent validation; CLI mining/contribution/relay; and a
-read-only escaped explorer.
+program-golf multiplier; automatic coinbase-lock-time/header-nonce search;
+cumulative base-work fork choice; seed derivation and bounded cache;
+contribution-aware co-op payouts; durable-parent validation; CLI
+mining/contribution/relay; and a read-only escaped explorer.
 
-Mainnet's timestamp and genesis constants remain non-final until launch.
-Version encoding, per-network target limits and lottery nonces all affect
-genesis. State from before this cutover is incompatible.
+Mainnet's final genesis cursor is coinbase lock-time `6`, header nonce
+`3129183091`. Version encoding, per-network target limits, coinbase lock-time
+and lottery nonces all affect genesis. State from before this cutover is
+incompatible.
 
 ## 16. Constants
 
@@ -1039,7 +1044,7 @@ genesis. State from before this cutover is incompatible.
 | complexity retarget | 16 blocks, target margin 100 milli-units |
 | target retarget | 16 headers / 15 intervals, 0.25x..4x clamp |
 | target spacing main/test/reg | 86400 / 3600 / 1 seconds |
-| pow-limit bits main/test/reg | `0x1d02d8f1` / `0x1f00ffff` / `0x2000ffff` |
+| pow-limit bits main/test/reg | `0x1c2bcf04` / `0x1f00ffff` / `0x2000ffff` |
 | lottery max bonus | 8 bytes |
 | lottery maximum integer / target ceiling | `2^256 - 1` / `2^255 - 1` |
 | header version | prefix/mask `0x20600000` / `0xffe00000`; `L-1` in 20..12, `C` in 11..0 |

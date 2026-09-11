@@ -20,9 +20,12 @@ Environment:
   SSH_IDENTITIES_ONLY=yes|no  Override OpenSSH identity selection. Unset keeps
                               the caller's SSH configuration unchanged.
 
-Mainnet additionally requires ALLOW_MAINNET=yes. Non-loopback testnet P2P
-requires either peer-ip-allowlisted with REMOTE_PEER_IP, or the exact explicit
-public-testnet-approved acknowledgement.
+Mainnet additionally requires ALLOW_MAINNET=yes. Its P2P listener stays
+loopback-only unless MAINNET_EXPOSURE_ACK is exactly public-mainnet-approved.
+Before the mainnet explorer starts, the repository Caddyfile must be installed
+at /etc/caddy/Caddyfile; deployment validates and reloads it fail-closed.
+Non-loopback testnet P2P requires either peer-ip-allowlisted with
+REMOTE_PEER_IP, or the exact public-testnet-approved acknowledgement.
 EOF
 }
 
@@ -226,6 +229,14 @@ if [[ $sigil_uid == - ]]; then sigil_uid=$(read_env_value SIGIL_UID); fi
 if [[ $sigil_gid == - ]]; then sigil_gid=$(read_env_value SIGIL_GID); fi
 if [[ $explorer_uid == - ]]; then explorer_uid=$(read_env_value EXPLORER_UID); fi
 if [[ $pool_uid == - ]]; then pool_uid=$(read_env_value POOL_UID); fi
+[[ -z $sigil_uid || $sigil_uid =~ ^[0-9]+$ ]] || {
+  echo 'SIGIL_UID from environment file must be numeric' >&2
+  exit 64
+}
+[[ -z $sigil_gid || $sigil_gid =~ ^[0-9]+$ ]] || {
+  echo 'SIGIL_GID from environment file must be numeric' >&2
+  exit 64
+}
 sigil_uid=${sigil_uid:-$(id -u)}
 sigil_gid=${sigil_gid:-$(id -g)}
 explorer_uid=${explorer_uid:-$((sigil_uid + 1))}
@@ -317,6 +328,31 @@ if [[ $mode == testnet ]]; then
 else
   state_spec=$(env_or_file SIGIL_MAINNET_STATE_DIR)
   state_spec=${state_spec:-./state/mainnet}
+  p2p_bind=$(env_or_file MAINNET_P2P_BIND)
+  p2p_bind=${p2p_bind:-127.0.0.1}
+  exposure_ack=$(env_or_file MAINNET_EXPOSURE_ACK)
+  case $p2p_bind in
+    127.*)
+      is_ipv4 "$p2p_bind" || { echo 'invalid loopback mainnet P2P bind' >&2; exit 64; }
+      [[ -z $exposure_ack ]] || {
+        echo 'MAINNET_EXPOSURE_ACK must be empty for a loopback mainnet P2P bind' >&2
+        exit 64
+      }
+      ;;
+    ::1)
+      [[ -z $exposure_ack ]] || {
+        echo 'MAINNET_EXPOSURE_ACK must be empty for a loopback mainnet P2P bind' >&2
+        exit 64
+      }
+      ;;
+    *)
+      is_ipv4 "$p2p_bind" || { echo 'non-loopback mainnet P2P bind must be an IPv4 literal' >&2; exit 64; }
+      [[ $exposure_ack == public-mainnet-approved ]] || {
+        echo 'non-loopback mainnet P2P requires MAINNET_EXPOSURE_ACK=public-mainnet-approved exactly' >&2
+        exit 64
+      }
+      ;;
+  esac
 fi
 validate_state_spec "$state_spec" || { echo 'unsafe chain state directory path' >&2; exit 64; }
 state_dir=$(canonical_state_path "$state_spec") || {
@@ -384,7 +420,11 @@ if [[ $mode == testnet ]]; then
   }
 fi
 
+
 compose_args=(-f "compose.$mode.yml")
+if [[ $mode == mainnet ]]; then
+  compose_args=(--profile mainnet-explorer "${compose_args[@]}")
+fi
 if [[ $has_env == yes ]]; then compose_args=(--env-file .env "${compose_args[@]}"); fi
 
 export SIGIL_UID="$sigil_uid" SIGIL_GID="$sigil_gid" EXPLORER_UID="$explorer_uid"
@@ -394,11 +434,21 @@ if [[ $mode == testnet ]]; then
   export P2P_BIND="$p2p_bind" TESTNET_EXPOSURE_ACK="$exposure_ack" REMOTE_PEER_IP="$remote_peer_ip"
   export SIGIL_TESTNET_STATE_DIR="$state_dir" SIGIL_TESTNET_POOL_STATE_DIR="$pool_state_dir"
 else
+  export MAINNET_P2P_BIND="$p2p_bind" MAINNET_EXPOSURE_ACK="$exposure_ack"
   export SIGIL_MAINNET_STATE_DIR="$state_dir"
 fi
 
 docker compose "${compose_args[@]}" config --quiet
 docker compose "${compose_args[@]}" build
+if [[ $mode == mainnet ]]; then
+  caddy_source=$remote_dir/sigil-coin/deploy/Caddyfile
+  if ! cmp -s "$caddy_source" /etc/caddy/Caddyfile; then
+    echo 'refusing mainnet explorer start: install the staged Caddy configuration first' >&2
+    exit 73
+  fi
+  caddy validate --config "$caddy_source"
+  caddy reload --config "$caddy_source"
+fi
 docker compose "${compose_args[@]}" up -d --remove-orphans --wait --wait-timeout 180
 docker compose "${compose_args[@]}" ps
 REMOTE_SCRIPT

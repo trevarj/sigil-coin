@@ -46,6 +46,11 @@ expect_exit 64 bash deploy/scripts/deploy-testnet-remote.sh
 expect_exit 64 bash deploy/scripts/deploy-testnet-remote.sh -host
 
 assert_fixed 'root * /srv/sigilcoin/site' deploy/Caddyfile
+[[ $(sed -n '1,3p' deploy/Caddyfile) == $'explorer.sigilcoin.lol {\n\trespond 404\n}' ]] ||
+  fail 'mainnet explorer prelaunch host is not a TLS-only 404 site'
+if grep -Fq '127.0.0.1:8081' deploy/Caddyfile; then
+  fail 'prelaunch mainnet explorer host reaches an origin'
+fi
 assert_fixed '@site_assets path /assets/sigilcoin-symbol.png /assets/plus-jakarta.woff2 /assets/jetbrains-mono.woff2' deploy/Caddyfile
 assert_fixed 'reverse_proxy 127.0.0.1:8080' deploy/Caddyfile
 assert_fixed 'pool.testnet.sigilcoin.lol {' deploy/Caddyfile
@@ -107,6 +112,16 @@ done
 assert_fixed '"${P2P_BIND:-127.0.0.1}:${P2P_PORT:-19446}:19446/tcp"' deploy/docker/compose.testnet.yml
 assert_fixed '"127.0.0.1:${EXPLORER_PORT:-8080}:8080/tcp"' deploy/docker/compose.testnet.yml
 if grep -Fq 'EXPLORER_BIND' deploy/docker/compose.testnet.yml; then fail 'testnet explorer has a bind override'; fi
+assert_fixed 'HOST_P2P_BIND: ${MAINNET_P2P_BIND:-127.0.0.1}' deploy/docker/compose.mainnet.yml
+assert_fixed 'MAINNET_EXPOSURE_ACK: ${MAINNET_EXPOSURE_ACK:-}' deploy/docker/compose.mainnet.yml
+assert_fixed '"${MAINNET_P2P_BIND:-127.0.0.1}:${MAINNET_P2P_PORT:-19444}:19444/tcp"' deploy/docker/compose.mainnet.yml
+assert_fixed '"127.0.0.1:8081:8080/tcp"' deploy/docker/compose.mainnet.yml
+assert_fixed 'profiles: ["mainnet-explorer"]' deploy/docker/compose.mainnet.yml
+assert_fixed 'compose_args=(--profile mainnet-explorer' deploy/scripts/deploy-remote.sh
+assert_fixed 'default_explorer_port=8081' deploy/scripts/run-local.sh
+if grep -Fq 'MAINNET_EXPLORER_' deploy/docker/compose.mainnet.yml deploy/docker/.env.example; then
+  fail 'mainnet explorer host mapping has an environment override'
+fi
 assert_fixed 'user: "${POOL_UID:-1002}:${SIGIL_GID:-1000}"' deploy/docker/compose.testnet.yml
 assert_fixed 'command: ["relay"]' deploy/docker/compose.testnet.yml
 assert_fixed '"127.0.0.1:${POOL_PORT:-8082}:8082/tcp"' deploy/docker/compose.testnet.yml
@@ -131,6 +146,13 @@ assert_fixed '--relay http://127.0.0.1:8082' deploy/docker/entrypoint.sh
 assert_fixed 'POOL_UID=1002' deploy/docker/.env.example
 assert_fixed 'SIGIL_TESTNET_POOL_STATE_DIR=./state/testnet-pool' deploy/docker/.env.example
 assert_fixed 'POOL_PORT=8082' deploy/docker/.env.example
+grep -Fxq 'MAINNET_P2P_BIND=127.0.0.1' deploy/docker/.env.example ||
+  fail 'example mainnet P2P bind is not private'
+grep -Fxq 'MAINNET_EXPOSURE_ACK=' deploy/docker/.env.example ||
+  fail 'example mainnet exposure acknowledgement is not empty'
+assert_fixed 'cmp -s "$caddy_source" /etc/caddy/Caddyfile' \
+  deploy/scripts/deploy-remote.sh
+assert_fixed 'caddy reload --config "$caddy_source"' deploy/scripts/deploy-remote.sh
 
 assert_fixed 'SSH_IDENTITIES_ONLY must be exactly yes or no' deploy/scripts/deploy-remote.sh
 assert_fixed 'rsync "${rsync_transport[@]}"' deploy/scripts/deploy-remote.sh
@@ -177,6 +199,10 @@ expect_exit 64 env REMOTE_HOST=host SSH_IDENTITIES_ONLY= bash deploy/scripts/dep
 expect_exit 64 env ALLOW_MAINNET=maybe BIN_DIR=/nonexistent bash deploy/scripts/run-local.sh
 expect_exit 64 env CHAIN=mainnet sh deploy/docker/entrypoint.sh listener
 expect_exit 64 env CHAIN=mainnet ALLOW_MAINNET=yes sh deploy/docker/entrypoint.sh relay
+expect_exit 64 env CHAIN=testnet sh deploy/docker/entrypoint.sh cli listen
+expect_exit 64 env CHAIN=testnet sh deploy/docker/entrypoint.sh cli -- listen
+expect_exit 64 env CHAIN=testnet sh deploy/docker/entrypoint.sh cli status \
+  --chain sigilcoin-main
 expect_exit 64 env CHAIN=testnet HOST_P2P_BIND=0.0.0.0 sh deploy/docker/entrypoint.sh listener
 expect_exit 64 env CHAIN=testnet HOST_P2P_BIND=0.0.0.0 \
   TESTNET_EXPOSURE_ACK=not-approved sh deploy/docker/entrypoint.sh listener
@@ -190,6 +216,20 @@ expect_exit 64 env P2P_BIND=0.0.0.0 TESTNET_EXPOSURE_ACK=peer-ip-allowlisted \
   REMOTE_PEER_IP=not-an-ip BIN_DIR=/nonexistent bash deploy/scripts/run-local.sh
 expect_exit 64 env TESTNET_EXPOSURE_ACK=public-testnet-approved-typo \
   BIN_DIR=/nonexistent bash deploy/scripts/run-local.sh
+expect_exit 64 env CHAIN=mainnet ALLOW_MAINNET=yes HOST_P2P_BIND=0.0.0.0 \
+  sh deploy/docker/entrypoint.sh listener
+expect_exit 64 env CHAIN=mainnet ALLOW_MAINNET=yes HOST_P2P_BIND=0.0.0.0 \
+  MAINNET_EXPOSURE_ACK=public-mainnet-approve sh deploy/docker/entrypoint.sh listener
+expect_exit 64 env CHAIN=mainnet ALLOW_MAINNET=yes HOST_P2P_BIND=127.0.0.1 \
+  MAINNET_EXPOSURE_ACK=public-mainnet-approved sh deploy/docker/entrypoint.sh listener
+expect_exit 64 env MODE=mainnet ALLOW_MAINNET=yes P2P_BIND=0.0.0.0 \
+  BIN_DIR=/nonexistent bash deploy/scripts/run-local.sh
+expect_exit 64 env MODE=mainnet ALLOW_MAINNET=yes P2P_BIND=0.0.0.0 \
+  MAINNET_EXPOSURE_ACK=public-mainnet-approve BIN_DIR=/nonexistent \
+  bash deploy/scripts/run-local.sh
+expect_exit 64 env MODE=mainnet ALLOW_MAINNET=yes P2P_BIND=127.0.0.1 \
+  MAINNET_EXPOSURE_ACK=public-mainnet-approved BIN_DIR=/nonexistent \
+  bash deploy/scripts/run-local.sh
 
 # Valid exposure modes must pass their guards. Later failure is expected here:
 # the entrypoint lacks /opt/sigilcoin and run-local receives a missing BIN_DIR.
@@ -207,6 +247,76 @@ expect_not_exit 64 env P2P_BIND=0.0.0.0 \
 expect_not_exit 64 env P2P_BIND=0.0.0.0 \
   TESTNET_EXPOSURE_ACK=public-testnet-approved BIN_DIR=/nonexistent \
   bash deploy/scripts/run-local.sh
+expect_not_exit 64 env -u HOST_P2P_BIND -u MAINNET_EXPOSURE_ACK \
+  CHAIN=mainnet ALLOW_MAINNET=yes DATA_DIR="$preflight_state/mainnet-private" \
+  sh deploy/docker/entrypoint.sh listener
+expect_not_exit 64 env CHAIN=mainnet ALLOW_MAINNET=yes \
+  DATA_DIR="$preflight_state/mainnet-public" HOST_P2P_BIND=0.0.0.0 \
+  MAINNET_EXPOSURE_ACK=public-mainnet-approved \
+  sh deploy/docker/entrypoint.sh listener
+expect_not_exit 64 env -u P2P_BIND -u MAINNET_EXPOSURE_ACK \
+  MODE=mainnet ALLOW_MAINNET=yes BIN_DIR=/nonexistent \
+  bash deploy/scripts/run-local.sh
+expect_not_exit 64 env MODE=mainnet ALLOW_MAINNET=yes P2P_BIND=0.0.0.0 \
+  MAINNET_EXPOSURE_ACK=public-mainnet-approved BIN_DIR=/nonexistent \
+  bash deploy/scripts/run-local.sh
+
+# Exercise the actual deploy-remote heredoc without SSH, Docker, or deployment.
+remote_script=$(sed -n "/<<'REMOTE_SCRIPT'$/,/^REMOTE_SCRIPT$/p" \
+  deploy/scripts/deploy-remote.sh | sed '1d;$d')
+[[ $remote_script == set\ -euo\ pipefail* ]] ||
+  fail 'could not extract deploy-remote preflight'
+remote_dir=$preflight_state/remote
+mkdir -p -- "$remote_dir/sigil-coin/deploy/docker" "$preflight_state/bin"
+cat > "$preflight_state/bin/cmp" <<'EOF'
+exit 0
+EOF
+cat > "$preflight_state/bin/caddy" <<'EOF'
+printf '%s\n' "$*" >> "${FAKE_CADDY_CALLS:?}"
+EOF
+cat > "$preflight_state/bin/docker" <<'EOF'
+case " $* " in
+  *" config "*|*" build "*) exit 0 ;;
+  *" up "*)
+    grep -Fq 'reload --config' "${FAKE_CADDY_CALLS:?}" || exit 68
+    exit 69
+    ;;
+  *) exit 67 ;;
+esac
+EOF
+chmod +x -- "$preflight_state/bin/cmp" "$preflight_state/bin/caddy" \
+  "$preflight_state/bin/docker"
+remote_uid=$(id -u)
+remote_gid=$(id -g)
+remote_mainnet=(bash -s -- "$remote_dir" mainnet "$remote_uid" "$remote_gid" \
+  "$((remote_uid + 1))" "$((remote_uid + 2))" yes no)
+remote_env=(env PATH="$preflight_state/bin:$PATH"
+  FAKE_CADDY_CALLS="$preflight_state/caddy-calls"
+  SIGIL_MAINNET_STATE_DIR=./state/mainnet)
+expect_exit 64 "${remote_env[@]}" MAINNET_P2P_BIND=0.0.0.0 \
+  MAINNET_EXPOSURE_ACK= "${remote_mainnet[@]}" <<< "$remote_script"
+expect_exit 64 "${remote_env[@]}" MAINNET_P2P_BIND=0.0.0.0 \
+  MAINNET_EXPOSURE_ACK=public-mainnet-approve "${remote_mainnet[@]}" <<< "$remote_script"
+expect_exit 64 "${remote_env[@]}" MAINNET_P2P_BIND=127.0.0.1 \
+  MAINNET_EXPOSURE_ACK=public-mainnet-approved "${remote_mainnet[@]}" <<< "$remote_script"
+rm -f -- "$preflight_state/caddy-calls"
+expect_exit 69 env -u MAINNET_P2P_BIND -u MAINNET_EXPOSURE_ACK \
+  PATH="$preflight_state/bin:$PATH" \
+  FAKE_CADDY_CALLS="$preflight_state/caddy-calls" \
+  SIGIL_MAINNET_STATE_DIR=./state/mainnet \
+  "${remote_mainnet[@]}" <<< "$remote_script"
+rm -f -- "$preflight_state/caddy-calls"
+expect_exit 69 "${remote_env[@]}" MAINNET_P2P_BIND=0.0.0.0 \
+  MAINNET_EXPOSURE_ACK=public-mainnet-approved "${remote_mainnet[@]}" \
+  <<< "$remote_script"
+injection_marker=$preflight_state/arithmetic-injection
+printf 'SIGIL_UID=x[$(touch %s)]\n' "$injection_marker" \
+  > "$remote_dir/sigil-coin/deploy/docker/.env"
+remote_mainnet_file=(bash -s -- "$remote_dir" mainnet - "$remote_gid" \
+  "$((remote_uid + 1))" "$((remote_uid + 2))" yes yes)
+expect_exit 64 "${remote_env[@]}" "${remote_mainnet_file[@]}" <<< "$remote_script"
+[[ ! -e $injection_marker ]] ||
+  fail 'deploy environment executed a command through arithmetic expansion'
 rm -rf -- "$preflight_state"
 
 if python3 -c 'import yaml' >/dev/null 2>&1; then
@@ -221,6 +331,15 @@ testnet = load('deploy/docker/compose.testnet.yml')
 mainnet = load('deploy/docker/compose.mainnet.yml')
 assert set(testnet['services']) == {'listener', 'sync', 'explorer', 'pool'}
 assert set(mainnet['services']) == {'listener', 'sync', 'explorer'}
+
+mainnet_listener = mainnet['services']['listener']
+assert mainnet_listener['environment']['HOST_P2P_BIND'] == '${MAINNET_P2P_BIND:-127.0.0.1}'
+assert mainnet_listener['environment']['MAINNET_EXPOSURE_ACK'] == '${MAINNET_EXPOSURE_ACK:-}'
+assert mainnet_listener['ports'] == [
+    '${MAINNET_P2P_BIND:-127.0.0.1}:${MAINNET_P2P_PORT:-19444}:19444/tcp'
+]
+assert mainnet['services']['explorer']['profiles'] == ['mainnet-explorer']
+assert mainnet['services']['explorer']['ports'] == ['127.0.0.1:8081:8080/tcp']
 
 pool = testnet['services']['pool']
 assert pool['user'] == '${POOL_UID:-1002}:${SIGIL_GID:-1000}'

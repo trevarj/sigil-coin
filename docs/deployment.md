@@ -1,10 +1,11 @@
 # SigilCoin deployment
 
 This tooling runs the public testnet on a Docker Compose host or as a
-foreground stack in the workspace. It also contains a guarded mainnet path,
-but mainnet genesis remains non-final and mainnet is not approved for use. The
-tooling does not publish DNS, configure firewalls, issue TLS certificates,
-commit, push, or deploy unless an operator runs it.
+foreground stack in the workspace. It also contains a guarded mainnet path.
+Mainnet genesis is final, but public activation still requires the explicit
+exposure acknowledgements and operator-controlled Caddy cutover. The tooling
+does not publish DNS, configure firewalls, issue TLS certificates, commit, or
+push.
 
 > **Public exposure warning:** `P2P_BIND=0.0.0.0` with
 > `TESTNET_EXPOSURE_ACK=public-testnet-approved` exposes unauthenticated P2P,
@@ -21,9 +22,10 @@ The configured public testnet starts from a new genesis marker
 all-network constants generated with the current lottery header rules.
 
 This is not an activation on the previous chain. Producer `L <= par`, the
-`bits` encoding of `L` and `C`, and the searched full-header nonce lottery all
-change genesis; shares retain `L < personalized_par`. The selected at-par
-witness guarantees an eligible producer candidate, not an immediate block.
+`bits` encoding of `L` and `C`, and the searched coinbase-lock-time/header-nonce
+lottery all change genesis; shares retain `L < personalized_par`. The selected
+at-par witness guarantees an eligible producer candidate, not an immediate
+block.
 Old public-testnet databases, history, and backups are incompatible and
 old-chain balances do not carry over. The `d3 7a 91 c5` magic is intentionally
 unchanged, so a successful frame handshake does not prove that a peer has the
@@ -394,14 +396,13 @@ authorize a mainnet push or deployment.
 
 Mainnet uses port `19444`, separate state, and loopback explorer port `8081`.
 The co-op relay service and public pool hostname are testnet-only; mainnet
-Compose has no pool. Mainnet's selected genesis
-uses the generated par candidate, commits its length and complexity in
-`version`, carries the compact base target in `bits`, and searches the uint32
-nonce against the effective full-header target. The header lottery cutover
-changed it, so older chain state is incompatible. Its launch
-timestamp and resulting final constants remain non-final. Both helper scripts
-and every container refuse mainnet unless the operator sets exactly
-`ALLOW_MAINNET=yes`.
+Compose has no pool. Mainnet's selected genesis uses the generated par
+candidate, commits its length and complexity in `version`, carries the compact
+base target in `bits`, and searches a coinbase-lock-time/header-nonce cursor
+against the effective full-header target. The final cursor is `(6,
+3129183091)`. This lottery cutover changed genesis, so older chain state is
+incompatible. Both helper scripts and every container refuse mainnet unless
+the operator sets exactly `ALLOW_MAINNET=yes`.
 
 ```sh
 ALLOW_MAINNET=yes MODE=mainnet bash deploy/scripts/run-local.sh

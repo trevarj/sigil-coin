@@ -1255,6 +1255,22 @@
       (let loop ((h (max height coin-retarget-window)))
         (if (explorer-retarget-height? h) h (loop (+ h 1)))))
 
+    ;; Genesis has no block body, but its header still commits the solution
+    ;; length used by the first complexity window.
+    (define (retarget-margin b)
+      (or (explorer-block-margin b)
+          (and (= 0 (explorer-block-height b))
+               (let ((view
+                       (explorer-puzzle-view
+                         (explorer-puzzle
+                           (make-bytevector 32 0)
+                           0
+                           (explorer-block-complexity b)))))
+                 (and view
+                      (explorer-margin
+                        (car view)
+                        (explorer-block-claimed-length b)))))))
+
     ;; The margins for the 16 heights below the tip, oldest first, or `'()`
     ;; when any of them is unknown. `coin-complexity-for` wants a full
     ;; window or nothing: a partial window is a different rule, and §9.4 has
@@ -1264,7 +1280,7 @@
         (walk-chain store
                     coin-retarget-window
                     (lambda (b)
-                      (set! out (cons (explorer-block-margin b) out))
+                      (set! out (cons (retarget-margin b) out))
                       #t))
         (if (or (not (= coin-retarget-window (length out)))
                 (let loop ((xs out))

@@ -51,9 +51,9 @@ validation.
 1. Creates producer/full node A, ordinary sender node B, ordinary recipient
    node C, node-free contributor wallet D, a separate relay store, and an
    explorer.
-2. Mines through H99 with automatic uint32 nonce search. The generated par
+2. Mines through H99 with automatic block-cursor search. The generated par
    witness is an eligible `L <= par` producer program, not a block by itself;
-   each finalized header must still produce a qualifying full-header `HASH256`
+   each candidate header must still produce a qualifying full-header `HASH256`
    roll.
 3. Captures H15/H16/H17 complexity and the corresponding `C`-dependent lottery
    base targets. The H16 retarget and historical queries must agree across

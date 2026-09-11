@@ -22,9 +22,10 @@ for its matching genesis.
 Compressed experimental-launch schedule:
 
 - `2026-09-08T05:30:15Z`: earliest close of the 48-hour testnet gate.
-- `2026-09-08T06:00:00Z`: start the private mainnet rehearsal.
-- `2026-09-09T06:00:00Z`: verify the calibrated target and final genesis.
-- `2026-09-10T16:00:00Z`: staffed public launch window.
+- `2026-09-08T12:38:33Z`: corrected private mainnet rehearsal start.
+- `2026-09-09T12:38:33Z`: earliest rehearsal close and final verification.
+- Public launch postponed: select a new timestamp only after optimized-miner
+  calibration, search-space rollover, and regenerated genesis complete.
 
 ---
 
@@ -103,7 +104,7 @@ header lottery, coinbase codec, and fork choice. Producer solutions must
 satisfy `L <= par`; shares must satisfy `L < personalized_par`. The generator's
 shorter verified witness (hidden on ties) has length exactly `par`, so an
 eligible producer candidate is always available. It does not itself produce a
-block: the builder must find a qualifying uint32 header nonce.
+block: the builder must find a qualifying block cursor.
 
 ## 2. Choose the genesis quote and regenerate the constants
 
@@ -111,37 +112,45 @@ Genesis carries a quote from `#systemcrafters` in its coinbase. The quote IS
 the genesis hash: change one byte and every constant below changes.
 
 - [x] Quote: `Sigil - Practical Symbolic Power`, with no third-party text.
-- [x] Timestamp: `1789056000` (`2026-09-10T16:00:00Z`), matching the staffed
-      launch window and valid under the 7200-second future-drift boundary.
-- [ ] From a clean cache, run the canonical all-network generator:
+- [x] Replacement timestamp: `1789228800` (`2026-09-12T16:00:00Z`), a
+      staffed launch window selected after the optimized nonce loop invalidated
+      the previous target calibration.
+- [x] From a clean cache, run the canonical all-network generator:
 
       cache=$(mktemp -d); trap 'rm -rf "$cache"' EXIT
-      nix develop /home/trev/Workspace/sigil -c env XDG_CACHE_HOME="$cache" \
-        /home/trev/Workspace/sigil/sigil/build/dev/bin/sigil \
-        deploy/genesis-constants.sgl --redirects ./dev-redirects.sgl
+      nix develop -c env XDG_CACHE_HOME="$cache" \
+        sigil deps install --redirects ./dev-redirects.sgl
+      nix develop -c env XDG_CACHE_HOME="$cache" \
+        sigil deploy/genesis-constants.sgl --redirects ./dev-redirects.sgl
 
       The empty cache is part of the check: a launch-critical genesis must
       compile from the current source, never reuse bytecode from an older build.
+      The 2026-09-11 run independently returned mainnet cursor `(6,
+      3129183091)` and reproduced every checked-in mainnet, testnet, and regtest
+      coinbase, merkle root, header, hash, and display id exactly.
 
       Record the selected final mainnet quote, timestamp, compact target,
       80-byte header hex, internal hash, and display id emitted by that run.
       Never reuse values generated before the packed `version`, compact target,
       and nonce-lottery cutover.
 
-- [x] Independently scan every nonce from 0 through `434733157` with eight
-      stdlib SHA256 workers. The selected nonce is the first qualifying value;
-      the exhaustive scan completed in 547.808 seconds.
+- [x] An independent OpenSSL scanner exhausted all `2^32` header nonces for
+      coinbase lock-times 0 through 5, then found the first lock-time 6 hit at
+      nonce `3129183091`. Before the final scan it reproduced the withdrawn
+      genesis's known first nonce, header, hash, and id byte-for-byte.
 
 - [x] Check `quote-bytes` against the 400-byte graffiti cap. 32 bytes used,
       368 to spare. It is a BYTE
       count of the UTF-8 the coinbase actually carries, not a character
       count, so a quote with any non-ASCII in it costs more than it looks.
 
-- [x] Copy the selected mainnet quote/time to `chain.sgl` and the header/id
-      pair to `genesis.sgl`; testnet and regtest constants remain unchanged.
-- [x] Re-run focused consensus, node/genesis, and site tests. `test-node.sgl`
-      rebuilds all three genesis blocks and checks the calibrated main header's
-      time, target, nonce, and lottery qualification.
+- [x] Copied the replacement quote/time/target and atomic
+      `(coinbase-lock-time, nonce, header, id)` constants to `chain.sgl` and
+      `genesis.sgl`; testnet and regtest constants remain unchanged.
+- [x] Focused consensus, node/genesis, network, CLI, site, and explorer
+      integration suites pass. `test-node.sgl` rebuilds all three genesis
+      blocks and checks the calibrated main header's time, target, coinbase
+      lock-time, nonce, and lottery qualification.
 
 ## 3. Stand the seed host's DNS up
 
@@ -150,7 +159,7 @@ the genesis hash: change one byte and every constant below changes.
 peer found nothing and said so, rather than silently reaching a stranger's
 host. It is gone.
 
-- [ ] Point `seed.sigilcoin.lol` at the seed host's A/AAAA records.
+- [x] `seed.sigilcoin.lol` A resolves publicly to `104.223.122.157`.
 - [x] `seed-peers` in `chain.sgl` is `(("seed.sigilcoin.lol" . 19444))`.
 - [ ] Re-run the suite, rebuild, and confirm a fresh data directory finds the
       seed with no `--peer` flag and no manual `peers add`.
@@ -164,11 +173,14 @@ Publish before the announcement, so the first person who reads it can verify
 rather than trust. A file in the repository is enough; a gist is not — it
 should be in the same place the code is.
 
-- [x] Genesis display id `000000026a3f4bfbb09e5efb21d6609ce1aa5f16a0784f1652eae75c1a0df8cf`;
-      internal hash `cff80d1a5ce7ea52164f78a0165faae19c60d621fb5e9eb0fb4b3f6a02000000`.
+- [x] Genesis display id
+      `000000000b25af1072272ae97b606d64b340fc8f61f78f04c3e794025832b969`;
+      internal hash
+      `69b932580294e7c3048ff7618ffc40b3646d607be92a277210af250b00000000`.
 - [x] Genesis header
-      `8090612000000000000000000000000000000000000000000000000000000000000000006f2fd2fcdd6310c40de5168f8d616a08059dd3de9e47aa5e3952995a04d11cb400d4a26af1d8021d6580e919`;
-      quote `Sigil - Practical Symbolic Power`.
+      `809061200000000000000000000000000000000000000000000000000000000000000000f7278556687a298a5f50eeea93a1bf1a6fabb91b164d6fca115ff754c90d5cd90077a56a04cf2b1c738b83ba`;
+      coinbase lock-time `6`, header nonce `3129183091`, quote
+      `Sigil - Practical Symbolic Power`.
 - [ ] Network magic `8f d1 c0 a5`, default port 19444, protocol version
       70015, user agent `/sigilcoin-node:0.1.0/`.
 - [ ] Address format: bech32, HRP `sgl`, so addresses read `sgl1…`.
@@ -187,22 +199,25 @@ should be in the same place the code is.
       personalized par (`L < personalized_par`); graffiti is at most 400 bytes,
       blocks at most 16384 bytes, and puzzles contain at most 8 example pairs.
       `version = 0x20600000 | ((L-1)<<12) | C`; `bits` is the canonical compact
-      base target. The builder finalizes the body and merkle root once, then
-      searches nonce `0..0xffffffff`. The full-header roll must not exceed
+      base target. The builder searches the uint32 header nonce, then increments
+      the coinbase transaction's final uint32 `lock-time`, rebuilds its txid and
+      merkle root, resets the nonce, and continues. The full-header roll must
+      not exceed
       `min(2^255-1,(compact-target(bits)+1)*2^min(max(par-L,0),8)-1)`.
-      Mainnet begins at `0x1d02d8f1`: about 1,508,367,639 rolls at par or
-      5,892,062 at `par-8`. Every 16 blocks, the preceding 15 timestamp intervals
-      retarget bits with a 0.25x..4x clamp toward one block per day. The
-      one-second parent floor only keeps timestamps monotone; future drift is
-      7200 seconds. Coinbase maturity is 1; the mainnet wallet waits six.
+      Mainnet begins at `0x1c2bcf04`: about 25,098,045,881 rolls at par or
+      98,039,242 at `par-8`. Every 16 blocks, the preceding 15 timestamp
+      intervals retarget bits with a 0.25x..4x clamp toward one block per day.
+      The one-second parent floor only keeps timestamps monotone; future drift
+      is 7200 seconds. Coinbase maturity is 1; the mainnet wallet waits six.
 - [ ] Fork choice, stated plainly: greater cumulative compact-target base work
       wins; equal work prefers greater height; an exact work-and-height tie
       retains the first valid arrival. Golf savings change admission odds, not
       credited chain work.
-- [x] Initial target frozen after benchmarking both launch hosts. Measured
-      at-par header search was 11,013 rolls/s locally and 17,458 rolls/s on
-      `racknerd-chi`; the faster host gives `0x1d02d8f1`, about 1,508,367,639
-      expected rolls or 24 hours at par. The final genesis uses this target.
+- [x] Initial target frozen after benchmarking both launch hosts with the
+      optimized nonce loop. Measured at-par search was 290,487 rolls/s locally
+      and 230,801 rolls/s on `racknerd-chi`; the faster host gives `0x1c2bcf04`,
+      25,098,045,881 expected rolls or 24 hours at par. The final genesis uses
+      this target.
 
 Anyone can check the internal hash with `sigilcoin status` on a fresh data
 directory and reproduce header, hash, and display id with
@@ -213,10 +228,10 @@ directory and reproduce header, hash, and display id with
 Follow [`deploy/RUNBOOK.md`](deploy/RUNBOOK.md); the checklist here is only
 the launch-day gate.
 
-- [ ] `deploy/flake.lock` pins `sigil-bitcoin` at
-      `424a4a83beb9e81ab7e292f4d51c05ce16306450` or a reviewed descendant with
-      the durable-parent seven-argument connector seam.
-- [ ] `cd …/sigil-coin/deploy && nix flake check` passes on the build host.
+- [x] `deploy/flake.lock` pins `sigil-bitcoin` at reviewed descendant
+      `4ecc1f188c51887450eb448b991dae28ba36dfa0`, which contains the
+      durable-parent seven-argument connector seam.
+- [x] `cd …/sigil-coin/deploy && nix flake check` passes on the build host.
       The number it prints is what was left to build (three checks exist;
       zero once cached), so do not read it as a pass count. Force all three:
       `nix build --rebuild --no-link .#checks.x86_64-linux.module-eval .#checks.x86_64-linux.sigilcoin-runs .#checks.x86_64-linux.sigilcoin-durable-parent`.
@@ -225,15 +240,12 @@ the launch-day gate.
       canonical flags and state paths, firewall port 19444,
       wallet/data-directory modes, and absence of any
       `sigilcoin-listen-proxy` unit.
-- [ ] `nix build …/sigil-coin?dir=deploy#sigilcoin` produces
-      `result/bin/sigilcoin` and `result/bin/sigilcoin-explorer`. Verify both
-      bounded command surfaces:
-      `timeout 5 ./result/bin/sigilcoin help`,
-      `timeout 5 ./result/bin/sigilcoin version`,
-      `timeout 5 ./result/bin/sigilcoin-explorer --help`, and
-      `timeout 5 ./result/bin/sigilcoin-explorer --version`.
-      Both version commands print `0.1.0`; all four return zero. The
-      `?dir=deploy` is required; see `deploy/flake.nix`.
+- [x] Final remote image `sigilcoin-local:mainnet` built from the reviewed
+      source with image id
+      `sha256:d782e6104def14cd7f59fed37c714c33f61d0d9cccfe8de4a295d322ad2be86a`.
+      Fresh containers returned zero for `sigilcoin help`, `sigilcoin version`,
+      `sigilcoin-explorer --help`, and `sigilcoin-explorer --version`; both
+      versions print `0.1.0`.
 - [ ] Host deployed with `services.sigilcoin.enable = true`,
       `chain = "sigilcoin-main"`, `listen.bind = "0.0.0.0"`,
       `openFirewall = true`.
@@ -252,8 +264,8 @@ the launch-day gate.
       build predates `--help`/`--version` handling and every explorer
       command has to be run under `timeout`.
 - [ ] Explorer up at `explorer.sigilcoin.lol` behind a TLS reverse proxy. The
-      explorer itself stays bound to `127.0.0.1:8080`; the proxy is the only
-      public path. Smoke-test canonical routes `/`, `/blocks`, `/difficulty`,
+      mainnet explorer itself stays bound to `127.0.0.1:8081`; the proxy is the
+      only public path. Smoke-test canonical routes `/`, `/blocks`, `/difficulty`,
       `/block/0`, `/api/summary`, `/api/blocks`, `/api/difficulty`, and
       `/api/block/0`. If explorer is not ready, launch without it and say so
       rather than delaying — a chain with no explorer is fine; a chain with no
@@ -335,14 +347,28 @@ soak. Run it before step 5, not after.
 
 Run mainnet rules — `--chain sigilcoin-main`, not regtest — on two nodes for
 **at least 24 hours**. The remote tag
-`sigilcoin-rehearsal:pre-calibration` pins image
-`sha256:5d8adf3f6705caff5f459a24b2d260bbeaab5ae631d30d758dd8a990b395dc67`
-to mine through H17 quickly, so both H16 retargets execute; that accelerated
+`sigilcoin-rehearsal:pre-calibration-optimized` pins image
+`sha256:a242ba169e64b28255ed65fc9e6f05e972c354278cbf4500bca3afc7d6749163`
+to mine through H17 quickly within the 768 MiB container limit, so both H16
+retargets execute; that accelerated
 chain tests consensus, not final cadence. Then leave both nodes connected for
 the full rehearsal while
 observing cumulative-work fork choice, disconnect/reconnect behavior, restart
 recovery, commit/reveal, and exact agreement. This compressed rehearsal accepts
 that long-duration resource and network behavior remains untested.
+
+The corrected rehearsal ran from `2026-09-08T12:38:33Z` through
+`2026-09-09T12:41:14Z`. Twenty-seven hashed snapshots record both nodes at
+the same H20 tip, work `352326912`, 20 validated bodies, and
+`16.00000000 SGL` issued. Both containers remained inside their limits with
+no OOM or unplanned restart; disconnect/reconnect, clean restart, planned
+hard-kill recovery, restore, over-par rejection, 400/401-byte graffiti, and
+first-seen sibling/child drills completed.
+
+This closes the elapsed-time, synchronization, recovery, and resource portion
+only. It does not close the launch gate while the public-testnet checklist and
+the operational exact-size, forced-timestamp, exact-target, and full varied
+sibling drills below remain unresolved.
 
 On `racknerd-chi`, the prepared launcher refuses to run before the testnet gate:
 
@@ -420,8 +446,8 @@ DNS and TLS, and nothing unresolved here can be deferred past step 5.
 | # | Decision | Where it lives now |
 | --- | --- | --- |
 | 1 | ~~The genesis quote~~ — RESOLVED: `Sigil - Practical Symbolic Power`, the operator's own words, so no third-party permission is needed. 32 UTF-8 bytes, 368 under the 400-byte graffiti cap. | `coin-genesis-quote` in `packages/sigil-coin-node/src/sigil/coin/node/chain.sgl` |
-| 2 | ~~The genesis timestamp~~ — RESOLVED: `1789056000` (`2026-09-10T16:00:00Z`). | `coin-genesis-time` in `packages/sigil-coin-node/src/sigil/coin/node/chain.sgl` |
-| 3 | ~~Final mainnet genesis constants~~ — RESOLVED from the selected quote, timestamp, and calibrated `0x1d02d8f1` target. | `coin-genesis-header-constant` and `coin-genesis-id-constant` in `genesis.sgl` |
+| 2 | ~~The genesis timestamp~~ — RESOLVED: `1789228800` (`2026-09-12T16:00:00Z`). | `coin-genesis-time` in `packages/sigil-coin-node/src/sigil/coin/node/chain.sgl` |
+| 3 | ~~Final mainnet genesis constants~~ — RESOLVED by an exhaustive independent scan: first qualifying pair `(coinbase lock-time 6, header nonce 3129183091)` for the selected quote, timestamp, and `0x1c2bcf04` target. | `coin-genesis-coinbase-lock-time-constant`, `coin-genesis-nonce-constant`, `coin-genesis-header-constant`, and `coin-genesis-id-constant` in `genesis.sgl` |
 | 4 | ~~The real seed DNS name~~ — RESOLVED: `seed.sigilcoin.lol:19444`, on the operator's own domain. The A/AAAA records still have to exist before step 5. | `sigilcoin-main-chain` seed peers in `chain.sgl` |
 | 5 | ~~Where the repository is published~~ — RESOLVED and confirmed: `https://github.com/trevarj/sigil-coin`, the operator's account. Every `package.sgl` and the announcement now say so. | `package.sgl` files, the step 6 announcement |
 | 6 | ~~`depsHash`~~ — RESOLVED. There is no vendoring derivation and no hash to fill in: every `from-git` dependency is a pinned flake input, so Nix fetches it and the sandbox stays offline. Bumping one is `nix flake update <input>` in `deploy/`. | — |

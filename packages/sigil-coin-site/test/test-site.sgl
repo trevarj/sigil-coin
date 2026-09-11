@@ -66,7 +66,7 @@
       (lambda (text) (assert-true (has? %html text)))
       '("Bitcoin foundation" "Frozen puzzle machine" "Header nonce lottery"
         "Independent retargets" "Co-op commit–reveal"
-        "full-header HASH256" "1.51 billion rolls at par"
+        "full-header HASH256" "25.10 billion rolls at par"
         "cumulative retargeted base work"
         "https://usesigil.org"
         "https://github.com/trevarj/sigil-coin"
@@ -188,11 +188,11 @@
           (fork (generated %a "assets/score-fork.svg")))
       (for-each
         (lambda (text) (assert-true (has? mining text)))
-        '("uint32 nonces" "full-header HASH256" "ROLL ≤ TARGET"
+        '("coinbase lock-time" "full-header HASH256" "ROLL ≤ TARGET"
           "Shorter improves odds"))
       (for-each
         (lambda (text) (assert-true (has? fork text)))
-        '("~1.51B expected" "~5.89M expected" "Cumulative base work"
+        '("~25.10B expected" "~98.04M expected" "Cumulative base work"
           "More cumulative base work" "Golf bonus changes admission odds"))))
 
 (run-tests)
