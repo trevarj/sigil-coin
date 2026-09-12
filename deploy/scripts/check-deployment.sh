@@ -48,10 +48,10 @@ expect_exit 64 bash deploy/scripts/deploy-testnet-remote.sh
 expect_exit 64 bash deploy/scripts/deploy-testnet-remote.sh -host
 
 assert_fixed 'root * /srv/sigilcoin/site' deploy/Caddyfile
-[[ $(sed -n '1,3p' deploy/Caddyfile) == $'explorer.sigilcoin.lol {\n\trespond 404\n}' ]] ||
-  fail 'mainnet explorer prelaunch host is not a TLS-only 404 site'
-if grep -Fq '127.0.0.1:8081' deploy/Caddyfile; then
-  fail 'prelaunch mainnet explorer host reaches an origin'
+assert_fixed 'explorer.sigilcoin.lol {' deploy/Caddyfile
+assert_fixed 'reverse_proxy 127.0.0.1:8081' deploy/Caddyfile
+if grep -Fq 'respond 404' deploy/Caddyfile; then
+  fail 'public mainnet explorer still returns the prelaunch 404'
 fi
 assert_fixed '@site_assets path /assets/sigilcoin-symbol.png /assets/plus-jakarta.woff2 /assets/jetbrains-mono.woff2' deploy/Caddyfile
 assert_fixed 'reverse_proxy 127.0.0.1:8080' deploy/Caddyfile

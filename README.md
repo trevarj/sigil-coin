@@ -49,9 +49,9 @@ Program length changes admission odds, not credited chain work. Fork choice foll
 
 | Parameter | Mainnet |
 |---|---|
-| Status | Experimental |
+| Status | Live, experimental |
 | DNS seed | `seed.sigilcoin.lol:19444` |
-| Explorer | [explorer.sigilcoin.lol](https://explorer.sigilcoin.lol) — opens at public cutover |
+| Explorer | [explorer.sigilcoin.lol](https://explorer.sigilcoin.lol) |
 | Address prefix | `sgl1…` |
 | Target cadence | About one block per day |
 | Initial target | `0x1c2bcf04` |

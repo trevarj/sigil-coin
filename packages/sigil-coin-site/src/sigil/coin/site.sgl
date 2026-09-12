@@ -24,7 +24,7 @@
       "https://github.com/trevarj/sigil-coin/blob/HEAD/docs/whitepaper.md")
     (define %consensus
       "https://github.com/trevarj/sigil-coin/blob/HEAD/docs/consensus.md")
-    (define %explorer "https://explorer.testnet.sigilcoin.lol")
+    (define %explorer "https://explorer.sigilcoin.lol")
     (define %pool "https://pool.testnet.sigilcoin.lol")
     (define %release "https://github.com/trevarj/sigil-coin/releases")
 

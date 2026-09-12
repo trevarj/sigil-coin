@@ -33,8 +33,8 @@
     (assert-true
       (has? %html
             "Solve the puzzle, then roll the nonce. Every byte saved doubles your odds, up to eight."))
-    (assert-true (has? %html "https://explorer.testnet.sigilcoin.lol"))
-    (assert-true (not (has? %html "https://explorer.sigilcoin.lol")))
+    (assert-true (has? %html "https://explorer.sigilcoin.lol"))
+    (assert-true (not (has? %html "https://explorer.testnet.sigilcoin.lol")))
     (assert-true
       (has? %html
             "https://github.com/trevarj/sigil-coin/blob/HEAD/docs/whitepaper.md")))
