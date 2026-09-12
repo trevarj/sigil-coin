@@ -21,6 +21,7 @@
 
 <p align="center">
   <a href="https://sigilcoin.lol"><strong>Website</strong></a> ·
+  <a href="https://explorer.sigilcoin.lol"><strong>Mainnet explorer</strong></a> ·
   <a href="https://explorer.testnet.sigilcoin.lol"><strong>Testnet explorer</strong></a> ·
   <a href="docs/whitepaper.md"><strong>Whitepaper</strong></a> ·
   <a href="docs/consensus.md"><strong>Consensus</strong></a> ·
@@ -50,7 +51,7 @@ Program length changes admission odds, not credited chain work. Fork choice foll
 |---|---|
 | Status | Experimental |
 | DNS seed | `seed.sigilcoin.lol:19444` |
-| Explorer | `explorer.sigilcoin.lol` (opens at public cutover) |
+| Explorer | [explorer.sigilcoin.lol](https://explorer.sigilcoin.lol) — opens at public cutover |
 | Address prefix | `sgl1…` |
 | Target cadence | About one block per day |
 | Initial target | `0x1c2bcf04` |
