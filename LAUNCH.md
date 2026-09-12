@@ -242,7 +242,7 @@ the launch-day gate.
       `sigilcoin-listen-proxy` unit.
 - [x] Final remote image `sigilcoin-local:mainnet` built from the reviewed
       source with image id
-      `sha256:d782e6104def14cd7f59fed37c714c33f61d0d9cccfe8de4a295d322ad2be86a`.
+      `sha256:faa7b310268de2d45d1a2c71555bafd5bd7bc8033694a14db439db4ebda46f6d`.
       Fresh containers returned zero for `sigilcoin help`, `sigilcoin version`,
       `sigilcoin-explorer --help`, and `sigilcoin-explorer --version`; both
       versions print `0.1.0`.

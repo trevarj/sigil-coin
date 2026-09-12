@@ -223,6 +223,124 @@ case "$service_mode" in
     done
     ;;
 
+  miner-loop)
+    required_address=sgl1qj9f6eeqxhjgynml4glztyrdw5tj5fn72s6shud
+    launch_time=1789228800
+    [ "$chain" = mainnet ] || {
+      echo "miner-loop is mainnet-only" >&2
+      exit 64
+    }
+    miner_address=${MINER_ADDRESS:-}
+    [ "$miner_address" = "$required_address" ] || {
+      echo "miner-loop requires the configured mainnet payout address" >&2
+      exit 64
+    }
+    interval=${MINE_INTERVAL:-60}
+    case "$interval" in
+      ''|*[!0-9]*)
+        echo "MINE_INTERVAL must be a positive integer" >&2
+        exit 64
+        ;;
+    esac
+    [ "$interval" -gt 0 ] 2>/dev/null || {
+      echo "MINE_INTERVAL must be a positive integer" >&2
+      exit 64
+    }
+    now=$(/usr/local/bin/date -u +%s) || {
+      echo "miner-loop could not read the UTC clock" >&2
+      exit 64
+    }
+    case "$now" in
+      ''|*[!0-9]*)
+        echo "miner-loop received an invalid UTC clock" >&2
+        exit 64
+        ;;
+    esac
+    [ "$now" -ge "$launch_time" ] 2>/dev/null || {
+      echo "refusing miner before 2026-09-12T16:00:00Z" >&2
+      exit 64
+    }
+    secure_node_state
+
+    miner_tip() {
+      status=$("$coin" status --data-dir "$data_dir") || return 1
+      while IFS= read -r line; do
+        case "$line" in
+          "best-block-hash: "*)
+            printf '%s\n' "${line#best-block-hash: }"
+            return 0
+            ;;
+        esac
+      done <<EOF
+$status
+EOF
+      return 1
+    }
+
+    stop=0
+    miner_child=
+    sleep_child=
+    on_signal() {
+      stop=1
+      if [ -n "$miner_child" ]; then
+        kill -TERM "$miner_child" 2>/dev/null || true
+      fi
+      if [ -n "$sleep_child" ]; then
+        kill -TERM "$sleep_child" 2>/dev/null || true
+      fi
+    }
+    trap on_signal INT TERM HUP
+
+    while [ "$stop" -eq 0 ]; do
+      if ! start_tip=$(miner_tip); then
+        echo "mine skipped: could not read the validated tip" >&2
+        rc=1
+        stale=0
+      else
+        "$coin" mine \
+          --address "$required_address" \
+          --data-dir "$data_dir" &
+        miner_child=$!
+        if [ "$stop" -ne 0 ]; then
+          kill -TERM "$miner_child" 2>/dev/null || true
+        fi
+        stale=0
+        while kill -0 "$miner_child" 2>/dev/null; do
+          sleep 10 &
+          sleep_child=$!
+          if [ "$stop" -ne 0 ]; then
+            kill -TERM "$sleep_child" 2>/dev/null || true
+          fi
+          wait "$sleep_child" 2>/dev/null || true
+          sleep_child=
+          [ "$stop" -eq 0 ] || break
+          kill -0 "$miner_child" 2>/dev/null || break
+          if current_tip=$(miner_tip) && [ "$current_tip" != "$start_tip" ]; then
+            stale=1
+            kill -TERM "$miner_child" 2>/dev/null || true
+            break
+          fi
+        done
+        if wait "$miner_child"; then rc=0; else rc=$?; fi
+        miner_child=
+      fi
+
+      [ "$stop" -eq 0 ] || break
+      if [ "$stale" -eq 1 ]; then
+        echo "mine canceled: validated tip changed; rebuilding in ${interval}s" >&2
+      elif [ "$rc" -ne 0 ]; then
+        echo "mine failed (exit $rc); retrying in ${interval}s" >&2
+      fi
+      sleep "$interval" &
+      sleep_child=$!
+      if [ "$stop" -ne 0 ]; then
+        kill -TERM "$sleep_child" 2>/dev/null || true
+      fi
+      wait "$sleep_child" 2>/dev/null || true
+      sleep_child=
+    done
+    ;;
+
   explorer)
     set -- "$explorer" \
       --host "${EXPLORER_HOST:-0.0.0.0}" \

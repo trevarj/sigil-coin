@@ -421,7 +421,7 @@ if [[ $mode == testnet ]]; then
 fi
 
 
-compose_args=(-f "compose.$mode.yml")
+compose_args=(-p "sigilcoin-$mode" -f "compose.$mode.yml")
 if [[ $mode == mainnet ]]; then
   compose_args=(--profile mainnet-explorer "${compose_args[@]}")
 fi
@@ -439,6 +439,9 @@ else
 fi
 
 docker compose "${compose_args[@]}" config --quiet
+if [[ $mode == mainnet ]]; then
+  docker compose "${compose_args[@]}" --profile mainnet-miner rm -sf miner
+fi
 docker compose "${compose_args[@]}" build
 if [[ $mode == mainnet ]]; then
   caddy_source=$remote_dir/sigil-coin/deploy/Caddyfile

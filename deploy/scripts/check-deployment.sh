@@ -33,11 +33,13 @@ expect_not_exit() {
 
 bash -n deploy/scripts/deploy-remote.sh deploy/scripts/deploy-site-remote.sh \
   deploy/scripts/deploy-testnet-remote.sh deploy/scripts/run-local.sh \
-  deploy/scripts/stop-local.sh deploy/scripts/check-deployment.sh
+  deploy/scripts/start-mainnet-miner.sh deploy/scripts/stop-local.sh \
+  deploy/scripts/check-deployment.sh
 sh -n deploy/docker/entrypoint.sh
 for script in deploy/scripts/deploy-remote.sh \
   deploy/scripts/deploy-site-remote.sh deploy/scripts/deploy-testnet-remote.sh \
-  deploy/scripts/run-local.sh deploy/scripts/stop-local.sh
+  deploy/scripts/run-local.sh deploy/scripts/start-mainnet-miner.sh \
+  deploy/scripts/stop-local.sh
 do
   bash "$script" --help >/dev/null
 done
@@ -119,6 +121,20 @@ assert_fixed '"127.0.0.1:8081:8080/tcp"' deploy/docker/compose.mainnet.yml
 assert_fixed 'profiles: ["mainnet-explorer"]' deploy/docker/compose.mainnet.yml
 assert_fixed 'compose_args=(--profile mainnet-explorer' deploy/scripts/deploy-remote.sh
 assert_fixed 'default_explorer_port=8081' deploy/scripts/run-local.sh
+assert_fixed 'profiles: ["mainnet-miner"]' deploy/docker/compose.mainnet.yml
+assert_fixed 'command: ["miner-loop"]' deploy/docker/compose.mainnet.yml
+assert_fixed 'MINER_ADDRESS: ${MAINNET_MINER_ADDRESS:-}' \
+  deploy/docker/compose.mainnet.yml
+assert_fixed 'MAINNET_MINER_ADDRESS=sgl1qj9f6eeqxhjgynml4glztyrdw5tj5fn72s6shud' \
+  deploy/scripts/start-mainnet-miner.sh
+assert_fixed 'required_address=sgl1qj9f6eeqxhjgynml4glztyrdw5tj5fn72s6shud' \
+  deploy/docker/entrypoint.sh
+assert_fixed 'launch_time=1789228800' deploy/docker/entrypoint.sh
+assert_fixed 'mine canceled: validated tip changed' deploy/docker/entrypoint.sh
+assert_fixed 'for command in chmod date mkdir sleep' deploy/docker/Dockerfile
+assert_fixed 'compose -p sigilcoin-mainnet' deploy/scripts/start-mainnet-miner.sh
+assert_fixed '--wait-timeout 180 miner' deploy/scripts/start-mainnet-miner.sh
+assert_fixed '--profile mainnet-miner rm -sf miner' deploy/scripts/deploy-remote.sh
 if grep -Fq 'MAINNET_EXPLORER_' deploy/docker/compose.mainnet.yml deploy/docker/.env.example; then
   fail 'mainnet explorer host mapping has an environment override'
 fi
@@ -199,6 +215,15 @@ expect_exit 64 env REMOTE_HOST=host SSH_IDENTITIES_ONLY= bash deploy/scripts/dep
 expect_exit 64 env ALLOW_MAINNET=maybe BIN_DIR=/nonexistent bash deploy/scripts/run-local.sh
 expect_exit 64 env CHAIN=mainnet sh deploy/docker/entrypoint.sh listener
 expect_exit 64 env CHAIN=mainnet ALLOW_MAINNET=yes sh deploy/docker/entrypoint.sh relay
+expect_exit 64 env CHAIN=testnet MINER_ADDRESS=sgl1qj9f6eeqxhjgynml4glztyrdw5tj5fn72s6shud \
+  sh deploy/docker/entrypoint.sh miner-loop
+expect_exit 64 env CHAIN=mainnet ALLOW_MAINNET=yes \
+  sh deploy/docker/entrypoint.sh miner-loop
+expect_exit 64 env CHAIN=mainnet ALLOW_MAINNET=yes MINER_ADDRESS=sgl1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq \
+  sh deploy/docker/entrypoint.sh miner-loop
+expect_exit 64 env CHAIN=mainnet ALLOW_MAINNET=yes \
+  MINER_ADDRESS=sgl1qj9f6eeqxhjgynml4glztyrdw5tj5fn72s6shud MINE_INTERVAL=0 \
+  sh deploy/docker/entrypoint.sh miner-loop
 expect_exit 64 env CHAIN=testnet sh deploy/docker/entrypoint.sh cli listen
 expect_exit 64 env CHAIN=testnet sh deploy/docker/entrypoint.sh cli -- listen
 expect_exit 64 env CHAIN=testnet sh deploy/docker/entrypoint.sh cli status \
@@ -276,7 +301,7 @@ printf '%s\n' "$*" >> "${FAKE_CADDY_CALLS:?}"
 EOF
 cat > "$preflight_state/bin/docker" <<'EOF'
 case " $* " in
-  *" config "*|*" build "*) exit 0 ;;
+  *" config "*|*" build "*|*" rm "*) exit 0 ;;
   *" up "*)
     grep -Fq 'reload --config' "${FAKE_CADDY_CALLS:?}" || exit 68
     exit 69
@@ -330,7 +355,7 @@ def load(name):
 testnet = load('deploy/docker/compose.testnet.yml')
 mainnet = load('deploy/docker/compose.mainnet.yml')
 assert set(testnet['services']) == {'listener', 'sync', 'explorer', 'pool'}
-assert set(mainnet['services']) == {'listener', 'sync', 'explorer'}
+assert set(mainnet['services']) == {'listener', 'sync', 'explorer', 'miner'}
 
 mainnet_listener = mainnet['services']['listener']
 assert mainnet_listener['environment']['HOST_P2P_BIND'] == '${MAINNET_P2P_BIND:-127.0.0.1}'
@@ -340,6 +365,11 @@ assert mainnet_listener['ports'] == [
 ]
 assert mainnet['services']['explorer']['profiles'] == ['mainnet-explorer']
 assert mainnet['services']['explorer']['ports'] == ['127.0.0.1:8081:8080/tcp']
+miner = mainnet['services']['miner']
+assert miner['profiles'] == ['mainnet-miner']
+assert miner['command'] == ['miner-loop']
+assert miner['environment']['MINER_ADDRESS'] == '${MAINNET_MINER_ADDRESS:-}'
+assert miner['depends_on']['sync']['condition'] == 'service_healthy'
 
 pool = testnet['services']['pool']
 assert pool['user'] == '${POOL_UID:-1002}:${SIGIL_GID:-1000}'
@@ -368,16 +398,103 @@ fi
 tmp=$(mktemp -d)
 runner=
 deceptive=
+miner_runner=
 cleanup() {
   [[ -z $runner ]] || kill -KILL "$runner" 2>/dev/null || true
   [[ -z $deceptive ]] || kill -KILL "$deceptive" 2>/dev/null || true
+  [[ -z $miner_runner ]] || kill -KILL "$miner_runner" 2>/dev/null || true
   [[ -z $runner ]] || wait "$runner" 2>/dev/null || true
   [[ -z $deceptive ]] || wait "$deceptive" 2>/dev/null || true
+  [[ -z $miner_runner ]] || wait "$miner_runner" 2>/dev/null || true
   rm -rf -- "$tmp"
 }
 trap cleanup EXIT
 
 bash_path=$(command -v bash)
+mkdir -p -- "$tmp/miner-bin"
+cat > "$tmp/miner-bin/date" <<EOF
+#!$bash_path
+printf '%s\n' "\${FAKE_NOW:?}"
+EOF
+cat > "$tmp/miner-bin/sigilcoin" <<EOF
+#!$bash_path
+case \${1:-} in
+  status)
+    if [[ -e \${FAKE_TIP_CHANGED:?} ]]; then
+      printf 'best-block-hash: bb\n'
+    else
+      printf 'best-block-hash: aa\n'
+    fi
+    ;;
+  mine)
+    printf '%s\n' "\$*" > "\${FAKE_MINE_ARGS:?}"
+    : > "\${FAKE_MINE_STARTED:?}"
+    child=
+    stop() {
+      [[ -z \$child ]] || kill "\$child" 2>/dev/null || true
+      : > "\${FAKE_MINE_CANCELED:?}"
+      exit 0
+    }
+    trap stop TERM INT HUP
+    while :; do sleep 30 & child=\$!; wait "\$child" || true; done
+    ;;
+  *) exit 64 ;;
+esac
+EOF
+chmod +x -- "$tmp/miner-bin/date" "$tmp/miner-bin/sigilcoin"
+sed -e "s|coin=/opt/sigilcoin/bin/sigilcoin|coin=$tmp/miner-bin/sigilcoin|" \
+  -e "s|/usr/local/bin/date|$tmp/miner-bin/date|" \
+  -e 's|sleep 10|sleep 0.05|' \
+  deploy/docker/entrypoint.sh > "$tmp/miner-entrypoint.sh"
+
+expect_exit 64 env CHAIN=mainnet ALLOW_MAINNET=yes \
+  MINER_ADDRESS=sgl1qj9f6eeqxhjgynml4glztyrdw5tj5fn72s6shud \
+  MINE_INTERVAL=1 FAKE_NOW=1789228799 DATA_DIR="$tmp/miner-state" \
+  sh "$tmp/miner-entrypoint.sh" miner-loop
+[[ ! -e $tmp/mine-started ]] ||
+  fail 'prelaunch miner reached its child'
+
+CHAIN=mainnet ALLOW_MAINNET=yes \
+  FAKE_NOW=1789228800 \
+  MINER_ADDRESS=sgl1qj9f6eeqxhjgynml4glztyrdw5tj5fn72s6shud \
+  MINE_INTERVAL=1 DATA_DIR="$tmp/miner-state" \
+  FAKE_TIP_CHANGED="$tmp/tip-changed" \
+  FAKE_MINE_ARGS="$tmp/mine-args" \
+  FAKE_MINE_STARTED="$tmp/mine-started" \
+  FAKE_MINE_CANCELED="$tmp/mine-canceled" \
+  sh "$tmp/miner-entrypoint.sh" miner-loop >"$tmp/miner.out" 2>&1 &
+miner_runner=$!
+for _ in {1..100}; do
+  [[ -e $tmp/mine-started ]] && break
+  kill -0 "$miner_runner" 2>/dev/null || {
+    cat "$tmp/miner.out" >&2
+    fail 'miner loop exited before launching its child'
+  }
+  sleep 0.05
+done
+[[ -e $tmp/mine-started ]] || fail 'miner loop did not launch its child'
+grep -Fxq "mine --address sgl1qj9f6eeqxhjgynml4glztyrdw5tj5fn72s6shud --data-dir $tmp/miner-state" \
+  "$tmp/mine-args" || fail 'miner did not use the fixed payout address'
+[[ ! -e $tmp/miner-state/wallet/wallet.key ]] ||
+  fail 'fixed-address miner created a wallet key'
+: > "$tmp/tip-changed"
+for _ in {1..100}; do
+  [[ -e $tmp/mine-canceled ]] && break
+  sleep 0.05
+done
+[[ -e $tmp/mine-canceled ]] || fail 'miner did not cancel after a tip change'
+grep -Fq 'mine canceled: validated tip changed' "$tmp/miner.out" ||
+  fail 'miner did not report stale-work cancellation'
+kill -TERM "$miner_runner"
+for _ in {1..100}; do
+  kill -0 "$miner_runner" 2>/dev/null || break
+  sleep 0.05
+done
+kill -0 "$miner_runner" 2>/dev/null &&
+  fail 'miner loop did not stop promptly'
+wait "$miner_runner" 2>/dev/null || true
+miner_runner=
+
 mkdir -p -- "$tmp/bin"
 cat > "$tmp/bin/sigilcoin" <<EOF
 #!$bash_path

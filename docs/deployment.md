@@ -414,3 +414,27 @@ These commands document the future safety gate; they are not launch approval.
 The public testnet must complete its 48-hour gate before the separate 24-hour
 private mainnet rehearsal. See [testnet.md](testnet.md) and
 [LAUNCH.md](../LAUNCH.md).
+
+### Automatic mainnet mining
+
+On the Docker host, `start-mainnet-miner.sh` starts the non-default
+`mainnet-miner` profile only after the launch timestamp. It pays every producer
+reward to `sgl1qj9f6eeqxhjgynml4glztyrdw5tj5fn72s6shud`, stores no wallet key
+on the seed, and cancels an in-flight search whenever the validated tip changes.
+
+```sh
+bash /srv/sigilcoin/sigil-coin/deploy/scripts/start-mainnet-miner.sh
+cd /srv/sigilcoin/sigil-coin/deploy/docker
+docker compose -p sigilcoin-mainnet --env-file .env --profile mainnet-miner \
+  -f compose.mainnet.yml logs -f miner
+```
+
+Normal mainnet deployment stops and removes an active miner before replacing
+node binaries. Run the guarded launcher again after every deployment. To stop
+only mining:
+
+```sh
+cd /srv/sigilcoin/sigil-coin/deploy/docker
+docker compose -p sigilcoin-mainnet --env-file .env --profile mainnet-miner \
+  -f compose.mainnet.yml stop miner
+```

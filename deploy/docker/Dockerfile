@@ -30,7 +30,7 @@ RUN nix-store --import < /tmp/sigilcoin.nar \
     && test -f "$out/share/sigilcoin-site/index.html" \
     && mkdir -p /opt /usr/local/bin \
     && ln -s "$out" /opt/sigilcoin \
-    && for command in chmod mkdir sleep; do \
+    && for command in chmod date mkdir sleep; do \
          ln -s "$(readlink -f "$(command -v "$command")")" "/usr/local/bin/$command"; \
        done \
     && rm -f /tmp/sigilcoin.nar /tmp/sigilcoin-out
