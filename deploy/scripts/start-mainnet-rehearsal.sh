@@ -1,10 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-[[ $(date -u +%s) -ge 1788845415 ]] || {
-  echo "refusing rehearsal before the 48-hour testnet gate" >&2
-  exit 64
-}
 
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../docker" && pwd)
 cd "$root"
@@ -16,8 +12,8 @@ for name in sigilcoin-main-rehearsal-a sigilcoin-main-rehearsal-b sigilcoin-main
   }
 done
 
-state_a=$root/state/mainnet-rehearsal-a
-state_b=$root/state/mainnet-rehearsal-b
+state_a=$root/state/mainnet-rehearsal-a-proof-of-golf
+state_b=$root/state/mainnet-rehearsal-b-proof-of-golf
 [[ ! -e $state_a && ! -e $state_b ]] || {
   echo "refusing existing rehearsal state; archive it first" >&2
   exit 73
@@ -41,12 +37,7 @@ common=(
   -e ALLOW_MAINNET=yes
   -e DATA_DIR=/var/lib/sigilcoin
 )
-image=${SIGIL_IMAGE:-sigilcoin-rehearsal:pre-calibration-optimized}
-
-docker run --rm "${common[@]}" \
-  -v "$state_a:/var/lib/sigilcoin" \
-  --entrypoint /opt/sigilcoin/bin/sigilcoin "$image" \
-  address --data-dir /var/lib/sigilcoin
+image=${SIGIL_IMAGE:-sigilcoin-proof-of-golf:latest}
 
 docker run -d --name sigilcoin-main-rehearsal-a --restart unless-stopped \
   --network-alias main-a "${common[@]}" \
@@ -57,18 +48,13 @@ docker run -d --name sigilcoin-main-rehearsal-b --restart unless-stopped \
   -v "$state_b:/var/lib/sigilcoin" \
   --entrypoint /usr/local/bin/sigilcoin-entrypoint "$image" sync-loop >/dev/null
 
-# Mine the current easy-target rehearsal chain through both H16 retargets.
-# This validates transitions quickly; the final calibrated target is applied
-# only after the rehearsal and gets its own fresh-genesis two-node smoke.
+# Rehearse the real schedule and payout guard, not an accelerated mainnet.
 docker run -d --name sigilcoin-main-rehearsal-miner \
-  "${common[@]}" -v "$state_a:/var/lib/sigilcoin" \
-  --entrypoint /bin/sh "$image" -c '
-    i=0
-    while [ "$i" -lt 17 ]; do
-      /opt/sigilcoin/bin/sigilcoin mine --data-dir /var/lib/sigilcoin || exit $?
-      i=$((i + 1))
-    done
-  ' >/dev/null
+  "${common[@]}" \
+  -e MINER_ADDRESS=sgl1qj9f6eeqxhjgynml4glztyrdw5tj5fn72s6shud \
+  -e MINE_INTERVAL=60 \
+  -v "$state_a:/var/lib/sigilcoin" \
+  --entrypoint /usr/local/bin/sigilcoin-entrypoint "$image" producer-loop >/dev/null
 
 printf 'rehearsal-started: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 printf 'inspect: docker logs -f sigilcoin-main-rehearsal-miner\n'

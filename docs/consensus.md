@@ -1,5 +1,11 @@
 # SigilCoin Consensus Specification
 
+This specification applies to replacement proof-of-golf networks from height 0.
+The nonce-PoW launch was retired before height 1 because its compute burn
+contradicted the project's intent. Its launch record is historical and
+superseded; retired nonce-PoW state is archived, never reused or validated under
+two rule sets. This is a hobby chain, not settlement-grade security (§13).
+
 ---
 
 ## 1. Overview of the six mechanisms
@@ -13,13 +19,16 @@
 3. **Co-op blocks.** Up to 8 signed shares ride in the coinbase alongside the
    producer's own solution. Each share solves a task personalized by its payout
    pubkey and receives a mandatory payout output.
-4. **Program-golf lottery.** Header `version` commits producer length `L` and
-   puzzle complexity `C`; `bits` carries the interval-retargeted compact base
-   target; the coinbase lock-time and header nonce are searched automatically.
-   Each byte below par doubles the accepted hash range, up to eight bytes.
-5. **Independent retargets.** Every 16 blocks, elapsed header time retargets
-   `bits` while median relative improvement below par adjusts puzzle complexity
-   `C`. Neither feedback signal controls the other.
+4. **Scheduled proof-of-golf and longest-height selection.** Header `version`
+   commits producer length `L` and puzzle complexity `C`. Validity requires
+   `L <= par`. Golf score displays quality, not selection weight or subsidy.
+   Only a strictly taller valid branch wins; equal height retains the durable
+   active incumbent. Hardcoded release checkpoints bound reorgs (§5.8).
+5. **Exact slots and puzzle-complexity retarget.** A non-genesis timestamp is
+   exactly its parent's time plus the network spacing and MUST NOT be in the
+   future. Header nonce is zero and `bits` is fixed at the network pow limit;
+   there is no hash-target check, search, or hash-difficulty retarget. Every
+   16 blocks, median relative improvement below par still adjusts `C`.
 6. **Commit–reveal.** Commitments for puzzle `H` ride in block `H`; reveals and
    share payouts ride in block `H+1`.
 
@@ -55,23 +64,21 @@
 |---|---:|
 | `coin-max-block-bytes` | 16384 |
 | `coin-max-solution-bytes` | 512 |
-| `coin-max-graffiti-bytes` | 400 |
+| `coin-max-graffiti-bytes` | 400 in the payload codec; non-genesis graffiti MUST be empty |
 | `coin-max-shares` | 8 |
 | `coin-max-commitments` | 16 |
-| `coin-min-block-spacing` | 1 |
-| `coin-max-future-drift` | 7200 |
+| `coin-min-block-spacing` | 86400 s on mainnet; configured shorter slots on test networks |
+| `coin-max-future-drift` | 0 |
 | `coin-median-time-span` | 11 |
-| target retarget interval | 16 blocks |
-| target retarget timespan | 15 target spacings |
-| mainnet/testnet/regtest target spacing | 86400 / 3600 / 1 s |
-| mainnet/testnet/regtest pow-limit bits | `0x1c2bcf04` / `0x1f00ffff` / `0x2000ffff` |
+| mainnet/testnet/regtest exact slot spacing | 86400 / 3600 / 1 s |
+| mainnet/testnet/regtest fixed `bits` (pow limit) | `0x1c2bcf04` / `0x1f00ffff` / `0x2000ffff` |
 | `coin-retarget-window` | 16 |
 | `coin-target-margin` | 100 milli-units |
-| lottery maximum bonus | 8 bytes |
-| lottery maximum integer | `2^256 - 1` |
-| lottery target ceiling | `2^255 - 1` |
+| `coin-golf-max-savings` | 8 bytes |
+| non-genesis block score / genesis score | 1..9 / 0 |
+| header nonce / non-genesis coinbase `nLockTime` | 0 / 0 |
 | header `version` prefix | `0x20600000` under `0xffe00000` |
-| coinbase scriptSig bytes | 8..6588 |
+| coinbase scriptSig bytes | codec 8..6583; non-genesis at most 6186 |
 
 The block-subsidy schedule, scheduled maximum, and coinbase maturity are
 consensus rules. SigilCoin sets maturity to 1 block, so an output created in
@@ -110,11 +117,13 @@ seed(H) = SHA256d( "SigilCoin/puzzle/1"          (18 ASCII bytes)
 seed(0) = SHA256d( "SigilCoin/genesis/puzzle/1" )
 ```
 
-**Determinism.** Fixed-width fields make the preimage injective, so no two
-`(prev_hash, H, C)` triples share a seed. `C(H)` is derived from the parent
-chain (§9), not read from the candidate header, so a block cannot choose its
-own puzzle by lying in `bits`; §9.4 requires the header to match the derived
-value exactly.
+**Determinism.** Fixed-width fields make the preimage encoding injective.
+`C(H)` is derived from the parent chain (§9), not read from the candidate
+header, so a block cannot choose its own complexity by lying in `version`;
+§9.4 requires the header to match the derived value exactly. Hash collision
+resistance is assumed, not mathematical injectivity of SHA256d. A producer
+can still vary an otherwise valid parent template to change its hash and thus
+sample the next puzzle (§13).
 
 ### 3.2 Puzzle spec
 
@@ -276,7 +285,7 @@ is not.
 
 ---
 
-## 5. Header lottery and fork choice
+## 5. Scheduled proof-of-golf and fork choice
 
 ### 5.1 The header budget
 
@@ -285,12 +294,16 @@ The serialized header remains Bitcoin's 80 bytes:
 | Field | Bits | Use |
 |---|---|---|
 | `version` | 32 | producer length `L` and puzzle complexity `C` |
-| `time` | 32 | timestamp used by MTP, drift and target retarget |
-| `bits` | 32 | canonical Bitcoin compact base target |
-| `nonce` | 32 | uint32 lottery nonce |
+| `time` | 32 | exact scheduled timestamp |
+| `bits` | 32 | fixed per-network pow-limit value, for header compatibility only |
+| `nonce` | 32 | MUST be zero |
 
-`previous-block` and `merkle-root` retain their Bitcoin meanings. The nonce is
-serialized as `u32le` and carries no score, rank, length, or share quality.
+`previous-block` retains its Bitcoin meaning. `merkle-root` instead commits
+the full `wtxid` of every transaction, so ordinary SegWit and Taproot witnesses
+are part of the header identity without a separate BIP141 coinbase commitment.
+A block MUST NOT contain duplicate `wtxid` values; this closes the odd-leaf
+duplication ambiguity in Bitcoin's Merkle algorithm. Headers are hashed for
+block identifiers and linkage, not to meet a target.
 
 ### 5.2 `version` layout
 
@@ -310,86 +323,150 @@ length to equal encoded `L`.
 `coin-version-encode`, `coin-version-decode`,
 `coin-version-solution-length`, and `coin-check-version` own this layout.
 
-### 5.3 Chain-retargeted base target
+### 5.3 Exact schedule and fixed `bits`
 
-`bits` uses Bitcoin's canonical compact target codec. The required value is
-`next-required-bits(params, previous_headers)`:
-
-- genesis uses the chain's pow-limit bits;
-- non-boundary heights inherit their parent's bits;
-- every 16th height measures the 15 timestamp intervals across the preceding
-  16 headers;
-- the new target is `old_target * actual_timespan / target_timespan`;
-- actual timespan is clamped to `[target_timespan/4, 4*target_timespan]`;
-- the result cannot be easier than the chain's pow limit.
-
-Mainnet targets one day, public testnet one hour, and regtest one second. Their
-initial compact limits are respectively `0x1c2bcf04`, `0x1f00ffff`, and
-`0x2000ffff`. The one-second parent timestamp floor is only a monotonicity
-guard; the retargeted lottery controls cadence.
-
-### 5.4 Golf-weighted effective target
-
-All arithmetic is exact integer arithmetic. Let:
+For every non-genesis block:
 
 ```text
-U         = 2^256
-base      = compact-target(bits)
-bonus     = min(max(par - L, 0), 8)
-mult      = 2^bonus
-effective = min(2^255 - 1, (base + 1) * mult - 1)
+header.time = parent.time + network_spacing
+header.time <= validator_current_time
+header.bits = network_pow_limit_bits
+header.nonce = 0
 ```
 
-The inclusive effective target gives `effective + 1` winning values among
-`2^256` possible rolls. Reported expected rolls is
-`ceil(U / (effective + 1))`. The ceiling keeps acceptance probability at or
-below one half.
+Mainnet spacing is 86400 seconds; public testnet uses 3600 seconds and regtest
+uses 1 second. Future drift is zero on every network. Parent linkage and MTP
+checks remain; an otherwise valid future slot must wait until the local clock
+reaches it. Genesis uses its configured timestamp because it has no parent.
 
-At the initial mainnet limit, par expects 25,098,045,881 rolls and `par - 8`
-expects 98,039,242. Public testnet expects 65,538 and 257; regtest expects 257
-and 2. Further shortening remains valid and still affects the independent
-complexity retarget, but does not increase this block's multiplier.
+`bits` remains in the 80-byte header and MUST equal the network's fixed pow-limit
+value at every height. It does not encode puzzle complexity or security effort.
+There is no hash-target validation, nonce search, elapsed-time target retarget,
+or requirement for a low block hash. Puzzle-complexity retargeting (§9) remains.
 
-### 5.5 Full-header nonce search
+Exact timestamps schedule chain time, not the effort spent constructing a
+branch. Past slots can be constructed without waiting a real slot between
+them. A caught-up incumbent cannot be overtaken before another slot becomes
+eligible, but missed slots and partitions can let a replacement become taller.
+Checkpoint-compatible reorgs remain possible above the latest checkpoint.
+
+### 5.4 Capped additive quality score
+
+All arithmetic is exact integer arithmetic:
 
 ```text
-roll = integer_le(HASH256(header))
+savings = min(8, max(0, par - L))
+score   = 1 + savings
 ```
 
-Header acceptance requires `roll <= effective`. A builder validates the
-producer solution, finalizes the body, encodes `L/C` in `version`, and writes
-the chain-required `bits`. It searches the header nonce from its current value
-through `0xffffffff`; on exhaustion it increments the coinbase transaction's
-final `lock-time`, rebuilds its txid and the merkle root, resets the nonce to
-zero, and continues. The first qualifying lexicographic `(lock-time, nonce)`
-pair is used. Exhausting both uint32 fields fails construction; the public par
-witness is a valid program, not an automatic winning block.
+Block validity separately requires `1 <= L <= min(512, par)` and a correct
+program. The clamp does not make an over-par source valid. The public
+`coin-golf-max-savings` constant is 8;
+`coin-golf-savings(par, length)` and `coin-golf-score(par, length)` implement
+the formula for positive exact-integer arguments.
+
+A valid at-par fallback scores 1. Saving one byte scores 2; saving eight or
+more scores 9. Further shortening remains valid and affects the uncapped
+relative-margin signal for puzzle complexity, but adds no more block score.
+Genesis contributes exactly 0, regardless of its witness length; the
+non-genesis formula is not applied to genesis.
+
+Block and cumulative golf scores are displayed competition quality only. They
+MUST NOT affect canonical fork choice and currently do not alter subsidy.
+Source length still participates in validity and puzzle-complexity retargeting.
+
+### 5.5 One complete candidate, without grinding
+
+The producer chooses a valid solution, transactions, payouts, commitments,
+and reveals, builds the complete candidate once, encodes `L/C`, and sets the
+scheduled timestamp, fixed `bits`, and zero nonce. It does not search hashes
+or retry coinbase/header variations for a qualifying result.
+
+A non-genesis coinbase MUST have transaction version 1, one input with final
+sequence `0xffffffff`, no witness, `nLockTime = 0`, and empty graffiti. The
+five-push payload, commitments, shares, ordinary transactions, and exact
+payout rules remain in force. These canonical fields remove former free
+cursors; they do not make the whole block template unique (§13).
+
+The generated at-par witness is sufficient for a score-1 candidate without
+program optimization. That candidate must still satisfy all body, payout,
+transaction, and timestamp rules; validity does not guarantee selection over
+a taller competing branch or an equal-height incumbent.
 
 ### 5.6 Header-first and body validation
 
-Header acceptance checks, in order:
+Header acceptance requires:
 
-1. canonical `version` shape;
-2. linkage, one-second parent floor, MTP and future drift;
-3. encoded `C` against the parent-derived complexity;
-4. `bits` against the interval-derived compact base target;
+1. canonical `version` shape and zero nonce;
+2. linkage, exact parent-relative slot, MTP, and no future timestamp;
+3. encoded `C` equal to the parent-derived complexity;
+4. `bits` equal to the fixed network pow-limit value;
 5. encoded `L <= par`;
-6. the full-header lottery roll.
+6. agreement with each reached hardcoded checkpoint (§5.8).
 
-Body validation reruns the puzzle and requires actual UTF-8 source length to
-equal encoded `L`. A false claim invalidates the block and descendants.
+Header download prioritization uses height, not claimed or verified golf
+score. Valid peer `headers` responses must be contiguous, and body requests
+rotate to less-tried valid branches after the preferred path has been tried.
+Before persistence, a body must fit the 16 KiB cap, match the full-witness
+Merkle commitment, and contain no duplicate `wtxid`.
 
-### 5.7 Cumulative base-work fork choice
+Only full body validation may activate a branch. It reruns the puzzle and
+requires actual UTF-8 source length to equal encoded `L`. Persisted scores and
+any descendant score rebasing are display-quality accounting, not ordering
+inputs. A false length claim or invalid program invalidates the block and
+descendants. Non-genesis coinbase canonicality is mandatory, not merely a
+builder preference.
 
-Each accepted header contributes Bitcoin's
-`floor((2^256)/(base_target + 1))` work derived from its compact base target.
-The golf multiplier changes admission probability but does not discount the
-credited work: verified program improvement substitutes for those hashes.
+### 5.7 Strict longest-height fork choice
 
-The candidate with greater cumulative base work wins. Equal work prefers
-greater height. An exact work-and-height tie retains the first-seen incumbent;
-solution length, share quality, nonce and raw block hash add no hidden
-tie-break. Persisted header replay preserves insertion order for that final tie.
+```text
+height(genesis) = 0
+height(block)   = height(parent) + 1
+replace incumbent iff valid candidate.height > incumbent.height
+```
+
+Only a strictly taller fully validated, checkpoint-compatible branch replaces
+the active chain. Equal height MUST retain the durable active incumbent,
+including after restart. Golf score, producer length, share quality, raw block
+hash, nonce, and arrival metadata MUST NOT displace that incumbent. There is no
+global deterministic hash ordering.
+
+Different nodes can retain different equal-height incumbents, notably across
+a partition. Building such a branch is cheap but cannot by itself replace the
+incumbent. A child can make a branch strictly taller; it does not finalize any
+ancestor above the latest checkpoint. Missed slots offer a takeover opportunity
+because a replacement can fill elapsed slots without new wall-clock waits.
+
+### 5.8 Hardcoded release checkpoints
+
+Each network's chain config publishes a hardcoded, strictly height-ascending
+list of `(height . internal-hash)` pairs. Heights are unique nonnegative exact
+integers; each hash is the 32-byte internal `block-header-hash` bytevector,
+not the reversed display identifier.
+
+A branch MUST match every checkpoint at or below its tip height. Checkpoints
+above that tip are not yet applied; an incompatible branch MUST NOT cross one.
+Once a checkpoint at height `K` is reached, its hash and ancestry through `K`
+are fixed under that release. Reorgs remain possible above `K`.
+
+Checkpoints advance only in reviewed software releases. Nodes MUST upgrade to
+share a newer checkpoint; there is no automatic, signed-broadcast, or
+confirmation-count finality mechanism. Mainnet pins H0 and the live H1 block:
+
+- H1 internal hash: `24f2cbbf4a5dbbce67abbcc047e300cda17c600e7ab3565846d27a0eb6b041d2`.
+- H1 reversed display ID: `d241b0b60e7ad2465856b37a0e607ca1cd00e347c0bcab67cebb5d4abfcbf224`.
+
+Mainnet rejects reorgs below H1; reorgs above H1 remain possible. Public
+testnet and regtest still pin H0 only, fixing genesis but no post-genesis
+history. This fork-choice/checkpoint cutover leaves block bytes, proof-of-golf
+genesis hashes, and genesis timestamps
+unchanged. Transport magic becomes `SGM3` / `SGT3` / `SGR3` on mainnet /
+testnet / regtest to isolate older score-ranked peers. Existing proof-of-golf
+H0 state may be reused; retired nonce-PoW state may not.
+
+Opening durable state whose active branch conflicts with an installed
+checkpoint fails rather than silently replacing active history. Operators
+must compare released checkpoints as well as genesis when diagnosing a split.
 
 ## 6. Co-op shares
 
@@ -403,10 +480,14 @@ The scriptSig is exactly five minimally-encoded data pushes:
 | 2 | SOLUTION | 1–512 B | the producer's own solution for puzzle `H` |
 | 3 | SHARES | 0–5145 B | reveals for puzzle `H-1` (§6.2) |
 | 4 | COMMITS | 0–513 B | commitments for puzzle `H` (§7.1) |
-| 5 | GRAFFITI | 0–400 B | opaque |
+| 5 | GRAFFITI | 0–400 B in codec | MUST be empty in non-genesis blocks; genesis marker only |
 
 Decoder tags include `wrong-field-count`, `shares-oversize`,
 `shares-malformed`, `commits-oversize`, and `commits-malformed`.
+
+Non-genesis coinbases also obey §5.5's fixed version, input sequence, witness,
+and lock-time rules. Ordinary transaction versions, sequences, witnesses,
+lock times, and payouts are unchanged.
 
 ### 6.2 SHARES encoding
 
@@ -563,7 +644,7 @@ contribution = 1 + min(3, floor(margin_milli / 50))
 are exact integers from 1 through 4: 1 for margins 1..49, 2 for 50..99, 3 for
 100..149, and 4 for 150 or more. The aligned contribution list prices the
 share pool. Share count, contribution, and margin affect payout selection and
-amounts, never the producer lottery or fork choice.
+amounts, never producer block score or fork choice.
 
 “Independent shares” means distinct pubkey-personalized tasks. It does not
 claim or require independent owners: one owner may control several keys, but
@@ -636,17 +717,22 @@ are `internal-error`.
 
 ### 6.6 Size budget
 
-Worst-case coinbase scriptSig:
+Payload-codec size bound (height 0 is the only height allowing a marker):
 
 ```
-HEIGHT     5 data +   1 opcode  =    6
+HEIGHT     0 data +   1 opcode  =    1   (height 0, OP_0)
 SOLUTION 512 data +   3         =  515   (OP_PUSHDATA2)
 SHARES  5145 data +   3         = 5148
 COMMITS  513 data +   3         =  516
 GRAFFITI 400 data +   3         =  403
                                  ------
-                                   6588  = coin-max-coinbase-script-bytes
+                                   6583  = coin-max-coinbase-script-bytes
 ```
+
+This is an encoder bound, not a valid genesis with shares: full validation
+forbids shares at genesis. Non-genesis heights need at most 6 bytes for HEIGHT
+and require a one-byte empty GRAFFITI push, so their actual maximum scriptSig
+is `6 + 515 + 5148 + 516 + 1 = 6186` bytes.
 
 `coin-min-coinbase-script-bytes` is derived from the encoder as today, and is 8:
 height 0 (`OP_0`, 1), a 1-byte solution (2), `SHARES = #u8(0)` (2),
@@ -696,9 +782,9 @@ reveal := pubkey (33 B) || sig (64 B) || blind (32 B) || u16le len || solution
 This costs nothing in hiding. The blind's only job is to keep the commitment
 opaque during the window between commit and reveal; once the solution itself is
 published, the blind protects nothing and its disclosure lets every validator
-verify the commitment matched. Derived size caps move accordingly (5145 and
-6588 bytes), and the binding constraint — the coinbase staying under about
-7 KB inside a 16384-byte block — still holds at roughly 6976 bytes.
+verify the commitment matched. SHARES is capped at 5145 bytes; the payload codec
+is capped at 6583 bytes, and a non-genesis scriptSig at 6186 bytes (§6.6).
+These remain bounded within a 16384-byte block.
 
 ### 7.2 The pipeline
 
@@ -714,9 +800,10 @@ A share revealed in a block at height `H` solves puzzle `H-1`, and its
 commitment must appear in COMMITS of block `H-1`. Both are on the same branch by
 construction, since `H-1` is the validated parent.
 
-At mainnet target cadence (one day) a miner has the whole interval to solve
-puzzle `H`, publish a commitment for inclusion in block `H`, and reveal in
-`H+1`. At regtest cadence (1 s) the window is not humanly usable; regtest tests
+At mainnet's one-day scheduled spacing, an up-to-date producer normally has the
+interval to solve puzzle `H`, publish a commitment for block `H`, and reveal in
+`H+1`. This is not a guaranteed wall-clock window: overdue slots and replacement
+branches can be built immediately. At regtest's one-second spacing, tests
 construct commitments and reveals directly.
 
 ### 7.3 Unrevealed commitments
@@ -744,24 +831,22 @@ commitments does not multiply the carrier output.
 
 **Cannot:**
 
-- *Steal an unrevealed share solution.* The commitment is `SHA256d` over the
-  solution hash plus a 32-byte blind. Nothing about the program is recoverable.
-- *Steal a revealed share solution.* A reveal for puzzle `P` is published in a
-  block at height `P+1`. To use it, a thief would have to mine a sibling of
-  block `P` — but height `P` is already extended by the very block that carried
-  the reveal, so §5.7's `extended?` hysteresis refuses to displace it. **The
-  reveal is safe precisely because publishing it requires a block that settles
-  its height.** This is the whole reason the pipeline is `H` / `H+1` and not
-  same-block.
+- *Recover a blinded share merely from its commitment.* The 32-byte blind
+  prevents confirming solution guesses, assuming the blind remains secret and
+  the hash is secure.
+- *Rebind an included signed reveal to the thief's payout key.* The personalized
+  puzzle and signature bind its key; knowing a revealed program does not remove
+  those checks. The `H` / `H+1` pipeline proves prior commitment on that branch,
+  not finality. A taller checkpoint-compatible branch can reorganize both heights.
 - *Redirect a share's payout.* `pubkey` is in the signed preimage and the payout
   script is derived from it.
 - *Include a share without its required contribution-weighted payout.* Output
   shape and exact values are consensus (§6.5).
 - *Replay a share at another height, branch, or retarget epoch.*
   `parent_prev_hash`, `P` and `C(P)` are in the preimage.
-- *Use a lower hash to win a sibling tie.* A qualifying header hash proves only
-  lottery acceptance; block hash and nonce do not order same-height siblings
-  (§5.6).
+- *Use a better golf score or lower hash to win an equal-height fork.* Golf
+  scores display quality; hashes identify and link blocks. Neither displaces
+  an equal-height incumbent (§5.7).
 
 **Can:**
 
@@ -771,8 +856,8 @@ commitments does not multiply the carrier output.
 - *Censor commitments and reveals.* A producer chooses what his block carries.
   Censoring may forgo a future carrier output or current share participation,
   but share count and contribution do not improve or worsen fork position.
-  There is no in-protocol defence beyond the bounded one-height opportunity;
-  see Open Question 1.
+  There is no in-protocol defence; repeated production or a replacement branch
+  can repeat the censorship. See §13.
 - *Withhold a reveal.* Costs the withholder his own payout.
 - *See, at reveal time, the full program of every sharer.* Programs are public
   once revealed, and reusing one at a later height is worthless because the
@@ -780,8 +865,8 @@ commitments does not multiply the carrier output.
 
 ### 7.6 Non-normative public-testnet relay
 
-The reference public testnet operates
-`https://pool.testnet.sigilcoin.lol` as an optional coordination relay. This
+The reference public-testnet relay interface uses
+`https://pool.testnet.sigilcoin.lol` as an optional coordination endpoint. This
 service, its HTTP routes, authorization signature, first-16 admission order,
 source-address limits, receipt database, and status names are operational
 policy only. They are not serialized into blocks, consulted by validators, or
@@ -811,8 +896,9 @@ implementation exposes no mainnet pool.
 
 **Claim.** For every height, every constraint `ci`, and every complexity `C`,
 there is a consensus-valid solution of length exactly `par` that any producer
-can construct mechanically from public data. The producer must still search
-the block cursor for a qualifying full-header lottery roll.
+can construct mechanically from public data. Used in an otherwise valid
+non-genesis block at its scheduled timestamp, it earns score 1 without hashing
+search or program optimization.
 
 ### 8.1 Public data available to a miner
 
@@ -898,15 +984,14 @@ ties) as the par witness. Every published puzzle therefore has a mechanically
 available producer candidate of length exactly `par`. The table bound is 400
 bytes globally or 443 bytes when personalized at the frozen `k=8`; `par` may
 be shorter because it is the minimum of the two verified witnesses. A builder
-using that candidate must still search the block cursor and meet §5's target.
+using that candidate must still meet §5's schedule and the ordinary block rules.
 
-Genesis uses the same par-witness selection and the same lexicographic
-coinbase-lock-time/header-nonce lottery. Changes to witness selection, packed
-`version`, compact target `bits`, or lottery rules change genesis; older chain
-state is incompatible and each network requires fresh state for its matching
-genesis.
+Genesis uses the same par-witness selection, a zero header nonce, and fixed
+network `bits`, but contributes score 0. The replacement networks began with
+fresh genesis identities and fresh state from height 0. There is no nonce-PoW
+compatibility path and no reuse of retired chain state (§14).
 
-## 9. Retargeting
+## 9. Puzzle-complexity retargeting
 
 ### 9.1 Signal
 
@@ -938,9 +1023,9 @@ f  = clamp(1000 + m_med - 100, 250, 4000)      ; the 4x clamp, both directions
 C' = clamp( floor(C * f / 1000), 16, 4095 )
 ```
 
-- `m_med > 100` (producers beating par by more than 10%) raises `C`, which
-  lowers the next epoch's lottery base target.
-- `m_med < 100` lowers `C`, which raises the base target.
+- `m_med > 100` (producers beating par by more than 10%) raises `C`, adjusting
+  the generator's example count, grammar width, and constraint tier.
+- `m_med < 100` lowers `C`. Neither case changes slot spacing or fixed `bits`.
 - `f` is clamped to `[250, 4000]`, i.e. `0.25x .. 4x` per window, matching
   Bitcoin's clamp. For valid blocks `m_med` is non-negative, so the raw factor
   is in `[0.9, 1.899]`; the wider clamp remains part of the frozen arithmetic.
@@ -956,22 +1041,22 @@ Retarget fires at heights where `H mod 16 = 0` and `H >= 16`. Between retargets
 partial window is ever used: the first retarget is at `H = 16` with a full
 window of heights 0..15, genesis included, which has a well-defined `par`.
 
-`bits` MUST equal
+Header `version` MUST equal
 `0x20600000 | ((L(H) - 1) << 12) | C(H)`. Its fixed prefix, decoded length,
 complexity range, derived `C`, and `L <= par` are all validated as described in
 §5.2.
 
 Neither `C` nor `L` is freely chosen: `C` comes from the parent chain and `L`
 must equal the validated body solution's byte length. Encoding both supports
-constant-time header checks and determines the header's lottery target.
+header length/complexity checks and determines the claimed additive score.
 
 ### 9.5 Determinism
 
-`par_i` is a pure function of `(prev_hash_i, i)`, `L_i` is read from the header,
-all arithmetic is exact integer with explicit floors and clamps, and the median
-is a sort of exactly 16 values with a fixed index. A reorg recomputes `C` from
-the new branch's own 16 blocks, which is why `C(P)` is bound into the share
-preimage (§6.3).
+`par_i` is a pure function of `(prev_hash_i, i, C(i))`, `L_i` is read from the
+header, all arithmetic is exact integer with explicit floors and clamps, and
+the median is a sort of exactly 16 values with a fixed index. A reorg recomputes
+`C` from the new branch's own 16 blocks, which is why `C(P)` is bound into the
+share preimage (§6.3).
 
 ---
 
@@ -1077,19 +1162,18 @@ is not consensus.
 
 ### 10.5 What protects the producer
 
-The producer's own solution for puzzle `H` is necessarily revealed in block
-`H` and cannot be committed in advance, because puzzle `H` does not exist until
-block `H-1` does. A copier receives the same `L`, bonus, and target but must
-independently find a qualifying nonce for a different full header. If that
-sibling arrives later, it cannot displace the first-seen incumbent: neither a
-shorter replacement program, a lower hash, nor more shares is a fork-choice
-advantage. A valid child must link to the selected incumbent and settles its
-height against still later siblings.
+The producer's own solution for puzzle `H` is revealed in block `H` without
+a prior commitment. A copier can use the same source in a sibling with the
+same parent, obtaining the same `L` and block score without a nonce search.
+That alone cannot displace an equal-height active incumbent at the receiving
+node. A shorter valid source improves displayed score, not fork position; only
+a strictly taller valid, checkpoint-compatible branch can replace it.
 
-Before the child, observers that receive different valid siblings first may
-temporarily retain different incumbents. This is an arrival-order race, not a
-program-rank race; the next accepted child settles the height.
-
+This is limited local incumbent protection, not authorship protection or
+settlement. Different observers can retain different equal-height branches.
+Children add height, not finality above the latest checkpoint. Public witnesses
+make alternate histories cheap to build, and missed slots or partitions may
+let one become taller.
 
 ## 11. Validation cost
 
@@ -1097,9 +1181,9 @@ Per block, worst case, with the frozen caps:
 
 | Work | Bound | Notes |
 |---|---|---|
-| header checks | O(1) | version, `bits`, MTP, drift, spacing, one full-header `HASH256`, target comparison |
-| block size | one serialization | first body rule, bounds everything after |
-| coinbase decode | O(6588) bytes | five pushes + one re-encode |
+| header checks | O(1) after puzzle derivation | version, fixed `bits`, zero nonce, MTP, exact slot, no future time, provisional base point; hashes only for identity/linkage |
+| block size and commitment | one serialization plus `wtxid` tree | checked before persistence; commits ordinary transaction witnesses |
+| coinbase decode | O(6583) bytes | five pushes + one re-encode; non-genesis at most 6186 |
 | global puzzle derivation | 65 x 20000 = 1.30 M steps | 64 rejected attempts plus one verified fallback; cached per `(prev_hash, H)` so siblings pay once |
 | personalized puzzle derivation | 8 x 65 x 20000 = 10.40 M steps | one bounded explicit-constraint derivation per distinct share pubkey, including fallback; cacheable by `(global_seed, pubkey)` |
 | producer solution | 200000 steps | one machine across all `k` applications |
@@ -1118,6 +1202,10 @@ worst case     : 13.5 M steps ~= 74.3 s before caching; personalized specs are
                  cacheable by `(global_seed, pubkey)` across sibling blocks
 ```
 
+The timing estimates above and derivation audit below are historical
+measurements of the bounded puzzle VM, not a new validation run or a
+throughput/security claim for the replacement networks.
+
 The machine boundary is executable: a 20000-step evaluation succeeds, the same
 program on 19999 fuel stops at 19999, and an attempt containing a formerly
 unbounded single evaluator call returns `budget-exhausted` at exactly 20000.
@@ -1126,16 +1214,18 @@ complexities and all eight constraints) measured 2117 steps for both the
 heaviest attempt and heaviest complete non-fallback derivation. The hard bounds,
 not the sample, govern consensus.
 
-Against the 86400 s mainnet target cadence, the theoretical 74.3 s is about 0.1% validation duty.
+At 86400 s mainnet spacing, the historical 74.3 s estimate is about 0.1% of one
+slot. This does not bound hostile traffic or repeated validation of siblings.
 
 **Pre-validation gate (required).** A node MUST order body validation
 cheapest-first. The canonical order is:
 
-1. header acceptance: canonical version, timestamp context, derived `C`,
-   interval-required compact `bits`, `L <= par`, and full-header lottery roll,
+1. header acceptance: canonical version, zero nonce, exact slot and no future
+   time, derived `C`, fixed network `bits`, and `L <= par`,
 2. block size and merkle commitment,
-3. canonical coinbase payload and actual producer-source length equal to the
-   header's encoded `L`,
+3. canonical non-genesis coinbase version, sequence, witness, lock-time and
+   empty graffiti; canonical payload and actual producer-source length equal
+   to the header's encoded `L`,
 4. cheap share count, shape, order, deduplication, and parent-commitment checks,
 5. transaction-fee derivation and cheap payout shape/value/total checks,
 6. derive each personalized spec once; enforce source length, strict under-par,
@@ -1155,7 +1245,7 @@ validate bodies for concurrently. That is policy, not consensus.
 **Never call `sigil-bitcoin`'s `connect-block` or `connect-block/structural`
 directly on a SigilCoin block.** They enforce Bitcoin's 100-byte coinbase
 scriptSig cap and Bitcoin's block subsidy; a real SigilCoin coinbase scriptSig
-is up to 6588 bytes. `coin-connect-block` passes SigilCoin's own rules record
+has a 6583-byte codec bound. `coin-connect-block` passes SigilCoin's own rules record
 into Bitcoin's connector, which is the only supported path.
 
 ---
@@ -1166,6 +1256,7 @@ into Bitcoin's connector, which is the only supported path.
 |---|---|---|
 | `not-bytevector`, `malformed-script`, `wrong-field-count`, `not-a-push`, `bad-height`, `non-canonical` | coinbase codec | malformed or non-canonical payload |
 | `solution-empty`, `solution-oversize`, `graffiti-oversize` | coinbase codec | field exceeds frozen bounds |
+| `non-canonical-graffiti` | coinbase codec | nonempty graffiti at a non-genesis height |
 | `shares-oversize`, `shares-malformed`, `shares-unordered`, `shares-at-genesis` | SHARES codec | invalid reveal set |
 | `commits-oversize`, `commits-malformed`, `commits-unordered` | COMMITS codec | invalid commitment set |
 | `solution-malformed`, `solution-over-par`, `solution-parse-failed`, `solution-eval-failed` | solution check | malformed source, source above the puzzle's par ceiling, or interpreter failure |
@@ -1174,28 +1265,30 @@ into Bitcoin's connector, which is the only supported path.
 | `share-bad-pubkey`, `share-bad-signature`, `share-uncommitted`, `share-duplicate-solution`, `share-not-under-par` | share check | personalized task or binding failed |
 | `share-solution-*` | share check | solution rejection, prefixed for a share |
 | `coinbase-output-shape`, `coinbase-output-value` | payout validation | output count, scripts, or values differ |
+| `non-canonical-coinbase` | body connection | non-genesis coinbase version, sequence, witness, or lock time is not canonical |
+| `bad-slot`, `time-too-far-ahead` | header context | timestamp differs from the exact parent-relative slot or is in the future |
 | `malformed-header`, `version-prefix`, `complexity-range`, `complexity-mismatch` | header/version check | malformed fields, invalid prefix or complexity, or encoded `C` differs from the parent-derived value |
 | `solution-length-mismatch` | body connection | encoded `L` differs from the validated solution byte length |
 | `height-mismatch`, `missing-coinbase`, `block-oversize`, `malformed-block` | block check | malformed block envelope or body |
 | `internal-error` | any check | implementation failure while validating |
 
+The header predicate also rejects nonzero nonce or non-network `bits`; those
+boolean failures do not expose separate detailed tags.
+
 ---
 
-## 13. Open questions
+## 13. Limitations and open questions
 
 **1. Commitment censorship has no in-protocol defence.**
-A producer can simply omit COMMITS. The carrier output (§7.4) pays him to
-include them, but a miner who expects to win most heights is better off
-excluding everyone. *Recommendation:* ship as specified and measure. The
-cheapest real fix, if censorship shows up, may be to feed commitment count into
-the existing `C` retarget, making persistent omission raise both puzzle
-complexity and lottery difficulty. That changes consensus and is intentionally
-not built until behavior is observed.
+A producer can simply omit COMMITS. The carrier output (§7.4) pays for a valid
+commitment path, but does not force inclusion. Repeated producers and taller
+checkpoint-compatible replacement branches can repeat censorship. No commitment-count retarget or
+other anti-censorship rule is part of this protocol.
 
 **2. Contribution bands are launch constants.**
 The 5%, 10%, and 15% margin thresholds assign payout contributions 1 through
-4. They affect reveal selection and payout weights, not producer lottery odds
-or fork choice. No live co-op margin distribution exists yet. *Recommendation:*
+4. They affect reveal selection and payout weights, not producer block score
+or fork choice. No replacement-network co-op margin distribution is claimed. *Recommendation:*
 ship the four frozen bands and measure. Distinct shares mean distinct
 personalized tasks, not distinct owners; ownership identity is neither
 observable nor required by
@@ -1219,9 +1312,9 @@ decouple `k` from `C` and drive it from a separate, slower signal.
 Solo blocks mint 80% of scheduled subsidy plus fees. Cooperative blocks mint
 the full scheduled subsidy plus fees, target 85% for the producer, divide 10%
 by contributions 1 through 4, and pay 5% to the parent carrier; floors and
-residual routing are consensus. Coverage proves output shape, conservation,
-and payout binding, not that participants will commit, reveal, or carry
-others' work. Changing the formula after launch is a hard fork.
+residual routing are consensus. The payout contract binds output shape,
+conservation, and signed keys; it does not prove that participants will commit,
+reveal, or carry others' work. Changing the formula after launch is a hard fork.
 
 **5. Permissionless keys are not identities and can be ground.**
 One actor may control all eight share keys. The full-key anchor proves each
@@ -1231,38 +1324,69 @@ personalized puzzles. Contribution is capped at 4 per share for selection and
 payout, not fork-choice benefit; no rule proves distinct owners or makes key
 selection scarce.
 
-**6. Public-network duration is minimal.**
-The reset public testnet has run since 2026-09-06, but long-running reorg
-frequency, peer churn, SQLite contention, hostile validation load and resource
-growth remain unknown under the compressed experimental-launch schedule.
+**6. Alternative histories are cheap above the latest checkpoint.**
+Old puzzles and solutions are public, and descendants can be rebuilt with
+mechanically available witnesses. Changing a block hash changes subsequent
+puzzles but adds no hash-search cost; past slots are already eligible.
+Better golf score cannot make a shorter or equal-height rewrite win.
+A replacement must become strictly taller, for example when the incumbent
+misses a slot or during a partition, and must match every reached checkpoint.
+Only reviewed release upgrades advance that boundary: currently H1 on mainnet,
+H0 on public testnet and regtest. The latter protect genesis, not later history.
+
+**7. Equal-height forks are local, and template manipulation remains possible.**
+Equal height preserves each node's durable active incumbent, so observers
+can remain split. Neither score nor a lower hash resolves the tie. Zero nonce, fixed
+coinbase metadata, and exact time remove obvious free cursors, not all template
+freedom: valid producer sources, payout scripts, transaction selection/order,
+commitments, and reveals still change a parent's hash and the next puzzle.
+The reference producer builds once; consensus does not prove that nobody
+sampled alternative valid parent templates.
+
+**8. This is not settlement-grade security.**
+The schedule, displayed golf quality, and longest-height rule organize a
+low-value hobby competition. They do not provide Bitcoin's accumulated
+expenditure or globally convergent equal-height choice. Checkpoints protect
+only their pinned ancestry on nodes that install the same release. Reorgs
+above that boundary, local forks, key sampling, censorship, and bodyless-header
+flooding remain possible. Claimed savings cannot improve body-download
+priority, but peer quotas are not Sybil resistance and flooding can still
+delay body selection. Neither historical tests nor a one-day slot justify
+exchange, bridge, payment-settlement, or valuable-balance reliance.
+Long-running hostile load, resource growth, and replacement-network behavior
+remain unmeasured here.
 
 ---
 
 ## 14. Network and implementation status (non-consensus)
 
 The sole public rule surface is `(sigil coin consensus)`; node code consumes it
-through `(sigil coin node)`.
+through `(sigil coin node)`. The replacement networks apply this proof-of-golf
+contract from genesis, with no old/new dual validation mode.
 
-- Mainnet uses the packed `0x20600000` version prefix, magic `8f d1 c0 a5`,
-  port 19444, and HRP `sgl`. Its quote is `Sigil - Practical Symbolic Power`;
-  timestamp `1789228800`, compact limit `0x1c2bcf04`, and derived genesis
-  constants are selected for the 2026-09-12 experimental launch.
-  Its first genesis cursor is coinbase lock-time `6`, header nonce
-  `3129183091`; display id
-  `000000000b25af1072272ae97b606d64b340fc8f61f78f04c3e794025832b969`.
-- The reset public testnet keeps magic `d3 7a 91 c5`, port 19446, HRP `tsgl`,
-  a one-hour target cadence, one-second parent floor, and five-minute future
-  drift. Its quote is `SigilCoin public testnet reset - 2026-09-02` and
-  timestamp `1788307200`.
-  Previous public-testnet databases and history are incompatible; operators
-  must archive or move the old directory themselves and initialize an empty
-  one. Software does not delete it.
-- Regtest uses magic `a5 c0 d1 8f`, port 19445, HRP `sgl`, and one-second
-  spacing.
+Mainnet uses 86400-second slots, public testnet 3600-second slots, and regtest
+1-second slots. All require exact parent-relative timestamps and zero future
+drift. Fixed pow-limit `bits` are compatibility fields, not measured security
+targets. Current network definitions and the all-network genesis generator are
+the source of genesis timestamps, quotes, and display/internal hashes; old
+launch identifiers must not be copied into replacement state.
+The longest-height/checkpoint change preserves those replacement genesis
+identities, timestamps, and block bytes. Mainnet/testnet/regtest transport magic
+is `SGM3` / `SGT3` / `SGR3` (final byte `0x33`), isolating older score-ranked
+peers. Existing proof-of-golf H0 state may be reused. Nodes must install
+reviewed release updates to share newer checkpoints; the initial release pins
+only each network's H0.
 
-The all-network generator is the source of current display/internal genesis
-hashes. Par-witness selection, the packed `version`, compact target `bits`, and
-searched lottery nonce all affect the serialized genesis header. Pre-cutover
-incompatible and each network requires fresh matching state. A node validates
-genesis, not network magic alone.
+The 2026-09-12 nonce-PoW mainnet launch was retired before height 1: no
+post-genesis blocks existed, and compute burn contradicted the hobby project's
+intent. `LAUNCH.md` remains a superseded historical record, not instructions or
+evidence for operating the replacement networks.
 
+Archive retired nonce-PoW databases and histories; never reopen or migrate them
+as the new chain. Replacing that state requires fresh `state/*-proof-of-golf`
+directories matching each network's genesis. Software must not delete archived operator
+state. Deploy a low-CPU scheduled producer that builds a complete candidate
+once, rather than an always-busy hashing loop. The puzzle VM, co-op signatures
+and commitments, ordinary transactions, payout arithmetic, and 80-byte headers
+are unchanged; the network identity and consensus admission/fork contract are
+not backward compatible.

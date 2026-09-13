@@ -1,145 +1,90 @@
 # SigilCoin operations runbook
 
-Covers the seed node and the explorer on NixOS. Every command here was run
-against the `sigilcoin 0.1.0` binaries this flake builds, except the few
-marked UNVERIFIED. Anything that can block a terminal is shown wrapped in
-`timeout`; run it that way.
+This runbook covers the replacement proof-of-golf seed and explorer on NixOS.
+For Docker, the public testnet relay, and the supervised scheduled producer,
+use [deployment.md](../docs/deployment.md). These are operator procedures, not
+a claim that this replacement deployment has already passed live validation.
 
-The systemd units themselves were generated and inspected, not started: this
-sandbox has no root, so `systemctl` behaviour is argued from the unit files
-and from systemd's documented `PrivateUsers` mapping rather than from a live
-boot. Treat the first `nixos-rebuild switch` as the moment they are proven.
+The launched nonce-PoW mainnet was retired before height 1 because its compute
+burn contradicted the project's intent. Its launch identity and evidence remain
+historical and superseded in [LAUNCH.md](../LAUNCH.md). Replacement networks
+start at height 0 with fresh genesis identities and fresh state. Never open a
+retired database with the replacement binary or count the old launch as
+approval for this one.
 
-Contents: [what is here](#what-is-in-deploy) ·
-[wire it up](#wiring-it-into-a-host) · [first bring-up](#first-time-bring-up) ·
-[health](#is-the-node-healthy) · [peers](#adding-peers) ·
-[backup](#backup-and-restore) · [upgrade](#upgrading) ·
-[stalls and reorgs](#when-the-chain-stalls) · [known rough edges](#known-rough-edges)
+## Consensus an operator needs to know
+
+- The puzzle VM and producer validity `L <= par` remain. The generated at-par
+  witness is a valid fallback, not an invitation to search for a header hash.
+- `savings = min(8, max(0, par - L))`; a non-genesis block scores `1 + savings`,
+  from 1 to 9. Genesis contributes 0. Only strictly greater cumulative score
+  replaces the durable active incumbent. Equality has no global hash tie-break.
+- Every header time is exactly `parent.time + network spacing` and must not be
+  in the validating node's future. Mainnet spacing is exactly 86,400 seconds;
+  regtest retains its configured shorter slots. `next-slot-time` is a UTC epoch
+  timestamp, not a suggestion to change the clock.
+- Headers remain 80 bytes. Nonce is 0, `bits` is fixed at the network's pow-limit
+  compatibility value, and there is no hash target check or hash-difficulty
+  retarget. Non-genesis coinbase lock-time is 0, graffiti is empty, and
+  sequence/version are canonical.
+- Build the complete candidate once per attempt. Puzzle-complexity retargeting,
+  co-op commitments, strict under-personalized-par shares, ordinary
+  transactions, and payouts remain.
+
+This is a hobby chain, not settlement-grade security. Cheap historical
+re-optimization permits deep rewrites, parent-template manipulation remains
+possible, and equal-score local forks can persist. Neither daily slots nor a
+confirmation count makes an old payment final.
 
 ## What is in deploy/
 
 | File | Purpose |
 | --- | --- |
-| `flake.nix` | Packages, the NixOS module, and a `nix flake check` that builds the binaries and the systemd units |
-| `package.nix` | Derivations: the Sigil toolchain and the `sigilcoin` / `sigilcoin-explorer` binaries |
+| `flake.nix` | Packages, the NixOS module, and deployment checks |
+| `package.nix` | Sigil toolchain and `sigilcoin` / `sigilcoin-explorer` derivations |
 | `module.nix` | `services.sigilcoin` and `services.sigilcoin-explorer` |
-| `genesis-constants.sgl` | Prints the genesis constants for a quote and timestamp |
+| `genesis-constants.sgl` | Generates the reviewed replacement genesis constants |
 | `RUNBOOK.md` | This file |
-
-The launch checklist is `../LAUNCH.md`.
 
 ## Wiring it into a host
 
-Nothing outside `deploy/` was changed, and the workspace flake at
-`/path/to/workspace/flake.nix` is untouched. The operator has to do two things.
+Keep `sigil`, `sigil-bitcoin`, and `sigil-coin` as sibling checkouts. The flake
+uses revision-pinned local inputs; the local and Docker helpers override them
+from the detected sibling layout. Use the reviewed sibling revisions together:
+consensus, cumulative-score persistence, and durable parent validation cross
+the package boundary. Do not substitute an old dependency pin because it
+compiles. A local-only revision is not a reproducible public release until its
+source and dependency revisions are published.
 
-**1. Add the flake as an input** to the host configuration. The `?dir=deploy`
-is not optional: `flake.nix` lives in `deploy/` but its source is the
-sigil-coin repository above it, which it reads through
-`self.sourceInfo.outPath`. Rooting the flake at `deploy/` instead throws an
-error that says so rather than building the wrong thing.
+Add the deployment flake as a host input; `?dir=deploy` is required:
 
 ```nix
+inputs.sigil.url = "path:/workspace/sigil";
+inputs.sigil.flake = false;
+inputs.sigil-bitcoin.url = "path:/workspace/sigil-bitcoin";
+inputs.sigil-bitcoin.flake = false;
 inputs.sigilcoin.url = "git+file:///workspace/sigil-coin?dir=deploy";
+inputs.sigilcoin.inputs.sigil.follows = "sigil";
+inputs.sigilcoin.inputs.sigil-bitcoin.follows = "sigil-bitcoin";
 ```
 
-**This is intentionally a local-testnet flake until the repositories are
-pushed.** The current `sigil-bitcoin` pin includes unpublished commits, so a
-`github:<forge-owner>/sigil-coin?dir=deploy` input cannot reproduce this build
-yet. After the manual testnet and explicit push approval, replace all three
-local `git+file:` source inputs with public forge URLs at the pushed revisions
-and re-run every flake check before calling the deployment portable.
-
-Direct flake use assumes the two sibling checkouts exist below `/workspace` as
-revision-pinned inputs (`git+file:///workspace/sigil` and
-`git+file:///workspace/sigil-bitcoin`). The local and Docker helpers override
-those defaults from their detected sibling layout. The fourteen `from-git`
-Sigil libraries needed by the two dependency graphs are also pinned. The
-`sigil-bitcoin` pin is `424a4a83beb9e81ab7e292f4d51c05ce16306450`, which
-provides the durable-parent seven-argument block connector and is currently
-available only in the local checkout. An older pin can
-build yet lose H2 parent-body validation after reopen, so
-`sigilcoin-durable-parent` is a blocking flake check. These pins let the build
-sandbox stay offline, and are why there is no `depsHash` to fill in. Bump a sibling with `--override-input` or
-`nix flake update`; see the comment block at the top of `flake.nix`.
-
-There is no separate explorer package: `sigil-coin-explorer` declares
-`bundle-name: "sigilcoin-explorer"` and bundles out of the same `sigil build`
-as the CLI, so one derivation ships `bin/sigilcoin` and
-`bin/sigilcoin-explorer`.
-
-The build is real, not evaluated. Verified here:
+Build on the build host using the reviewed inputs:
 
 ```sh
 cd /path/to/workspace/sigil-coin/deploy
-nix build .#sigilcoin --print-build-logs
-```
-
-```
-sigilcoin> ✓ Build complete!
-sigilcoin> Running phase: installCheckPhase
-```
-
-Build duration and the resulting store hash depend on cache state and the exact
-source revision; neither is a release invariant and neither should be compared
-to a pasted historical value.
-
-That build compiled the canonical module paths, including
-`sigil/coin/consensus/{retarget,score,shares}.sgl`,
-`sigil/coin/node/{rules,body,miner,genesis,chain}.sgl`, and
-`sigil/coin/explorer/derive.sgl`, then consumed the sole public
-`(sigil coin consensus)` and `(sigil coin node)` surfaces.
-
-```sh
-readlink -f result   # => /nix/store/<hash>-sigilcoin-0.1.0
-ls result/bin        # => sigilcoin  sigilcoin-explorer
-timeout 5 ./result/bin/sigilcoin help >/dev/null
+nix build .#sigilcoin --print-build-logs \
+  --override-input sigil ../../sigil \
+  --override-input sigil-bitcoin ../../sigil-bitcoin
 timeout 5 ./result/bin/sigilcoin version
-timeout 5 ./result/bin/sigilcoin-explorer --help >/dev/null
 timeout 5 ./result/bin/sigilcoin-explorer --version
 ```
 
-```
-sigilcoin 0.1.0
-sigilcoin-explorer 0.1.0
-```
+One derivation ships both binaries. A version string alone does not prove
+genesis or consensus compatibility. Record the exact source and image/store
+identity alongside the reviewed all-network genesis output; do not compare a
+new build to a pasted historical store hash.
 
-and `nix flake check`, run from inside `deploy/`:
-
-```
-running 2 flake checks...
-all checks passed!
-```
-
-The count is what is LEFT TO BUILD, not how many checks exist. There are
-exactly three: `sigilcoin-runs` builds both binaries and runs
-`sigilcoin version`; `sigilcoin-durable-parent` mines H1, closes, reopens to
-mine H2, then checks both validated bodies from a third process; and
-`module-eval` evaluates a host and checks node, sync and explorer units,
-canonical flags and state paths, firewall port 19444, wallet/data-directory
-modes, and absence of `sigilcoin-listen-proxy`. A run whose dependencies are already built legitimately prints
-`running 0 flake checks`.
-Zero means "nothing left to do", not "nothing was verified" — but it also
-proves nothing, so when you want the checks to actually execute, force them:
-
-```sh
-nix build --rebuild --no-link \
-  .#checks.x86_64-linux.module-eval \
-  .#checks.x86_64-linux.sigilcoin-runs \
-  .#checks.x86_64-linux.sigilcoin-durable-parent
-```
-
-```
-checking outputs of '/nix/store/…-sigilcoin-durable-parent.drv'...
-checking outputs of '/nix/store/…-sigilcoin-module-eval.drv'...
-checking outputs of '/nix/store/…-sigilcoin-runs.drv'...
-```
-
-`deploy/` and `LAUNCH.md` must be at least `git add`ed for any of this to
-work; Nix refuses to read a file the git tree does not track, and reports
-`Path 'deploy/flake.nix' … is not tracked by Git`.
-
-**2. Import the module and set options:**
+Import the module and explicitly select the new state directory:
 
 ```nix
 {
@@ -149,525 +94,339 @@ work; Nix refuses to read a file the git tree does not track, and reports
   services.sigilcoin = {
     enable = true;
     chain = "sigilcoin-main";
-    listen.bind = "0.0.0.0";        # the CLI default is 127.0.0.1: serves nobody
-    openFirewall = true;            # opens 19444/tcp
+    dataDir = "/var/lib/sigilcoin-proof-of-golf";
+    listen.bind = "0.0.0.0";
+    openFirewall = true;
     peers = [ "seed2.example.org:19444" ];
   };
 
-  services.sigilcoin-explorer.enable = true;   # binds 127.0.0.1:8080
+  services.sigilcoin-explorer.enable = true;
 }
 ```
 
-The explorer's public name is `explorer.sigilcoin.lol`. Put a TLS reverse
-proxy in front of it on that name; nothing here terminates TLS, and the
-explorer keeps binding `127.0.0.1:8080` so the proxy is the only way in. Do
-not give it a public bind address.
+Replace the example peer with an approved reachable replacement-network peer.
+This mainnet configuration is not launch approval. The module supports mainnet
+and regtest; use the Docker/local workflow for public testnet. Keep regtest
+loopback-only. Put a TLS reverse proxy in front of the explorer at
+`explorer.sigilcoin.lol`; the explorer itself stays on `127.0.0.1:8080`.
 
-### Ports and firewall
-
-| Port | Chain | Who needs it open |
-| --- | --- | --- |
-| 19444/tcp | `sigilcoin-main` | Everyone. `openFirewall = true` opens it. Bound by `sigilcoin listen` itself. |
-| 19445/tcp | `sigilcoin-regtest` | Local only. Never expose it. |
-| 8080/tcp | explorer | Localhost only; reverse-proxy it, do not open the port. |
-
-Mainnet magic is `8f d1 c0 a5`, regtest is `a5 c0 d1 8f`, and the user agent
-is `/sigilcoin-node:0.1.0/`.
-
-### Where state lives
-
-`/var/lib/sigilcoin`, mode 0750, owned `sigilcoin:sigilcoin`:
-
-| Path | What it is |
+| Port | Use |
 | --- | --- |
-| `sigilcoin-main.sqlite` | Headers, blocks, UTXOs, mempool, peer table, mode 0644 |
-| `wallet/` | Key directory, mode 0700 |
-| `wallet/wallet.key` | 32-byte secret, hex, mode 0600 |
+| 19444/tcp | Mainnet P2P; opened by `openFirewall = true` |
+| 19445/tcp | Regtest P2P; local only, never expose it |
+| 8080/tcp | Explorer loopback origin; do not expose it directly |
 
-The key is in its own 0700 subdirectory, not loose in the data directory, and
-that separation is load-bearing. The CLI locks the directory that holds the
-key down to 0700 before it creates the file; when the key lived in the data
-directory, the first `sigilcoin address` took the data directory from 0750 to
-0700 and destroyed the group-execute bit the explorer needs to traverse into
-it. Measured against the two builds:
+Restrict SSH independently to operator sources or a VPN. A public P2P bind
+does not authorize public administration or direct explorer access.
 
+## Retired-state cutover
+
+On a host that ran the retired network, stop every database user, including any
+external producer, contributor, observer, or one-shot CLI, before switching
+software. Archive the old chain and wallet state offline with its old genesis
+and source revision. It is historical evidence, not a backup to restore into
+the replacement network.
+
+For the retired NixOS default `/var/lib/sigilcoin`, preserve it and require an
+unused replacement path:
+
+```sh
+(
+set -euo pipefail
+sudo systemctl stop sigilcoin-explorer sigilcoin-sync sigilcoin-listen
+sudo test ! -e /var/lib/sigilcoin-proof-of-golf
+stamp=$(date -u +%Y%m%dT%H%M%SZ)
+sudo mv /var/lib/sigilcoin "/var/lib/sigilcoin.retired-nonce-pow-$stamp"
+sudo install -d -o sigilcoin -g sigilcoin -m 0750 \
+  /var/lib/sigilcoin-proof-of-golf
+)
 ```
-old binary, after `sigilcoin address`:   drwx------ /tmp/sgl-before
-                                         -rw-r--r-- /tmp/sgl-before/sigilcoin-main.sqlite
-                                         -rw------- /tmp/sgl-before/wallet.key
-this build, after `sigilcoin address`:   drwxr-x--- /tmp/sgl-after
-                                         -rw-r--r-- /tmp/sgl-after/sigilcoin-main.sqlite
-                                         drwx------ /tmp/sgl-after/wallet
-                                         -rw------- /tmp/sgl-after/wallet/wallet.key
-```
 
-The explorer's PRIMARY group is `sigilcoin`, so it can traverse the directory
-and read the database, and it cannot reach the key: the group has no bits at
-all on `wallet/`, and the key inside is 0600 owned by the node user. Its unit
-also carries `ReadOnlyPaths=/var/lib/sigilcoin`, so read-only is enforced by
-the kernel rather than by a flag the explorer promises to honour.
+Substitute the actual old `dataDir` if it differed. Do not run this archive
+step on a new host with no retired state. The subshell never restarts services;
+on a failure leave the host stopped and preserve what exists. Keep a verified
+encrypted offline copy of the retired directory. Do not copy its database,
+wallet, balances, or commitment receipts into the new directory.
 
-A key written by an older build at `<dataDir>/wallet.key` is MOVED into
-`wallet/` the first time any key-using command runs, and the move is printed:
-`wallet: moved …/wallet.key to …/wallet/wallet.key`. If a key exists at BOTH
-paths the CLI refuses rather than guessing which one holds the coins; keep
-the right one, move the other somewhere safe, and remove it from the data
-directory.
-
-Primary group rather than supplementary is load-bearing. Every unit here runs
-with `PrivateUsers=true`, and in that user namespace only the unit's own UID
-and GID are mapped: a supplementary GID arrives as `65534(nogroup)` and
-`/proc/self/setgroups` reads `deny`, so it cannot be recovered. An explorer
-configured with `extraGroups = [ "sigilcoin" ]` fails closed and cannot open
-the database at all. If you change the explorer's `Group`, check that it can
-still read `<dataDir>` before deciding the explorer is broken.
-
-> **wallet.key is the coins.** Lose it and every coin paid to that address is
-> gone: there is no seed phrase, no recovery, no second copy anywhere. Never
-> commit it, never paste it into a terminal you are sharing, never put it in
-> a bug report, and never let it into the Nix store, which is world-readable.
+The NixOS default is `/var/lib/sigilcoin-proof-of-golf`. Docker defaults are
+`state/mainnet-proof-of-golf`, `state/testnet-proof-of-golf`, and
+`state/testnet-pool-proof-of-golf`; the local helpers use
+`deploy/state/local-mainnet-proof-of-golf` or
+`deploy/state/local-testnet-proof-of-golf`. Renaming an old database directory
+to one of these names does not make it compatible.
 
 ## First-time bring-up
+
+After the archive boundary and explicit launch approval:
 
 ```sh
 sudo nixos-rebuild switch --flake /path/to/host-config
 systemctl status sigilcoin-listen sigilcoin-sync
-sudo -u sigilcoin sigilcoin status --chain sigilcoin-main --data-dir /var/lib/sigilcoin
+sudo -u sigilcoin sigilcoin status --chain sigilcoin-main \
+  --data-dir /var/lib/sigilcoin-proof-of-golf
 ```
 
-`sigilcoin-listen` must be `active (running)`. It binds port 19444 itself;
-there is no socket unit and no proxy in front of it.
+The listener must be active and own port 19444 directly; there is no socket
+proxy. A fresh database reports the replacement genesis at height 0, cumulative
+score 0, and no issued supply. Compare the internal and display-order genesis
+ids with the reviewed all-network output from `deploy/genesis-constants.sgl`.
+A matching chain name or wire handshake is insufficient. Stop for any retired
+genesis or unexpected history before connecting more peers.
 
-A node that has done nothing but open a fresh mainnet database reports the
-current generated genesis at height 0 with no peers, mempool entries, pending
-blocks, or issued supply. Compare its internal `best-hash` and reversed display
-id with the all-network output from `deploy/genesis-constants.sgl`; never use a
-pre-lottery pasted value.
-
-`best-work` is cumulative compact-target base work, not height or a projected
-program rank. Genesis carries the generated at-par candidate, encodes length
-and `C` in `version`, carries its chain's compact base target in `bits`, and
-uses a searched coinbase-lock-time/header-nonce cursor. Producer solutions
-require `L <= par`; shares require `L < personalized_par`. This cursor and
-target cutover changes genesis, so earlier state is incompatible. Mainnet's
-final genesis cursor is coinbase lock-time `6`, header nonce `3129183091`.
-See `../LAUNCH.md` for the exhaustive first-hit proof and published hash.
-
-Creating the node's own address writes the wallet key:
+Create a wallet only if this node actually needs one:
 
 ```sh
-sudo -u sigilcoin sigilcoin address --chain sigilcoin-main --data-dir /var/lib/sigilcoin
+sudo -u sigilcoin sigilcoin address --chain sigilcoin-main \
+  --data-dir /var/lib/sigilcoin-proof-of-golf
 ```
 
-Verbatim from this build on a mainnet data directory at `/tmp/sgl-after`,
-which is a 0750 directory standing in for `/var/lib/sigilcoin`:
+The node's fresh key determines its address; do not copy an example address's
+key or use a testnet wallet. The data directory is mode `0750`, owned
+`sigilcoin:sigilcoin`. The private key lives at `wallet/wallet.key`, mode `0600`,
+inside `wallet/`, mode `0700`. Back it up before receiving funds; there is no
+seed phrase or remote recovery.
 
-```
-address: sgl1q396xfcr5yjygshnnjxazyu5lhufgzy6r9hpptg
-chain: sigilcoin-main
-key-file: /tmp/sgl-after/wallet/wallet.key
-```
+The explorer's primary group is the node's group so it can traverse the data
+directory but not `wallet/`. With `PrivateUsers=true`, substituting a
+supplementary group can fail closed. Its unit uses
+`ReadOnlyPaths=/var/lib/sigilcoin-proof-of-golf`; do not grant it key access or
+write access to repair an unrelated failure.
 
-The address is whatever that node's own fresh key derives; the seed's will
-differ. What must not differ is the data directory's mode, which the explorer
-depends on:
+## Scheduled production
+
+The NixOS listener and sync units do not produce blocks. A manual producer first
+synchronizes, then asks for the current puzzle and scheduled time:
 
 ```sh
-stat -c '%A %n' /var/lib/sigilcoin /var/lib/sigilcoin/wallet /var/lib/sigilcoin/wallet/wallet.key
+sudo -u sigilcoin sigilcoin puzzle --chain sigilcoin-main \
+  --data-dir /var/lib/sigilcoin-proof-of-golf
 ```
 
-```
-drwxr-x--- /var/lib/sigilcoin
-drwx------ /var/lib/sigilcoin/wallet
--rw------- /var/lib/sigilcoin/wallet/wallet.key
+At or after the reported `next-slot-time`, submit one complete at-par candidate:
+
+```sh
+sudo -u sigilcoin sigilcoin mine --chain sigilcoin-main \
+  --data-dir /var/lib/sigilcoin-proof-of-golf
 ```
 
-Back the key up before the node earns anything. See
-[Backup and restore](#backup-and-restore).
+The CLI name remains `mine`, but it does not search. With no `--solution`, it
+uses the generated valid at-par witness for score 1. Supply `--solution` only
+for a valid current-context program you have actually shortened. Omitting
+`--address` uses or creates the node's wallet; a seed using an external payout
+address should pass its reviewed `--address` instead and need not hold a key.
+An early-slot refusal means wait, not change a timestamp or retry in a tight
+loop. A tip change requires a new parent-specific puzzle and candidate.
+
+For supervised production, use the Docker procedure in
+[deployment.md](../docs/deployment.md#scheduled-mainnet-production).
+`start-mainnet-miner.sh`, the `mainnet-miner` profile, and the `miner` service
+retain their operator-facing names, but run `producer-loop`. It waits for
+`next-slot-time`, checks the validated tip, and submits once; `MINE_INTERVAL=60`
+is the idle polling/retry delay, not the 86,400-second consensus spacing.
+Sleeping and low CPU are normal. Do not point two differently managed stacks
+at one live state directory.
 
 ## Is the node healthy?
 
 ```sh
-sudo -u sigilcoin sigilcoin status --chain sigilcoin-main --data-dir /var/lib/sigilcoin
+sudo -u sigilcoin sigilcoin status --chain sigilcoin-main \
+  --data-dir /var/lib/sigilcoin-proof-of-golf
 journalctl -u sigilcoin-sync -u sigilcoin-listen -n 50
 ```
 
-**Read deltas, not absolutes.** `sync-stage` and `sync-last-error` are sticky:
-they record the LAST outcome, not the current one, and a single unreachable
-peer in the table is enough to leave `sync-stage: failed` and a populated
-`sync-last-error` on a node that is otherwise perfectly healthy. "Watch for
-`sync-last-error` to be empty" is not a criterion anyone can meet. Take two
-`status` readings at least ten minutes apart and compare them.
+Read deltas, not just the last error. `sync-stage` and `sync-last-error` describe
+the last outcome; an unreachable peer can leave a sticky error after another
+peer succeeds. Compare two status readings and a separate node.
 
-| Signal | Healthy | Unhealthy |
-| --- | --- | --- |
-| `peer-successes` | strictly larger in the second reading | flat across two readings while `peer-failures` grows — the node is reaching nobody |
-| `peer-failures` | may grow; growth alone means nothing | growing while `peer-successes` is flat |
-| `sync-last-error` | any value, as long as `peer-successes` moved after it | unchanged for hours AND `peer-successes` flat; then the text names the cause |
-| `validated-blocks` | rising about once a day; identical to the second node at the same height | flat for more than ~2 days, or DIFFERENT from another node at the same height (that is a consensus split, not an ops problem) |
-| `best-height` vs `best-block-height` | within a few blocks | headers far ahead of validated bodies: block download or validation is behind |
-| `pending-blocks` | 0, or briefly non-zero | persistently non-zero means validation is stuck |
-| `peers` | at least 1 | 0 means nothing was ever configured |
-| supply | `issued-supply <= scheduled-supply-cap <= max-supply`; issued may trail the height cap after solo blocks | issued above the scheduled cap, or inconsistent with another node on the same active branch |
+| Signal | Interpretation |
+| --- | --- |
+| Peer successes/failures | Successes should advance; growing failures with no new success means connectivity needs attention. |
+| Validated tip and score | Compare branch identity and cumulative score, not height alone. An equal-score local incumbent may legitimately differ. |
+| `next-slot-time` | No new mainnet block is admissible before its exact daily slot; a due slot may remain empty without a producer. |
+| `best-height` vs `best-block-height` | Headers persistently ahead of validated bodies indicate download or validation lag. |
+| `pending-blocks` | Persistently nonzero indicates unresolved body validation/download work. |
+| Supply | Require `issued-supply <= scheduled-supply-cap <= max-supply` and agreement on the same active branch. |
 
-Verified contrast, both from this build. A sync that reached its peer:
-
-```
-peers: 1
-peer-successes: 1
-peer-failures: 0
-sync-stage: idle
-sync-last-error:
-```
-
-and a sync against a peer that is not there:
-
-```
-peers: 1
-peer-successes: 0
-peer-failures: 1
-sync-stage: failed
-sync-last-error: connect failed: peers: could not connect to 127.0.0.1 (p2p-socket-connect-timeout: connection refused).
-```
-
-The difference that matters is `peer-successes`, not the presence of an error
-string.
-
-**Journal lines that look like faults and are not.** The listener reports how
-each inbound connection ended, and the normal end of a Bitcoin-style
-conversation is the peer hanging up:
-
-```
-peer-served: 4 answered=1 ended=p2p-read-envelope: unexpected end of stream
-```
-
-Measured 6/6 on ordinary connects, hangups and garbage writes. Treat these as
-traffic, not errors. `p2p-read-envelope: payload too large` on the same line
-is a malformed peer being rejected — also normal, and also not a fault of the
-seed.
-
-`next-reward` is the next **scheduled subsidy**, not
-an exact coinbase payout: a solo block mints `floor(4*S/5)+F`, while a
-cooperative block mints `S+F`, targets 10% for verified shares and 5% for the
-parent carrier, and sends fees and integer residuals to the producer. These
-fields are chain state, not health signals.
-
-**Is the seed actually reachable?** The only real answer comes from off-host:
+Check P2P reachability from outside the host:
 
 ```sh
 nc -vz seed.sigilcoin.lol 19444
 ```
 
-On the host itself, `systemctl is-active sigilcoin-listen` answers whether
-the node is up, and `ss -ltnp | grep 19444` whether it is holding the port.
-The port is closed for the few seconds of a restart, and only then.
+Review CPU, memory, disk, file descriptors, restart counts, and malformed public
+input. Low-CPU production does not make every hostile-but-valid puzzle evaluation
+cheap. Ordinary peer hangups are not by themselves a seed failure.
+
+`next-reward` is scheduled subsidy, not an exact payout. For subsidy `S` and
+fees `F`, a solo block mints `floor(4*S/5)+F`; a cooperative block mints `S+F`,
+targets 10% for contribution-weighted shares and 5% for the parent carrier, and
+gives fees and integer residuals to the producer. The unused solo reserve is
+unminted, so issued supply can trail the scheduled cap.
 
 ## Adding peers
 
-Declaratively, in the host config (re-asserted on every start, idempotent):
+Configure peers declaratively:
 
 ```nix
-services.sigilcoin.peers = [ "seed2.example.org:19444" "203.0.113.10:19444" ];
+services.sigilcoin.peers = [ "seed2.example.org:19444" ];
 ```
 
-By hand, verified against the running binary:
+Or add an approved reachable peer by hand:
 
 ```sh
-sudo -u sigilcoin sigilcoin peers add 203.0.113.10:19444 \
-  --chain sigilcoin-main --data-dir /var/lib/sigilcoin
+sudo -u sigilcoin sigilcoin peers add seed2.example.org:19444 \
+  --chain sigilcoin-main --data-dir /var/lib/sigilcoin-proof-of-golf
 ```
 
-```
-203.0.113.10:19444 source=manual score=0 failures=0 last-result= last-error=
-```
-
-`peers list`, `peers remove HOST:PORT` and `peers test HOST:PORT` take the
-same shape. `peers test` dials the peer and reports the result on the same
-line. Adding a peer twice is a no-op, verified. An empty table prints:
-
-```
-no peers configured; add one with `sigilcoin peers add HOST:PORT`
-```
-
-IPv6 needs brackets: `[2001:db8::1]:19444`.
+`peers list`, `peers remove HOST:PORT`, and `peers test HOST:PORT` use the same
+chain/data flags. Peer registration is idempotent. IPv6 endpoints need brackets,
+for example `[2001:db8::1]:19444`. DNS is bootstrap, not a consensus authority;
+every peer must validate the replacement genesis.
 
 ## Backup and restore
 
-Two files matter, and they matter for different reasons. The database is
-replaceable by re-syncing from the network. `wallet.key` is not replaceable
-by anything.
-
-### Backup
+Stop all writers and readers before a plain filesystem archive. Stop any
+producer or contributor outside these units as well. Back up the complete
+current state, including its wallet and local commitment records:
 
 ```sh
-sudo systemctl stop sigilcoin-sync sigilcoin-listen
-sudo install -d -m 0700 /var/backups/sigilcoin
-sudo cp -a /var/lib/sigilcoin/sigilcoin-main.sqlite /var/backups/sigilcoin/
-sudo cp -a /var/lib/sigilcoin/wallet/wallet.key /var/backups/sigilcoin/
+(
+set -euo pipefail
+sudo systemctl stop sigilcoin-explorer sigilcoin-sync sigilcoin-listen
+backup_dir=/var/backups/sigilcoin-proof-of-golf
+sudo install -d -m 0700 "$backup_dir"
+stamp=$(date -u +%Y%m%dT%H%M%SZ)
+sudo tar -C /var/lib/sigilcoin-proof-of-golf \
+  -czf "$backup_dir/$stamp-chain.tgz" .
+sudo chmod 0600 "$backup_dir/$stamp-chain.tgz"
+sudo sha256sum "$backup_dir/$stamp-chain.tgz"
 sudo systemctl start sigilcoin-sync sigilcoin-listen
+sudo systemctl start sigilcoin-explorer
+)
 ```
 
-Stopping first is not optional for a plain `cp`: the database is not in WAL
-mode and a copy taken mid-write can be torn. For an online copy use
-`sqlite3 <db> ".backup <dest>"` instead (UNVERIFIED here; `sqlite3` is not
-installed by this module).
+Record the checksum and replacement genesis/source identity with the archive.
+Encrypt it and keep it offline; it contains secrets and must not enter source,
+logs, chat, or the world-readable Nix store. A live copy can contain torn SQLite
+state. The fail-fast subshell leaves services stopped if archiving fails.
 
-Store the wallet backup encrypted and offline. It is 65 bytes of hex; a
-printed copy in a safe is a legitimate answer for a chain that mints one
-block a day.
-
-### Restore
+Restore only a verified backup from this replacement genesis. Set `BACKUP` to
+that archive's absolute path, stop all other database users, and preserve the
+current directory rather than overwriting it:
 
 ```sh
-sudo systemctl stop sigilcoin-sync sigilcoin-listen
-sudo install -d -o sigilcoin -g sigilcoin -m 0700 /var/lib/sigilcoin/wallet
-sudo install -o sigilcoin -g sigilcoin -m 0600 \
-  /var/backups/sigilcoin/wallet.key /var/lib/sigilcoin/wallet/wallet.key
-sudo install -o sigilcoin -g sigilcoin -m 0644 \
-  /var/backups/sigilcoin/sigilcoin-main.sqlite /var/lib/sigilcoin/
+(
+set -euo pipefail
+: "${BACKUP:?Set BACKUP to a verified replacement-genesis archive}"
+sudo systemctl stop sigilcoin-explorer sigilcoin-sync sigilcoin-listen
+stamp=$(date -u +%Y%m%dT%H%M%SZ)
+sudo mv /var/lib/sigilcoin-proof-of-golf \
+  "/var/lib/sigilcoin-proof-of-golf.before-restore-$stamp"
+sudo install -d -o sigilcoin -g sigilcoin -m 0750 \
+  /var/lib/sigilcoin-proof-of-golf
+sudo tar -C /var/lib/sigilcoin-proof-of-golf -xzf "$BACKUP"
+sudo -u sigilcoin sigilcoin status --chain sigilcoin-main \
+  --data-dir /var/lib/sigilcoin-proof-of-golf
 sudo systemctl start sigilcoin-sync sigilcoin-listen
-sudo -u sigilcoin sigilcoin balance --chain sigilcoin-main --data-dir /var/lib/sigilcoin
+sudo systemctl start sigilcoin-explorer
+)
 ```
 
-`balance` prints the address, `outputs`, `balance`, `spendable` and
-`immature`. SigilCoin uses one-block coinbase maturity: an output created in
-block `H` may first be spent in `H+1`. Because `balance` evaluates spending in
-the candidate after the current tip, a fresh reward at tip `H` is already
-reported as `spendable`. Bitcoin's block-rules default remains 100 blocks.
+Compare restored genesis, tip, cumulative score, wallet permissions, and balance
+with the archived evidence and a replacement-network peer. Never restore a
+retired nonce-PoW archive into this directory. A fresh re-sync can replace lost
+chain data, but it cannot recover a lost wallet key.
 
-Losing only the database: delete it and let the node re-sync from peers. The
-wallet key is independent of it, and the balance reappears once the chain is
-back.
+Coinbase maturity remains one block: an output created at H may be spent in
+H+1. `balance` considers the candidate after the current tip. The bundled
+mainnet wallet separately waits six confirmations before selecting coinbase
+inputs; test networks select at one. Those wallet delays are policy, not
+settlement guarantees against a later higher-score rewrite.
 
 ## Upgrading
 
-```sh
-# 1. Build and check first, on the build host
-cd /path/to/sigil-coin/deploy && nix flake check
-nix build /path/to/sigil-coin?dir=deploy#sigilcoin
+Record the reviewed source/dependency revisions, build identity, and genesis.
+Stop all database users and take an offline replacement-network backup before
+switching the host configuration. Afterward compare status, scores, peers,
+explorer routes, and balances on the same active branch.
 
-# 2. Confirm the binary is the version you expect
-./result/bin/sigilcoin version     # => sigilcoin 0.1.0
+`nixos-rebuild switch --rollback` rolls back software, not state. Only use a
+generation compatible with the current replacement genesis, schema, and
+consensus. The retired nonce-PoW generation is not a rollback target. Never try
+different binaries against an uncertain database; preserve it and recover to
+an explicitly compatible empty location.
 
-# 3. Roll it out
-sudo nixos-rebuild switch --flake /path/to/host-config
-
-# 4. Confirm the chain survived the restart
-sudo -u sigilcoin sigilcoin status --chain sigilcoin-main --data-dir /var/lib/sigilcoin
-```
-
-`nixos-rebuild switch` restarts both units. Rollback is `nixos-rebuild
-switch --rollback`; the data directory is untouched by either direction.
-
-**Before upgrading, check what changed.** The puzzle language, the puzzle
-generator, emission, the solution rules and fork choice are consensus. A
-release that changes any of them is a hard fork, not an upgrade: every node
-must run it, and a node left behind will diverge silently rather than error.
-`sigilcoin status` cannot prove consensus compatibility, so this check is
-manual: compare consensus changes against `../docs/consensus.md`. Any change to
-frozen puzzle or consensus rules is a fork.
+Puzzle language/generation, emission, solution validity, scheduling, and fork
+choice are consensus. Compare changes with [consensus.md](../docs/consensus.md);
+a version string and a successful `status` command cannot establish
+compatibility.
 
 ## When the chain stalls
 
-Expected cadence is one block per day. This is a target, not a hard schedule:
-`bits` retargets every 16 blocks from the preceding 15 timestamp intervals,
-with a 4x clamp and `0x1c2bcf04` easiest mainnet base target. The parent
-timestamp floor is one second and future drift is 7200 seconds. Twenty-six
-hours without a block is unremarkable. Three days warrants investigation.
+Mainnet has exact daily header slots, not a probabilistic cadence. Publication
+can be late when nobody is producing; a late block still uses its scheduled
+time. Work through:
 
-Work through it in this order:
-
-1. **Is anyone mining?** Nothing forces a block to exist. The generated par
-   witness is an eligible program, but a producer must still find a qualifying
-   full-header nonce roll. On a chain this small, "stalled" usually means the
-   humans stopped playing, and no operational action fixes that.
-2. **Are peers reachable?**
-   `sigilcoin peers test HOST:PORT --chain sigilcoin-main --data-dir /var/lib/sigilcoin`,
-   then check `peer-failures` in `status`.
-3. **Is the node refusing blocks?** Read `sync-last-error`. A rule refusal
-   names the rule. A transport failure looks like this, verified:
-   `sync-last-error: connect failed: peers: could not connect to 127.0.0.1 (p2p-socket-connect-timeout: connection refused).`
-4. **Are bodies arriving but not validating?** `best-height` climbing while
-   `validated-blocks` is flat and `pending-blocks` is non-zero. Raise
-   `services.sigilcoin.sync.validationBlocks`, or check whether the unit is
-   hitting `CPUQuota`: `systemctl show sigilcoin-sync -p CPUUsageNSec`.
-   Hostile-but-legal solutions are bounded, not cheap.
-5. **Nothing else worked.** Stop the units, move the database aside (keep it,
-   do not delete it — it is the evidence), restart, and let the node re-sync
-   from genesis. The wallet key is not involved.
+1. Check `next-slot-time` and the host's UTC clock. A future slot means wait;
+   zero future drift makes clock correctness important.
+2. Check that a producer is running or deliberately submit one due at-par
+   candidate. No target, nonce, or coinbase search is required.
+3. Check peers and `sync-last-error`; distinguish transport failures from
+   explicit validation refusals.
+4. If headers arrive but bodies remain pending, inspect validation limits and
+   resource pressure. The module exposes `services.sigilcoin.sync.validationBlocks`
+   and `services.sigilcoin.cpuQuota`; these bound processing, not fork weight.
+5. If corruption is suspected, stop every database user, preserve the complete
+   state and logs, and recover from a matching backup or a fresh replacement
+   re-sync. Never delete the evidence or reuse retired state.
 
 ### Reorgs
 
-A reorg here is routine, not an incident. Every accepted block contributes one
-unit. A child already observed on the selected incumbent settles that height;
-otherwise greater validated height wins, and same-height siblings retain the
-first valid arrival. Program length, evaluator cost, share contribution,
-nonce, and block hash do not break the tie. Nodes can briefly retain different
-siblings; a child must link the selected incumbent and explicitly settles its
-height against later siblings.
+Strictly greater cumulative validated score wins, even at a lower height.
+Equal-score branches retain the durable active incumbent across restart, so two
+nodes can disagree locally without either violating consensus. There is no
+global height/hash tie-break and no special finality once a child appears.
 
-What that means operationally:
+A reorg rolls back orphaned UTXOs and reconnects the winning branch, with
+affected mempool transactions revalidated. A spend whose orphaned funding
+output no longer exists cannot remain spendable. Co-op receipts follow exact
+active-branch commitment/reveal membership and can move backward or become
+stale/missed; ordinary payouts remain vulnerable to later rewrites.
 
-- A `best-block-hash` change is a reorg. Rollback and reconnect commit as one
-  SQLite transaction: the node removes orphan-created UTXOs, reactivates
-  orphan-spent outputs, restores affected mempool rows, then revalidates them
-  against the fully connected winning branch. A spend whose orphaned coinbase
-  no longer exists becomes `rejected` with `missing-input` instead of remaining
-  a permanent available entry.
-- **Consensus permits a coinbase created in H to be spent in H+1.** That spend
-  remains vulnerable to a later taller fork even after H has a child. The
-  bundled mainnet wallet therefore waits for six confirmations before selecting
-  coinbase inputs; testnet and regtest deliberately select at one.
-- A reorg deeper than a few blocks, or one that repeats at the same height,
-  is worth reporting in `#systemcrafters` with the two competing block ids
-  and the output of `sigilcoin status` from both sides.
-- No action is required for a routine reorg. There is no `invalidateblock`.
+Record the competing ids, cumulative scores, and status from both sides.
+Investigate unexplained divergence or repeated deep rewrites without claiming
+they are computationally expensive. There is no `invalidateblock` operator
+escape hatch and no confirmation count that makes this settlement-grade.
 
 ## Known rough edges
 
-Verified behaviour of `sigilcoin 0.1.0` that the module works around. Read
-this before deciding something is broken.
+- `sigilcoin listen --max-connections 0` is the daemon mode used by the module.
+  A positive connection budget is bounded operation, not a seed service. The
+  accept timeout is a poll interval in daemon mode; ordinary disconnects should
+  not terminate the listener.
+- Listener and sync share one SQLite database. The driver retries contended
+  steps, but sustained write contention still needs investigation. Do not add
+  more writers to cure busy/locked errors.
+- The explorer uses `--host`, not the node CLI's `--bind`; it selects test
+  chains with `--regtest` or `--testnet`, not `--chain NAME`. Its unit enforces
+  read-only access rather than relying on a read-only command-line flag.
+- Explorer routes remain `/`, `/blocks`, `/difficulty`, `/block/<height|id>`,
+  and `/address/<address>`, with JSON under `/api/summary`, `/api/blocks`,
+  `/api/difficulty`, `/api/block/<height|id>`, and `/api/address/<address>`.
+  `/api/difficulty` describes puzzle complexity, not a hash search target.
+  Block JSON has `golf` fields `claimed_length`, `par`, `savings`,
+  `block_score`, and `chain_score`; summary exposes `next_slot` and
+  `chain_score`. Compare data on the same active branch.
+- A read-only explorer cannot recover a hot SQLite journal after a killed
+  writer. Do not delete the journal or make the explorer writable. Let a node
+  open the database normally, then restart the explorer:
 
-**`sigilcoin listen` must be run with `--max-connections 0`, which is what
-makes it a daemon.** Measured against the binary this flake builds, on
-loopback, with the results pasted from the runs:
+  ```sh
+  sudo -u sigilcoin sigilcoin status --chain sigilcoin-main \
+    --data-dir /var/lib/sigilcoin-proof-of-golf
+  sudo systemctl restart sigilcoin-explorer
+  ```
 
-| Invocation | Result |
-| --- | --- |
-| `--max-connections 0 --accept-timeout 2000`, idle | alive at 30 s and at 55 s; ended by an external `timeout 61` (exit 124), never by itself |
-| `--max-connections 0`, 3 garbage writes then 3 bare hangups | all six absorbed, a 7th connect accepted afterwards, process still alive |
-| `--max-connections 7`, the same six plus one | `connections-accepted: 7`, `connections-dropped: 7`, exit 0 only when its own budget was reached |
-| `--max-connections 1`, one connect | `connections-accepted: 1`, exit 0 |
-
-The accept timeout is a poll interval under `--max-connections 0`:
-`operate.sgl`'s loop answers an idle poll with `((= max-connections 0) (loop
-last))` instead of returning. A POSITIVE `--max-connections` is what makes
-the command exit on an idle timeout, which is what a probe or a test wants
-and what a seed must not have.
-
-Each connection is served inside its own guard, so a hangup, garbage bytes or
-a silent client drop end that connection and nothing else. That is why the
-unit is an ordinary `Type=simple` service that binds `0.0.0.0:19444`
-directly, with `Restart=always`, `RestartSec=5s` and systemd's start rate
-limit left on (5 starts in 60 s). A restart now means a real fault, so a
-crash loop should reach `failed` and be visible rather than spin forever.
-
-An earlier revision of this module ran the node on loopback behind
-`sigilcoin-listen-proxy.socket` and `systemd-socket-proxyd`, because the
-listen command of the time exited on an accept timeout and died on a bare
-connect-and-hangup. Both defects were fixed in the CLI, so the workaround is
-gone: it added a hop, it hid the peer address from a node that will one day
-want to ban one, and its own `Restart=always` without
-`StartLimitIntervalSec=0` could leave the proxy `failed` with port 19444 out
-of service. If you are looking at a host that still has those units, it is
-running an old generation.
-
-So: `systemctl is-active sigilcoin-listen` is the thing that must say
-`active`, and a recent start time on it is worth a look rather than a shrug.
-
-**Two processes share one SQLite file.** `sigilcoin-listen` and
-`sigilcoin-sync` both open `<data-dir>/<chain>.sqlite`. The Sigil SQLite
-driver forces `busy_timeout=0` and retries a contended step rather than
-blocking, and the database is not in WAL mode. Concurrent reads while the
-other unit is running were verified to work. Under sustained write contention
-they have not been. If `sync-last-error` starts reporting busy or locked
-database errors, run the two units on a schedule that does not overlap rather
-than adding a third writer.
-
-**The explorer's flags, confirmed by running it.** `sigilcoin-explorer`
-builds and runs out of the same derivation as the node. Two differences from
-the node CLI matter and the module handles both: chain selection is the bare
-`--regtest` flag, not `--chain NAME`, and the bind address flag is `--host`,
-not `--bind`. There is no read-only flag; read-only is enforced by the unit's
-`ReadOnlyPaths`.
-
-```sh
-timeout 5 sigilcoin-explorer --help
-```
-
-```
-sigilcoin-explorer — read-only web explorer for SigilCoin
-
-usage:
-  sigilcoin-explorer [--regtest] [--data-dir DIR] [--host HOST] [--port N]
-
-options:
-  --regtest         serve sigilcoin-regtest instead of sigilcoin-main
-  --data-dir DIR    node data directory to read (default: .)
-  --host HOST       address to bind (default: 127.0.0.1)
-  --port N          port to bind (default: 8080)
-  -h, --help        print this and exit
-  --version         print the package version and exit
-
-The explorer never writes: it opens the node's database read-only,
-answers one request per connection, and closes.
-```
-
-MINIMUM VERSION: `--help`, `-h` and `--version` answer and exit before
-anything binds a port. An explorer built before that landed has no `--help`
-handling at all and falls through to serving, so the command blocks the
-terminal instead of printing. If `sigilcoin-explorer --version` does not
-print `sigilcoin-explorer 0.1.0` and return, you are on an older build: read
-`explorer-main` in
-`packages/sigil-coin-explorer/src/sigil/coin/explorer/server.sgl` instead of
-running it. Every explorer command in this runbook is wrapped in `timeout`
-for that reason.
-
-Serving was verified the same way — bounded, because the server itself does
-not exit. Canonical HTML routes are `/`, `/blocks`, `/difficulty`,
-`/block/<height|id>`, and `/address/<sgl1...>`; JSON mirrors them under
-`/api/summary`, `/api/blocks`, `/api/difficulty`, `/api/block/<height|id>`, and
-`/api/address/<sgl1...>`.
-
-```sh
-dir=$(mktemp -d)
-sigilcoin status --regtest --data-dir "$dir" >/dev/null
-timeout 10 sigilcoin-explorer --regtest --data-dir "$dir" \
-  --host 127.0.0.1 --port 18099 &
-server=$!
-sleep 2
-for route in / /blocks /difficulty /block/0 \
-  /api/summary /api/blocks /api/difficulty /api/block/0; do
-  curl -s -o /dev/null -w "$route %{http_code}\n" "http://127.0.0.1:18099$route"
-done
-kill "$server"
-rm -rf "$dir"
-```
-
-```
-/ 200
-/blocks 200
-/difficulty 200
-/block/0 200
-/api/summary 200
-/api/blocks 200
-/api/difficulty 200
-/api/block/0 200
-```
-
-On an initialized regtest database every listed route must return 200. Address
-routes need a real `sgl1...` address from that database; unknown names and
-unknown routes return 404, and missing database routes return 503.
-
-**A read-only SQLite reader cannot recover a hot journal.** If the node is
-killed mid-write — `SIGKILL`, a power cut, the soak plan's own hard-kill test
-— SQLite leaves `sigilcoin-main.sqlite-journal` beside the database, and
-rolling it back is a WRITE. The explorer's unit has
-`ReadOnlyPaths=/var/lib/sigilcoin`, so it cannot perform that write and will
-not serve; expect it to fail on start, or to error on every query, until
-something writable has opened the database.
-
-What the operator does about it:
-
-1. Do not delete the journal. It is the uncommitted transaction, and removing
-   it corrupts the database instead of repairing it.
-2. Let a node unit open the database, which performs the rollback:
-   `systemctl start sigilcoin-sync`, or
-   `sudo -u sigilcoin sigilcoin status --chain sigilcoin-main --data-dir /var/lib/sigilcoin`.
-3. Confirm the journal is gone: `ls /var/lib/sigilcoin` should show only the
-   `.sqlite` file and `wallet/`.
-4. Then `systemctl restart sigilcoin-explorer`.
-
-The unit ordering (`After=sigilcoin-sync.service`) makes that sequence happen
-by itself on a normal boot, so this is a manual step only when the explorer
-is started while the node units are stopped.
+  Preserve state and investigate if recovery fails. Unit ordering after sync
+  helps on normal startup, but an independently restarted explorer may still
+  need the writable recovery step.

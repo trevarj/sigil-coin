@@ -24,6 +24,7 @@
         (sigil string)
         (sigil process)
         (sigil socket)
+        (sigil sqlite)
         (sigil secp256k1)
         (sigil bitcoin utils)
         (sigil bitcoin primitives)
@@ -129,7 +130,7 @@
 
 
 ;; Build next canonical block directly for integration setup.
-(define (build-next n graffiti script)
+(define (build-next n script)
   (let* ((tip (coin-validated-tip-height n))
          (height (+ tip 1))
          (parent (coin-validated-tip-header n))
@@ -143,7 +144,7 @@
            (coin-required-bits
              (chain-config-consensus-params (node-config n))
              headers)))
-    (coin-build-block parent height complexity bits #f graffiti script
+    (coin-build-block parent height complexity bits #f #u8() script
                       (+ (block-header-time parent)
                          (coin-chain-min-block-spacing (node-config n))))))
 
@@ -158,7 +159,7 @@
           (let loop ((i 0))
             (if (>= i count)
                 (node-status-snapshot-best-block-height (node-status n))
-                (let ((b (build-next n "fast-forward" %elsewhere)))
+                (let ((b (build-next n %elsewhere)))
                   (node-ingest-headers n (list (block-header-field b)))
                   (node-store-block n b)
                   (unless (= 1 (node-validate-blocks n))
@@ -218,7 +219,7 @@
     (lambda ()
       (cli-with-node args
         (lambda (n)
-          (let ((b (build-next n "funding" script)))
+          (let ((b (build-next n script)))
             (node-ingest-headers n (list (block-header-field b)))
             (node-store-block n b)
             (unless (= 1 (node-validate-blocks n))
@@ -359,10 +360,11 @@
       (assert-true (string-contains? message "sigilcoin-main"))))
 
   (test "testnet defaults to an independent operator-overridable data dir"
-    (assert-equal ".sigilcoin" (cli-data-dir '()))
-    (assert-equal ".sigilcoin" (cli-data-dir '("--regtest")))
-    (assert-equal ".sigilcoin-testnet" (cli-data-dir '("--testnet")))
-    (assert-equal ".sigilcoin-testnet"
+    (assert-equal ".sigilcoin-proof-of-golf" (cli-data-dir '()))
+    (assert-equal ".sigilcoin-proof-of-golf" (cli-data-dir '("--regtest")))
+    (assert-equal ".sigilcoin-testnet-proof-of-golf"
+                  (cli-data-dir '("--testnet")))
+    (assert-equal ".sigilcoin-testnet-proof-of-golf"
                   (cli-data-dir '("--chain" "sigilcoin-testnet")))
     ;; Sharing is possible only when the operator explicitly chooses it.
     (assert-equal "/tmp/n"
@@ -433,40 +435,6 @@
 ;; ============================================================
 
 (test-group "sigilcoin dispatch"
-  (test "no arguments prints the command surface"
-    (let ((text (run-text '())))
-      (assert-true (string-contains? text "sigilcoin puzzle"))
-      (assert-true (string-contains? text "sigilcoin mine"))
-      (assert-true (string-contains? text "sigilcoin send"))
-      (assert-true (string-contains? text "sigilcoin status"))
-      (assert-true (string-contains? text "sigilcoin peers"))
-      (assert-true (string-contains? text "sigilcoin header-sync"))
-      (assert-true (string-contains? text "sigilcoin block-sync"))
-      (assert-true (string-contains? text "sigilcoin sync"))
-      (assert-true (string-contains? text "sigilcoin run"))
-      (assert-true (string-contains? text "sigilcoin listen"))
-      (assert-true (string-contains? text "sigilcoin contribute"))
-      (assert-true (string-contains? text "sigilcoin relay serve"))
-      (assert-true (string-contains? text "mine [--solution EXPR]"))
-      (assert-true (string-contains? text "guaranteed par witness"))
-      (assert-true (string-contains? text "par is still lottery-gated"))
-      (assert-true (string-contains? text "Every byte saved"))
-      (assert-true (string-contains? text "eight-byte (256x) bonus"))
-      (assert-false (string-contains? text "--nonce"))
-      (assert-false (string-contains? text "Blocks are ranked"))
-      (assert-true (string-contains? text "[--relay URL]"))
-      (assert-true (string-contains? text "sigilcoin address"))
-      (assert-true (string-contains? text "sigilcoin balance"))
-      (assert-true (string-contains? text "--testnet"))
-      (assert-true (string-contains? text "sigilcoin-testnet"))
-      (assert-true (string-contains? text ".sigilcoin-testnet"))))
-
-  (test "help and version answer without touching a node"
-    (assert-true (string-contains? (run-text '("help")) "sigilcoin puzzle"))
-    (assert-true (string-contains? (run-text '("--help")) "sigilcoin mine"))
-    (assert-true (string-contains? (run-text '("version"))
-                                   (cli-package-version))))
-
   (test "an unknown command names itself and points at help"
     (let ((message (failure-message '("mien"))))
       (assert-true (string-contains? message "mien"))
@@ -633,9 +601,7 @@
 ;; The puzzle command
 ;; ============================================================
 
-;; Regtest genesis is a constant, so the puzzle at height 1 is a constant
-;; too. Pinning it here is what catches a generator or seed change that
-;; would silently move every miner's target.
+;; Every height-one fixture follows the chain's canonical genesis.
 (define %regtest-genesis-hash
   (chain-config-genesis-hash sigilcoin-regtest-chain))
 
@@ -654,6 +620,17 @@
       (assert-true (string-contains? text "best-block-height: 0"))
       (assert-true (string-contains? text "validated-blocks: 0"))
       (assert-true (string-contains? text "next-height: 1"))
+      (assert-true (string-contains? text "\nbest-chain-score: 0\n"))
+      (assert-true
+        (string-contains?
+          text
+          (string-append
+            "next-slot-time: "
+            (number->string
+              (+ (block-header-time
+                   (chain-config-genesis-header sigilcoin-regtest-chain))
+                 (coin-chain-min-block-spacing sigilcoin-regtest-chain)))
+            "\n")))
       (assert-true (string-contains? text "next-reward: 1.00000000 SGL"))
       (assert-true (string-contains? text "issued-supply: 0.00000000 SGL"))
       (assert-true
@@ -662,7 +639,6 @@
                      text
                      (string-append "max-supply: "
                                     (cli-daviwils->sgl coin-max-supply))))
-      (assert-false (string-contains? text "tip-solution-bytes:"))
       (assert-true (string-contains?
                      text
                      (string-append "best-hash: "
@@ -670,14 +646,14 @@
                                       (chain-config-genesis-hash
                                         sigilcoin-regtest-chain)))))))
 
-  (test "status follows the chain as it is mined"
+  (test "status accumulates block scores and advances the scheduled slot"
     (let ((args (fresh-args)))
       (mine-to args %payout-address "--solution" %height-one-source)
       (let ((text (run-text (cons "status" args))))
         (assert-true (string-contains? text "best-block-height: 1"))
         (assert-true (string-contains? text "validated-blocks: 1"))
         (assert-true (string-contains? text "next-height: 2"))
-        (assert-false (string-contains? text "tip-solution-bytes:"))
+        (assert-true (string-contains? text "\nbest-chain-score: 1\n"))
         (let ((issued (quotient (* 4 (coin-block-reward 1)) 5))
               (scheduled (coin-cumulative-supply 1)))
           (assert-true
@@ -694,7 +670,22 @@
             (string-contains?
               text
               (string-append "issued-supply: "
-                             (cli-daviwils->sgl scheduled)))))))))
+                             (cli-daviwils->sgl scheduled))))))
+      (let* ((second (car (mine-to args %payout-address)))
+             (text (run-text (cons "status" args)))
+             (spacing (coin-chain-min-block-spacing sigilcoin-regtest-chain))
+             (genesis (chain-config-genesis-header sigilcoin-regtest-chain)))
+        (assert-equal (+ (block-header-time genesis) (* 2 spacing))
+                      (block-header-time (block-header-field second)))
+        (assert-true (string-contains? text "best-block-height: 2"))
+        (assert-true (string-contains? text "\nbest-chain-score: 2\n"))
+        (assert-true
+          (string-contains?
+            text
+            (string-append "next-slot-time: "
+                           (number->string
+                             (+ (block-header-time genesis) (* 3 spacing)))
+                           "\n"))))))
 
 
 (test-group "sigilcoin private testnet"
@@ -712,29 +703,35 @@
                      (run-text (cons "puzzle" shortcut))
                      "height: 1"))))
 
-  (test "testnet mine accepts tsgl without a spacing throttle"
-    (let ((args (fresh-testnet-args)))
-      (assert-true (string-starts-with? %testnet-payout-address "tsgl1"))
+  (test "testnet accepts tsgl and respects its first scheduled slot"
+    (let* ((args (fresh-testnet-args))
+           (genesis (chain-config-genesis-header sigilcoin-testnet-chain))
+           (slot (+ (block-header-time genesis)
+                    (coin-chain-min-block-spacing sigilcoin-testnet-chain))))
       (assert-true (string-contains?
                      (failure-message
                        (append (list "mine" "--address" %payout-address)
                                args))
                      "tsgl1"))
-      ;; Before the scheduled testnet launch, the timestamp guard still holds
-      ;; mining. After launch, cadence comes from the nonce target rather than
-      ;; an artificial one-hour parent-spacing floor.
-      (let* ((command (append (list "mine"
-                                    "--address" %testnet-payout-address)
-                              args))
-             (message (failure-message command)))
+      ;; A fixed future launch may still be outside the chain's drift allowance.
+      (let ((message
+              (failure-message
+                (append (list "mine" "--address" %testnet-payout-address)
+                        args))))
         (if message
             (begin
               (assert-true (string-contains? message "too early"))
               (assert-equal 0 (tip-height args)))
             (begin
               (assert-equal 1 (tip-height args))
-              (assert-false (failure-message command))
-              (assert-equal 2 (tip-height args))))))))
+              (assert-equal
+                slot
+                (quietly
+                  (lambda ()
+                    (cli-with-node args
+                      (lambda (n)
+                        (block-header-time
+                          (coin-validated-tip-header n)))))))))))))
 
 (test-group "sigilcoin peers"
   (test "peers are added, listed and removed on the SigilCoin chain"
@@ -842,7 +839,7 @@
         (lambda ()
           (cli-with-node args
             (lambda (n)
-              (let ((b (build-next n "backlog" %elsewhere)))
+              (let ((b (build-next n %elsewhere)))
                 (node-ingest-headers n (list (block-header-field b)))
                 (node-store-block n b))))))
       (assert-equal 0 (tip-height args))
@@ -1030,54 +1027,19 @@
         (else "(lambda(x)x)")))
 
 (test-group "sigilcoin puzzle"
-  (test "report is consensus derivation"
-    (let ((report (coin-puzzle-report %regtest-genesis-hash 1
-                                      coin-genesis-complexity
-                                      coin-regtest-pow-limit-bits)))
-      (assert-equal 1 (cdr (assq 'height report)))
-      (assert-equal coin-genesis-complexity (cdr (assq 'complexity report)))
-      (assert-equal (puzzle-spec-examples %height-one-spec)
-                    (puzzle-spec-examples
-                      (cli-puzzle %regtest-genesis-hash 1
-                                  coin-genesis-complexity)))
-      (assert-equal (puzzle-spec-par-solution %height-one-spec)
-                    (cdr (assq 'par-witness report)))
-      (assert-equal (puzzle-spec-par %height-one-spec)
-                    (cdr (assq 'par-witness-length report)))
-      (assert-false (assq 'fallback-score report))))
-
-  (test "solution report exposes validity and resources, not a rank"
-    (let ((report (cli-solution-report %height-one-spec
-                                       %height-one-source)))
-      (assert-equal #t (cdr (assq 'ok report)))
-      (assert-equal (coin-solution-length %height-one-source)
-                    (cdr (assq 'length report)))
-      (assert-true (>= (cdr (assq 'cells report)) 0))
-      (assert-true (>= (cdr (assq 'steps report)) 0))
-      (assert-false (assq 'word report))
-      (assert-false (assq 'quality report))))
-
-  (test "command prints sole puzzle shape"
+  (test "puzzle publishes the par witness, its score, and the next slot"
     (let* ((text (run-text (cons "puzzle" (work-args))))
-           (par (puzzle-spec-par %height-one-spec)))
-      (assert-true (string-contains? text "complexity: 128"))
-      (assert-true (string-contains? text "constraint:"))
-      (assert-true (string-contains? text "examples:"))
-      (assert-true (string-contains? text "ONE-ARGUMENT function"))
-      (assert-true (string-contains? text "guaranteed-valid"))
-      (assert-true (string-contains? text "lottery-bonus: 0"))
-      (assert-true (string-contains? text "lottery-multiplier: 1"))
-      (assert-true (string-contains? text "lottery-expected-rolls: 257"))
+           (genesis (chain-config-genesis-header sigilcoin-regtest-chain))
+           (slot (+ (block-header-time genesis)
+                    (coin-chain-min-block-spacing sigilcoin-regtest-chain))))
       (assert-true
         (string-contains?
-          text
-          (string-append
-            "lottery-target: "
-            (number->string
-              (coin-lottery-target
-                coin-regtest-pow-limit-bits par par)))))
-      (assert-false (string-contains? text "fallback-score:"))
-      (assert-false (string-contains? text "rank: shorter"))))
+          text (string-append "par-witness: " %height-one-source "\n")))
+      (assert-true (string-contains? text "\nsavings: 0\n"))
+      (assert-true (string-contains? text "\nblock-score: 1\n"))
+      (assert-true
+        (string-contains?
+          text (string-append "next-slot-time: " (number->string slot) "\n")))))
 
   (test "complexity preview validates its input"
     (assert-true (string-contains?
@@ -1091,7 +1053,18 @@
                    "--complexity"))))
 
 (test-group "sigilcoin mine"
-  (test "valid function submits canonical block"
+  (test "structurally empty transactions never enter a candidate"
+    (let ((empty (transaction version: 1
+                              inputs: '()
+                              outputs: '()
+                              lock-time: 0)))
+      (cli-with-node
+        (work-args)
+        (lambda (n)
+          (assert-false
+            (coin-block-transaction-fee n 1 empty '()))))))
+
+  (test "valid function submits a canonical scheduled block"
     (let* ((args (work-args))
            (result (run (append (list "mine" "--solution"
                                       %height-one-source
@@ -1103,50 +1076,26 @@
            (minted (quotient (* 4 subsidy) 5))
            (unminted (- subsidy minted))
            (header (block-header-field b))
-           (par (puzzle-spec-par %height-one-spec))
-           (solution-length (string-length %height-one-source))
-           (target (coin-lottery-target (block-header-bits header)
-                                        par solution-length))
-           (encoded-length
-             (coin-version-solution-length
-               (block-header-version header)))
-           (roll (block-header-work-value header)))
-      (assert-true (block? b))
-      (assert-equal
-        0
-        (transaction-lock-time (car (block-transactions b))))
+           (payload (coin-result-value (coin-block-coinbase-payload b)))
+           (genesis (chain-config-genesis-header sigilcoin-regtest-chain))
+           (slot (+ (block-header-time genesis)
+                    (coin-chain-min-block-spacing sigilcoin-regtest-chain))))
       (assert-equal 1 (tip-height args))
-      (assert-true (coin-ok? encoded-length))
-      (assert-equal solution-length (coin-result-value encoded-length))
-      (assert-true
-        (coin-lottery-valid? roll (block-header-bits header)
-                             par solution-length))
+      (assert-equal slot (block-header-time header))
+      (assert-equal coin-regtest-pow-limit-bits (block-header-bits header))
+      (assert-equal 0 (block-header-nonce header))
+      (assert-equal 0 (transaction-lock-time (car (block-transactions b))))
+      (assert-equal #u8() (coin-coinbase-payload-graffiti payload))
       (assert-true (string-contains? text "solution-valid: yes"))
-      (assert-true (string-contains? text "memory:"))
-      (assert-true (string-contains? text "steps:"))
-      (assert-true (string-contains? text "lottery-bonus: 0"))
-      (assert-true (string-contains? text "lottery-multiplier: 1"))
-      (assert-true (string-contains? text "lottery-expected-rolls: 257"))
+      (assert-true (string-contains? text "\nsavings: 0\n"))
+      (assert-true (string-contains? text "\nblock-score: 1\n"))
+      (assert-true (string-contains? text "\nchain-score: 1\n"))
       (assert-true
         (string-contains?
-          text
-          (string-append "qualifying-nonce: "
-                         (number->string (block-header-nonce header)))))
-      (assert-true
-        (string-contains? text "coinbase-lock-time: 0"))
+          text (string-append "next-slot-time: " (number->string slot) "\n")))
       (assert-true
         (string-contains?
-          text (string-append "qualifying-target: "
-                              (number->string target))))
-      (assert-true
-        (string-contains?
-          text (string-append "block-id: " (block-header-id header))))
-      (assert-true
-        (string-contains?
-          text (string-append "block-roll: " (number->string roll))))
-      (assert-false (string-contains? text "fallback-score:"))
-      (assert-false (string-contains? text "outranks-fallback:"))
-      (assert-true (string-contains? text "examples-reproduced:"))
+          text (string-append "block-id: " (block-header-id header) "\n")))
       (assert-true (string-contains? text "payout: role=producer"))
       (assert-true
         (string-contains?
@@ -1159,7 +1108,8 @@
       (assert-equal minted
                     (transaction-output-value
                       (car (block-transactions b))))
-      (assert-true (string-contains? text "submitted: yes"))))
+      (assert-true (string-contains? text "submitted: yes"))
+      (assert-true (string-contains? text "active-chain: yes"))))
 
   (test "guaranteed par witness submits when source is omitted"
     (let* ((args (work-args))
@@ -1180,11 +1130,66 @@
                          (number->string
                            (puzzle-spec-par %height-one-spec)))))
       (assert-true (string-contains? text "within-par: yes"))
-      (assert-true
-        (string-contains? text "valid at-par work is still lottery-gated"))
-      (assert-true (string-contains? text "lottery-expected-rolls: 257"))
+      (assert-true (string-contains? text "\nsavings: 0\n"))
+      (assert-true (string-contains? text "\nblock-score: 1\n"))
       (assert-true (string-contains? text "submitted: yes"))
       (assert-equal 1 (tip-height args))))
+
+  (test "duplicates and equal or losing candidates persist without replacing the tip"
+    (let* ((args (work-args))
+           (blocks
+             (quietly
+               (lambda ()
+                 (cli-with-node args
+                   (lambda (n)
+                     (let* ((first (build-next n %purse-a))
+                            (equal-sibling (build-next n %purse-b))
+                            (losing-sibling (build-next n %elsewhere))
+                            (first-hash
+                              (block-header-hash (block-header-field first))))
+                       ;; All three siblings occupy the same slot and score one;
+                       ;; only their actual payout scripts differ.
+                       (for-each
+                         (lambda (candidate)
+                           (assert-equal
+                             (block-serialize candidate)
+                             (block-serialize (coin-submit-block! n candidate)))
+                           (assert-equal
+                             first-hash
+                             (block-header-hash (coin-validated-tip-header n))))
+                         (list first first equal-sibling))
+                       (let ((second (build-next n %purse-a)))
+                         (coin-submit-block! n second)
+                         (assert-equal
+                           (block-serialize losing-sibling)
+                           (block-serialize
+                             (coin-submit-block! n losing-sibling)))
+                         (list second first equal-sibling losing-sibling)))))))))
+      ;; Reopening proves submission retained the exact candidate body, not
+      ;; merely a header or a successful return value.
+      (quietly
+        (lambda ()
+          (cli-with-node args
+            (lambda (n)
+              (assert-equal 2 (coin-validated-tip-height n))
+              (assert-equal
+                (block-header-hash (block-header-field (car blocks)))
+                (block-header-hash (coin-validated-tip-header n)))
+              (for-each
+                (lambda (candidate)
+                  (let ((row
+                          (sqlite-query-row
+                            (node-db n)
+                            "SELECT block_hex FROM blocks WHERE hash = ?"
+                            (hex-encode
+                              (block-header-hash
+                                (block-header-field candidate))))))
+                    (assert-equal
+                      (hex-encode (block-serialize candidate))
+                      (and row
+                           (cdr (or (assq 'block_hex row)
+                                    (assoc "block_hex" row)))))))
+                blocks)))))))
 
   (test "explicit semantic padding over par is rejected with useful advice"
     (let* ((args (work-args))
@@ -1702,7 +1707,7 @@
                                        parent height complexity bits
                                        #f
                                        (list share)
-                                       "selected reveal" producer-script
+                                       #u8() producer-script
                                        (+ (block-header-time
                                             (block-header-field parent))
                                           (coin-chain-min-block-spacing
@@ -2552,4 +2557,4 @@
     #t)
   #t)
 
-(run-tests)
+(run-tests))

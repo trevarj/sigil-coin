@@ -501,35 +501,9 @@
       pool-producer-candidate<?)))
 
 
-(define (pool-assert-lottery block)
-  (let* ((header (block-header-field block))
-         (complexity-result
-           (coin-version-decode (block-header-version header)))
-         (length-result
-           (coin-version-solution-length (block-header-version header)))
-         (payload-result (coin-block-coinbase-payload block)))
-    (assert-true (coin-ok? complexity-result))
-    (assert-true (coin-ok? length-result))
-    (assert-true (coin-ok? payload-result))
-    (let* ((complexity (coin-result-value complexity-result))
-           (length (coin-result-value length-result))
-           (payload (coin-result-value payload-result))
-           (height (coin-coinbase-payload-height payload))
-           (solution (coin-coinbase-payload-solution payload))
-           (par
-             (puzzle-spec-par
-               (coin-puzzle-for
-                 (block-header-previous-block header) height complexity))))
-      (assert-equal length (bytevector-length solution))
-      (assert-true
-        (coin-lottery-valid?
-          (block-header-work-value header)
-          (block-header-bits header) par length))))
-  block)
 
 
 (define (pool-submit-block! n block)
-  (pool-assert-lottery block)
   (node-ingest-headers n (list (block-header-field block)))
   (node-store-block n block)
   (unless (= 1 (node-validate-blocks n))
@@ -541,11 +515,10 @@
                (node-status-snapshot-sync-last-error status)))))
   block)
 
-;; Valid siblings are first-seen in node fork choice. This relay projection
-;; fixture deliberately moves between such bodies, so store the canonical
-;; builder's sibling as validated before selecting it in metadata.
+;; Equal-height siblings retain the node's active incumbent. This relay
+;; projection fixture deliberately selects canonical builder bodies in
+;; metadata rather than requiring them to win a reorg.
 (define (pool-store-validated-sibling! n block)
-  (pool-assert-lottery block)
   (unless (= 1
              (node-ingest-headers n (list (block-header-field block))))
     (error "test-pool: sibling header was not ingested"))
@@ -736,7 +709,7 @@
                (coin-build-block
                  genesis height complexity coin-regtest-pow-limit-bits
                  #f
-                 "post-persist race" %pool-script
+                 #u8() %pool-script
                  (+ (block-header-time genesis)
                     (coin-chain-min-block-spacing (node-config n)))))
              (key (make-bytevector 32 42))
@@ -780,7 +753,7 @@
                (coin-build-block
                  genesis height complexity coin-regtest-pow-limit-bits
                  #f
-                 "prototype" %pool-script time-one))
+                 #u8() %pool-script time-one))
              (share-context (coin-parent-context prototype))
              (fixtures (pool-share-fixtures 3 share-context))
              (shares (map cadr fixtures))
@@ -856,12 +829,12 @@
                  (coin-build-block
                    genesis height complexity coin-regtest-pow-limit-bits
                    #f
-                   "commitment omitted" %pool-script time-one))
+                   #u8() %pool-script time-one))
                (committed-one
                  (coin-build-block
                    genesis height complexity coin-regtest-pow-limit-bits
                    #f
-                   "commitment included" %pool-script time-one
+                   #u8() %pool-script time-one
                    '() 0 all-commitments)))
           (pool-submit-block! n missed-one)
           (let ((status (pool-status service primary-commitment)))
@@ -869,8 +842,8 @@
             (assert-equal
               (block-header-id (block-header-field missed-one))
               (field status 'commit_block_id)))
-          ;; Siblings are first-seen, so select the second validated body
-          ;; explicitly and prove status follows its exact COMMITS body.
+          ;; Equal-height siblings retain the incumbent, so select the other
+          ;; body explicitly and prove status follows its exact COMMITS body.
           (pool-store-validated-sibling! n committed-one)
           (pool-activate-tip!
             chain data-dir (block-header-field committed-one) height)
@@ -991,7 +964,7 @@
                            next-complexity
                            coin-regtest-pow-limit-bits
                            #f
-                           "reveal omitted" %pool-script time-two))
+                           #u8() %pool-script time-two))
                        (included-two
                          (coin-build-coop-block
                            committed-one
@@ -1000,7 +973,7 @@
                            coin-regtest-pow-limit-bits
                            #f
                            shares
-                           "reveal included"
+                           #u8()
                            %pool-script
                            time-two)))
                   (pool-store-validated-sibling! n missed-two)
@@ -1059,9 +1032,9 @@
                         'status)))
 
                   ;; Re-point only the node's published active validated tip.
-                  ;; Every body below was consensus-validated above, so this
-                  ;; deterministically exercises backward and sibling reorg
-                  ;; projection without fabricating relay state.
+                  ;; These canonical builder bodies were stored above. This
+                  ;; isolates backward and sibling reorg projection from the
+                  ;; node's longest-height selection policy.
                   (pool-activate-tip!
                     chain data-dir
                     (block-header-field missed-two)

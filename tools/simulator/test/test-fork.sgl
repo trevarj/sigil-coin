@@ -1,0 +1,21 @@
+;;; A taller low-score branch wins; score cannot break height ties.
+
+(import (sigil test)
+        (sigil list)
+        (sigil coin simulation fork))
+
+(test-group "bounded longest-height fork observer"
+  (test "taller branch wins and later equal or shorter branches cannot displace it"
+    (let* ((result
+             (coin-run-fork-observer
+               (list
+                 (coin-fork-candidate "incumbent" 10 0 'a 'parent 100)
+                 (coin-fork-candidate "challenger" 10 1 'b 'parent 1)
+                 (coin-fork-candidate "challenger-child" 11 2 'b1 'b 2)
+                 (coin-fork-candidate "incumbent-child" 11 3 'a1 'a 101)
+                 (coin-fork-candidate "late-golfer" 10 4 'c 'parent 1000))))
+           (trace (cdr (assq 'trace result))))
+      (assert-equal '("incumbent" "incumbent" "challenger" "challenger" "challenger")
+                    (map (lambda (entry) (list-ref entry 5)) trace))
+      (assert-equal 'b1
+                    (coin-fork-candidate-id (cdr (assq 'tip result)))))))

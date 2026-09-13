@@ -76,18 +76,14 @@
     "sigil-bitcoin": {
       "flake": false,
       "locked": {
-        "lastModified": 1788534654,
-        "narHash": "sha256-lrhFv1dqyEtg3CnlSuEoUrzf9UjXoByehalbD3xRmPs=",
-        "ref": "refs/heads/master",
-        "rev": "4ecc1f188c51887450eb448b991dae28ba36dfa0",
-        "revCount": 111,
-        "type": "git",
-        "url": "file:///home/trev/Workspace/sigil/sigil-bitcoin"
+        "lastModified": 1789313465,
+        "narHash": "sha256-PZaW7t+4O50wb79kCVeeaJV+1ZghB/6CsDlDov+7TT0=",
+        "path": "/home/trev/Workspace/sigil/sigil-bitcoin",
+        "type": "path"
       },
       "original": {
-        "rev": "4ecc1f188c51887450eb448b991dae28ba36dfa0",
-        "type": "git",
-        "url": "file:///home/trev/Workspace/sigil/sigil-bitcoin"
+        "path": "/home/trev/Workspace/sigil/sigil-bitcoin",
+        "type": "path"
       }
     },
     "sigil-crypto": {

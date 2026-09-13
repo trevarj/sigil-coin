@@ -12,6 +12,14 @@
 .sigilcoin-testnet/**
 **/.sigilcoin-testnet
 **/.sigilcoin-testnet/**
+.sigilcoin-proof-of-golf
+.sigilcoin-proof-of-golf/**
+**/.sigilcoin-proof-of-golf
+**/.sigilcoin-proof-of-golf/**
+.sigilcoin-testnet-proof-of-golf
+.sigilcoin-testnet-proof-of-golf/**
+**/.sigilcoin-testnet-proof-of-golf
+**/.sigilcoin-testnet-proof-of-golf/**
 result
 result-*
 deploy/docker/.env

@@ -10,14 +10,13 @@
         (sigil bitcoin encoding)
         (sigil bitcoin consensus)
         (sigil bitcoin node)
-        (sigil coin puzzle)
-        (sigil coin puzzle generator)
         (sigil coin consensus)
         (sigil coin node)
         (sigil coin cli history)
         (sigil coin cli))
 
 (define %payout #u8(#x6a #x02 #x68 #x69))
+(define %fork-payout #u8(#x6a #x02 #x66 #x6b))
 
 (define (last-of xs)
   (if (null? (cdr xs)) (car xs) (last-of (cdr xs))))
@@ -55,37 +54,24 @@
       (error "test-puzzle-history: generated header has invalid version"))
     (coin-result-value decoded)))
 
-(define (build-block n history height label)
+(define (build-block n history height script)
   (let* ((parent (last-of history))
          (complexity (coin-required-complexity history height))
          (bits
            (coin-required-bits
              (chain-config-consensus-params (node-config n))
-             history))
-         (solution
-           (puzzle-spec-par-solution
-             (coin-puzzle-for
-               (block-header-hash parent) height complexity)))
-         (b
-           (coin-build-block
-             parent height complexity bits solution label %payout
-             (+ (block-header-time parent)
-                (coin-chain-min-block-spacing (node-config n)))))
-         (encoded-length
-           (coin-version-solution-length
-             (block-header-version (block-header-field b)))))
-    (unless (and (coin-ok? encoded-length)
-                 (= (coin-solution-length solution)
-                    (coin-result-value encoded-length)))
-      (error "test-puzzle-history: builder encoded the wrong solution length"))
-    b))
+             history)))
+    (coin-build-block
+      parent height complexity bits #f #u8() script
+      (+ (block-header-time parent)
+         (coin-chain-min-block-spacing (node-config n))))))
 
-(define (extend-validated n history target label)
+(define (extend-validated n history target script)
   (let loop ((headers history))
     (let ((height (length headers)))
       (if (> height target)
           headers
-          (let* ((b (build-block n headers height label))
+          (let* ((b (build-block n headers height script))
                  (header (block-header-field b)))
             (unless (= 1 (node-ingest-headers n (list header)))
               (error "test-puzzle-history: header was not ingested"))
@@ -97,12 +83,12 @@
                          (node-status n)))))
             (loop (append headers (list header))))))))
 
-(define (extend-downloaded n history target label)
+(define (extend-downloaded n history target script)
   (let loop ((headers history))
     (let ((height (length headers)))
       (if (> height target)
           headers
-          (let* ((b (build-block n headers height label))
+          (let* ((b (build-block n headers height script))
                  (header (block-header-field b)))
             (unless (= 1 (node-ingest-headers n (list header)))
               (error "test-puzzle-history: branch header was not ingested"))
@@ -125,10 +111,9 @@
            (args (list "--regtest" "--data-dir" dir))
            (n (node-open sigilcoin-regtest-chain dir))
            (genesis (chain-config-genesis-header (node-config n)))
-           ;; The branches are hash-distinct and every automatic nonce winner
-           ;; uses its at-par witness, so both retarget margin windows stay zero
-           ;; while this fixture checks exact ancestry.
-           (canonical (extend-validated n (list genesis) 32 "canonical"))
+           ;; Distinct payout scripts separate the branches. Their at-par
+           ;; witnesses give every block score one and zero retarget savings.
+           (canonical (extend-validated n (list genesis) 32 %payout))
            (old-h32 (list-ref canonical 32)))
       (assert-equal 32
                     (node-status-snapshot-best-block-height (node-status n)))
@@ -145,7 +130,7 @@
       ;; Download a taller fork from H15. Validation rolls canonical state
       ;; onto this branch; stale rows at every shared height remain stored.
       (let* ((fork-base (prefix canonical 16))
-             (fork (extend-downloaded n fork-base 33 "fork")))
+             (fork (extend-downloaded n fork-base 33 %fork-payout)))
         (assert-equal 18 (node-validate-blocks n))
         (assert-equal 33
                       (node-status-snapshot-best-block-height (node-status n)))
@@ -169,7 +154,7 @@
           ;; A taller header without its body may lead header sync, but cannot
           ;; change validated puzzle ancestry.
           (let ((ghost (block-header-field
-                         (build-block n fork 34 "bodyless"))))
+                         (build-block n fork 34 %fork-payout))))
             (assert-equal 1 (node-ingest-headers n (list ghost)))
             (assert-equal 34
                           (node-status-snapshot-best-height (node-status n)))

@@ -3,8 +3,6 @@
 (define-library (sigil coin node miner)
   (import (sigil math)
           (sigil io)
-          (sigil crypto)
-          (sigil bitcoin utils)
           (sigil bitcoin tx)
           (sigil bitcoin consensus)
           (sigil coin puzzle generator)
@@ -15,8 +13,6 @@
     coin-par-solution
     coin-mining-coinbase
     coin-mining-coinbase/coop
-    coin-mine-header
-    coin-mine-block
     coin-build-block
     coin-build-coop-block)
 
@@ -25,10 +21,6 @@
     (define %zero32 (make-bytevector 32 0))
     (define %coinbase-index #xffffffff)
     (define %sequence-final #xffffffff)
-
-    (define (coin-mining-u32? value)
-      (and (number? value) (exact? value) (integer? value)
-           (<= 0 value #xffffffff)))
 
     ;; Coerce miner text or bytes to wire bytes.
     (define (coin-mining-bytes who value)
@@ -70,7 +62,9 @@
          -> transaction?)
       (if (not (bytevector? producer-script))
           (error "coin-mining-coinbase/coop: expected producer script"))
-      (let* ((fees (require-fees "coin-mining-coinbase/coop"
+      (let* ((graffiti-bytes
+               (coin-mining-bytes "coin coinbase graffiti" graffiti))
+             (fees (require-fees "coin-mining-coinbase/coop"
                                  (optional-argument maybe-fees 0 0)))
              (subsidy (coin-block-reward height))
              (plan (coin-payout-plan
@@ -89,9 +83,7 @@
                                           shares: (coin-shares-encode shares)
                                           commits: (coin-commits-encode
                                                      commitments)
-                                          graffiti: (coin-mining-bytes
-                                                      "coin coinbase graffiti"
-                                                      graffiti)))
+                                          graffiti: graffiti-bytes))
                           sequence: %sequence-final
                           witness: '()))
           outputs: (outputs-for plan producer-script)
@@ -106,7 +98,7 @@
         (require-fees "coin-mining-coinbase"
                       (optional-argument maybe-fees 0 0))))
 
-    (define (solution-shape-or-raise previous-hash height complexity solution)
+    (define (solution-length-or-raise previous-hash height complexity solution)
       (let* ((spec (coin-node-puzzle previous-hash height complexity))
              (checked (coin-check-solution spec solution)))
         (if (coin-failed? checked)
@@ -114,157 +106,7 @@
                      "coin-build-block: solution rejected ("
                      (symbol->string (coin-result-reason checked))
                      ")"))
-            (cons (coin-solution-length solution)
-                  (puzzle-spec-par spec)))))
-
-    (define (decoded-or-raise who result)
-      (if (coin-failed? result)
-          (error (string-append
-                   who
-                   ": "
-                   (symbol->string (coin-result-reason result))))
-          (coin-result-value result)))
-
-    ;; Mutate only the nonce bytes in an already-finalized wire header.
-    (define (write-nonce! wire nonce)
-      (bytevector-u8-set! wire 76 (bitwise-and nonce #xff))
-      (bytevector-u8-set! wire 77
-        (bitwise-and (arithmetic-shift nonce -8) #xff))
-      (bytevector-u8-set! wire 78
-        (bitwise-and (arithmetic-shift nonce -16) #xff))
-      (bytevector-u8-set! wire 79
-        (bitwise-and (arithmetic-shift nonce -24) #xff)))
-
-    (define (u256-le n)
-      (let ((out (make-bytevector 32 0)))
-        (do ((i 0 (+ i 1))
-             (value n (quotient value 256)))
-            ((= i 32) out)
-          (bytevector-u8-set! out i (remainder value 256)))))
-
-    (define (u256-le<=? left right)
-      (let loop ((i 31))
-        (cond ((< i 0) #t)
-              ((< (bytevector-u8-ref left i)
-                  (bytevector-u8-ref right i)) #t)
-              ((> (bytevector-u8-ref left i)
-                  (bytevector-u8-ref right i)) #f)
-              (else (loop (- i 1))))))
-
-    (define (coin-mining-target-bytes who header par)
-      (if (not (block-header? header))
-          (error (string-append who ": expected a block header")))
-      (let ((length
-              (decoded-or-raise
-                who
-                (coin-version-solution-length
-                  (block-header-version header)))))
-        (if (> length par)
-            (error (string-append who ": solution length exceeds par")))
-        (u256-le
-          (coin-lottery-target (block-header-bits header) par length))))
-
-    ;; Return the first qualifying nonce at or after `start`, or #f.
-    (define (coin-search-header-nonce header target-bytes start)
-      (let ((wire (block-header-serialize header))
-            (winner #f))
-        (do ((nonce start (+ nonce 1)))
-            ((or winner (> nonce #xffffffff)) winner)
-          (write-nonce! wire nonce)
-          ;; ponytail: the crypto API returns digest bytevectors. The measured
-          ;; launch rate includes this bounded GC; a native SHA256d predicate
-          ;; would require target recalibration.
-          (when
-            (u256-le<=?
-              (sha256-bytes (sha256-bytes wire))
-              target-bytes)
-            (set! winner nonce)))))
-
-    ;;; Search the full uint32 nonce range for a qualifying finalized header.
-    ;;;
-    ;;; `header` must already carry its final merkle root, version claim and
-    ;;; chain-required compact base target. Only the 80-byte header nonce
-    ;;; changes, and the search always starts at zero.
-    (define (coin-mine-header header par)
-      (: block-header? integer? -> block-header?)
-      (let* ((target-bytes
-               (coin-mining-target-bytes "coin-mine-header" header par))
-             (winner
-               (coin-search-header-nonce header target-bytes 0)))
-        (if winner
-            (block-header header nonce: winner)
-            (error "coin-mine-header: nonce range exhausted"))))
-
-    ;;; Search a block's uint64 `(coinbase lock-time, header nonce)` cursor.
-    ;;;
-    ;;; Search starts at the cursor already carried by `prototype`. Nonce
-    ;;; exhaustion increments the final coinbase's lock-time, recomputes the
-    ;;; merkle root, and resets nonce to zero.
-    ;;;
-    ;;; ```scheme
-    ;;; (coin-mine-block prototype par) ; => a qualifying complete block
-    ;;; ```
-    (define (coin-mine-block prototype par)
-      (: block? integer? -> block?)
-      (if (not (block? prototype))
-          (error "coin-mine-block: expected a block"))
-      (let* ((transactions (block-transactions prototype))
-             (coinbase (coin-block-coinbase prototype)))
-        (if (not coinbase)
-            (error "coin-mine-block: expected a coinbase first transaction"))
-        (if (not (= %sequence-final
-                    (txin-sequence (car (transaction-inputs coinbase)))))
-            (error "coin-mine-block: expected final coinbase sequence"))
-        (if (not (coin-mining-u32? (transaction-lock-time coinbase)))
-            (error "coin-mine-block: expected uint32 coinbase lock-time"))
-        (if (not
-              (coin-mining-u32?
-                (block-header-nonce (block-header-field prototype))))
-            (error "coin-mine-block: expected uint32 header nonce"))
-        (let* ((prototype-header (block-header-field prototype))
-               (txids (map transaction-txid transactions))
-               (base-header
-                 (block-header
-                   prototype-header
-                   merkle-root: (merkle-root txids)))
-               (target-bytes
-                 (coin-mining-target-bytes
-                   "coin-mine-block" base-header par)))
-          (let loop ((header base-header)
-                     (txs transactions)
-                     (start (block-header-nonce base-header))
-                     (tail-txids (cdr txids)))
-            (let* ((coinbase (car txs))
-                   (winner
-                     (coin-search-header-nonce
-                       header target-bytes start)))
-              (cond
-                (winner
-                 (block prototype
-                        header-field: (block-header header nonce: winner)
-                        transactions: txs))
-                ((= #xffffffff (transaction-lock-time coinbase))
-                 (error "coin-mine-block: search space exhausted"))
-                (else
-                  (let* ((next-coinbase
-                           (transaction
-                             coinbase
-                             lock-time:
-                               (+ 1 (transaction-lock-time coinbase))))
-                         (next-transactions
-                           (cons next-coinbase (cdr txs)))
-                         (next-tail-txids tail-txids)
-                         (next-header
-                           (block-header
-                             header
-                             merkle-root:
-                               (merkle-root
-                                 (cons
-                                   (transaction-txid next-coinbase)
-                                   next-tail-txids))
-                             nonce: 0)))
-                    (loop next-header next-transactions 0
-                          next-tail-txids)))))))))
+            (coin-solution-length solution))))
 
     (define (build parent-header height complexity bits solution shares
                    contributions commitments graffiti producer-script
@@ -275,10 +117,8 @@
                  "coin-build-block solution"
                  (or solution
                      (coin-par-solution parent-hash height complexity))))
-             (shape (solution-shape-or-raise
-                      parent-hash height complexity solution-bytes))
-             (length (car shape))
-             (par (cdr shape))
+             (length (solution-length-or-raise
+                       parent-hash height complexity solution-bytes))
              (coinbase (coin-mining-coinbase/coop
                          height solution-bytes shares contributions commitments
                          graffiti producer-script carrier-script fees))
@@ -287,13 +127,11 @@
                (block-header
                  version: (coin-version-encode complexity length)
                  previous-block: parent-hash
-                 merkle-root: (merkle-root (map transaction-txid transactions))
+                 merkle-root: (merkle-root (map transaction-wtxid transactions))
                  time: time
                  bits: bits
                  nonce: 0)))
-        (coin-mine-block
-          (block header-field: header transactions: transactions)
-          par)))
+        (block header-field: header transactions: transactions)))
 
     ;;; Build a producer-only block. Optional values are transactions, fees,
     ;;; then commitments for this height's future shares.

@@ -16,6 +16,7 @@
         (sigil bitcoin utils)
         (sigil bitcoin encoding)
         (sigil bitcoin tx)
+        (sigil bitcoin script)
         (sigil bitcoin consensus)
         (sigil bitcoin node)
         (sigil secp256k1)
@@ -50,14 +51,12 @@
 (define %genesis-block
   (coin-genesis-block
     coin-regtest-genesis-quote coin-regtest-genesis-time
-    coin-regtest-pow-limit-bits
-    coin-regtest-genesis-coinbase-lock-time-constant
-    coin-regtest-genesis-nonce-constant))
+    coin-regtest-pow-limit-bits))
 (define %genesis (block-header-field %genesis-block))
 (define %genesis-hash (block-header-hash %genesis))
 (define %genesis-time (block-header-time %genesis))
 
-;; The local chain's spacing floor: one second, so a test never waits.
+;; The local chain's exact slot spacing: one second, so a test never waits.
 (define %spacing coin-regtest-min-block-spacing)
 
 (define (accept? previous-headers header)
@@ -73,7 +72,7 @@
 (define (par-at previous height complexity)
   (puzzle-spec-par (coin-puzzle-for previous height complexity)))
 
-;; A block extending `parent` at `height`, mining `solution` (or the generated
+;; A block extending `parent` at `height`, using `solution` (or the generated
 ;; par witness when `#f`) against the puzzle at `complexity`.
 (define (build-on parent height complexity solution)
   (coin-build-block parent
@@ -81,7 +80,7 @@
                     complexity
                     (block-header-bits parent)
                     solution
-                    "systemcrafters"
+                    #u8()
                     %payout
                     (+ (block-header-time parent) %spacing)))
 
@@ -103,16 +102,13 @@
 (define (with-header b header)
   (block b header-field: header))
 
-(define (with-nonce b w)
-  (with-header b (block-header (block-header-field b) nonce: w)))
-
-;; A block whose coinbase claims `solution`, built without the miner's own
+;; A block whose coinbase claims `solution`, built without the builder's own
 ;; check, so a test can present a body the rules are supposed to refuse.
 (define (block-claiming header height solution)
   (block header-field: header
          transactions: (list (coin-mining-coinbase height
                                                       solution
-                                                      "systemcrafters"
+                                                      #u8()
                                                       %payout))))
 
 (define (candidate-at height work hash extended?)
@@ -217,36 +213,19 @@
     (thunk)
     #f))
 
-(define (block-with-coinbase b coinbase . maybe-nonce)
+(define (block-with-coinbase b coinbase)
   (let* ((transactions (cons coinbase (cdr (block-transactions b))))
          (header (block-header (block-header-field b)
                                merkle-root: (merkle-root
-                                              (map transaction-txid
-                                                   transactions))
-                               nonce: (if (null? maybe-nonce)
-                                          (block-header-nonce
-                                            (block-header-field b))
-                                          (car maybe-nonce)))))
+                                              (map transaction-wtxid
+                                                   transactions)))))
     (block b header-field: header transactions: transactions)))
 
-(define (with-mining-cursor b lock-time nonce)
-  (block-with-coinbase
-    b
-    (transaction (car (block-transactions b)) lock-time: lock-time)
-    nonce))
-
-(define (qualifying-header? header par)
-  (coin-lottery-valid?
-    (block-header-work-value header)
-    (block-header-bits header)
-    par
-    (coin-result-value (coin-header-solution-length header))))
-
 ;; ============================================================
-;; Header fields and lottery
+;; Header fields and deterministic construction
 ;; ============================================================
 
-(test-group "sigilcoin header fields and lottery"
+(test-group "sigilcoin header fields and deterministic construction"
   (test "version commits genesis complexity and producer length"
     (assert-equal coin-genesis-complexity
                   (coin-result-value
@@ -263,273 +242,61 @@
     (assert-equal 'malformed-header
                   (coin-result-reason (coin-version-decode "soon"))))
 
-  (test "bits is the chain-specific compact base target"
+  (test "bits is the fixed chain-specific compatibility field"
     (assert-equal coin-regtest-pow-limit-bits
                   (block-header-bits %genesis))
     (assert-equal coin-regtest-pow-limit-bits
                   (coin-required-bits
                     sigilcoin-regtest-consensus-params
-                    (list %genesis)))
-    (assert-equal (compact-target->integer coin-regtest-pow-limit-bits)
-                  (block-header-target %genesis)))
+                    (list %genesis))))
 
-  (test "the automatic at-par builder finds an accepted nonce"
-    (let* ((spec (coin-node-puzzle %genesis-hash
-                                  1
-                                  coin-genesis-complexity))
-           (par (puzzle-spec-par spec))
-           (length (coin-result-value
-                     (coin-header-solution-length %header1)))
-           (bits (block-header-bits %header1))
-           (target (coin-lottery-target bits par length)))
-      (assert-equal par length)
-      (assert-equal 257
-                    (coin-lottery-expected-rolls bits par length))
-      (assert-true
-        (<= 0 (block-header-nonce %header1) #xffffffff))
-      (assert-true
-        (<= (block-header-work-value %header1) target))
+  (test "the at-par builder produces the same canonical block in one pass"
+    (let* ((again (build-on %genesis 1 coin-genesis-complexity #f))
+           (coinbase (car (block-transactions again)))
+           (payload (coin-result-value (coin-block-coinbase-payload again)))
+           (spec (coin-node-puzzle %genesis-hash 1 coin-genesis-complexity)))
+      (assert-equal (block-serialize %block1) (block-serialize again))
+      (assert-equal (puzzle-spec-par spec)
+                    (coin-result-value (coin-header-solution-length %header1)))
+      (assert-equal 0 (block-header-nonce %header1))
+      (assert-equal 1 (transaction-version coinbase))
+      (assert-equal 0 (transaction-lock-time coinbase))
+      (assert-equal #xffffffff
+                    (txin-sequence (car (transaction-inputs coinbase))))
+      (assert-equal #u8() (coin-coinbase-payload-graffiti payload))
+      (assert-equal (+ %genesis-time %spacing) (block-header-time %header1))
+      (assert-equal 80 (bytevector-length (block-header-serialize %header1)))
+      (assert-true (coin-block-merkle-root-valid? again))
       (assert-true (accept? (list %genesis) %header1))))
 
-  (test "header acceptance distinguishes a nonce hit from a miss"
-    (let* ((spec (coin-node-puzzle %genesis-hash
-                                  1
-                                  coin-genesis-complexity))
-           (par (puzzle-spec-par spec))
-           (length (coin-result-value
-                     (coin-header-solution-length %header1)))
-           (bits (block-header-bits %header1))
-           (target (coin-lottery-target bits par length))
-           (miss
-             (let loop ((nonce 0))
-               (let ((candidate (block-header %header1 nonce: nonce)))
-                 (if (> (block-header-work-value candidate) target)
-                     candidate
-                     (loop (+ nonce 1)))))))
-      (assert-true (accept? (list %genesis) %header1))
-      (assert-false (accept? (list %genesis) miss))))
+  (test "a nonzero nonce is not a canonical header"
+    (assert-false
+      (accept? (list %genesis) (block-header %header1 nonce: 1))))
 
-  (test "the standalone grinder starts at zero on finalized fields"
-    (let* ((spec (coin-node-puzzle %genesis-hash
-                                  1
-                                  coin-genesis-complexity))
-           (par (puzzle-spec-par spec))
-           (base (block-header %header1 nonce: #xffffffff))
-           (mined (coin-mine-header base par))
-           (prototype
-             (block %block1
-                    header-field: (block-header %header1 nonce: 0)))
-           (mined-block (coin-mine-block prototype par))
-           (stale
-             (block
-               prototype
-               header-field:
-                 (block-header
-                   (block-header-field prototype)
-                   merkle-root: %zero32)))
-           (repaired (coin-mine-block stale par)))
-      (assert-equal (block-header-nonce %header1)
-                    (block-header-nonce mined))
-      (assert-equal (block-header-merkle-root %header1)
-                    (block-header-merkle-root mined))
-      (assert-true (qualifying-header? mined par))
-      (assert-equal
-        (block-serialize
-          (block prototype header-field: mined))
-        (block-serialize mined-block))
-      (assert-equal (block-serialize mined-block)
-                    (block-serialize repaired))))
-
-  (test "the block grinder rolls the coinbase cursor and returns its body"
-    (let* ((spec (coin-node-puzzle %genesis-hash
-                                  1
-                                  coin-genesis-complexity))
-           (par (puzzle-spec-par spec))
-           (extra
+  (test "a builder commits ordinary transactions without changing them"
+    (let* ((extra
              (transaction
                version: 2
-               inputs:
-                 (list
-                   (txin
-                     previous-output:
-                       (outpoint txid: (hash-of 99) index: 3)
-                     script-sig: #u8(#x51)
-                     sequence: #xfffffffe
-                     witness: '()))
+               inputs: (list
+                         (txin previous-output:
+                                 (outpoint txid: (hash-of 99) index: 3)
+                               script-sig: #u8(#x51)
+                               sequence: #xfffffffe
+                               witness: '()))
                outputs: (list (txout value: 7 script-pubkey: %payout))
                lock-time: 11))
-           (transactions
-             (append (block-transactions %block1) (list extra)))
-           (base
-             (block
-               %block1
-               header-field:
-                 (block-header
-                   %header1
-                   merkle-root:
-                     (merkle-root (map transaction-txid transactions))
-                   nonce: 0)
-               transactions: transactions))
-           (pair
-             (let find ((lock-time 0))
-               (if (= #xffffffff lock-time)
-                   (error "test-node: no rollover fixture found"))
-               (let ((prototype
-                       (with-mining-cursor
-                         base lock-time #xffffffff))
-                     (next
-                       (with-mining-cursor base (+ lock-time 1) 0)))
-                 (if (and
-                       (not
-                         (qualifying-header?
-                           (block-header-field prototype) par))
-                       (qualifying-header?
-                         (block-header-field next) par))
-                     (cons prototype next)
-                     (find (+ lock-time 1))))))
-           (prototype (car pair))
-           (expected (cdr pair))
-           (mined (coin-mine-block prototype par))
-           (prototype-header (block-header-field prototype))
-           (mined-header (block-header-field mined))
-           (prototype-transactions (block-transactions prototype))
-           (mined-transactions (block-transactions mined))
-           (prototype-coinbase (car prototype-transactions))
-           (mined-coinbase (car mined-transactions)))
-      (assert-equal #xffffffff
-                    (block-header-nonce prototype-header))
-      (assert-false (qualifying-header? prototype-header par))
-      (assert-true
-        (qualifying-header? (block-header-field expected) par))
-      (assert-equal
-        (+ 1 (transaction-lock-time prototype-coinbase))
-        (transaction-lock-time mined-coinbase))
-      (assert-equal 0 (block-header-nonce mined-header))
-      (assert-equal (block-serialize expected) (block-serialize mined))
-      (assert-equal 80
-                    (bytevector-length
-                      (block-header-serialize mined-header)))
-      (assert-equal (block-header-version prototype-header)
-                    (block-header-version mined-header))
-      (assert-equal (block-header-previous-block prototype-header)
-                    (block-header-previous-block mined-header))
-      (assert-equal (block-header-time prototype-header)
-                    (block-header-time mined-header))
-      (assert-equal (block-header-bits prototype-header)
-                    (block-header-bits mined-header))
-      (assert-false
-        (equal? (block-header-merkle-root prototype-header)
-                (block-header-merkle-root mined-header)))
-      (assert-equal
-        (merkle-root (map transaction-txid mined-transactions))
-        (block-header-merkle-root mined-header))
-      (assert-true (block-merkle-root-valid? mined))
-      (assert-equal
-        (bytevector-length (block-serialize prototype))
-        (bytevector-length (block-serialize mined)))
-      (assert-equal
-        (transaction-serialize prototype-coinbase)
-        (transaction-serialize
-          (transaction
-            mined-coinbase
-            lock-time: (transaction-lock-time prototype-coinbase))))
-      (assert-equal
-        (map transaction-serialize (cdr prototype-transactions))
-        (map transaction-serialize (cdr mined-transactions)))))
-
-  (test "the block grinder cannot wrap the terminal cursor"
-    (let* ((spec (coin-node-puzzle %genesis-hash
-                                  1
-                                  coin-genesis-complexity))
-           (par (puzzle-spec-par spec))
-           (terminal
-             (with-mining-cursor %block1 #xffffffff #xffffffff))
-           (miss
-             (let find ((time (block-header-time
-                                (block-header-field terminal))))
-               (if (> time #xffffffff)
-                   (error "test-node: no terminal miss found"))
-               (let* ((header
-                        (block-header
-                          (block-header-field terminal)
-                          time: time))
-                      (candidate
-                        (block terminal header-field: header)))
-                 (if (qualifying-header? header par)
-                     (find (+ time 1))
-                     candidate)))))
-      (assert-equal #xffffffff
+           (built
+             (coin-build-block %genesis 1 coin-genesis-complexity
+                               coin-regtest-pow-limit-bits #f #u8() %payout
+                               (+ %genesis-time %spacing) (list extra) 0)))
+      (assert-equal (transaction-serialize extra)
+                    (transaction-serialize
+                      (cadr (block-transactions built))))
+      (assert-true (coin-block-merkle-root-valid? built))
+      (assert-equal 0 (block-header-nonce (block-header-field built)))
+      (assert-equal 0
                     (transaction-lock-time
-                      (car (block-transactions miss))))
-      (assert-equal #xffffffff
-                    (block-header-nonce (block-header-field miss)))
-      (assert-false
-        (qualifying-header? (block-header-field miss) par))
-      (assert-true (block-merkle-root-valid? miss))
-      (assert-true
-        (raises-containing?
-          (lambda () (coin-mine-block miss par))
-          "coin-mine-block: search space exhausted"))))
-
-  (test "the block grinder validates its coinbase cursor first"
-    (let* ((spec (coin-node-puzzle %genesis-hash
-                                  1
-                                  coin-genesis-complexity))
-           (par (puzzle-spec-par spec))
-           (coinbase (car (block-transactions %block1)))
-           (input (car (transaction-inputs coinbase)))
-           (ordinary
-             (transaction
-               coinbase
-               inputs:
-                 (list
-                   (txin
-                     input
-                     previous-output:
-                       (outpoint txid: (hash-of 23) index: 0)))))
-           (non-final
-             (transaction
-               coinbase
-               inputs: (list (txin input sequence: 0))))
-           (bad-lock
-             (block
-               %block1
-               transactions:
-                 (cons
-                   (transaction coinbase lock-time: -1)
-                   (cdr (block-transactions %block1)))))
-           (bad-nonce
-             (block
-               %block1
-               header-field: (block-header %header1 nonce: -1))))
-      (assert-false (coinbase-transaction? ordinary))
-      (assert-true (coinbase-transaction? non-final))
-      (assert-true
-        (raises-containing?
-          (lambda () (coin-mine-block 42 par))
-          "coin-mine-block: expected a block"))
-      (assert-true
-        (raises-containing?
-          (lambda ()
-            (coin-mine-block
-              (block-with-coinbase %block1 ordinary)
-              par))
-          "coin-mine-block: expected a coinbase first transaction"))
-      (assert-true
-        (raises-containing?
-          (lambda ()
-            (coin-mine-block
-              (block-with-coinbase %block1 non-final)
-              par))
-          "coin-mine-block: expected final coinbase sequence"))
-      (assert-true
-        (raises-containing?
-          (lambda () (coin-mine-block bad-lock par))
-          "coin-mine-block: expected uint32 coinbase lock-time"))
-      (assert-true
-        (raises-containing?
-          (lambda () (coin-mine-block bad-nonce par))
-          "coin-mine-block: expected uint32 header nonce"))))
+                      (car (block-transactions built))))))
 
   (test "a header cannot claim an over-par producer length"
     (let* ((spec (coin-node-puzzle %genesis-hash
@@ -544,60 +311,48 @@
       (assert-false (accept? (list %genesis) bad)))))
 
 ;; ============================================================
-;; Cumulative base work and fork choice
+;; Cumulative golf score and fork choice
 ;; ============================================================
 
-(test-group "sigilcoin cumulative base work"
-  (test "header target contributes body-independent work"
-    (let ((unit (block-header-chain-work %header1)))
-      (assert-equal unit (coin-chain-work %header1 #f 0))
-      (assert-equal unit (coin-chain-work %header1 %block1 0))
-      (assert-equal unit (coin-chain-work %header1 42 0))
-      (assert-equal (+ 7 unit) (coin-chain-work %header1 #f 7))
-      (assert-equal
-        (coin-chain-work (block-header %header1 nonce: 0) #f 11)
-        (coin-chain-work
-          (block-header %header1 nonce: #xffffffff) #f 11)))))
+(test-group "sigilcoin cumulative golf score"
+  (test "genesis contributes no score"
+    (assert-equal 0 (coin-chain-work %genesis 0 #f 0))
+    (assert-equal 7 (coin-chain-work %genesis 0 %genesis-block 7)))
+
+  (test "bodyless headers earn only the provisional base point"
+    (let* ((par (par-at %genesis-hash 1 coin-genesis-complexity))
+           (shorter
+             (block-header
+               %header1
+               version: (coin-version-encode coin-genesis-complexity (- par 1))))
+           (capped
+             (block-header
+               %header1
+               version: (coin-version-encode coin-genesis-complexity 1))))
+      (assert-equal 1 (coin-chain-work %header1 1 #f 0))
+      (assert-equal 8 (coin-chain-work %header1 1 %block1 7))
+      (assert-equal 8 (coin-chain-work shorter 1 #f 7))
+      (assert-equal 9 (coin-chain-work shorter 1 %block1 7))
+      (assert-equal 8 (coin-chain-work capped 1 #f 7))
+      (assert-equal (+ 7 (coin-golf-score par 1))
+                    (coin-chain-work capped 1 %block1 7)))))
 
 (test-group "sigilcoin fork choice"
-  (test "greater accumulated base work wins"
+  (test "strictly taller chains win regardless of golf score"
     (assert-true
       (coin-better-chain?
-        (candidate-at 5 100 (hash-of 9) #f)
-        (candidate-at 6 99 (hash-of 1) #f)))
+        (candidate-at 6 1 (hash-of 9) #f)
+        (candidate-at 5 100 (hash-of 1) #f)))
     (assert-false
       (coin-better-chain?
-        (candidate-at 6 99 (hash-of 1) #f)
-        (candidate-at 5 100 (hash-of 9) #f))))
+        (candidate-at 5 100 (hash-of 1) #f)
+        (candidate-at 6 1 (hash-of 9) #f))))
 
-  (test "equal work prefers greater height"
-    (assert-true
-      (coin-better-chain?
-        (candidate-at 6 100 (hash-of 9) #f)
-        (candidate-at 5 100 (hash-of 1) #f))))
-
-  (test "equal work and height remain first-seen"
-    (let ((a (candidate-at 5 100 (hash-of 1) #f))
-          (b (candidate-at 5 100 (hash-of 200) #f)))
-      (assert-false (coin-better-chain? a b))
-      (assert-false (coin-better-chain? b a))))
-
-  (test "the relation is irreflexive and asymmetric"
-    (let ((candidates
-            (list (candidate-at 5 1 (hash-of 1) #f)
-                  (candidate-at 5 99 (hash-of 2) #f)
-                  (candidate-at 6 1 (hash-of 1) #f)
-                  (candidate-at 6 99 (hash-of 2) #f))))
-      (for-each
-        (lambda (x)
-          (assert-false (coin-better-chain? x x))
-          (for-each
-            (lambda (y)
-              (assert-false
-                (and (coin-better-chain? x y)
-                     (coin-better-chain? y x))))
-            candidates))
-        candidates))))
+  (test "equal height retains the incumbent regardless of score or hash"
+    (let ((low (candidate-at 5 1 (hash-of 1) #f))
+          (high (candidate-at 5 100 (hash-of 200) #t)))
+      (assert-false (coin-better-chain? high low))
+      (assert-false (coin-better-chain? low high)))))
 
 ;; ============================================================
 ;; The puzzle derivation cache
@@ -668,18 +423,15 @@
 ;; ============================================================
 
 ;; A synthetic header chain from genesis, each header committing to a
-;; solution exactly as long as its own height's par. Regtest's one-second
-;; target cadence keeps its compact base target unchanged through the window.
+;; solution exactly as long as its own height's par.
 (define (header-claiming previous height time complexity length)
-  (let ((base
-          (block-header
-            version: (coin-version-encode complexity length)
-            previous-block: previous
-            merkle-root: %zero32
-            time: time
-            bits: coin-regtest-pow-limit-bits
-            nonce: 0)))
-    (coin-mine-header base (par-at previous height complexity))))
+  (block-header
+    version: (coin-version-encode complexity length)
+    previous-block: previous
+    merkle-root: %zero32
+    time: time
+    bits: coin-regtest-pow-limit-bits
+    nonce: 0))
 
 ;; Genesis plus `count` headers, oldest first, each claiming its own par.
 (define (chain-of count)
@@ -724,7 +476,7 @@
                   (coin-required-bits
                     sigilcoin-regtest-consensus-params %window)))
 
-  (test "a fast interval independently tightens the base target"
+  (test "bits stays fixed across a fast interval and complexity adjustment"
     (let* ((params
              (consensus-params
                pow-limit-bits: coin-regtest-pow-limit-bits
@@ -738,9 +490,7 @@
                segwit-height: 0
                taproot-height: 0))
            (next (coin-required-bits params %window)))
-      (assert-true
-        (< (compact-target->integer next)
-           (compact-target->integer coin-regtest-pow-limit-bits)))))
+      (assert-equal coin-regtest-pow-limit-bits next)))
 
   (test "a window that beats par raises puzzle complexity"
     (let* ((beaten
@@ -789,7 +539,7 @@
                         (coin-version-encode 129 length)
                         128)))))
 
-  (test "bits must equal the interval-derived base target"
+  (test "bits must equal the network's fixed value"
     (assert-false
       (accept? (list %genesis)
                (block-header %header1 bits: coin-testnet-pow-limit-bits))))
@@ -818,13 +568,10 @@
                                     1
                                     coin-genesis-complexity)))
            (claimed (max 1 (- par 1)))
-           (base (block-header
-                   %header1
-                   version: (coin-version-encode
-                              coin-genesis-complexity
-                              claimed)
-                   nonce: 0))
-           (header (coin-mine-header base par)))
+           (header (block-header
+                     %header1
+                     version: (coin-version-encode
+                                coin-genesis-complexity claimed))))
       (assert-true (accept? (list %genesis) header))
       (assert-error (connect 1 (with-header %block1 header)))))
 
@@ -835,16 +582,39 @@
     (assert-false (accept? (list %genesis)
                            (block-header %header1 time: %genesis-time)))
     (assert-false (accept? (list %genesis)
+                           (block-header %header1
+                                         time: (+ %genesis-time %spacing 1))))
+    (assert-false (accept? (list %genesis)
                            (block-header %header1 time: #xfffffffe))))
+
+  (test "the exact slot is usable now but neither late nor ahead of now"
+    (let ((slot (block-header-time %header1)))
+      (assert-true
+        (coin-ok?
+          (coin-validate-header-context (list %genesis) %header1 slot %spacing)))
+      (assert-equal 'bad-slot
+                    (coin-result-reason
+                      (coin-validate-header-context
+                        (list %genesis)
+                        (block-header %header1 time: (+ slot 1))
+                        (+ slot 1) %spacing)))
+      (assert-equal 'time-too-far-ahead
+                    (coin-result-reason
+                      (coin-validate-header-context
+                        (list %genesis) %header1 (- slot 1) %spacing)))))
 
   (test "a malformed header is rejected rather than raising"
     (assert-false (accept? (list %genesis) 42))
     (assert-false (accept? (list %genesis) "soon"))
     (assert-error (coin-header-rules -1))
     (assert-error (coin-header-rules %spacing -1))
-    (assert-error (coin-header-rules %spacing 300 0))
+    (assert-error (coin-header-rules %spacing 1))
+    (assert-error (coin-header-rules %spacing 0 0))
     (assert-true (header-rules? (coin-header-rules %spacing)))
-    (assert-true (header-rules? (coin-header-rules %spacing 300)))))
+    (assert-true (header-rules? (coin-header-rules %spacing 0)))
+    (assert-false
+      (coin-accept-header? sigilcoin-regtest-consensus-params
+                           (list %genesis) %header1 %spacing 1))))
 
 ;; ============================================================
 ;; The coinbase payload codec and the co-op seam
@@ -853,8 +623,8 @@
 (test-group "sigilcoin coinbase payload"
   (test "the bounds are the payload format's own extremes"
     (assert-equal 8 coin-min-coinbase-script-bytes)
-    (assert-equal 6588 coin-max-coinbase-script-bytes)
-    (assert-equal (cons 8 6588) coin-coinbase-script-bounds)
+    (assert-equal 6583 coin-max-coinbase-script-bytes)
+    (assert-equal (cons 8 6583) coin-coinbase-script-bounds)
     (assert-equal 5145 coin-max-shares-bytes)
     (assert-equal 513 coin-max-commits-bytes)
     (assert-true (> coin-max-coinbase-script-bytes 100)))
@@ -865,7 +635,7 @@
                       solution: #u8(99 97 114)
                       shares: coin-empty-shares
                       commits: coin-empty-commits
-                      graffiti: #u8(104 105)))
+                      graffiti: #u8()))
            (script (coin-coinbase-payload-encode payload))
            (decoded (coin-coinbase-payload-decode script)))
       (assert-true (coin-ok? decoded))
@@ -874,7 +644,7 @@
       (assert-equal #u8(99 97 114)
                     (coin-coinbase-payload-solution
                       (coin-result-value decoded)))
-      (assert-equal #u8(104 105)
+      (assert-equal #u8()
                     (coin-coinbase-payload-graffiti
                       (coin-result-value decoded)))
       (assert-equal script
@@ -943,8 +713,8 @@
 ;; ============================================================
 
 (test-group "sigilcoin body validation"
-  (test "a mined block validates end to end"
-    ;; The miner's block, through the exact `connect` the node calls, with
+  (test "a constructed block validates end to end"
+    ;; The builder's block, through the exact `connect` the node calls, with
     ;; the header it built accepted by the exact `accept?` the node calls.
     (assert-true (accept? (list %genesis) %header1))
     (assert-equal
@@ -955,7 +725,7 @@
     (assert-equal coin-genesis-complexity
                   (coin-result-value
                     (coin-header-complexity %header1)))
-    (assert-true (block-merkle-root-valid? %block1))
+    (assert-true (coin-block-merkle-root-valid? %block1))
     (assert-equal
       (coin-result-value (coin-header-solution-length %header1))
       (coin-solution-length
@@ -971,6 +741,61 @@
       (assert-equal (quotient (* 4 (coin-block-reward 1)) 5)
                     (transaction-output-value
                       (car (block-transactions %block1))))))
+
+  (test "non-genesis coinbase transaction fields are canonical"
+    (let* ((coinbase (car (block-transactions %block1)))
+           (input (car (transaction-inputs coinbase))))
+      (for-each
+        (lambda (bad-coinbase)
+          (let ((bad (block-with-coinbase %block1 bad-coinbase)))
+            (assert-true (coin-block-merkle-root-valid? bad))
+            (assert-true
+              (raises-containing?
+                (lambda () (connect 1 bad))
+                "non-canonical-coinbase"))))
+        (list (transaction coinbase version: 2)
+              (transaction coinbase lock-time: 1)
+              (transaction coinbase
+                           inputs: (list (txin input sequence: #xfffffffe)))
+              (transaction coinbase
+                           inputs: (list (txin input witness: (list #u8(1)))))))))
+
+  (test "nonempty graffiti is rejected by builders and hostile body decoding"
+    (let* ((coinbase (car (block-transactions %block1)))
+           (input (car (transaction-inputs coinbase)))
+           (payload (coin-result-value (coin-block-coinbase-payload %block1)))
+           (solution (coin-coinbase-payload-solution payload))
+           (script
+             (script-append
+               (script-push-data (script-number-encode 1))
+               (script-push-data solution)
+               (script-push-data (coin-coinbase-payload-shares payload))
+               (script-push-data (coin-coinbase-payload-commits payload))
+               (script-push-data #u8(120))))
+           (bad
+             (block-with-coinbase
+               %block1
+               (transaction coinbase
+                            inputs: (list (txin input script-sig: script))))))
+      (assert-error (coin-mining-coinbase 1 solution #u8(120) %payout))
+      (assert-error
+        (coin-mining-coinbase/coop
+          1 solution '() '() '() #u8(120) %payout #f 0))
+      (assert-error
+        (coin-build-block %genesis 1 coin-genesis-complexity
+                          coin-regtest-pow-limit-bits #f #u8(120) %payout
+                          (+ %genesis-time %spacing)))
+      (assert-error
+        (coin-build-coop-block %genesis-block 1 coin-genesis-complexity
+                               coin-regtest-pow-limit-bits #f '() #u8(120)
+                               %payout (+ %genesis-time %spacing)))
+      (assert-true (coin-block-merkle-root-valid? bad))
+      (assert-equal 'non-canonical-graffiti
+                    (coin-result-reason (coin-block-coinbase-payload bad)))
+      (assert-true
+        (raises-containing?
+          (lambda () (connect 1 bad))
+          "non-canonical-graffiti"))))
 
   (test "the default solution is the generated par witness"
     (let* ((spec (coin-puzzle-for %genesis-hash
@@ -1008,21 +833,15 @@
   (test "the body must exactly match the encoded solution length"
     (let* ((actual
              (coin-result-value (coin-header-solution-length %header1)))
-           (spec
-             (coin-node-puzzle %genesis-hash
-                               1
-                               coin-genesis-complexity))
-           (base
+           (claim
              (block-header
                %header1
                version: (coin-version-encode
-                           coin-genesis-complexity
-                           (- actual 1))
-               nonce: 0))
-           (claim (coin-mine-header base (puzzle-spec-par spec)))
+                           coin-genesis-complexity (- actual 1))))
            (lying (with-header %block1 claim)))
-      ;; The header is a valid lottery winner with a plausible under-par claim.
+      ;; A plausible shorter claim gets only the provisional base point.
       (assert-true (accept? (list %genesis) claim))
+      (assert-equal 1 (coin-chain-work claim 1 #f 0))
       (assert-true
         (raises-containing?
           (lambda () (connect 1 lying))
@@ -1036,8 +855,8 @@
                                 coin-genesis-complexity
                                 coin-regtest-pow-limit-bits
                                 #f
-                                "different graffiti"
-                                %payout
+                                #u8()
+                                #u8(#x51)
                                 (+ %genesis-time %spacing))
               %header1)))
       (assert-error (connect 1 swapped))))
@@ -1053,7 +872,7 @@
     (assert-error (connect 2 %block1)))
 
   (test "a block whose solution does not solve its puzzle is rejected"
-    ;; The miner refuses to build one at all.
+    ;; The builder refuses to construct one at all.
     (assert-error (build-on %genesis 1 coin-genesis-complexity "car"))
     ;; And a body assembled around a solution the builder would refuse is
     ;; refused by the rules: this one is a 1-arity procedure that simply
@@ -1144,7 +963,7 @@
              (coin-build-block
                %header1 2 coin-genesis-complexity
                coin-regtest-pow-limit-bits
-               #f "age zero" %payout
+               #f #u8() %payout
                (+ (block-header-time %header1) %spacing)
                (list spend) 0))
            (age-zero-utxos
@@ -1171,128 +990,72 @@
 ;; ============================================================
 
 (test-group "sigilcoin genesis"
-  (test "rebuilding from the quote reproduces the checked-in constants"
-    (assert-equal
-      coin-genesis-header-constant
-      (hex-encode
-        (block-header-serialize
-          (coin-genesis-header
-            coin-genesis-quote coin-genesis-time coin-main-pow-limit-bits
-            coin-genesis-coinbase-lock-time-constant
-            coin-genesis-nonce-constant))))
-    (assert-equal
-      coin-testnet-genesis-header-constant
-      (hex-encode
-        (block-header-serialize
-          (coin-genesis-header
-            coin-testnet-genesis-quote coin-testnet-genesis-time
-            coin-testnet-pow-limit-bits
-            coin-testnet-genesis-coinbase-lock-time-constant
-            coin-testnet-genesis-nonce-constant))))
-    ;; Regtest's 257 expected rolls keep the search path directly covered.
-    (assert-equal coin-regtest-genesis-header-constant
-                  (coin-genesis-header-hex coin-regtest-genesis-quote
-                                           coin-regtest-genesis-time
-                                           coin-regtest-pow-limit-bits))
-    (assert-equal 160 (string-length coin-genesis-header-constant))
-    (assert-equal 160 (string-length coin-testnet-genesis-header-constant))
-    (assert-equal 160 (string-length coin-regtest-genesis-header-constant))
-    (assert-equal coin-genesis-header-constant
-                  (hex-encode
-                    (block-header-serialize
-                      (chain-config-genesis-header sigilcoin-main-chain))))
-    (assert-equal coin-testnet-genesis-header-constant
-                  (hex-encode
-                    (block-header-serialize
-                      (chain-config-genesis-header sigilcoin-testnet-chain))))
-    (assert-equal coin-regtest-genesis-header-constant
-                  (hex-encode
-                    (block-header-serialize
-                      (chain-config-genesis-header sigilcoin-regtest-chain))))
-    (assert-equal coin-genesis-id-constant
-                  (block-header-id
-                    (coin-genesis-header
-                      coin-genesis-quote coin-genesis-time
-                      coin-main-pow-limit-bits
-                      coin-genesis-coinbase-lock-time-constant
-                      coin-genesis-nonce-constant)))
-    (assert-equal coin-testnet-genesis-id-constant
-                  (block-header-id
-                    (coin-genesis-header
-                      coin-testnet-genesis-quote coin-testnet-genesis-time
-                      coin-testnet-pow-limit-bits
-                      coin-testnet-genesis-coinbase-lock-time-constant
-                      coin-testnet-genesis-nonce-constant)))
-    (assert-equal coin-regtest-genesis-id-constant
-                  (block-header-id %genesis))
-    (let* ((main-block
-             (coin-genesis-block
-               coin-genesis-quote coin-genesis-time coin-main-pow-limit-bits
-               coin-genesis-coinbase-lock-time-constant
-               coin-genesis-nonce-constant))
-           (main (block-header-field main-block))
-           (par (puzzle-spec-par
-                  (coin-puzzle-for %zero32 0 coin-genesis-complexity)))
-           (length (coin-result-value
-                     (coin-header-solution-length main))))
-      (assert-equal 1789228800 (block-header-time main))
-      (assert-equal #x1c2bcf04 (block-header-bits main))
-      (assert-equal 6
-                    (transaction-lock-time
-                      (car (block-transactions main-block))))
-      (assert-equal 3129183091 (block-header-nonce main))
-      (assert-true
-        (coin-lottery-valid?
-          (block-header-work-value main)
-          (block-header-bits main)
-          par
-          length)))
-    (assert-true
-      (not (equal?
-             (coin-genesis-hash
-               coin-genesis-quote coin-genesis-time
-               coin-main-pow-limit-bits
-               coin-genesis-coinbase-lock-time-constant
-               coin-genesis-nonce-constant)
-             (coin-genesis-hash
-               "something else" coin-genesis-time
-               coin-main-pow-limit-bits
-               coin-genesis-coinbase-lock-time-constant
-               coin-genesis-nonce-constant))))
-    (assert-true
-      (not (equal?
-             (coin-genesis-hash
-               coin-genesis-quote coin-genesis-time
-               coin-main-pow-limit-bits
-               coin-genesis-coinbase-lock-time-constant
-               coin-genesis-nonce-constant)
-             (coin-genesis-hash
-               coin-genesis-quote (+ 1 coin-genesis-time)
-               coin-main-pow-limit-bits
-               coin-genesis-coinbase-lock-time-constant
-               coin-genesis-nonce-constant)))))
+  (test "every network rebuilds its checked-in genesis with zero cursors"
+    (for-each
+      (lambda (fixture)
+        (let* ((quote (list-ref fixture 0))
+               (time (list-ref fixture 1))
+               (bits (list-ref fixture 2))
+               (expected-header (list-ref fixture 3))
+               (expected-id (list-ref fixture 4))
+               (chain (list-ref fixture 5))
+               (built (coin-genesis-block quote time bits))
+               (header (block-header-field built))
+               (coinbase (car (block-transactions built))))
+          (assert-equal expected-header (coin-genesis-header-hex quote time bits))
+          (assert-equal expected-header
+                        (hex-encode (block-header-serialize header)))
+          (assert-equal expected-id (block-header-id header))
+          (assert-equal (chain-config-genesis-hash chain)
+                        (coin-genesis-hash quote time bits))
+          (assert-equal (block-header-serialize header)
+                        (block-header-serialize
+                          (chain-config-genesis-header chain)))
+          (assert-equal (block-header-serialize header)
+                        (block-header-serialize
+                          (coin-genesis-header quote time bits)))
+          (assert-equal (transaction-serialize coinbase)
+                        (transaction-serialize (coin-genesis-coinbase quote)))
+          (assert-equal 80 (bytevector-length (block-header-serialize header)))
+          (assert-equal time (block-header-time header))
+          (assert-equal bits (block-header-bits header))
+          (assert-equal 0 (block-header-nonce header))
+          (assert-equal 0 (transaction-lock-time coinbase))
+          (assert-equal 0 (coin-chain-work header 0 built 0))
+          (assert-true (coin-block-merkle-root-valid? built))))
+      (list
+        (list coin-genesis-quote coin-genesis-time coin-main-pow-limit-bits
+              coin-genesis-header-constant coin-genesis-id-constant
+              sigilcoin-main-chain)
+        (list coin-testnet-genesis-quote coin-testnet-genesis-time
+              coin-testnet-pow-limit-bits coin-testnet-genesis-header-constant
+              coin-testnet-genesis-id-constant sigilcoin-testnet-chain)
+        (list coin-regtest-genesis-quote coin-regtest-genesis-time
+              coin-regtest-pow-limit-bits coin-regtest-genesis-header-constant
+              coin-regtest-genesis-id-constant sigilcoin-regtest-chain))))
 
-  (test "the header fields are frozen and lottery-qualified"
-    (let* ((spec (coin-puzzle-for %zero32 0 coin-genesis-complexity))
-           (par (puzzle-spec-par spec))
-           (length
-             (coin-result-value (coin-header-solution-length %genesis))))
-      (assert-equal coin-genesis-version (block-header-version %genesis))
-      (assert-equal coin-regtest-pow-limit-bits
-                    (block-header-bits %genesis))
-      (assert-equal coin-genesis-complexity
-                    (coin-result-value (coin-header-complexity %genesis)))
-      (assert-equal (coin-solution-length coin-genesis-solution) length)
-      (assert-true
-        (coin-lottery-valid?
-          (block-header-work-value %genesis)
-          (block-header-bits %genesis)
-          par
-          length))
-      (assert-equal %zero32 (block-header-previous-block %genesis))))
+  (test "quote and timestamp remain bound into the genesis identity"
+    (assert-false
+      (equal? (coin-genesis-hash coin-genesis-quote coin-genesis-time
+                                 coin-main-pow-limit-bits)
+              (coin-genesis-hash "something else" coin-genesis-time
+                                 coin-main-pow-limit-bits)))
+    (assert-false
+      (equal? (coin-genesis-hash coin-genesis-quote coin-genesis-time
+                                 coin-main-pow-limit-bits)
+              (coin-genesis-hash coin-genesis-quote (+ 1 coin-genesis-time)
+                                 coin-main-pow-limit-bits))))
+
+  (test "the genesis header commits the frozen puzzle fields"
+    (assert-equal coin-genesis-version (block-header-version %genesis))
+    (assert-equal coin-genesis-complexity
+                  (coin-result-value (coin-header-complexity %genesis)))
+    (assert-equal (coin-solution-length coin-genesis-solution)
+                  (coin-result-value (coin-header-solution-length %genesis)))
+    (assert-equal %zero32 (block-header-previous-block %genesis)))
 
   (test "the header commits to its own body"
-    (assert-true (block-merkle-root-valid? %genesis-block))
+    (assert-true (coin-block-merkle-root-valid? %genesis-block))
     (assert-equal
       (coin-result-value (coin-header-solution-length %genesis))
       (coin-result-value
@@ -1341,7 +1104,11 @@
     (assert-true (coin-ok? (coin-validate-header-context
                              '()
                              %genesis
-                             coin-regtest-genesis-time)))))
+                             coin-regtest-genesis-time)))
+    (assert-equal 'time-too-far-ahead
+                  (coin-result-reason
+                    (coin-validate-header-context
+                      '() %genesis (- coin-regtest-genesis-time 1))))))
 
 ;; ============================================================
 ;; Co-op commit/reveal, payouts, and live canonical node path
@@ -1373,7 +1140,7 @@
                        coin-genesis-complexity
                        coin-regtest-pow-limit-bits
                        #f
-                       "commit"
+                       #u8()
                        %payout
                        (+ %genesis-time %spacing)
                        '()
@@ -1389,7 +1156,7 @@
          coin-regtest-pow-limit-bits
          #f
          %coop-shares
-         "reveal"
+         #u8()
          %payout
          (+ (block-header-time (block-header-field %coop-parent)) %spacing))))
 
@@ -1504,7 +1271,7 @@
            (carrier (coin-carrier-script %coop-parent))
            (coinbase
              (coin-mining-coinbase/coop
-               2 #u8(120) %coop-shares contributions '() "weighted"
+               2 #u8(120) %coop-shares contributions '() #u8()
                %payout carrier fees))
            (outputs (transaction-outputs coinbase))
            (share-pool (quotient subsidy 10))
@@ -1541,13 +1308,13 @@
              (coin-build-block
                %genesis 1 coin-genesis-complexity
                coin-regtest-pow-limit-bits
-               #f "eight commits" %payout
+               #f #u8() %payout
                (+ %genesis-time %spacing) '() 0 commitments))
            (child
              (coin-build-coop-block
                parent 2 coin-genesis-complexity
                coin-regtest-pow-limit-bits
-               #f shares "eight reveals" %payout
+               #f shares #u8() %payout
                (+ (block-header-time (block-header-field parent)) %spacing)))
            (payload
              (coin-result-value (coin-block-coinbase-payload child)))
@@ -1576,7 +1343,7 @@
       ;; counter 8 instead of 0. Derivation, parse/arity and ECDSA may run.
       (assert-equal '(8 8 0) (coin-body-validation-stats))))
 
-  (test "co-op shares leave producer length in bits"
+  (test "co-op shares leave producer length in the version"
     (let* ((header (block-header-field %coop-block))
            (payload
              (coin-result-value (coin-block-coinbase-payload %coop-block)))
@@ -1740,7 +1507,7 @@
                                      coin-genesis-complexity
                                      coin-regtest-pow-limit-bits
                                      #f
-                                     "fat"
+                                     #u8()
                                      %payout
                                      (+ %genesis-time %spacing)
                                      (list huge-tx)
@@ -1749,58 +1516,132 @@
                     (coin-result-reason (coin-validate-block-size fat)))
       (assert-true (raises-containing?
                      (lambda () (connect/parent 1 fat %genesis-block '()))
-                     "block-oversize")))))
+                     "block-oversize"))
+      (let ((n (node-open sigilcoin-regtest-chain (make-temp-directory))))
+        (node-ingest-headers n (list (block-header-field fat)))
+        (assert-true
+          (raises-containing? (lambda () (node-store-block n fat))
+                              "chain storage policy"))
+        (let ((entry (node-store-transaction n huge-tx "hostile.example")))
+          (assert-equal "transaction-oversize"
+                        (node-mempool-entry-last-error entry))
+          (assert-equal '() (node-mempool n)))
+        (node-close n)))))
+)
 
 (test-group "sigilcoin canonical live node"
-  (test "equal-work first-seen tip survives persistence and restart"
+  (test "a duplicate Merkle tail cannot poison a stored header"
     (let* ((dir (make-temp-directory))
-           (previous (block-header-hash %header1))
-           (par (par-at previous 2 coin-genesis-complexity))
-           (version (coin-version-encode coin-genesis-complexity par))
-           (first
-             (coin-mine-header
-               (block-header
-                 version: version
-                 previous-block: previous
-                 merkle-root: (make-bytevector 32 10)
-                 time: (+ (block-header-time %header1) %spacing)
-                 bits: coin-regtest-pow-limit-bits
-                 nonce: 0)
-               par))
-           (second
-             (coin-mine-header
-               (block-header
-                 first
-                 merkle-root: (make-bytevector 32 15)
-                 nonce: 0)
-               par))
-           (saved-work #f)
+           (tx-a
+             (transaction
+               version: 2
+               inputs: (list
+                         (txin previous-output:
+                                 (outpoint txid: (hash-of 40) index: 0)
+                               script-sig: #u8()
+                               sequence: #xffffffff
+                               witness: '()))
+               outputs: (list (txout value: 1 script-pubkey: %payout))
+               lock-time: 0))
+           (tx-b (transaction tx-a lock-time: 1))
+           (honest
+             (coin-build-block
+               %genesis 1 coin-genesis-complexity coin-regtest-pow-limit-bits
+               #f #u8() %payout (+ %genesis-time %spacing)
+               (list tx-a tx-b) 0))
+           (header (block-header-field honest))
+           (mutated
+             (block honest
+                    transactions:
+                      (append (block-transactions honest) (list tx-b))))
+           (n (node-open sigilcoin-regtest-chain dir)))
+      (assert-equal (coin-block-merkle-root honest)
+                    (coin-block-merkle-root mutated))
+      (assert-true (coin-block-merkle-root-valid? honest))
+      (assert-false (coin-block-merkle-root-valid? mutated))
+      (node-ingest-headers n (list header))
+      (assert-true
+        (raises-containing? (lambda () (node-store-block n mutated))
+                            "does not match header commitment"))
+      ;; Rejection happened before persistence; the committed body still stores.
+      (node-store-block n honest)
+      (node-close n)))
+
+  (test "equal-height validated siblings retain the incumbent after restart"
+    (let* ((dir (make-temp-directory))
+           (first-block (build-on %header1 2 coin-genesis-complexity #f))
+           (second-block
+             (coin-build-block
+               %header1 2 coin-genesis-complexity coin-regtest-pow-limit-bits
+               #f #u8() #u8(#x51) (+ (block-header-time %header1) %spacing)))
+           (first (block-header-field first-block))
+           (second (block-header-field second-block))
            (saved-hash (hex-encode (block-header-hash first)))
            (n (node-open sigilcoin-regtest-chain dir)))
       (assert-equal 1 (submit-block n %block1))
-      (let ((parent-work
-              (node-status-snapshot-best-work (node-status n))))
-        (assert-equal
-          (+ parent-work (block-header-chain-work first))
-          (coin-chain-work first #f parent-work))
-        (assert-equal (coin-chain-work first #f parent-work)
-                      (coin-chain-work second #f parent-work)))
-      (assert-equal 1 (node-ingest-headers n (list first)))
-      (assert-equal 1 (node-ingest-headers n (list second)))
+      (assert-equal 1 (submit-block n first-block))
+      (assert-equal 0 (submit-block n second-block))
+      (assert-equal 2 (coin-chain-work first 2 first-block 1))
+      (assert-equal 2 (coin-chain-work second 2 second-block 1))
       (assert-equal saved-hash
-                    (node-status-snapshot-best-hash (node-status n)))
-      (set! saved-work
-            (node-status-snapshot-best-work (node-status n)))
+                    (node-status-snapshot-best-block-hash (node-status n)))
       (node-close n)
       (let ((reopened (node-open sigilcoin-regtest-chain dir)))
         (assert-equal saved-hash
-                      (node-status-snapshot-best-hash
-                        (node-status reopened)))
-        (assert-equal saved-work
-                      (node-status-snapshot-best-work
-                        (node-status reopened)))
+                      (node-status-snapshot-best-hash (node-status reopened)))
+        (assert-equal saved-hash
+                      (node-status-snapshot-best-block-hash (node-status reopened)))
+        (assert-equal 2
+                      (node-status-snapshot-best-work (node-status reopened)))
+        (assert-equal 0 (node-validate-blocks reopened))
         (node-close reopened))))
 
+  (test "bodyless score claims cannot outrank a longer header branch"
+    (let* ((dir (make-temp-directory))
+           (par (par-at (block-header-hash %header1) 2 coin-genesis-complexity))
+           (inflated
+             (block-header
+               (block-header-field
+                 (build-on %header1 2 coin-genesis-complexity #f))
+               version: (coin-version-encode coin-genesis-complexity (- par 1))))
+           (second-block
+             (coin-build-block
+               %header1 2 coin-genesis-complexity coin-regtest-pow-limit-bits
+               #f #u8() #u8(#x51) (+ (block-header-time %header1) %spacing)))
+           (second (block-header-field second-block))
+           (third-block (build-on second 3 coin-genesis-complexity #f))
+           (third (block-header-field third-block))
+           (fourth-block (build-on third 4 coin-genesis-complexity #f))
+           (fourth (block-header-field fourth-block))
+           (third-hash (hex-encode (block-header-hash third)))
+           (n (node-open sigilcoin-regtest-chain dir)))
+      (assert-equal 1 (submit-block n %block1))
+      (assert-equal 2 (coin-chain-work inflated 2 #f 1))
+      (assert-equal 3
+                    (coin-chain-work third 3 #f
+                                     (coin-chain-work second 2 #f 1)))
+      (assert-equal 1 (node-ingest-headers n (list inflated)))
+      (assert-equal 2 (node-ingest-headers n (list second third)))
+      (assert-equal 3 (node-status-snapshot-best-height (node-status n)))
+      (assert-equal third-hash
+                    (node-status-snapshot-best-hash (node-status n)))
+      (node-close n)
+      (let ((reopened (node-open sigilcoin-regtest-chain dir)))
+        (assert-equal third-hash
+                      (node-status-snapshot-best-hash (node-status reopened)))
+        (assert-equal 3
+                      (node-status-snapshot-best-work (node-status reopened)))
+        (assert-equal 1 (node-ingest-headers reopened (list fourth)))
+        (for-each (lambda (b) (node-store-block reopened b))
+                  (list second-block third-block fourth-block))
+        (assert-equal 3 (node-validate-blocks reopened))
+        (assert-equal (hex-encode (block-header-hash fourth))
+                      (node-status-snapshot-best-block-hash (node-status reopened)))
+        (assert-equal 4
+                      (node-status-snapshot-best-work (node-status reopened)))
+        (node-close reopened))))
+
+  (when %native-secp256k1?
   (test "configured genesis validates H1 and durable H validates H+1 after restart"
     (let ((dir (make-temp-directory)))
       ;; H1 receives trusted configured genesis because generic node's genesis
@@ -1834,15 +1675,13 @@
            (previous (block-header-hash parent-header))
            (par (par-at previous 2 coin-genesis-complexity))
            (fake
-             (coin-mine-header
-               (block-header
-                 version: (coin-version-encode coin-genesis-complexity par)
-                 previous-block: previous
-                 merkle-root: (make-bytevector 32 9)
-                 time: (+ (block-header-time parent-header) %spacing)
-                 bits: coin-regtest-pow-limit-bits
-                 nonce: 0)
-               par)))
+             (block-header
+               (block-header-field
+                 (coin-build-block
+                   parent-header 2 coin-genesis-complexity
+                   coin-regtest-pow-limit-bits #f #u8() #u8(#x51)
+                   (+ (block-header-time parent-header) %spacing)))
+               version: (coin-version-encode coin-genesis-complexity (- par 1)))))
       (assert-equal 1 (submit-block n %coop-parent))
       (assert-equal 1 (submit-block n %coop-block))
       (assert-equal 1 (node-ingest-headers n (list fake)))
@@ -1868,10 +1707,6 @@
 ;; Public testnet chain
 ;; ============================================================
 
-;; Frozen previous public-testnet genesis. The reset must never adopt it.
-(define %previous-public-testnet-genesis-header-hex
-  "050000000000000000000000000000000000000000000000000000000000000000000000c2dae5665d3349784ed7b82fb085c470971e33a3999e26e96d6dbd0dc31ba1198015966a80007f20f0a55516")
-
 (define (chain-extension-ref chain extension key)
   (let ((entry (assq key (chain-config-extension chain extension '()))))
     (and (pair? entry) (cdr entry))))
@@ -1881,13 +1716,11 @@
     (let* ((built
              (coin-genesis-block
                coin-testnet-genesis-quote coin-testnet-genesis-time
-               coin-testnet-pow-limit-bits
-               coin-testnet-genesis-coinbase-lock-time-constant
-               coin-testnet-genesis-nonce-constant))
+               coin-testnet-pow-limit-bits))
            (header (block-header-field built))
            (coinbase (car (block-transactions built)))
            (outputs (transaction-outputs coinbase)))
-      (assert-equal "SigilCoin public testnet reset - 2026-09-02"
+      (assert-equal "SigilCoin proof-of-golf testnet"
                     coin-testnet-genesis-quote)
       (assert-equal 1788307200 coin-testnet-genesis-time)
       (assert-equal coin-testnet-genesis-header-constant
@@ -1899,22 +1732,14 @@
       (assert-equal 1 (length outputs))
       (assert-equal 0 (txout-value (car outputs)))
       (assert-equal #u8(#x6a) (txout-script-pubkey (car outputs)))
-      (assert-true (block-merkle-root-valid? built))))
+      (assert-true (coin-block-merkle-root-valid? built))))
 
-  (test "the previous public-testnet genesis is foreign to the reset chain"
-    (let* ((old-header
-             (block-header-parse
-               (hex-decode %previous-public-testnet-genesis-header-hex)))
-           (configured
+  (test "regtest genesis is foreign to the public testnet"
+    (let* ((configured
              (chain-config-genesis-header sigilcoin-testnet-chain))
            (dir (make-temp-directory))
            (n (node-open sigilcoin-testnet-chain dir)))
-      (assert-equal "953c60759643c0701ea19e52d9e97bf57ed4fe1295830545ca7244757a3921a1"
-                    (block-header-id old-header))
-      (assert-false
-        (equal? (block-header-hash old-header)
-                (chain-config-genesis-hash sigilcoin-testnet-chain)))
-      (assert-error (node-ingest-headers n (list old-header)))
+      (assert-error (node-ingest-headers n (list %genesis)))
       (assert-equal (block-header-hash configured)
                     (block-header-hash (node-best-header n)))
       (node-close n)))
@@ -1926,7 +1751,7 @@
                   (chain-config-network-id sigilcoin-testnet-chain))
     (assert-equal coin-testnet-network-magic
                   (chain-config-magic sigilcoin-testnet-chain))
-    (assert-equal #u8(#xd3 #x7a #x91 #xc5)
+    (assert-equal #u8(#x53 #x47 #x54 #x33)
                   coin-testnet-network-magic)
     (assert-equal 19446
                   (chain-config-default-port sigilcoin-testnet-chain))
@@ -1940,16 +1765,36 @@
     (assert-true
       (eq? sigilcoin-testnet-consensus-params
            (chain-config-consensus-params sigilcoin-testnet-chain)))
-    (assert-equal 1 coin-testnet-min-block-spacing)
-    (assert-equal 1
+    (assert-equal 3600 coin-testnet-min-block-spacing)
+    (assert-equal 3600
                   (coin-chain-min-block-spacing sigilcoin-testnet-chain))
-    (assert-equal 300 coin-testnet-max-future-drift)
-    (assert-equal 300
+    (assert-equal 0 coin-testnet-max-future-drift)
+    (assert-equal 0
                   (coin-chain-max-future-drift sigilcoin-testnet-chain))
     (assert-equal coin-max-future-drift
                   (coin-chain-max-future-drift sigilcoin-main-chain))
     (assert-equal coin-max-future-drift
                   (coin-chain-max-future-drift sigilcoin-regtest-chain))
+    (assert-equal 0 coin-max-future-drift)
+    (assert-equal 86400 (coin-chain-min-block-spacing sigilcoin-main-chain))
+    (assert-equal 1 (coin-chain-min-block-spacing sigilcoin-regtest-chain))
+    (assert-equal "SigilCoin proof-of-golf mainnet" coin-genesis-quote)
+    (assert-equal "SigilCoin proof-of-golf regtest" coin-regtest-genesis-quote)
+    (assert-equal #u8(#x53 #x47 #x4d #x33)
+                  (chain-config-magic sigilcoin-main-chain))
+    (assert-equal #u8(#x53 #x47 #x52 #x33)
+                  (chain-config-magic sigilcoin-regtest-chain))
+    (assert-equal
+      (list
+        (cons 0 (chain-config-genesis-hash sigilcoin-main-chain))
+        (cons 1 coin-main-checkpoint-one-hash))
+      (chain-config-extension sigilcoin-main-chain 'checkpoints '()))
+    (for-each
+      (lambda (chain)
+        (assert-equal
+          (list (cons 0 (chain-config-genesis-hash chain)))
+          (chain-config-extension chain 'checkpoints '())))
+      (list sigilcoin-testnet-chain sigilcoin-regtest-chain))
     (assert-equal coin-testnet-target-block-spacing
                   (chain-extension-ref sigilcoin-testnet-chain
                                        'policy 'target-block-spacing))
@@ -1968,6 +1813,23 @@
     (assert-equal coin-max-block-bytes
                   (chain-extension-ref sigilcoin-testnet-chain
                                        'policy 'max-block-bytes))
+    (assert-equal coin-max-block-bytes
+                  (chain-extension-ref
+                    sigilcoin-testnet-chain
+                    'policy
+                    'max-mempool-transaction-bytes))
+    (assert-equal (* 64 coin-max-block-bytes)
+                  (chain-extension-ref sigilcoin-testnet-chain
+                                       'policy 'max-mempool-bytes))
+    (assert-equal 1024
+                  (chain-extension-ref sigilcoin-testnet-chain
+                                       'policy 'max-mempool-count))
+    (assert-equal 4096
+                  (chain-extension-ref sigilcoin-testnet-chain
+                                       'policy 'max-unsettled-headers))
+    (assert-equal #t
+                  (chain-extension-ref sigilcoin-testnet-chain
+                                       'policy 'verify-mempool-scripts?))
     (assert-equal coin-max-solution-bytes
                   (chain-extension-ref sigilcoin-testnet-chain
                                        'policy 'max-solution-bytes))
@@ -2020,13 +1882,11 @@
               sigilcoin-main-chain
               sigilcoin-regtest-chain))))
 
-  (test "testnet target and timestamp policy accept a mined successor"
+  (test "testnet fixed bits and exact slot accept a deterministic successor"
     (let* ((genesis
              (coin-genesis-header
                coin-testnet-genesis-quote coin-testnet-genesis-time
-               coin-testnet-pow-limit-bits
-               coin-testnet-genesis-coinbase-lock-time-constant
-               coin-testnet-genesis-nonce-constant))
+               coin-testnet-pow-limit-bits))
            (good-block
              (coin-build-block
                genesis
@@ -2034,9 +1894,9 @@
                coin-genesis-complexity
                coin-testnet-pow-limit-bits
                #f
-               "testnet target"
+               #u8()
                %payout
-               (+ coin-testnet-genesis-time 1)))
+               (+ coin-testnet-genesis-time coin-testnet-min-block-spacing)))
            (good (block-header-field good-block))
            (rules (chain-config-header-rules sigilcoin-testnet-chain))
            (accept-header? (header-rules-accept? rules)))
@@ -2047,7 +1907,7 @@
         (accept-header? sigilcoin-testnet-consensus-params
                         (list genesis)
                         (block-header good bits: coin-regtest-pow-limit-bits)))
-      (assert-equal 'insufficient-spacing
+      (assert-equal 'bad-slot
                     (coin-result-reason
                       (coin-validate-header-context
                         (list genesis)
@@ -2062,9 +1922,7 @@
     (let* ((genesis-block
              (coin-genesis-block
                coin-testnet-genesis-quote coin-testnet-genesis-time
-               coin-testnet-pow-limit-bits
-               coin-testnet-genesis-coinbase-lock-time-constant
-               coin-testnet-genesis-nonce-constant))
+               coin-testnet-pow-limit-bits))
            (genesis (block-header-field genesis-block))
            (h1 (coin-build-block
                  genesis
@@ -2072,9 +1930,9 @@
                  coin-genesis-complexity
                  coin-testnet-pow-limit-bits
                  #f
-                 "testnet producer"
+                 #u8()
                  %payout
-                 (+ coin-testnet-genesis-time 1)))
+                 (+ coin-testnet-genesis-time coin-testnet-min-block-spacing)))
            (h2 (coin-build-coop-block
                  h1
                  2
@@ -2082,9 +1940,9 @@
                  coin-testnet-pow-limit-bits
                  #f
                  '()
-                 "testnet co-op"
+                 #u8()
                  %payout
-                 (+ coin-testnet-genesis-time 2)))
+                 (+ coin-testnet-genesis-time (* 2 coin-testnet-min-block-spacing))))
            (rules (chain-config-block-rules sigilcoin-testnet-chain))
            (connect-testnet (block-rules-connect rules))
            (utxos (connect-testnet rules

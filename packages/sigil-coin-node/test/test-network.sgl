@@ -86,8 +86,8 @@
 ;; Scripts and keys
 ;; ============================================================
 
-;; `OP_RETURN "sg"`: unspendable, so blocks mined only for their height stay
-;; out of every balance. The script the single-node fixtures mine to.
+;; `OP_RETURN "sg"`: unspendable, so blocks built only for their height stay
+;; out of every balance. The script the single-node fixtures pay to.
 (define %elsewhere #u8(#x6a #x02 #x73 #x67))
 
 ;; `OP_TRUE`: a coinbase anyone can spend with an empty scriptSig.
@@ -381,7 +381,7 @@
   (block-header-hash (block-header-field b)))
 
 (define (coin-next-block-time parent spacing)
-  (+ (block-header-time parent) (max 1 spacing)))
+  (+ (block-header-time parent) spacing))
 
 (define (height-of n)
   (node-status-snapshot-best-height (node-status n)))
@@ -431,7 +431,7 @@
                 (hex-encode (block-header-previous-block header)))
               (cons header out)))))
 
-(define (mine-blocks n count payout)
+(define (build-blocks n count payout)
   (let loop ((i 0) (blocks '()))
     (if (>= i count)
         (reverse blocks)
@@ -444,7 +444,7 @@
                    (chain-config-consensus-params (node-config n))
                    headers))
                (b (coin-build-block
-                    parent height complexity bits #f "two-node" payout
+                    parent height complexity bits #f #u8() payout
                     (coin-next-block-time parent
                                           coin-regtest-min-block-spacing))))
           (unless (= 1 (submit n b))
@@ -497,13 +497,13 @@
           (else (loop (cdr rows) out)))))
 
 
-(define (build-at parent height complexity solution graffiti payout)
+(define (build-at parent height complexity solution payout)
   (coin-build-block parent
                     height
                     complexity
                     (block-header-bits parent)
                     solution
-                    graffiti
+                    #u8()
                     payout
                     (coin-next-block-time parent
                                           coin-regtest-min-block-spacing)))
@@ -513,11 +513,11 @@
 ;; ============================================================
 
 (test-group "sigilcoin two-node sync"
-  (test "an empty peer process syncs a mined chain from genesis"
+  (test "an empty peer process syncs a scheduled chain from genesis"
     (let* ((dir-a (fresh-dir))
            (dir-b (fresh-dir))
            (a (open-node dir-a))
-           (blocks (mine-blocks a 16 %elsewhere))
+           (blocks (build-blocks a 16 %elsewhere))
            (at-16 (list-ref blocks 15))
            (complexity-16
              (coin-result-value
@@ -562,15 +562,15 @@
       (remove-tree dir-b))))
 
 ;; ============================================================
-;; Propagating a newly mined block
+;; Propagating a newly constructed block
 ;; ============================================================
 
 (test-group "sigilcoin block propagation"
-  (test "a block mined after the peer caught up reaches it too"
+  (test "a block constructed after the peer caught up reaches it too"
     (let* ((dir-a (fresh-dir))
            (dir-b (fresh-dir))
            (a (open-node dir-a))
-           (blocks (mine-blocks a 2 %elsewhere))
+           (blocks (build-blocks a 2 %elsewhere))
            (endpoint (open-endpoint))
            (port (car endpoint))
            (listener (cdr endpoint)))
@@ -580,9 +580,9 @@
         (assert-equal 2 (best-block-height b))
         (assert-true (tip-is? b (list-ref blocks 1)))
         (node-close b))
-      ;; A new block is mined while the peer is idle, and reaches it on the
+      ;; A new block is built while the peer is idle, and reaches it on the
       ;; next ordinary sync — no headers, blocks or hashes handed over.
-      (let ((next (car (mine-blocks a 1 %elsewhere))))
+      (let ((next (car (build-blocks a 1 %elsewhere))))
         (assert-equal 3 (best-block-height a))
         (let ((lines (sync-peer-ok a listener port dir-b 1)))
           (assert-equal "3" (peer-field lines "best-block-height"))
@@ -600,15 +600,13 @@
       (remove-tree dir-b))))
 
 ;; ============================================================
-;; Composite quality over the network
+;; Cooperative payouts and additive score over the network
 ;; ============================================================
 
 (define %genesis-block
   (coin-genesis-block
     coin-regtest-genesis-quote coin-regtest-genesis-time
-    coin-regtest-pow-limit-bits
-    coin-regtest-genesis-coinbase-lock-time-constant
-    coin-regtest-genesis-nonce-constant))
+    coin-regtest-pow-limit-bits))
 (define %genesis-header (block-header-field %genesis-block))
 
 ;; A personalized source can broaden only its exact reserved-string branch.
@@ -699,41 +697,25 @@
 (define (block-from-coinbase parent height complexity solution coinbase)
   (let* ((previous (block-header-hash parent))
          (length (coin-solution-length solution))
-         (par (puzzle-spec-par
-                (coin-node-puzzle previous height complexity)))
          (header
            (block-header
              version: (coin-version-encode complexity length)
              previous-block: previous
              merkle-root: (merkle-root
-                            (list (transaction-txid coinbase)))
+                            (list (transaction-wtxid coinbase)))
              time: (coin-next-block-time
                      parent coin-regtest-min-block-spacing)
              bits: (block-header-bits parent)
              nonce: 0)))
-    (block header-field: (coin-mine-header header par)
+    (block header-field: header
            transactions: (list coinbase))))
 
 (define (block-with-coinbase b coinbase)
-  (let* ((old-payload
-           (coin-result-value (coin-block-coinbase-payload b)))
-         (height (coin-coinbase-payload-height old-payload))
-         (txs (cons coinbase (cdr (block-transactions b))))
-         (old-header (block-header-field b))
-         (complexity
-           (coin-result-value (coin-header-complexity old-header)))
-         (par
-           (puzzle-spec-par
-             (coin-node-puzzle
-               (block-header-previous-block old-header)
-               height
-               complexity)))
+  (let* ((txs (cons coinbase (cdr (block-transactions b))))
          (header (block-header
-                   old-header
-                   merkle-root: (merkle-root (map transaction-txid txs))
-                   nonce: 0)))
-    (block header-field: (coin-mine-header header par)
-           transactions: txs)))
+                   (block-header-field b)
+                   merkle-root: (merkle-root (map transaction-wtxid txs)))))
+    (block header-field: header transactions: txs)))
 
 ;; Five raw pushes let hostile wire tests carry SHARES bytes the canonical
 ;; encoder correctly refuses to create.
@@ -793,7 +775,7 @@
                (coin-build-block
                  %genesis-header 1 coin-genesis-complexity
                  coin-regtest-pow-limit-bits
-                 #f "prototype" %elsewhere (+ coin-regtest-genesis-time 1)))
+                 #f #u8() %elsewhere (+ coin-regtest-genesis-time 1)))
              (share
                (car (generated-shares 1 (coin-parent-context prototype))))
              (commitment
@@ -802,7 +784,7 @@
                (coin-build-block
                  %genesis-header 1 coin-genesis-complexity
                  coin-regtest-pow-limit-bits
-                 #f "commit" %elsewhere (+ coin-regtest-genesis-time 1)
+                 #f #u8() %elsewhere (+ coin-regtest-genesis-time 1)
                  '() 0 (list commitment)))
              (parent-header (block-header-field parent))
              (height 2)
@@ -818,12 +800,12 @@
                (coin-build-block
                  parent-header height coin-genesis-complexity
                  coin-regtest-pow-limit-bits
-                 solution "original solver" %elsewhere arrival))
+                 solution #u8() %elsewhere arrival))
              (copy-before-child
                (coin-build-coop-block
                  parent height coin-genesis-complexity
                  coin-regtest-pow-limit-bits
-                 solution (list share) "copy before child" %anyone arrival))
+                 solution (list share) #u8() %anyone arrival))
              (child
                (coin-build-block
                  (block-header-field original)
@@ -831,22 +813,16 @@
                  coin-genesis-complexity
                  coin-regtest-pow-limit-bits
                  #f
-                 "settling child"
+                 #u8()
                  %elsewhere
                  (+ arrival coin-regtest-min-block-spacing)))
              (copy-after-child
                (coin-build-coop-block
                  parent height coin-genesis-complexity
                  coin-regtest-pow-limit-bits
-                 solution (list share) "copy after child" %anyone arrival))
+                 solution (list share) #u8() #u8(#x6a) arrival))
              (original-header (block-header-field original))
              (copy-header (block-header-field copy-before-child))
-             (par
-               (puzzle-spec-par
-                 (coin-node-puzzle
-                   (block-header-hash parent-header)
-                   height
-                   coin-genesis-complexity)))
              (n (open-node dir))
              (validation-node (open-node validation-dir)))
         ;; The copy is a genuinely valid cooperative block. A separate node
@@ -857,7 +833,7 @@
         (node-close validation-node)
 
         ;; Producer source and encoded length are identical. Shares affect
-        ;; payouts, while each distinct finalized header wins its own lottery.
+        ;; payouts, not the additive score awarded to the producer.
         (assert-equal
           (coin-result-value
             (coin-header-solution-length original-header))
@@ -868,20 +844,11 @@
           (coin-result-value
             (coin-block-solution-length
               parent height coin-genesis-complexity copy-before-child)))
-        (assert-true
-          (coin-lottery-valid?
-            (block-header-work-value original-header)
-            coin-regtest-pow-limit-bits
-            par
-            (coin-solution-length solution)))
-        (assert-true
-          (coin-lottery-valid?
-            (block-header-work-value copy-header)
-            coin-regtest-pow-limit-bits
-            par
-            (coin-solution-length solution)))
-        (assert-equal (coin-chain-work original-header #f 2)
-                      (coin-chain-work copy-header #f 2))
+        (assert-equal 0 (block-header-nonce original-header))
+        (assert-equal 0 (block-header-nonce copy-header))
+        (assert-equal 2 (coin-chain-work original-header height original 1))
+        (assert-equal 2
+                      (coin-chain-work copy-header height copy-before-child 1))
 
         ;; First-seen retains H2. The losing copy body is downloaded but is
         ;; not revalidated onto the active chain.
@@ -907,7 +874,7 @@
 (define %coop-prototype
   (coin-build-block %genesis-header 1 coin-genesis-complexity
                     coin-regtest-pow-limit-bits
-                    #f "prototype" %anyone
+                    #f #u8() %anyone
                     (+ coin-regtest-genesis-time 1)))
 (define %coop-context (coin-parent-context %coop-prototype))
 (define %coop-shares
@@ -922,7 +889,7 @@
 (define %coop-parent
   (coin-build-block %genesis-header 1 coin-genesis-complexity
                     coin-regtest-pow-limit-bits
-                    #f "commit" %anyone
+                    #f #u8() %anyone
                     (+ coin-regtest-genesis-time 1)
                     '() 0 %coop-commits))
 (define %coop-child
@@ -930,7 +897,7 @@
        (coin-build-coop-block
          %coop-parent 2 coin-genesis-complexity
          coin-regtest-pow-limit-bits
-         #f %coop-shares "reveal" %elsewhere
+         #f %coop-shares #u8() %elsewhere
          (+ coin-regtest-genesis-time 2))))
 
 (when %native-secp256k1?
@@ -1042,22 +1009,13 @@
              (peer-dir (fresh-dir))
              (server (open-node server-dir))
              (header (block-header-field %coop-child))
-             (previous (block-header-previous-block header))
              (length
                (coin-result-value (coin-header-solution-length header)))
-             (par
-               (puzzle-spec-par
-                 (coin-node-puzzle
-                   previous 2 coin-genesis-complexity)))
              (lying-header
-               (coin-mine-header
-                 (block-header
-                   header
-                   version: (coin-version-encode
-                              coin-genesis-complexity
-                              (- length 1))
-                   nonce: 0)
-                 par))
+               (block-header
+                 header
+                 version: (coin-version-encode
+                            coin-genesis-complexity (- length 1))))
              (bad (block %coop-child header-field: lying-header)))
         (assert-equal 1 (submit server %coop-parent))
         (assert-equal 1
@@ -1078,7 +1036,7 @@
                          3 coin-genesis-complexity))
              (coinbase (coin-mining-coinbase/coop
                          3 solution (list (car %coop-shares)) (list 1) '()
-                         "replay" %elsewhere
+                         #u8() %elsewhere
                          (coin-carrier-script %coop-child) 0))
              (bad (block-from-coinbase parent-header 3
                                        coin-genesis-complexity
@@ -1092,65 +1050,76 @@
         (assert-peer-rejects server bad peer-dir 0 "share")
         (node-close server)))))
 
-(test-group "sigilcoin equal-base-work header fork choice"
-  (test "distinct qualifying siblings keep the first-seen header"
+(test-group "sigilcoin longest-chain header propagation"
+  (test "bodyless score claims cannot outrank a taller valid branch"
     (let* ((dir-a (fresh-dir))
            (dir-b (fresh-dir))
+           (dir-fork (fresh-dir))
            (a (open-node dir-a))
-           (base (car (mine-blocks a 1 %elsewhere)))
+           (base (car (build-blocks a 1 %elsewhere)))
            (parent (block-header-field base))
-           (previous (block-header-hash parent))
            (par (puzzle-spec-par
                   (coin-node-puzzle
-                    previous 2 coin-genesis-complexity)))
-           (version (coin-version-encode coin-genesis-complexity par))
+                    (block-header-hash parent) 2 coin-genesis-complexity)))
+           ;; Header-only score claims remain provisional display metadata.
            (incumbent
-             (coin-mine-header
-               (block-header
-                 version: version
-                 previous-block: previous
-                 merkle-root: (make-bytevector 32 8)
-                 time: (coin-next-block-time
-                         parent coin-regtest-min-block-spacing)
-                 bits: (block-header-bits parent)
-                 nonce: 0)
-               par))
-           (challenger
-             (coin-mine-header
-               (block-header
-                 incumbent
-                 merkle-root: (make-bytevector 32 12)
-                 nonce: 0)
-               par)))
-      (assert-equal (coin-chain-work incumbent #f 2)
-                    (coin-chain-work challenger #f 2))
-
-      ;; Give the node a validated parent before two bodyless sibling claims.
+             (block-header
+               (block-header-field
+                 (build-at parent 2 coin-genesis-complexity #f %elsewhere))
+               version: (coin-version-encode coin-genesis-complexity (- par 1))))
+           (challenger-block
+             (build-at parent 2 coin-genesis-complexity #f %anyone))
+           (challenger (block-header-field challenger-block))
+           (longer-block
+             (build-at challenger 3 coin-genesis-complexity #f %anyone))
+           (longer (block-header-field longer-block)))
+      (assert-equal 2 (coin-chain-work incumbent 2 #f 1))
+      (assert-equal 3
+                    (coin-chain-work longer 3 longer-block
+                                     (coin-chain-work
+                                       challenger 2 challenger-block 1)))
+      ;; Give the peer a validated parent before propagating the incumbent.
       (let* ((endpoint (open-endpoint))
              (port (car endpoint))
              (listener (cdr endpoint)))
         (sync-peer-ok a listener port dir-b 1)
-        (socket-close listener))
-      (assert-equal 1 (node-ingest-headers a (list incumbent)))
-      (assert-equal (hex-encode (block-header-hash incumbent))
-                    (node-status-snapshot-best-hash (node-status a)))
-      (assert-equal 1 (node-ingest-headers a (list challenger)))
-      (assert-equal (hex-encode (block-header-hash incumbent))
-                    (node-status-snapshot-best-hash (node-status a)))
-
-      ;; Header-only propagation preserves first-seen order after persistence.
-      (let* ((endpoint (open-endpoint))
-             (port (car endpoint))
-             (listener (cdr endpoint)))
+        (assert-equal 1 (node-ingest-headers a (list incumbent)))
         (header-sync-peer-ok a listener port dir-b)
         (socket-close listener))
       (node-close a)
-      (let ((b (open-node dir-b)))
-        (assert-equal (hex-encode (block-header-hash incumbent))
-                      (node-status-snapshot-best-hash (node-status b)))
-        (assert-equal 1 (best-block-height b))
-        (assert-true (tip-is? b base))
-        (node-close b)))))
+      (let ((fork-server
+              (node-with-blocks dir-fork
+                                (list base challenger-block longer-block))))
+        ;; This independent server advertises its own height-three branch.
+        (let* ((endpoint (open-endpoint))
+               (port (car endpoint))
+               (listener (cdr endpoint)))
+          (header-sync-peer-ok fork-server listener port dir-b)
+          (socket-close listener))
+        (let ((b (open-node dir-b)))
+          (assert-equal (hex-encode (block-header-hash longer))
+                        (node-status-snapshot-best-hash (node-status b)))
+          (assert-equal 3 (height-of b))
+          (assert-equal 3 (node-status-snapshot-best-work (node-status b)))
+          (assert-equal 1 (best-block-height b))
+          (assert-true (tip-is? b base))
+          (node-close b))
+        ;; One additional at-par block makes the competing chain strictly taller.
+        (let* ((next (car (build-blocks fork-server 1 %anyone)))
+               (endpoint (open-endpoint))
+               (port (car endpoint))
+               (listener (cdr endpoint))
+               (lines (sync-peer-ok fork-server listener port dir-b 2)))
+          (assert-equal "4" (peer-field lines "best-block-height"))
+          (assert-equal (hex-encode (block-hash next))
+                        (peer-field lines "best-block-hash"))
+          (socket-close listener)
+          (let ((b (open-node dir-b)))
+            (assert-true (tip-is? b next))
+            (assert-equal 4 (validated-count b))
+            (assert-equal 4 (node-status-snapshot-best-work (node-status b)))
+            (node-close b)))
+        (node-close fork-server)))))
 
 ;; ============================================================
 ;; Spending across nodes
@@ -1170,7 +1139,7 @@
         (plant-wallet-key dir-a)
         (assert-address-matches-key)
         (let* ((a (open-node dir-a))
-               (blocks (mine-blocks a 1 wallet-script)))
+               (blocks (build-blocks a 1 wallet-script)))
           (assert-equal 1 (height-of a))
           (let* ((funding (car (block-transactions (car blocks))))
                  (funding-value (solo-coinbase-value 1))
@@ -1205,7 +1174,7 @@
                             parent 2 complexity
                             (coin-required-bits
                               sigilcoin-regtest-consensus-params history)
-                            #f '() "wallet payment"
+                            #f '() #u8()
                             wallet-script
                             (coin-next-block-time
                               (block-header-field parent)
@@ -1260,7 +1229,7 @@
       (let* ((dir-a (fresh-dir))
              (dir-b (fresh-dir))
              (a (open-node dir-a))
-             (blocks (mine-blocks a 1 %anyone))
+             (blocks (build-blocks a 1 %anyone))
              (funding (car (block-transactions (car blocks))))
              (to-script (address->script %peer-address))
              (parent (node-best-header a))
@@ -1284,7 +1253,7 @@
                         parent 2 complexity
                         (coin-required-bits
                           sigilcoin-regtest-consensus-params history)
-                        #f "payment" %anyone
+                        #f #u8() %anyone
                         (coin-next-block-time
                           parent coin-regtest-min-block-spacing)
                         (list transfer) 0)))
@@ -1321,7 +1290,7 @@
     (let* ((active-dir (fresh-dir))
            (fork-dir (fresh-dir))
            (n (open-node active-dir))
-           (original-h1 (car (mine-blocks n 1 %anyone)))
+           (original-h1 (car (build-blocks n 1 %anyone)))
            (funding (car (block-transactions original-h1)))
            (funding-value (solo-coinbase-value 1))
            (transfer
@@ -1348,7 +1317,7 @@
                (coin-required-bits
                  sigilcoin-regtest-consensus-params history)
                #f
-               "maturity-one spend"
+               #u8()
                %anyone
                (coin-next-block-time
                  (block-header-field original-h1)
@@ -1364,7 +1333,7 @@
           (node-store-transaction n transfer "wallet")))
       (assert-equal 1 (submit n original-h2))
       (let* ((fork-node (open-node fork-dir))
-             (fork (mine-blocks fork-node 3 %elsewhere)))
+             (fork (build-blocks fork-node 3 %elsewhere)))
         (node-close fork-node)
         (assert-equal
           3
@@ -1394,15 +1363,12 @@
 ;; ============================================================
 
 (define %generator-module (find-module '(sigil coin puzzle generator)))
-(define %constraints-module (find-module '(sigil coin puzzle constraints)))
 (define puzzle-constraint-for*
   (module-ref %generator-module 'puzzle-constraint-for))
 (define puzzle-spec-hidden-source*
   (module-ref %generator-module 'puzzle-spec-hidden-source))
 (define puzzle-spec-constraint*
   (module-ref %generator-module 'puzzle-spec-constraint))
-(define puzzle-constraint-name*
-  (module-ref %constraints-module 'puzzle-constraint-name))
 
 (define (complexity-for-constraint ci)
   (let loop ((complexity (if (memv ci '(0 1 3 5)) 256 1024)))
@@ -1426,7 +1392,7 @@
                     %genesis-header 1 complexity
                     coin-regtest-pow-limit-bits
                     (puzzle-spec-hidden-source* spec)
-                    (symbol->string (puzzle-constraint-name* ci))
+                    #u8()
                     %elsewhere (+ coin-regtest-genesis-time 1)))
                (length
                  (coin-block-solution-length
@@ -1437,12 +1403,10 @@
           (assert-equal
             (coin-result-value length)
             (coin-result-value (coin-header-solution-length header)))
-          (assert-true
-            (coin-lottery-valid?
-              (block-header-work-value header)
-              coin-regtest-pow-limit-bits
-              (puzzle-spec-par spec)
-              (coin-result-value length)))))
+          (assert-equal 0 (block-header-nonce header))
+          (assert-equal
+            (coin-golf-score (puzzle-spec-par spec) (coin-result-value length))
+            (coin-chain-work header 1 b 0))))
       '(0 1 2 3 4 5 6 7))))
 
 ;; ============================================================
@@ -1455,31 +1419,21 @@
            (dir-b (fresh-dir))
            (dir-bad (fresh-dir))
            (a (open-node dir-a))
-           (blocks (mine-blocks a 3 %elsewhere))
+           (blocks (build-blocks a 3 %elsewhere))
            (honest-tip (list-ref blocks 2))
            (parent (block-header-field honest-tip))
            (honest (build-at parent
                              4
                              coin-genesis-complexity
                              #f
-                             "lie"
                              %elsewhere))
            (header (block-header-field honest))
-           ;; The header makes a plausible one-byte claim and wins the easier
-           ;; lottery for that claim; the unchanged body cannot back it.
-           (par
-             (puzzle-spec-par
-               (coin-node-puzzle
-                 (block-header-previous-block header)
-                 4
-                 coin-genesis-complexity)))
+           ;; The header earns score for a plausible one-byte claim;
+           ;; the unchanged body cannot back it.
            (liar-header
-             (coin-mine-header
-               (block-header
-                 header
-                 version: (coin-version-encode coin-genesis-complexity 1)
-                 nonce: 0)
-               par))
+             (block-header
+               header
+               version: (coin-version-encode coin-genesis-complexity 1)))
            (liar
              (block header-field: liar-header
                     transactions: (block-transactions honest))))
@@ -1543,7 +1497,7 @@
         (node-close b))
       ;; Not poisoned for later either: the next honest block still lands.
       (let* ((a (open-node dir-a))
-             (next (car (mine-blocks a 1 %elsewhere)))
+             (next (car (build-blocks a 1 %elsewhere)))
              (endpoint (open-endpoint))
              (port (car endpoint))
              (listener (cdr endpoint)))

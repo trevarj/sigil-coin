@@ -57,7 +57,7 @@ services:
       - "${P2P_BIND:-127.0.0.1}:${P2P_PORT:-19446}:19446/tcp"
     volumes:
       - type: bind
-        source: ${SIGIL_TESTNET_STATE_DIR:-./state/testnet}
+        source: ${SIGIL_TESTNET_STATE_DIR:-./state/testnet-proof-of-golf}
         target: /var/lib/sigilcoin
         bind:
           create_host_path: false
@@ -79,7 +79,7 @@ services:
         condition: service_healthy
     volumes:
       - type: bind
-        source: ${SIGIL_TESTNET_STATE_DIR:-./state/testnet}
+        source: ${SIGIL_TESTNET_STATE_DIR:-./state/testnet-proof-of-golf}
         target: /var/lib/sigilcoin
         bind:
           create_host_path: false
@@ -108,7 +108,7 @@ services:
         condition: service_healthy
     volumes:
       - type: bind
-        source: ${SIGIL_TESTNET_STATE_DIR:-./state/testnet}
+        source: ${SIGIL_TESTNET_STATE_DIR:-./state/testnet-proof-of-golf}
         target: /var/lib/sigilcoin
         read_only: true
         bind:
@@ -134,13 +134,13 @@ services:
         condition: service_healthy
     volumes:
       - type: bind
-        source: ${SIGIL_TESTNET_STATE_DIR:-./state/testnet}
+        source: ${SIGIL_TESTNET_STATE_DIR:-./state/testnet-proof-of-golf}
         target: /var/lib/sigilcoin
         read_only: true
         bind:
           create_host_path: false
       - type: bind
-        source: ${SIGIL_TESTNET_POOL_STATE_DIR:-./state/testnet-pool}
+        source: ${SIGIL_TESTNET_POOL_STATE_DIR:-./state/testnet-pool-proof-of-golf}
         target: /var/lib/sigilcoin-pool
         bind:
           create_host_path: false

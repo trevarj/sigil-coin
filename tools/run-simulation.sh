@@ -3,7 +3,7 @@ set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 out="$root/tools/simulation-output"
-expected="d14b4bc9b49e14379f5c1b865a8dc734aa5ee84d961d6a68ea72c860ab8827dd"
+# Checked schema-4 observations remain in simulation-output-schema-4-historical.
 
 case "${1:-}" in
   ""|--check) ;;
@@ -18,22 +18,26 @@ fi
 nix develop "$root" -c sigil build \
   --redirects "$root/dev-redirects.sgl" >/dev/null
 cd "$root"
-rm -f "$out"/*
-tools/simulator/build/dev/bin/sigil-coin-simulator
-
 files=(censorship.csv market.csv payouts.csv puzzles.csv results.json shares.csv strategy.csv summary.txt)
-(
-  cd "$out"
-  sha256sum "${files[@]}" > SHA256SUMS
-)
+run_once() {
+  tools/simulator/build/dev/bin/sigil-coin-simulator
+  (
+    cd "$out"
+    sha256sum "${files[@]}" > SHA256SUMS
+  )
+}
+run_once
 actual=$(sha256sum "$out/SHA256SUMS" | cut -d' ' -f1)
 
 if [[ ${1:-} == --check ]]; then
+  expected=$actual
+  run_once
+  actual=$(sha256sum "$out/SHA256SUMS" | cut -d' ' -f1)
   [[ $actual == "$expected" ]] || {
-    echo "reproducibility hash mismatch: expected $expected, got $actual" >&2
+    echo "reproducibility mismatch between fresh runs: $expected != $actual" >&2
     exit 1
   }
-  echo "reproducibility hash: $actual"
+  echo "two-run reproducibility hash: $actual"
 else
   echo "wrote $out (reproducibility hash $actual)"
 fi

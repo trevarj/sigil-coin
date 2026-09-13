@@ -113,16 +113,16 @@
               (list 'meta (attrs '(name "theme-color") '(content "#080910")))
               (list 'meta
                     (attrs '(name "description")
-                           '(content "SigilCoin weights a full-header nonce lottery by how far a valid program beats par.")))
+                           '(content "SigilCoin is a hobby proof-of-golf chain: exact daily slots, longest-height forks, and hardcoded release checkpoints.")))
               (list 'meta (attrs '(property "og:title")
-                                 '(content "SigilCoin — Short programs. Better odds.")))
+                                 '(content "SigilCoin — Short programs. Daily slots.")))
               (list 'meta
                     (attrs '(property "og:description")
-                           '(content "Solve deterministic puzzles. Every byte saved doubles nonce-lottery odds, up to eight.")))
+                           '(content "Solve deterministic puzzles. Golf score measures competition quality, not fork weight. Release checkpoints bound reorgs; no settlement-grade security.")))
               (list 'meta (attrs '(property "og:url")
                                  '(content "https://sigilcoin.lol/")))
               (list 'meta (attrs '(property "og:type") '(content "website")))
-              (list 'title "SigilCoin — short programs, better odds")
+              (list 'title "SigilCoin — short programs, daily slots")
               (list 'link (attrs '(rel "canonical")
                                  '(href "https://sigilcoin.lol/")))
               (list 'link
@@ -158,33 +158,33 @@
             (list
               'section (attrs '(id "top") '(class "hero section-shell"))
               (list 'div (attrs '(class "hero-copy"))
-                    (list 'p (attrs '(class "eyebrow")) "Program-golf lottery")
-                    (list 'h1 "Short programs. Better odds.")
+                    (list 'p (attrs '(class "eyebrow")) "Scheduled proof-of-golf")
+                    (list 'h1 "Short programs. Daily slots.")
                     (list 'p (attrs '(class "hero-lead"))
-                          "Solve the puzzle, then roll the nonce. Every byte saved doubles your odds, up to eight.")
+                          "Solve the puzzle. Golf quality scores 1–9 points; strictly taller valid branches win. No nonce grinding.")
                     (list 'div (attrs '(class "hero-actions"))
                           (link %explorer "Open Explorer" "button button-primary")
                           (link %whitepaper "Read the whitepaper" "button button-secondary"))
                     (list 'p (attrs '(class "microcopy"))
-                          "A for-fun chain built in Sigil, with consensus rules treated seriously."))
+                          "A hobby chain built in Sigil. Not settlement-grade security."))
               (list 'div (attrs '(class "hero-visual reveal")
                                  '(data-parallax "0.06"))
                     (list 'div
                           (attrs '(class "hero-raster raster-slot")
                                  '(role "img")
-                                 '(aria-label "A valid short program receiving better odds in a full-header nonce lottery")
+                                 '(aria-label "A valid program five bytes below par scores six golf points for competition quality, not fork choice")
                                  '(data-raster-src "assets/sigilcoin-hero.webp"))
                           (list 'span "(lambda(x) …)")
                           (list 'strong "par − 5")
-                          (list 'span "32× LOTTERY ODDS"))
+                          (list 'span "6 GOLF POINTS"))
                     (list 'img (attrs '(src "assets/mining.svg")
-                                      '(alt "Mining flow: derive a puzzle, verify an eligible program, then search the block cursor until the full-header hash meets its target")))))
+                                      '(alt "Proof-of-golf flow: derive a puzzle, verify a program at or below par, then submit a zero-nonce block when its exact slot is due")))))
             (list
               'section (attrs '(id "how") '(class "section-shell section-block"))
               (list 'div (attrs '(class "section-heading reveal"))
                     (list 'p (attrs '(class "eyebrow")) "How it works")
-                    (list 'h2 "A daily synthesis and nonce lottery.")
-                    (list 'p "Every node derives the same input/output examples and syntactic constraint. Models and synthesis scripts search for short programs; the CLI handles the lightweight nonce search automatically."))
+                    (list 'h2 "A daily slot for a short program.")
+                    (list 'p "Every node derives the same input/output examples and syntactic constraint. Models and synthesis scripts search for short programs. The generated par witness is a valid fallback; block production does not require hash search."))
               (list 'div (attrs '(class "flow-grid"))
                     (list 'article (attrs '(class "flow-card reveal"))
                           (list 'b "01") (list 'h3 "Derive")
@@ -196,8 +196,8 @@
                           (list 'b "03") (list 'h3 "Verify")
                           (list 'p "Nodes rerun the program under fixed fuel, memory, string and depth caps."))
                     (list 'article (attrs '(class "flow-card reveal"))
-                          (list 'b "04") (list 'h3 "Mine")
-                          (list 'p "Finalize the block, then search its coinbase lock-time and header nonce until the full-header HASH256 roll meets the length-weighted target."))))
+                          (list 'b "04") (list 'h3 "Submit")
+                          (list 'p "When the next exact slot is due, build and submit one complete block with nonce and coinbase locktime set to zero."))))
             (list
               'section (attrs '(id "fundamentals")
                               '(class "section-shell section-block"))
@@ -207,8 +207,8 @@
                     (list 'p "One compact chain. Every headline number comes from the protocol, not a market feed."))
               (list 'ul (attrs '(class "facts")
                                '(aria-label "SigilCoin fundamentals"))
-                    (fact "Program-weighted" "nonce lottery")
-                    (fact "~1 block/day" "mainnet target")
+                    (fact "1–9 points" "competition quality only")
+                    (fact "86400 seconds" "exact mainnet slots")
                     (fact "512 bytes" "solution cap")
                     (fact "Zero" "premine")
                     (fact "143029.99991970 SGL" "scheduled maximum")
@@ -217,37 +217,45 @@
               'section (attrs '(id "consensus") '(class "section-shell section-block consensus"))
               (list 'div (attrs '(class "section-heading reveal"))
                     (list 'p (attrs '(class "eyebrow")) "Layered consensus")
-                    (list 'h2 "Familiar chain. Different work.")
-                    (list 'p "Bounded evaluation establishes a program's validity and length; a lightweight full-header nonce lottery admits the block."))
+                    (list 'h2 "Longest height. Release checkpoints.")
+                    (list 'p "Bounded evaluation establishes a program's validity and byte length. Golf score displays competition quality only: it neither selects canonical branches nor currently alters subsidy."))
               (list 'div (attrs '(class "consensus-layout"))
                     (list 'div (attrs '(class "layers"))
                           (layer "01" "Bitcoin foundation"
                                  "80-byte headers, transactions, UTXOs, script, P2WPKH, headers-first sync and block relay.")
                           (layer "02" "Frozen puzzle machine"
                                  "A small Scheme subset with no I/O, mutation, floating point or host eval; one bounded machine checks every example.")
-                          (layer "03" "Header nonce lottery"
-                                 "Version commits producer length and puzzle complexity. Bits is the interval-retargeted compact base target; the coinbase lock-time and header nonce are searched until full-header HASH256 meets the golf-weighted effective target.")
-                          (layer "04" "Independent retargets"
-                                 "Every 16 blocks, observed time moves the base target while median golf margin moves puzzle complexity C. Neither signal controls the other.")
+                          (layer "03" "Scheduled proof-of-golf"
+                                 "Version commits producer length and puzzle complexity. Bits stays fixed for header compatibility. Nonce and coinbase locktime are zero; non-genesis graffiti is empty.")
+                          (layer "04" "Puzzle-complexity retarget"
+                                 "Every 16 blocks, median golf margin moves puzzle complexity C. Mainnet slots stay exactly 86400 seconds apart; no hash difficulty is searched or retargeted.")
                           (layer "05" "Co-op commit–reveal"
                                  "Producers require L ≤ par; up to 8 signed personalized shares require L < personalized par and split a 10% contribution pool."))
                     (list 'figure (attrs '(class "diagram reveal"))
                           (list 'img (attrs '(src "assets/score-fork.svg")
-                                            '(alt "Program savings weight nonce-lottery odds; fork choice follows cumulative base work and exact ties remain first-seen")))
-                          (list 'figcaption "Shorter improves admission odds. Fork choice follows cumulative retargeted base work; exact ties remain first-seen.")))
+                                            '(alt "A valid height-two branch beats height one regardless of golf score; equal height keeps the durable active incumbent, and hardcoded release checkpoints bound reorgs")))
+                          (list 'figcaption "Switch only to a strictly taller valid branch that matches release checkpoints. Equal height retains the durable active incumbent. Mainnet pins H0 and H1; public testnet and regtest pin H0 only.")))
               (list 'div (attrs '(class "exact-grid reveal"))
                     (list 'details
-                          (list 'summary "Header and lottery target")
-                          (list 'p "Version uses prefix 0x20600000 under mask 0xffe00000, with L−1 in bits 20..12 and C in bits 11..0. Header bits is a Bitcoin compact base target retargeted every 16 blocks from elapsed time. Up to eight saved bytes double the accepted outcome count, capped at 2^255−1. The calibrated mainnet target expects about 25.10 billion rolls at par or 98.04 million at par−8."))
+                          (list 'summary "Header and golf score")
+                          (list 'p "Version uses prefix 0x20600000 under mask 0xffe00000, with L−1 in bits 20..12 and C in bits 11..0. Valid producer programs satisfy L ≤ par. Savings are min(8, max(0, par − L)); block score is 1 + savings, from 1 through 9. Genesis contributes zero. The 80-byte header keeps fixed per-network bits and nonce zero; non-genesis coinbase locktime is zero, graffiti is empty, and transaction version and sequence remain canonical. There is no hash admission target."))
                     (list 'details
                           (list 'summary "Fork choice")
-                          (list 'p "Each accepted block adds work derived from its compact base target. The chain with more cumulative base work wins; equal work prefers greater height, and an exact tie retains the first valid arrival."))
+                          (list 'p "A valid candidate branch must be strictly taller to replace the active chain. Equal height retains the durable active incumbent, including after restart; golf score, hash and arrival metadata never displace it. Chain configs publish hardcoded (height . internal-hash) checkpoints: incompatible branches cannot cross them. Checkpoints advance only in reviewed software releases, and nodes must upgrade to share newer checkpoints. Mainnet now pins H0 and the live H1 block; public testnet and regtest still pin H0 only, protecting genesis but no later history. Mainnet rejects reorgs below H1; reorgs above H1 remain possible."))
                     (list 'details
-                          (list 'summary "Retarget")
-                          (list 'p "Every 16 blocks, elapsed timestamps retarget bits with a 4× clamp. Separately, median relative golf margin adjusts C, changing grammar width, examples and constraint tier. Validator caps never move.")))
+                          (list 'summary "Exact slots and puzzle retarget")
+                          (list 'p "Header time must equal parent time plus the configured spacing: exactly 86400 seconds on mainnet, shorter on test networks. No network allows a future slot. Missed slots can be filled late, so this is not a guarantee of daily block arrival. Every 16 blocks, median relative golf margin adjusts C, changing grammar width, examples and constraint tier. Bits and validator caps never move.")))
                     (list 'details
                           (list 'summary "Payout and issuance")
                           (list 'p "Solo pays floor(4S/5)+fees and leaves the reserve unminted. With shares, canonical outputs divide floor(S/10) by verified contributions 1–4, pay the parent floor(S/20), retain zero-value required outputs, and send fees and integer residuals to the producer."))))
+            (list
+              'section (attrs '(id "limits") '(class "section-shell section-block"))
+              (list 'div (attrs '(class "section-heading reveal"))
+                    (list 'p (attrs '(class "eyebrow")) "Limits, plainly")
+                    (list 'h2 "A hobby chain, not financial settlement.")
+                    (list 'p "Valid equal-height branches are cheap to construct and can remain local to different nodes. A missed slot gives a rival an opportunity to become strictly taller; partitions can leave competing incumbents. Reorgs remain possible above the latest release checkpoint: H1 on mainnet, H0 on public testnet and regtest. Fixing nonce and coinbase fields does not prevent parent-template manipulation through remaining valid block choices. There is no settlement-grade security."))
+              (list 'p "The earlier nonce-PoW genesis was retired before height 1 because sustained compute burn contradicted the project's intent. Archive that retired state; never reuse its database. This longest-height/checkpoint update preserves proof-of-golf genesis hashes, timestamps and block bytes, and existing proof-of-golf H0 state may be reused. Transport magic changes to SGM3/SGT3/SGR3 (last byte 0x33) to isolate older score-ranked nodes.")
+              (list 'p "SGL is intended to have no monetary value. There is no sale, bridge or promise of future value. Commit–reveal binds contributions and payouts, not finality. Checkpoints are hardcoded release policy, not automatic or signed finality."))
             (list
               'section (attrs '(id "ecosystem") '(class "section-shell section-block"))
               (list 'div (attrs '(class "section-heading reveal"))
@@ -270,28 +278,28 @@
               (list 'div (attrs '(class "section-heading reveal"))
                     (list 'p (attrs '(class "eyebrow")) "Get started")
                     (list 'h2 "Download. Run a node or contribute.")
-                    (list 'p "Use the CLI as a full node, wallet and miner, or contribute to the public testnet pool without running a node. Read each command before running it."))
+                    (list 'p "Use the CLI as a full node, wallet and scheduled producer, or contribute to the public testnet pool without running a node. Read each command before running it."))
               (list 'div (attrs '(class "path"))
                     (step "1" "Download"
-                          "Published builds appear on Releases. If none matches your system, build the source with the repository's pinned Nix environment."
+                          "Published builds appear on Releases. If none matches your system, build the source with the repository's pinned Nix environment. Upgrade for newer reviewed checkpoints: mainnet now pins H0 and H1; public testnet and regtest still pin H0 only."
                           #f)
                     (list 'div (attrs '(class "step-links reveal"))
                           (link %release "Latest release" "button button-primary")
                           (link %github "Source fallback" "button button-secondary"))
                     (step "2" "Create and back up your wallet"
-                          "Run the address command once. Warning: back up .sigilcoin/wallet/wallet.key before receiving SGL. Losing that file loses access; never share it."
-                          '("sigilcoin address"))
+                          "Start with a fresh state directory or reuse existing proof-of-golf H0 state. Back up state/mainnet-proof-of-golf/wallet/wallet.key before receiving SGL. Losing that file loses access; never share it or import a retired nonce-PoW database."
+                          '("sigilcoin address --chain sigilcoin-main --data-dir ./state/mainnet-proof-of-golf"))
                     (step "3" "Sync the chain"
-                          "Download and validate headers and blocks from the configured public seed."
-                          '("sigilcoin sync"))
+                          "Use upgraded software to download and validate headers and blocks from the configured public seed; older score-ranked nodes use incompatible transport magic."
+                          '("sigilcoin sync --chain sigilcoin-main --data-dir ./state/mainnet-proof-of-golf"))
                     (step "4" "Solve and submit"
-                          "Use a valid program no longer than par. Saving bytes improves lottery odds; the miner searches the block cursor automatically."
-                          '("sigilcoin puzzle"
-                            "sigilcoin mine --solution '(lambda(x)...)'"))
+                          "Inspect the puzzle and next slot time. Once due, mine builds and submits one candidate using the valid at-par fallback. Pass --solution with your own shorter program to improve displayed golf quality, not fork weight or subsidy."
+                          '("sigilcoin puzzle --chain sigilcoin-main --data-dir ./state/mainnet-proof-of-golf"
+                            "sigilcoin mine --chain sigilcoin-main --data-dir ./state/mainnet-proof-of-golf"))
                     (list 'article (attrs '(class "prompt-card reveal"))
                           (list 'h3 "Contribute without a node")
                           (list 'p "On public testnet, the contributor watcher derives your personalized puzzle and requires a solution strictly below its personalized par. It keeps your wallet key local; your blind and source remain local until your commitment appears in a canonical block, then submits the signed reveal.")
-                          (command-row "sigilcoin contribute --relay https://pool.testnet.sigilcoin.lol --testnet")
+                          (command-row "sigilcoin contribute --relay https://pool.testnet.sigilcoin.lol --testnet --data-dir ./state/testnet-contributor-proof-of-golf")
                           (list 'p "Keep the watcher running through the following block, or resume it from the saved commitment. If included, the reward is a direct coinbase payout to your wallet and becomes spendable in the block after it is paid. Inclusion is not guaranteed: the relay or producer can delay, omit or censor work, but cannot redirect a valid signed payout.")
                           (list 'p (link (string-append %pool "/v1/context")
                                          "View current pool context ↗")))

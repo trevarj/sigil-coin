@@ -137,12 +137,20 @@
           (if (coin-failed? decoded)
               decoded
               (let* ((header (block-header-field b))
+                     (coinbase (coin-block-coinbase b))
+                     (input (car (transaction-inputs coinbase)))
                      (payload (coin-result-value decoded))
                      (commits (coin-commits-decode
                                 (coin-coinbase-payload-commits payload)))
                      (shares-result (coin-shares-decode
                                       (coin-coinbase-payload-shares payload))))
                 (cond
+                  ((not (and (= 1 (transaction-version coinbase))
+                             (= 0 (transaction-lock-time coinbase))
+                             (= #xffffffff (txin-sequence input))
+                             (null? (txin-witness input))))
+                   (coin-error 'non-canonical-coinbase
+                               "coinbase requires version 1, final sequence, zero locktime and no witness"))
                   ((not (= height (coin-coinbase-payload-height payload)))
                    (coin-error 'height-mismatch
                                "the coinbase height is not the block height"))
@@ -322,12 +330,11 @@
       (set! %last-validation-stats '(0 0 0))
       (require-coin-ok "coin-connect-block: block size"
                        (coin-validate-block-size b))
-      (unless (block-merkle-root-valid? b)
+      (unless (coin-block-merkle-root-valid? b)
         (error "coin-connect-block: invalid-merkle-root"))
       (let* ((header (block-header-field b)))
-        ;; Header acceptance binds version complexity/length and the
-        ;; chain-retargeted lottery target to history. Body validation proves
-        ;; the encoded length claim.
+        ;; Header acceptance binds complexity, length and the scheduled slot
+        ;; to history. Body validation proves the encoded length claim.
         (let* ((complexity (require-coin-ok
                              "coin-connect-block: version"
                              (coin-header-complexity header)))
@@ -368,11 +375,17 @@
       ((block-rules-connect bitcoin-block-rules)
        rules params height utxos b verify-scripts? parent-block))
 
+    (define (coin-block-storage-valid? b serialized)
+      (: block? bytevector? -> boolean?)
+      (<= (bytevector-length serialized) coin-max-block-bytes))
+
     (define coin-block-rules
       (block-rules connect: coin-connect-block
                    subsidy: coin-block-reward
                    coinbase-maturity: 1
-                   coinbase-script-bounds: coin-coinbase-script-bounds))
+                   coinbase-script-bounds: coin-coinbase-script-bounds
+                   commitment-valid?: coin-block-merkle-root-valid?
+                   storage-valid?: coin-block-storage-valid?))
 
     ;;; Build rules that provide trusted configured genesis to block one.
     (define (coin-block-rules-for-genesis genesis)
@@ -388,4 +401,6 @@
         subsidy: coin-block-reward
         coinbase-maturity:
           (block-rules-coinbase-maturity coin-block-rules)
-        coinbase-script-bounds: coin-coinbase-script-bounds))))
+        coinbase-script-bounds: coin-coinbase-script-bounds
+        commitment-valid?: coin-block-merkle-root-valid?
+        storage-valid?: coin-block-storage-valid?))))

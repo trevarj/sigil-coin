@@ -1,4 +1,91 @@
-# SigilCoin launch checklist
+# SigilCoin proof-of-golf cutover and retired launch record
+
+## Current contract: replacement networks from height 0
+
+The previously launched nonce-PoW mainnet was retired **before height 1**.
+No post-genesis blocks were produced on that launched chain. Sustained compute
+burn contradicted the project's program-golf intent, so this is a replacement
+network, not an upgrade that continues the old history.
+
+The replacement proof-of-golf networks began with fresh genesis markers and
+network magic, zero header nonce, zero coinbase locktime, zero genesis reward,
+and zero genesis score. Timestamps, ports, address HRPs, and fixed `bits` remain.
+The current identities are the generated constants in
+[`genesis.sgl`](packages/sigil-coin-node/src/sigil/coin/node/genesis.sgl) and
+[`chain.sgl`](packages/sigil-coin-node/src/sigil/coin/node/chain.sgl), not the
+retired hashes preserved below.
+
+The replacement rules are:
+
+- A producer's program must solve the parent-derived puzzle and satisfy
+  `L <= par`. The generated at-par witness is a valid score-1 fallback.
+- `savings = min(8, max(0, par - L))`; each non-genesis block adds
+  `1 + savings` points, from 1 through 9. Score displays competition quality;
+  it does not select branches or currently alter subsidy.
+- Fork choice replaces the active branch only for strictly greater height.
+  Equal height keeps the durable active incumbent across restart; score, hash,
+  and arrival metadata do not break ties. Equal-height local tips can differ.
+- Chain configs hardcode `(height . internal-hash)` checkpoints. Incompatible
+  branches cannot cross them. Only reviewed software releases advance
+  checkpoints, and nodes must upgrade to share a newer one. Mainnet now pins
+  H0 and the live H1 block; public testnet and regtest still pin H0 only.
+  Mainnet rejects reorgs below H1; reorgs above H1 remain possible. This is not
+  automatic or signed-checkpoint finality.
+- Mainnet header time is exactly `parent.time + 86400`. Each test network uses
+  its configured shorter spacing. No network accepts a future slot. Late
+  production can fill elapsed slots; this is not a guarantee of daily arrival.
+- Every header nonce is zero. Non-genesis coinbase locktime is zero and graffiti
+  is empty; transaction version and sequence remain canonical. `bits` is a fixed
+  per-network compatibility field in the unchanged 80-byte header, with no hash
+  admission target, nonce search, or hash retarget.
+- Bounded puzzle evaluation, puzzle-complexity retarget, co-op commitments and
+  shares, ordinary transactions, and payouts remain.
+
+Mainnet H1 is pinned by internal hash
+`24f2cbbf4a5dbbce67abbcc047e300cda17c600e7ab3565846d27a0eb6b041d2`;
+its reversed display ID is
+`d241b0b60e7ad2465856b37a0e607ca1cd00e347c0bcab67cebb5d4abfcbf224`.
+
+The longest-height/checkpoint cutover keeps proof-of-golf block bytes, genesis
+hashes, and genesis timestamps unchanged. Transport magic becomes `SGM3`,
+`SGT3`, and `SGR3` on mainnet, testnet, and regtest to isolate older score-ranked
+nodes. Existing proof-of-golf H0 state may be reused; retired nonce-PoW state
+must remain archived.
+
+When replacing retired nonce-PoW state, archive its chain and relay databases
+before starting proof-of-golf binaries. Never reuse them or treat the old H0 hash
+as a checkpoint. For that replacement, select fresh `state/*-proof-of-golf`
+directories and use the
+low-CPU scheduled producer described in [`docs/deployment.md`](docs/deployment.md)
+and [`deploy/RUNBOOK.md`](deploy/RUNBOOK.md). Old launch checks and measurements
+below do not validate this cutover.
+
+### Security limits identified by Astra
+
+This remains a hobby chain, not settlement-grade security. Public witnesses
+make equal-height alternative branches cheap to construct, but neither a
+shorter nor an equal-height branch wins by improving golf score. A missed slot
+can let a replacement branch become strictly taller; partitions can leave nodes
+with different incumbents. Reorgs remain possible above the latest released
+checkpoint: H1 on mainnet, H0 on public testnet and regtest. Fixing nonce, locktime, graffiti, and slots still
+leaves parent-template manipulation through the remaining valid block choices.
+Commit–reveal binds contributions and payouts, not finality. Do not treat
+confirmations as financial settlement.
+
+## Superseded nonce-PoW launch record
+
+Everything inside the following historical record describes the retired launch,
+including its old commands, hashes, calibration, and incomplete checklist
+entries. **It is not current operational guidance and must not be rerun as a
+proof-of-golf launch procedure.** The record is retained rather than rewriting
+past evidence to claim proof-of-golf was tested or originally launched.
+Its opening pre-launch status predates the completed public-launch entries
+later in the same record.
+
+<details>
+<summary>Historical nonce-PoW launch checklist — superseded before H1</summary>
+
+# Original SigilCoin launch checklist (superseded)
 
 Do these in order. The public testnet gate below must pass before the mainnet
 soak begins. Steps 1 through 4 are irreversible once step 5 puts a public
@@ -455,3 +542,5 @@ DNS and TLS, and nothing unresolved here can be deferred past step 5.
 | 12 | ~~Whether `sigilcoin listen` gets a persistent accept loop before launch~~ — RESOLVED IN THE CLI, not worked around. `run-listen` now loops indefinitely under `--max-connections 0` (`operate.sgl`: `((= max-connections 0) (loop last))`) and serves each connection inside its own guard, so a hangup, garbage bytes or a silent drop kill that connection only. Re-measured against this build: idle at `--accept-timeout 2000` it was alive at 30 s and 55 s and ended only by an external `timeout`; six hostile connections were absorbed and a seventh still accepted. The seed therefore binds 19444 itself. | `packages/sigil-coin-cli/src/sigil/coin/cli/operate.sgl`, `deploy/module.nix` |
 | 13 | Replace local deployment source pins with public forge URLs after the approved push | The current flake deliberately uses local `git+file:` inputs because required SigilCoin and sigil-bitcoin commits are not public yet. Manual local testnet approval and explicit push permission come first; then pin the pushed revisions and repeat every Nix check. |
 | 14 | ~~Whether to delete the socket proxy once the CLI can adopt an inherited fd~~ — DELETED NOW, and no fd adoption was needed. The proxy existed only because the old listener died on an accept timeout and on hostile input; with that fixed it was pure cost: an extra unit pair and hop, no inbound peer address ever reaching the node (which forecloses abuse-banning), and a `Restart=always` without `StartLimitIntervalSec=0` that could park `systemd-socket-proxyd` in `failed` and take port 19444 out of service — the outage it was supposed to prevent. `nix flake check`'s `module-eval` now fails if any `sigilcoin-listen-proxy` unit comes back. | `deploy/module.nix`, `deploy/flake.nix` |
+
+</details>

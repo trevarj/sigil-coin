@@ -31,6 +31,14 @@
     (from-path dir: "../../../sigil-bitcoin"
                package: "sigil-bitcoin-consensus"))
 
+  dev-dependencies: (list
+    (from-git url: "codeberg:sigil/sigil"
+              package: "sigil-stdlib" version: "^0.20")
+    (from-git url: "codeberg:sigil/sigil"
+              package: "sigil-test" version: "^0.20")
+    (from-git url: "codeberg:sigil/sigil"
+              package: "sigil-test-runner" version: "^0.20"))
+
   tasks: (list
     (task
       name: 'build

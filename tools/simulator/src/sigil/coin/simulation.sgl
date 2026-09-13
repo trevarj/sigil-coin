@@ -200,6 +200,27 @@
                     %global-puzzle-rows))
                 out)))))
 
+    ;; Score arithmetic assumes a valid producer program of each stated length;
+    ;; these are not solver discoveries or measurements of generated witnesses.
+    (define %golf-score-examples
+      (let loop ((lengths '(100 99 98 97 96 95 94 93 92 91 1))
+                 (chain-score 0)
+                 (out '()))
+        (if (null? lengths)
+            (reverse out)
+            (let* ((length (car lengths))
+                   (score (coin-golf-score 100 length))
+                   (next-score (+ chain-score score)))
+              (loop
+                (cdr lengths)
+                next-score
+                (cons `((par . 100)
+                        (solution_bytes . ,length)
+                        (savings . ,(coin-golf-savings 100 length))
+                        (block_score . ,score)
+                        (chain_score . ,next-score))
+                      out))))))
+
     ;; ============================================================
     ;; Signed-share and copy-and-attach strategy experiment
     ;; ============================================================
@@ -419,7 +440,7 @@
               "censorship matrix row count drifted"))
 
       ;; ============================================================
-      ;; Explicit-child market
+      ;; Height-selected market with explicit child observations
       ;; ============================================================
 
       (define %market (coin-run-market-simulation))
@@ -429,13 +450,13 @@
       (define %market-summary (ref %market 'summary))
 
       ;; ============================================================
-      ;; Schema-4 results and generated text
+      ;; Schema-5 results and generated text
       ;; ============================================================
 
       (define %puzzle-retries (puzzle-column 10 %global-puzzle-rows))
 
       (define %results
-        `((schema . 4)
+        `((schema . 5)
           (canonical_apis .
             ,(list->array
                '("coin-puzzle-for"
@@ -448,14 +469,12 @@
                  "coin-quality"
                  "coin-version-encode"
                  "coin-version-solution-length"
-                 "next-required-bits"
-                 "block-header-chain-work"
-                 "coin-lottery-bonus"
-                 "coin-lottery-multiplier"
-                 "coin-lottery-target"
-                 "coin-lottery-expected-rolls"
-                 "coin-lottery-valid?"
-                 "coin-mine-header"
+                 "coin-required-bits"
+                 "coin-chain-work"
+                 "coin-golf-max-savings"
+                 "coin-golf-savings"
+                 "coin-golf-score"
+                 "coin-genesis-block"
                  "coin-payout-plan"
                  "coin-build-block"
                  "coin-build-coop-block"
@@ -473,6 +492,12 @@
              (forced_constraints . ,(list->array '(0 1 2 3 4 5 6 7)))
              (strategy_key_scalars . "1..1024 multiples of secp256k1 G")
              (clock_or_host_randomness . #f)))
+          (golf_scoring .
+            ((max_savings . ,coin-golf-max-savings)
+             (genesis_score . 0)
+             (rule . "block_score = 1 + min(max_savings, max(0, par - solution_bytes)); chain_score is the sum of non-genesis block scores")
+             (scope . "arithmetic examples assume valid programs; no solution discovery is claimed")
+             (examples . ,(list->array %golf-score-examples))))
           (puzzles .
             ((global_count . ,(length %global-puzzle-rows))
              (forced_count . ,(length %forced-puzzle-rows))
@@ -524,14 +549,14 @@
              (reveal_producer_key . ,%producer-key)
              (rows . ,(length %censorship-rows))
              (scope . "H/H+1 contribution payout accounting; no profitability or equilibrium claim")))
-          (strategic_mining . ,%strategy-results)
+          (strategic_golf . ,%strategy-results)
           (market . ,%market-results)
           (caveat . "Consensus proves distinct pubkey-personalized tasks and verified work, not distinct owners or identity independence.")))
 
       (define %summary
         (string-append
-          "SigilCoin schema-4 deterministic simulation\n"
-          "===========================================\n"
+          "SigilCoin schema-5 deterministic proof-of-golf simulation\n"
+          "=======================================================\n"
           (format "Puzzles: ~a global + ~a forced-constraint rows.\n"
                   (length %global-puzzle-rows)
                   (length %forced-puzzle-rows))
@@ -549,6 +574,11 @@
                   (minimum (puzzle-column 9 %global-puzzle-rows))
                   (median (puzzle-column 9 %global-puzzle-rows))
                   (maximum (puzzle-column 9 %global-puzzle-rows)))
+          (format "Golf scoring: at-par score ~a; maximum savings ~a; maximum block score ~a; chain scores add linearly from genesis zero.\n"
+                  (coin-golf-score 100 100)
+                  coin-golf-max-savings
+                  (coin-golf-score 100 1))
+          "Score arithmetic examples assume valid programs of the stated lengths; they are not measured solver discoveries.\n"
           (format "Personalized shares: ~a/~a deterministic keys have a semantic under-par candidate.\n"
                   (length %available-share-rows)
                   (length %share-rows))

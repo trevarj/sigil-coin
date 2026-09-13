@@ -209,7 +209,7 @@
     ;;; the window of margins for heights `height-16 .. height-1`.
     ;;;
     ;;; This is the form a node uses: it already holds `C(height-1)` from
-    ;;; the parent's own `bits`, so it does no work at all on the 15 heights
+    ;;; the parent's own `version`, so it does no work at all on the 15 heights
     ;;; out of 16 that do not retarget, and `margins` may be `#f` there.
     ;;;
     ;;; ```scheme

@@ -1,8 +1,8 @@
-;;; Consensus derivation, verification, lottery arithmetic and retargeting.
+;;; Consensus derivation, verification, additive golf scoring and retargeting.
 ;;;
 ;;; Everything here is a rule every node applies to hostile block data as well
 ;;; as honest input. Wire checks return tagged `coin-result` failures instead
-;;; of raising. Golden seed vectors and exact integer lottery examples make
+;;; of raising. Golden seed vectors and exact integer score examples make
 ;;; consensus drift fail loudly.
 
 (import (sigil test)
@@ -10,6 +10,7 @@
         (sigil bitcoin utils)
         (sigil bitcoin primitives)
         (sigil bitcoin consensus)
+        (sigil bitcoin tx)
         (sigil coin puzzle)
         (sigil coin puzzle generator)
         (sigil coin consensus rules)
@@ -95,7 +96,7 @@
   (let loop ((i 0) (previous %zero32) (acc '()))
     (if (>= i n)
         (reverse acc)
-        (let ((h (header-at previous (+ start (* i 100)))))
+        (let ((h (header-at previous (+ start (* i coin-min-block-spacing)))))
           (loop (+ i 1) (block-header-hash h) (cons h acc))))))
 
 ;; ============================================================
@@ -119,8 +120,8 @@
     (assert-equal puzzle-max-fuel coin-max-fuel))
 
   (test "the timestamp rules are frozen"
-    (assert-equal 1 coin-min-block-spacing)
-    (assert-equal 7200 coin-max-future-drift)
+    (assert-equal 86400 coin-min-block-spacing)
+    (assert-equal 0 coin-max-future-drift)
     (assert-equal 11 coin-median-time-span))
 
   (test "block size checking is total"
@@ -128,42 +129,101 @@
                   (coin-result-reason (coin-validate-block-size 42)))
     (assert-false (coin-block-size 42))))
 
+(test-group "sigil-coin transaction commitment"
+  (test "header commitment includes witnesses and rejects duplicate tails"
+    (let* ((make-tx
+             (lambda (witness)
+               (transaction
+                 version: 1
+                 inputs:
+                   (list
+                     (txin
+                       previous-output:
+                         (outpoint txid: %zero32 index: #xffffffff)
+                       script-sig: #u8(#x01)
+                       sequence: #xffffffff
+                       witness: (list witness)))
+                 outputs: (list (txout value: 0 script-pubkey: #u8(#x6a)))
+                 lock-time: 0)))
+           (first (make-tx #u8(#x01)))
+           (second (make-tx #u8(#x02)))
+           (third (make-tx #u8(#x03)))
+           (header
+             (block-header
+               (header-at %zero32 1)
+               merkle-root: (merkle-root (list (transaction-wtxid first)))))
+           (committed (block header-field: header transactions: (list first)))
+           (changed (block header-field: header transactions: (list second)))
+           (three-hashes (map transaction-wtxid (list first second third)))
+           (three-root (merkle-root three-hashes))
+           (three-header (block-header header merkle-root: three-root))
+           (honest
+             (block header-field: three-header
+                    transactions: (list first second third)))
+           (mutated
+             (block header-field: three-header
+                    transactions: (list first second third third))))
+      (assert-equal (transaction-txid first) (transaction-txid second))
+      (assert-false (equal? (transaction-wtxid first)
+                            (transaction-wtxid second)))
+      (assert-true (coin-block-merkle-root-valid? committed))
+      (assert-false (coin-block-merkle-root-valid? changed))
+      (assert-equal three-root (coin-block-merkle-root mutated))
+      (assert-true (coin-block-merkle-root-valid? honest))
+      (assert-false (coin-block-merkle-root-valid? mutated)))))
+
 (test-group "sigil-coin pacing"
-  (test "header context checking"
+  (test "the default schedule accepts only the exact next daily slot"
     (let* ((chain (chain-of 12 1000000))
            (tip (list-ref chain 11))
-           (now 99999999)
-           (good (header-at (block-header-hash tip)
-                            (+ (block-header-time tip)
-                               coin-min-block-spacing)))
-           (close (header-at (block-header-hash tip)
-                             (block-header-time tip))))
-      (assert-true (coin-ok? (coin-validate-header-context
-                               chain good now)))
-      (assert-equal 'insufficient-spacing
+           (slot (+ (block-header-time tip) 86400))
+           (good (header-at (block-header-hash tip) slot))
+           (early (block-header good time: (- slot 1)))
+           (late (block-header good time: (+ slot 1)))
+           (now (+ slot 1)))
+      (assert-true (coin-ok? (coin-validate-header-context chain good now)))
+      (assert-equal 'bad-slot
                     (coin-result-reason
-                      (coin-validate-header-context chain close now)))
-      ;; Spacing-only callers retain the mainnet drift default.
-      (assert-true (coin-ok? (coin-validate-header-context
-                               chain good now 1)))))
+                      (coin-validate-header-context chain early now)))
+      (assert-equal 'bad-slot
+                    (coin-result-reason
+                      (coin-validate-header-context chain late now)))))
 
-  (test "future drift is inclusive at the exact chain-policy boundary"
-    (let* ((now 2000000)
-           (boundary (header-at %zero32 (+ now 300)))
-           (beyond (block-header boundary time: (+ now 301))))
+  (test "a configured slot defaults to no future allowance"
+    (let* ((parent (header-at %zero32 1000000))
+           (chain (list parent))
+           (slot (+ (block-header-time parent) 3600))
+           (good (header-at (block-header-hash parent) slot)))
       (assert-true
-        (coin-ok? (coin-validate-header-context '() boundary now 3600 300)))
+        (coin-ok? (coin-validate-header-context chain good slot 3600)))
+      (assert-true
+        (coin-ok? (coin-validate-header-context chain good slot 3600 0)))
       (assert-equal 'time-too-far-ahead
                     (coin-result-reason
-                      (coin-validate-header-context '() beyond now 3600 300)))))
+                      (coin-validate-header-context
+                        chain good (- slot 1) 3600)))))
 
-  (test "malformed pacing policy raises as node misconfiguration"
+  (test "genesis has no slot requirement but cannot be from the future"
+    (let* ((now 2000000)
+           (boundary (header-at %zero32 now))
+           (beyond (block-header boundary time: (+ now 1))))
+      (assert-true
+        (coin-ok? (coin-validate-header-context '() boundary now)))
+      (assert-equal 'time-too-far-ahead
+                    (coin-result-reason
+                      (coin-validate-header-context '() beyond now)))))
+
+  (test "nonzero drift and malformed pacing policy raise"
     (assert-error (coin-validate-header-context '() (header-at %zero32 1)
                                                 1 -1))
     (assert-error (coin-validate-header-context '() (header-at %zero32 1)
-                                                1 1 "300"))
+                                                1 1 "0"))
     (assert-error (coin-validate-header-context '() (header-at %zero32 1)
-                                                1 1 300 0))))
+                                                1 1 1))
+    (assert-error (coin-validate-header-context '() (header-at %zero32 1)
+                                                1 1 -1))
+    (assert-error (coin-validate-header-context '() (header-at %zero32 1)
+                                                1 1 0 0))))
 
 ;; ============================================================
 ;; Seed derivation (§3.1)
@@ -580,7 +640,7 @@
                                 par: 24 retries: 0)))))
 
 ;; ============================================================
-;; Resource reporting, lottery and fork choice
+;; Resource reporting and additive golf score
 ;; ============================================================
 
 (test-group "sigil-coin canonical bucketing"
@@ -650,59 +710,40 @@
           (coin-share-margin-milli (puzzle-spec-par b)
                                    (bytevector-length source)))))))
 
-(test-group "sigil-coin program-golf lottery"
-  (test "constants and compact-target examples are frozen"
-    (assert-equal 8 coin-lottery-max-bonus)
-    (assert-equal (- (arithmetic-shift 1 256) 1)
-                  coin-lottery-max-integer)
-    (assert-equal (- (arithmetic-shift 1 255) 1)
-                  coin-lottery-target-ceiling)
-    (assert-equal 25098045881
-                  (coin-lottery-expected-rolls #x1c2bcf04 100 100))
-    (assert-equal 98039242
-                  (coin-lottery-expected-rolls #x1c2bcf04 100 92))
-    (assert-equal 257
-                  (coin-lottery-expected-rolls #x2000ffff 100 100))
-    (assert-equal 2
-                  (coin-lottery-expected-rolls #x2000ffff 100 92)))
+(test-group "sigil-coin additive golf score"
+  (test "at par and over par earn only the base point"
+    (assert-equal 0 (coin-golf-savings 1 1))
+    (assert-equal 1 (coin-golf-score 1 1))
+    (assert-equal 0 (coin-golf-savings 100 101))
+    (assert-equal 1 (coin-golf-score 100 101)))
 
-  (test "each saved byte doubles accepted outcomes through the eighth"
-    (assert-equal 0 (coin-lottery-bonus 100 100))
-    (assert-equal 1 (coin-lottery-bonus 100 99))
-    (assert-equal 8 (coin-lottery-bonus 100 92))
-    (assert-equal 8 (coin-lottery-bonus 100 1))
-    (assert-equal 1 (coin-lottery-multiplier 100 100))
-    (assert-equal 2 (coin-lottery-multiplier 100 99))
-    (assert-equal 256 (coin-lottery-multiplier 100 92))
-    (assert-equal
-      (* 2 (+ 1 (coin-lottery-target #x1c2bcf04 100 100)))
-      (+ 1 (coin-lottery-target #x1c2bcf04 100 99))))
+  (test "saved bytes add points through the eighth byte"
+    (assert-equal 8 coin-golf-max-savings)
+    (assert-equal 1 (coin-golf-savings 100 99))
+    (assert-equal 2 (coin-golf-score 100 99))
+    (assert-equal 7 (coin-golf-savings 100 93))
+    (assert-equal 8 (coin-golf-score 100 93))
+    (assert-equal 8 (coin-golf-savings 100 92))
+    (assert-equal 9 (coin-golf-score 100 92))
+    (assert-equal 8 (coin-golf-savings 100 91))
+    (assert-equal 9 (coin-golf-score 100 91)))
 
-  (test "the target ceiling prevents certainty"
-    (assert-equal coin-lottery-target-ceiling
-                  (coin-lottery-target #x2000ffff 100 92))
-    (assert-equal coin-lottery-target-ceiling
-                  (coin-lottery-target #x2000ffff 100 1)))
+  (test "large exact lengths preserve single-byte savings and the cap"
+    (let ((par (+ (arithmetic-shift 1 100) 1)))
+      (assert-equal 1 (coin-golf-savings par (- par 1)))
+      (assert-equal 2 (coin-golf-score par (- par 1)))
+      (assert-equal 8 (coin-golf-savings par 1))
+      (assert-equal 9 (coin-golf-score par 1))))
 
-  (test "target comparison is inclusive and rejects non-uint256 rolls"
-    (let ((target (coin-lottery-target #x1c2bcf04 100 100)))
-      (assert-true
-        (coin-lottery-valid? target #x1c2bcf04 100 100))
-      (assert-false
-        (coin-lottery-valid? (+ target 1) #x1c2bcf04 100 100))
-      (assert-false
-        (coin-lottery-valid? -1 #x1c2bcf04 100 100))
-      (assert-false
-        (coin-lottery-valid?
-          (+ coin-lottery-max-integer 1) #x1c2bcf04 100 100))
-      (assert-false
-        (coin-lottery-valid? "0" #x1c2bcf04 100 100))))
-
-  (test "lottery parameters reject malformed compact targets and lengths"
-    (assert-error (coin-lottery-target 0 100 100))
-    (assert-error (coin-lottery-target #x1c2bcf04 0 1))
-    (assert-error (coin-lottery-target #x1c2bcf04 100 0))
-    (assert-error (coin-lottery-target #x1c2bcf04 100 1.0))))
+  (test "both arguments must be positive exact integers"
+    (let loop ((hostile (list 0 -1 1.0 1.5 "1" #f '())))
+      (if (pair? hostile)
+          (begin
+            (assert-error (coin-golf-savings (car hostile) 1))
+            (assert-error (coin-golf-savings 1 (car hostile)))
+            (assert-error (coin-golf-score (car hostile) 1))
+            (assert-error (coin-golf-score 1 (car hostile)))
+            (loop (cdr hostile)))))))
 
 
 ;; ============================================================

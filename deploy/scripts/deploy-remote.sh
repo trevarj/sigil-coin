@@ -166,6 +166,10 @@ rsync_args=(
   --exclude='**/.sigilcoin/'
   --exclude=.sigilcoin-testnet/
   --exclude='**/.sigilcoin-testnet/'
+  --exclude=.sigilcoin-proof-of-golf/
+  --exclude='**/.sigilcoin-proof-of-golf/'
+  --exclude=.sigilcoin-testnet-proof-of-golf/
+  --exclude='**/.sigilcoin-testnet-proof-of-golf/'
   --exclude=result
   --exclude='result-*'
   --exclude=.env
@@ -289,9 +293,9 @@ paths_overlap() {
 
 if [[ $mode == testnet ]]; then
   state_spec=$(env_or_file SIGIL_TESTNET_STATE_DIR)
-  state_spec=${state_spec:-./state/testnet}
+  state_spec=${state_spec:-./state/testnet-proof-of-golf}
   pool_state_spec=$(env_or_file SIGIL_TESTNET_POOL_STATE_DIR)
-  pool_state_spec=${pool_state_spec:-./state/testnet-pool}
+  pool_state_spec=${pool_state_spec:-./state/testnet-pool-proof-of-golf}
   p2p_bind=$(env_or_file P2P_BIND)
   p2p_bind=${p2p_bind:-127.0.0.1}
   exposure_ack=$(env_or_file TESTNET_EXPOSURE_ACK)
@@ -327,7 +331,7 @@ if [[ $mode == testnet ]]; then
   esac
 else
   state_spec=$(env_or_file SIGIL_MAINNET_STATE_DIR)
-  state_spec=${state_spec:-./state/mainnet}
+  state_spec=${state_spec:-./state/mainnet-proof-of-golf}
   p2p_bind=$(env_or_file MAINNET_P2P_BIND)
   p2p_bind=${p2p_bind:-127.0.0.1}
   exposure_ack=$(env_or_file MAINNET_EXPOSURE_ACK)

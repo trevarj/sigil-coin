@@ -90,6 +90,7 @@
     coin-print-puzzle
     coin-block-transaction-fee
     coin-select-block-transactions
+    coin-submit-block!
     run-puzzle
     run-mine
     run-commit
@@ -135,11 +136,11 @@
     ;;; ```
     (define (cli-usage)
       (: -> any?)
-      (println "sigilcoin — mine with program golf and an automatic nonce lottery")
+      (println "sigilcoin — scheduled, additive proof-of-golf")
       (println "")
       (println "mining:")
       (println "  sigilcoin puzzle [--height N] [--share] [--complexity C] [CHAIN] [--data-dir DIR]")
-      (println "  sigilcoin mine [--solution EXPR] [--commit HEX]... [--reveal HEX]... [--relay URL] [--graffiti TEXT] [--address ADDR] [--share] [--complexity C] [CHAIN] [--data-dir DIR]")
+      (println "  sigilcoin mine [--solution EXPR] [--commit HEX]... [--reveal HEX]... [--relay URL] [--address ADDR] [--share] [--complexity C] [CHAIN] [--data-dir DIR]")
       (println "  sigilcoin commit --solution EXPR [--height N] [--complexity C] [CHAIN] [--data-dir DIR]")
       (println "  sigilcoin reveal [--height N] [--commitment HEX] [CHAIN] [--data-dir DIR]")
       (println "  sigilcoin contribute --relay URL [--solution EXPR | --commitment HEX] [--data-dir DIR] [--testnet]")
@@ -153,13 +154,13 @@
       (println "  source that evaluates to a ONE-ARGUMENT function reproducing every pair")
       (println "  and obeying today's constraint. `sigilcoin puzzle` prints the pairs, the")
       (println "  constraint in plain words, and a guaranteed par witness whose source")
-      (println "  is exactly par bytes. It always solves the height, but valid work at")
-      (println "  par is still lottery-gated: mining searches the block cursor automatically.")
+      (println "  is exactly par bytes. It always solves the height and earns one point")
+      (println "  when submitted at or after the next slot printed by puzzle or status.")
       (println "")
-      (println "  Every byte saved below par doubles the chance that each nonce qualifies,")
-      (println "  up to an eight-byte (256x) bonus. Memory and evaluator steps are reported")
-      (println "  as resource diagnostics, not ranking fields. Each accepted block adds")
-      (println "  target-derived base work; cumulative work wins, with exact ties first-seen.")
+      (println "  Every byte saved below par adds one point, up to eight saved bytes:")
+      (println "  block score = 1 + min(8, max(0, par - solution length)). Memory and")
+      (println "  evaluator steps are diagnostics, not ranking fields. Cumulative score")
+      (println "  wins; exact ties retain the active chain. Mainnet slots are 86400 seconds.")
       (println "")
       (println "  commit/reveal is the two-phase way to be paid for a solution you did")
       (println "  not mine yourself. `commit` publishes a hash of your solution for")

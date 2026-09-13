@@ -2,10 +2,10 @@
 ;;;
 ;;; ## Everything from a block is hostile until it is escaped
 ;;;
-;;; Graffiti is 400 bytes a miner chose, and a solution is 512 bytes a miner
-;;; chose. Both reach this module as raw `bytevector`s, and both are printed
-;;; on a page other people read. So there is exactly ONE way text from a
-;;; block becomes markup, and it is two stages that always run in order:
+;;; Genesis quotes and producer/share solutions reach this module as opaque
+;;; bytes, and are printed on a page other people read. Non-genesis graffiti
+;;; must be empty. There is exactly ONE way block text becomes markup, in
+;;; two stages that always run in order:
 ;;;
 ;;;   1. SANITIZE — `explorer-safe-text` decodes bytes as STRICT UTF-8. Any
 ;;;      byte that is not part of a well-formed, shortest-form, non-surrogate
@@ -44,7 +44,6 @@
           (sigil string)
           (sigil time)
           (sigil json)
-          (sigil bitcoin encoding)
           (sigil coin consensus)
           (sigil coin explorer store))
   (export
@@ -473,18 +472,27 @@
 
     (define (optional-number value)
       (if (number? value) (number->string value) "&mdash;"))
-    ;; Targets are uint256 values. JSON keeps them as fixed-width hex strings
-    ;; so browser clients never round consensus integers through IEEE-754.
-    (define (lottery-target-hex value)
-      (and (number? value)
-           (exact? value)
-           (integer? value)
-           (>= value 0)
-           (let ((raw (number->string value 16)))
-             (and (<= (string-length raw) 64)
-                  (string-append
-                    (make-string (- 64 (string-length raw)) #\0)
-                    raw)))))
+
+    (define (block-status b)
+      (let ((problem (explorer-block-problem b)))
+        (cond ((eq? problem 'body-not-downloaded) "header-only")
+              (problem (symbol->string problem))
+              ((= (explorer-block-height b) 0) "genesis")
+              ((not (number? (explorer-block-solution-length b))) "header-only")
+              ((or (not (number? (explorer-block-claimed-length b)))
+                   (not (number? (explorer-block-par b)))
+                   (not (number? (explorer-block-savings b)))
+                   (not (number? (explorer-block-block-score b))))
+               "unavailable")
+              (else "validated"))))
+
+    (define (block-status-badge status)
+      (badge (cond ((string=? status "validated") "badge-good")
+                   ((string=? status "genesis") "badge-violet")
+                   ((or (string=? status "header-only")
+                        (string=? status "unavailable")) "badge-warn")
+                   (else "badge-bad"))
+             (explorer-escape status)))
 
     (define (graffiti-cell b)
       (let ((graffiti (explorer-block-graffiti b)))
@@ -510,15 +518,21 @@
                      "<tr>"
                      (rows (list
                              (block-link b)
+                             (block-status-badge (block-status b))
                              (explorer-escape
                                (explorer-format-time
                                  (explorer-block-time b)))
                              (address-cell b)
                              (optional-number
+                               (explorer-block-claimed-length b))
+                             (optional-number
                                (explorer-block-solution-length b))
                              (optional-number (explorer-block-par b))
                              (under-par-badge
                                (explorer-block-under-par b))
+                             (optional-number (explorer-block-savings b))
+                             (optional-number (explorer-block-block-score b))
+                             (optional-number (explorer-block-chain-score b))
                              (explorer-escape
                                (explorer-sigil-amount
                                  (explorer-block-reward b)))
@@ -527,49 +541,47 @@
                  blocks)))
 
     (define %block-headings
-      '("height" "time" "miner" "bytes" "par" "margin"
+      '("height" "status" "time" "miner" "claimed bytes" "solution bytes"
+        "par" "margin" "capped savings" "block score" "chain score"
         "scheduled subsidy" "quote"))
 
     (define (block-tile b)
       (let* ((id (explorer-block-id b))
-             (roll (explorer-block-lottery-roll b))
-             (roll-text (if (string? roll) roll id))
              (height (number->string (explorer-block-height b)))
-             (nonce (explorer-block-nonce b))
-             (target (lottery-target-hex
-                       (explorer-block-lottery-target b)))
-             (bonus (explorer-block-lottery-bonus b))
-             (multiplier (explorer-block-lottery-multiplier b))
-             (expected (explorer-block-lottery-expected-rolls b))
+             (claimed (optional-number (explorer-block-claimed-length b)))
+             (par (optional-number (explorer-block-par b)))
+             (savings (optional-number (explorer-block-savings b)))
+             (score (optional-number (explorer-block-block-score b)))
+             (chain-score (optional-number (explorer-block-chain-score b)))
+             (status (block-status b))
              (problem (explorer-block-problem b)))
         (join (list
                 "<a class=\"block-tile\" href=\"/block/" height
                 "\" role=\"listitem\" aria-label=\"Block " height
-                "; nonce " (explorer-escape (optional-number nonce))
-                "; bonus " (explorer-escape (optional-number bonus))
-                "; multiplier "
-                (explorer-escape (optional-number multiplier))
-                "; expected rolls "
-                (explorer-escape (optional-number expected))
+                "; " (explorer-escape status)
+                "; claimed " claimed " bytes; par " par
+                " bytes; capped savings " savings " bytes; block score "
+                score "; chain score " chain-score
                 "\" data-height=\"" height "\" data-block-id=\""
-                (explorer-escape id) "\" data-lottery-roll=\""
-                (explorer-escape roll-text) "\" data-lottery-target=\""
-                (explorer-escape (if target target "")) "\" title=\"Winning roll "
-                (explorer-escape roll-text) "; target "
-                (explorer-escape (if target target "unavailable")) "\">"
+                (explorer-escape id) "\" data-golf-claimed-length=\""
+                claimed "\" data-golf-par=\"" par
+                "\" data-golf-savings=\"" savings
+                "\" data-golf-block-score=\"" score
+                "\" data-golf-chain-score=\"" chain-score
+                "\" data-status=\"" (explorer-escape status)
+                "\" data-problem=\""
+                (if problem (explorer-escape (symbol->string problem)) "")
+                "\" title=\"Block ID " (explorer-escape id)
+                "; " (explorer-escape status) "\">"
                 "<span class=\"block-tile-head\"><span class=\"block-height\">#"
-                height "</span>"
-                (if problem
-                    (badge "badge-bad"
-                           (explorer-escape (symbol->string problem)))
-                    (badge "badge-good" "qualifying"))
-                "</span><span class=\"block-hash\">roll "
-                (explorer-escape (short-id roll-text)) "</span>"
-                "<span class=\"block-meta\"><span>N "
-                (optional-number nonce) "</span><span>&times;"
-                (optional-number multiplier) " (+"
-                (optional-number bonus) " B)</span><span>1/"
-                (optional-number expected) "</span></span></a>"))))
+                height "</span>" (block-status-badge status)
+                "</span><span class=\"block-hash\">id "
+                (explorer-escape (short-id id)) "</span>"
+                "<span class=\"block-meta\"><span>claimed " claimed
+                " / par " par " B</span><span>saved " savings
+                " B</span></span><span class=\"block-meta\"><span>score "
+                score "</span><span>chain " chain-score
+                "</span></span></a>"))))
 
     (define (block-strip blocks)
       (string-append
@@ -581,13 +593,9 @@
         "</div>"))
 
     ;; ============================================================
-    ;; Puzzle, lottery, shares and payout sections
+    ;; Puzzle, proof-of-golf, shares and payout sections
     ;; ============================================================
 
-    (define (hex-word n)
-      (if (number? n)
-          (string-append "0x" (number->string n 16))
-          "&mdash;"))
 
     (define (amount-cell value)
       (if (number? value)
@@ -651,18 +659,27 @@
               (examples-table (explorer-block-examples b))
               "</section>")))
 
-    (define (lottery-section b)
-      (let ((target (lottery-target-hex
-                      (explorer-block-lottery-target b)))
-            (problem (explorer-block-problem b)))
+    (define (golf-section b)
+      (let ((status (block-status b)))
         (join
           (list
-            "<section class=\"panel content-panel\"><h2>Nonce lottery</h2>"
-            "<p class=\"q\">The block ID is the header's 256-bit roll. A"
-            " header qualifies when that roll is at or below the effective"
-            " target. The chain retargets the compact base target from block"
-            " intervals; each byte saved below par doubles admission odds,"
-            " up to eight bytes. Fork choice uses cumulative base work.</p>"
+            "<section class=\"panel content-panel\"><h2>Scheduled proof-of-golf</h2>"
+            "<p class=\"q\">A valid non-genesis block contributes one point"
+            " plus one per byte saved below par, capped at "
+            (number->string coin-golf-max-savings)
+            " saved bytes. Golf score reports competition quality; fork"
+            " choice uses height and release checkpoints. The block ID is only the header hash, not a score.</p>"
+            (cond
+              ((string=? status "genesis")
+               "<p class=\"q\">Genesis has no solution body or puzzle par and contributes zero savings, zero block score and zero chain score.</p>")
+              ((string=? status "header-only")
+               "<div class=\"notice notice-warn\">Header-only claims: the body is unavailable. Savings and block score are derived from header claims, not validated execution.</div>")
+              ((not (string=? status "validated"))
+               (string-append
+                 "<div class=\"notice notice-error\">Not validated: "
+                 (explorer-escape status)
+                 ". Any displayed savings and block score are header-derived claims, not proof of a valid block.</div>"))
+              (else ""))
             (table-wrap
               (join
                 (list
@@ -671,101 +688,40 @@
                   "</tr></thead><tbody><tr>"
                   (rows
                     (list
-                      "winning roll (block ID)"
+                      "claimed length"
                       (string-append
-                        "<span class=\"hash-cell mono\">"
-                        (explorer-escape
-                          (explorer-block-lottery-roll b))
-                        "</span>")
-                      (cond
-                        ((or (eq? problem 'lottery-not-qualified)
-                             (eq? problem 'solution-over-par))
-                         (badge "badge-bad" "not qualifying"))
-                        (target (badge "badge-good" "qualifying"))
-                        (else "<span class=\"q\">unavailable</span>"))))
-                  "</tr><tr>"
-                  (rows
-                    (list
-                      "target"
-                      (if target
-                          (string-append
-                            "<span class=\"hash-cell mono\">0x"
-                            (explorer-escape target) "</span>")
-                          "&mdash;")
-                      "<span class=\"q\">roll must be at or below this value</span>"))
-                  "</tr><tr>"
-                  (rows
-                    (list
-                      "header nonce"
-                      (let ((nonce (explorer-block-nonce b)))
-                        (if (number? nonce)
-                            (string-append
-                              (number->string nonce) " ("
-                              (hex-word nonce) ")")
-                            "&mdash;"))
-                      "<span class=\"q\">uint32 lottery search nonce</span>"))
-                  "</tr><tr>"
-                  (rows
-                    (list
-                      "claimed length L"
-                      (string-append
-                        (optional-number
-                          (explorer-block-claimed-length b))
+                        (optional-number (explorer-block-claimed-length b))
                         " bytes")
-                      "<span class=\"q\">encoded in header version</span>"))
+                      "<span class=\"q\">header claim; checked against the solution body</span>"))
                   "</tr><tr>"
                   (rows
                     (list
-                      "compact base target"
-                      (let ((bits (explorer-block-bits b)))
-                        (if (number? bits)
-                            (string-append (number->string bits) " ("
-                                           (hex-word bits) ")")
-                            "&mdash;"))
-                      "<span class=\"q\">retargeted from canonical block intervals</span>"))
-                  "</tr><tr>"
-                  (rows
-                    (list
-                      "base target"
-                      (let ((base (lottery-target-hex
-                                    (explorer-block-base-target b))))
-                        (if base
-                            (string-append
-                              "<span class=\"hash-cell mono\">0x"
-                              (explorer-escape base) "</span>")
-                            "&mdash;"))
-                      "<span class=\"q\">determines cumulative chain work</span>"))
-                  "</tr><tr>"
-                  (rows
-                    (list
-                      "cumulative base work"
-                      (optional-number (explorer-block-chain-work b))
-                      "<span class=\"q\">fork-choice weight through this block</span>"))
-                  "</tr><tr>"
-                  (rows
-                    (list
-                      "savings bonus"
-                      (string-append "+"
-                        (optional-number
-                          (explorer-block-lottery-bonus b))
-                        " bytes")
-                      "<span class=\"q\">capped at eight bytes below par</span>"))
-                  "</tr><tr>"
-                  (rows
-                    (list
-                      "odds multiplier"
+                      "par"
                       (string-append
-                        (optional-number
-                          (explorer-block-lottery-multiplier b))
-                        "&times;")
-                      "<span class=\"q\">one doubling per bonus byte</span>"))
+                        (optional-number (explorer-block-par b)) " bytes")
+                      "<span class=\"q\">derived from this block's puzzle</span>"))
                   "</tr><tr>"
                   (rows
                     (list
-                      "expected rolls"
-                      (optional-number
-                        (explorer-block-lottery-expected-rolls b))
-                      "<span class=\"q\">exact expectation, rounded up</span>"))
+                      "capped savings"
+                      (string-append
+                        (optional-number (explorer-block-savings b)) " bytes")
+                      (string-append
+                        "<span class=\"q\">min("
+                        (number->string coin-golf-max-savings)
+                        ", max(0, par - claimed length))</span>")))
+                  "</tr><tr>"
+                  (rows
+                    (list
+                      "block score"
+                      (optional-number (explorer-block-block-score b))
+                      "<span class=\"q\">1 + capped savings; genesis contributes 0</span>"))
+                  "</tr><tr>"
+                  (rows
+                    (list
+                      "chain score"
+                      (optional-number (explorer-block-chain-score b))
+                      "<span class=\"q\">cumulative additive score through this block</span>"))
                   "</tr></tbody></table>")))
             "</section>"))))
 
@@ -1182,8 +1138,8 @@
                   "<span id=\"live-waiting\" class=\"waiting-indicator\">Waiting for block #"
                   (number->string (explorer-summary-next-height summary))
                   "</span><span id=\"live-announcement\" class=\"sr-only\" aria-live=\"polite\"></span>"
-                  "<p class=\"hero-note\">Validated chain state and the next"
-                  " program-golf puzzle, served directly from this node.</p>"
+                  "<p class=\"hero-note\">Node chain state and the next"
+                  " scheduled program-golf puzzle.</p>"
                   "</div></section>"
                   (if (explorer-summary-empty summary)
                       "<div class=\"notice notice-warn\"><strong>Waiting for chain data.</strong> This node has no chain data yet.</div>"
@@ -1215,8 +1171,20 @@
                         (explorer-summary-tip-time summary)))
                     "node-reported UTC")
                   (live-metric-card
+                    "live-next-slot" "live-next-slot-detail"
+                    "next scheduled slot"
+                    (explorer-escape
+                      (explorer-format-time
+                        (explorer-summary-next-slot summary)))
+                    "genesis-anchored schedule, UTC")
+                  (live-metric-card
+                    "live-chain-score" "live-chain-score-detail"
+                    "tip chain score"
+                    (optional-number (explorer-summary-chain-score summary))
+                    "cumulative additive score at the tip")
+                  (live-metric-card
                     "live-block-count" "live-header-detail"
-                    "qualifying blocks"
+                    "stored blocks"
                     (number->string (explorer-summary-block-count summary))
                     (string-append
                       (number->string (explorer-summary-header-count summary))
@@ -1262,9 +1230,10 @@
                   "</section>"
                   "<section class=\"panel content-panel\"><h2 id=\"live-puzzle-heading\">Puzzle for height "
                   (number->string (explorer-summary-next-height summary))
-                  "</h2><p class=\"q\">Programs at or under par enter the"
-                  " nonce lottery. Each byte saved doubles the chance to"
-                  " qualify, up to the eight-byte bonus cap.</p>"
+                  "</h2><p class=\"q\">A valid program at or under par earns"
+                  " one block-score point plus one per byte saved, capped at "
+                  (number->string coin-golf-max-savings)
+                  " saved bytes. Blocks use the next scheduled slot.</p>"
                   (table-wrap
                     (join (list
                             "<table><tbody>"
@@ -1363,7 +1332,7 @@
         (string-append (explorer-summary-chain-name summary) " blocks")
         (join (list
                 "<section class=\"page-head\"><div><p class=\"eyebrow\">"
-                "Qualifying ledger</p><h1>Blocks</h1></div>"
+                "Proof-of-golf ledger</p><h1>Blocks</h1></div>"
                 (badge "badge-warn"
                        (string-append (number->string (length blocks))
                                       " shown"))
@@ -1383,18 +1352,14 @@
         (string-append "Block " (number->string (explorer-block-height b)))
         (join (list
                 "<section class=\"page-head\"><div><p class=\"eyebrow\">"
-                "Lottery block</p><h1>Block "
+                "Scheduled proof-of-golf</p><h1>Block "
                 (number->string (explorer-block-height b))
                 "</h1></div>"
-                (let ((problem (explorer-block-problem b)))
-                  (if problem
-                      (badge "badge-bad"
-                             (explorer-escape (symbol->string problem)))
-                      (badge "badge-good" "qualifying")))
+                (block-status-badge (block-status b))
                 "</section><section class=\"panel\">"
                 "<h2 class=\"sr-only\">Block data</h2>"
                 "<div class=\"table-scroll\"><table><tbody>"
-                (field "id"
+                (field "block ID (header hash)"
                        (string-append "<span class=\"hash-cell mono\">"
                                       (explorer-escape (explorer-block-id b))
                                       "</span>"))
@@ -1451,7 +1416,7 @@
                 (puzzle-section b)
                 "<section class=\"panel content-panel\"><h2>Solution</h2><pre>"
                 (solution-text b) "</pre></section>"
-                (lottery-section b)
+                (golf-section b)
                 (transactions-section b)
                 (shares-section b)
                 (payout-section b)
@@ -1661,34 +1626,16 @@
                   'null))
         (cons "k" (json-number (explorer-block-k b)))
         (cons "examples" (map example-alist (explorer-block-examples b)))
-        (cons "lottery"
+        (cons "golf"
               (list
-                (cons "base_bits"
-                      (json-number (explorer-block-bits b)))
-                (cons "base_target"
-                      (or (lottery-target-hex
-                            (explorer-block-base-target b))
-                          'null))
-                (cons "chain_work"
-                      (let ((work (explorer-block-chain-work b)))
-                        (if (number? work) (number->string work) 'null)))
-                (cons "nonce"
-                      (json-number (explorer-block-nonce b)))
                 (cons "claimed_length"
                       (json-number (explorer-block-claimed-length b)))
-                (cons "roll"
-                      (json-text (explorer-block-lottery-roll b)))
-                (cons "target"
-                      (or (lottery-target-hex
-                            (explorer-block-lottery-target b))
-                          'null))
-                (cons "bonus"
-                      (json-number (explorer-block-lottery-bonus b)))
-                (cons "multiplier"
-                      (json-number (explorer-block-lottery-multiplier b)))
-                (cons "expected_rolls"
-                      (json-number
-                        (explorer-block-lottery-expected-rolls b)))))
+                (cons "par" (json-number (explorer-block-par b)))
+                (cons "savings" (json-number (explorer-block-savings b)))
+                (cons "block_score"
+                      (json-number (explorer-block-block-score b)))
+                (cons "chain_score"
+                      (json-number (explorer-block-chain-score b)))))
         (cons "share_quality"
               (json-number (explorer-block-share-quality b)))
         (cons "share_count" (json-number (explorer-block-share-count b)))
@@ -1819,12 +1766,14 @@
         (cons "tip_height" (explorer-summary-tip-height summary))
         (cons "tip_id" (explorer-summary-tip-id summary))
         (cons "tip_time" (explorer-summary-tip-time summary))
+        (cons "chain_score" (json-number (explorer-summary-chain-score summary)))
         (cons "header_height" (explorer-summary-header-height summary))
         (cons "header_count" (explorer-summary-header-count summary))
         (cons "block_count" (explorer-summary-block-count summary))
         (cons "supply" (explorer-summary-supply summary))
         (cons "max_supply" (explorer-summary-max-supply summary))
         (cons "next_height" (explorer-summary-next-height summary))
+        (cons "next_slot" (json-number (explorer-summary-next-slot summary)))
         (cons "next_reward" (explorer-summary-next-reward summary))
         (cons "next_halving_height"
               (json-number (explorer-summary-next-halving-height summary)))

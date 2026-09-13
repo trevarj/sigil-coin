@@ -48,9 +48,9 @@
     ;;; Data directory used when `--data-dir` is not given.
     ;;;
     ;;; ```scheme
-    ;;; cli-default-data-dir ; => ".sigilcoin"
+    ;;; cli-default-data-dir ; => ".sigilcoin-proof-of-golf"
     ;;; ```
-    (define cli-default-data-dir ".sigilcoin")
+    (define cli-default-data-dir ".sigilcoin-proof-of-golf")
 
     ;;; Testnet data directory used when `--data-dir` is not given.
     ;;;
@@ -58,9 +58,9 @@
     ;;; from mainnet. An operator can still choose any directory explicitly.
     ;;;
     ;;; ```scheme
-    ;;; cli-testnet-default-data-dir ; => ".sigilcoin-testnet"
+    ;;; cli-testnet-default-data-dir ; => ".sigilcoin-testnet-proof-of-golf"
     ;;; ```
-    (define cli-testnet-default-data-dir ".sigilcoin-testnet")
+    (define cli-testnet-default-data-dir ".sigilcoin-testnet-proof-of-golf")
 
     ;;; Value of the `--name value` flag in `args`, or `default`.
     ;;;

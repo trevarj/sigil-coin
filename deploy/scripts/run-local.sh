@@ -161,7 +161,7 @@ explorer=$BIN_DIR/sigilcoin-explorer
 coin=$(readlink -f -- "$coin")
 explorer=$(readlink -f -- "$explorer")
 
-DATA_DIR=${DATA_DIR:-$root/deploy/state/local-$MODE}
+DATA_DIR=${DATA_DIR:-$root/deploy/state/local-$MODE-proof-of-golf}
 LOG_DIR=${LOG_DIR:-$root/deploy/logs/local-$MODE}
 RUN_DIR=${RUN_DIR:-$root/deploy/run/local-$MODE}
 P2P_PORT=${P2P_PORT:-$default_port}

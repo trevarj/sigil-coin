@@ -1,7 +1,7 @@
 ;;; (sigil coin node chain) — live SigilCoin chain configs
 ;;;
-;;; Mainnet, public testnet, and regtest run canonical program-by-example
-;;; consensus. Mainnet is calibrated for the postponed 2026-09-12 launch.
+;;; Mainnet, public testnet, and regtest start fresh proof-of-golf chains.
+;;; Fixed timestamp slots and additive program savings replace hash search.
 
 (define-library (sigil coin node chain)
   (import (sigil bitcoin consensus)
@@ -18,6 +18,7 @@
     coin-testnet-pow-limit-bits
     coin-regtest-pow-limit-bits
     coin-testnet-network-magic
+    coin-main-checkpoint-one-hash
     coin-testnet-min-block-spacing
     coin-regtest-min-block-spacing
     coin-testnet-max-future-drift
@@ -43,31 +44,36 @@
 
   (begin
 
-    ;;; Mainnet target cadence: one day.
+    ;;; Mainnet slot spacing: one day.
     (define coin-target-block-spacing 86400)
 
-    ;;; Public testnet target cadence: one hour.
+    ;;; Public testnet slot spacing: one hour.
     (define coin-testnet-target-block-spacing 3600)
 
-    ;;; Regtest target cadence: one second.
+    ;;; Regtest slot spacing: one second.
     (define coin-regtest-target-block-spacing 1)
 
-    ;;; Easiest compact base targets. Mainnet uses the faster measured
-    ;;; serialized-header miner rate of 290,487 rolls/s for one at-par day.
+    ;;; Fixed per-network compact bits, retained in the 80-byte header.
     (define coin-main-pow-limit-bits #x1c2bcf04)
     (define coin-testnet-pow-limit-bits #x1f00ffff)
     (define coin-regtest-pow-limit-bits #x2000ffff)
 
-    ;;; Public testnet transport magic. Retained across the genesis reset so
-    ;;; the pending public-testnet connection boundary remains unchanged.
-    (define coin-testnet-network-magic #u8(#xd3 #x7a #x91 #xc5))
+    ;;; Longest-chain/checkpoint public-testnet transport magic: "SGT3".
+    (define coin-testnet-network-magic #u8(#x53 #x47 #x54 #x33))
 
-    ;;; Timestamp monotonicity floors. The retargeted lottery controls cadence.
-    (define coin-testnet-min-block-spacing 1)
+    ;;; Internal hash pinned by the first post-genesis mainnet checkpoint.
+    (define coin-main-checkpoint-one-hash
+      #u8(#x24 #xf2 #xcb #xbf #x4a #x5d #xbb #xce
+          #x67 #xab #xbc #xc0 #x47 #xe3 #x00 #xcd
+          #xa1 #x7c #x60 #x0e #x7a #xb3 #x56 #x58
+          #x46 #xd2 #x7a #x0e #xb6 #xb0 #x41 #xd2))
+
+    ;;; Exact timestamp spacing on the smaller networks.
+    (define coin-testnet-min-block-spacing 3600)
     (define coin-regtest-min-block-spacing 1)
 
-    ;;; Public testnet future-drift allowance: five minutes.
-    (define coin-testnet-max-future-drift 300)
+    ;;; No network admits a future production slot.
+    (define coin-testnet-max-future-drift 0)
 
     ;;; Mainnet wallet policy waits six confirmations before selecting a
     ;;; coinbase, while consensus still permits spending it in the next block.
@@ -78,26 +84,26 @@
 
     ;;; Mainnet genesis quote.
     (define coin-genesis-quote
-      "Sigil - Practical Symbolic Power")
+      "SigilCoin proof-of-golf mainnet")
 
     ;;; Mainnet timestamp: 2026-09-12T16:00:00Z.
     (define coin-genesis-time 1789228800)
 
-    ;;; Canonical reset public-testnet genesis quote.
+    ;;; Replacement public-testnet genesis marker.
     (define coin-testnet-genesis-quote
-      "SigilCoin public testnet reset - 2026-09-02")
+      "SigilCoin proof-of-golf testnet")
 
     ;;; Fixed testnet genesis timestamp: 2026-09-02T00:00:00Z.
     (define coin-testnet-genesis-time 1788307200)
 
     ;;; Regtest genesis quote.
     (define coin-regtest-genesis-quote
-      "SigilCoin regtest: worthless on purpose")
+      "SigilCoin proof-of-golf regtest")
 
     ;;; Fixed regtest genesis timestamp: 2026-01-01T00:00:00Z.
     (define coin-regtest-genesis-time 1767225600)
 
-    ;; Target retarget spans the 15 intervals between 16 sampled headers.
+    ;; Retain the shared parameter shape; only puzzle complexity retargets.
     (define (coin-params pow-limit-bits target-spacing)
       (consensus-params
         pow-limit-bits: pow-limit-bits
@@ -122,13 +128,13 @@
       (coin-params coin-regtest-pow-limit-bits
                    coin-regtest-target-block-spacing))
 
-    ;;; Read enforced spacing floor from chain policy.
+    ;;; Read exact slot spacing from chain policy.
     (define (coin-chain-min-block-spacing chain)
       (: chain-config? -> integer?)
       (let ((entry (assq 'min-block-spacing
                          (chain-config-extension chain 'policy '()))))
         (if (not (pair? entry))
-            (error "coin-chain-min-block-spacing: chain publishes no spacing floor"))
+            (error "coin-chain-min-block-spacing: chain publishes no slot spacing"))
         (cdr entry)))
 
     ;;; Read enforced future-drift allowance from chain policy.
@@ -167,7 +173,7 @@
         (cdr entry)))
 
     (define (extensions min-spacing max-future-drift genesis params hrp
-                        wallet-coinbase-maturity)
+                        wallet-coinbase-maturity released-checkpoints)
       (list
         (cons 'address (list (cons 'hrp hrp)))
         (cons 'consensus
@@ -177,8 +183,14 @@
                     ;; trusted configured genesis supplies H1's parent body.
                     (cons 'block-rules
                           (coin-block-rules-for-genesis genesis))))
+        (cons 'checkpoints
+              (cons
+                (cons 0
+                      (block-header-hash
+                        (block-header-field genesis)))
+                released-checkpoints))
         (cons 'mining
-              (list (cons 'rule 'program-golf-lottery)
+              (list (cons 'rule 'proof-of-golf)
                     (cons 'irc-channel coin-irc-channel)))
         (cons 'policy
               (list (cons 'min-block-spacing min-spacing)
@@ -193,6 +205,13 @@
                           wallet-coinbase-maturity)
                     (cons 'median-time-span coin-median-time-span)
                     (cons 'max-block-bytes coin-max-block-bytes)
+                    (cons 'max-mempool-transaction-bytes
+                          coin-max-block-bytes)
+                    (cons 'max-mempool-bytes
+                          (* 64 coin-max-block-bytes))
+                    (cons 'max-mempool-count 1024)
+                    (cons 'max-unsettled-headers 4096)
+                    (cons 'verify-mempool-scripts? #t)
                     (cons 'max-solution-bytes coin-max-solution-bytes)
                     (cons 'max-graffiti-bytes coin-max-graffiti-bytes)
                     (cons 'max-supply coin-max-supply)
@@ -201,7 +220,7 @@
 
     (define (config name network-id magic port seeds min-spacing
                     max-future-drift genesis params hrp
-                    wallet-coinbase-maturity)
+                    wallet-coinbase-maturity released-checkpoints)
       (let ((header (block-header-field genesis)))
         (chain-config name: name
                       network-id: network-id
@@ -216,33 +235,28 @@
                       consensus-params: params
                       extensions: (extensions
                                     min-spacing max-future-drift genesis params
-                                    hrp wallet-coinbase-maturity))))
+                                    hrp wallet-coinbase-maturity
+                                    released-checkpoints))))
 
     (define %main-genesis
       (coin-genesis-block
-        coin-genesis-quote coin-genesis-time coin-main-pow-limit-bits
-        coin-genesis-coinbase-lock-time-constant
-        coin-genesis-nonce-constant))
+        coin-genesis-quote coin-genesis-time coin-main-pow-limit-bits))
 
     (define %testnet-genesis
       (coin-genesis-block
         coin-testnet-genesis-quote coin-testnet-genesis-time
-        coin-testnet-pow-limit-bits
-        coin-testnet-genesis-coinbase-lock-time-constant
-        coin-testnet-genesis-nonce-constant))
+        coin-testnet-pow-limit-bits))
 
     (define %regtest-genesis
       (coin-genesis-block
         coin-regtest-genesis-quote coin-regtest-genesis-time
-        coin-regtest-pow-limit-bits
-        coin-regtest-genesis-coinbase-lock-time-constant
-        coin-regtest-genesis-nonce-constant))
+        coin-regtest-pow-limit-bits))
 
     ;;; Main SigilCoin network.
     (define sigilcoin-main-chain
       (config "sigilcoin-main"
               "sigilcoin-main"
-              #u8(#x8f #xd1 #xc0 #xa5)
+              #u8(#x53 #x47 #x4d #x33)
               19444
               '(("seed.sigilcoin.lol" . 19444))
               coin-min-block-spacing
@@ -250,7 +264,9 @@
               %main-genesis
               sigilcoin-main-consensus-params
               "sgl"
-              coin-main-wallet-coinbase-maturity))
+              coin-main-wallet-coinbase-maturity
+              (list
+                (cons 1 coin-main-checkpoint-one-hash))))
 
     ;;; Public test network with canonical validation.
     (define sigilcoin-testnet-chain
@@ -264,13 +280,14 @@
               %testnet-genesis
               sigilcoin-testnet-consensus-params
               "tsgl"
-              1))
+              1
+              '()))
 
     ;;; Local development chain.
     (define sigilcoin-regtest-chain
       (config "sigilcoin-regtest"
               "sigilcoin-regtest"
-              #u8(#xa5 #xc0 #xd1 #x8f)
+              #u8(#x53 #x47 #x52 #x33)
               19445
               '()
               coin-regtest-min-block-spacing
@@ -278,7 +295,8 @@
               %regtest-genesis
               sigilcoin-regtest-consensus-params
               "sgl"
-              1))
+              1
+              '()))
 
     ;;; Return a SigilCoin chain config by canonical or short name.
     ;;;

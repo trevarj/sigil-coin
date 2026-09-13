@@ -1,25 +1,19 @@
 ;;; (sigil coin consensus rules) — size and timestamp context
 ;;;
-;;; SigilCoin blocks serialize to at most `coin-max-block-bytes`. The nonce
-;;; lottery and its interval-retargeted base target control cadence; the
-;;; one-second parent floor only keeps rapid local mining timestamps monotone.
+;;; SigilCoin blocks serialize to at most `coin-max-block-bytes`. Every
+;;; non-genesis header occupies exactly the next configured timestamp slot,
+;;; and no header may be ahead of the validating clock.
 ;;;
-;;; The spacing floor and future-drift allowance are chain policy. Mainnet uses
-;;; `coin-min-block-spacing` and `coin-max-future-drift`; other chains pass both
-;;; values to `coin-validate-header-context`.
-;;;
-;;; The usual Bitcoin median-time rule also applies: a header's time must exceed
-;;; the median of the last `coin-median-time-span` headers.
-;;;
-;;; These checks live here because `sigil-bitcoin-consensus` supplies linkage,
-;;; target and proof-of-work helpers but no median-time-past or future-drift
-;;; policy. Every check is total and returns a `coin-result`.
+;;; Mainnet uses `coin-min-block-spacing`; other chains supply their own
+;;; spacing. Median-time-past and parent linkage remain independently checked.
+;;; Every network-data check is total and returns a `coin-result`.
 
 (define-library (sigil coin consensus rules)
   (import (sigil math)
           (sigil list)
           (sigil coin puzzle)
           (sigil bitcoin consensus)
+          (sigil bitcoin tx)
           (sigil coin consensus result))
   (export
     coin-max-block-bytes
@@ -33,6 +27,8 @@
     coin-max-future-drift
     coin-median-time-span
     coin-median-time-past
+    coin-block-merkle-root
+    coin-block-merkle-root-valid?
     coin-block-size
     coin-validate-block-size
     coin-validate-header-context)
@@ -45,7 +41,7 @@
     ;;; Maximum source bytes accepted by consensus.
     (define coin-max-solution-bytes puzzle-max-source-bytes)
 
-    ;;; Maximum opaque coinbase graffiti bytes.
+    ;;; Maximum genesis marker bytes; non-genesis graffiti must be empty.
     (define coin-max-graffiti-bytes 400)
 
     ;;; Maximum co-op reveals per block.
@@ -60,12 +56,11 @@
     ;;; Shared evaluator fuel cap.
     (define coin-max-fuel puzzle-max-fuel)
 
-    ;;; Minimum seconds between a header and its parent: one second.
-    ;;; Mining difficulty, not this monotonicity floor, controls cadence.
-    (define coin-min-block-spacing 1)
+    ;;; Exact seconds between mainnet headers: one day.
+    (define coin-min-block-spacing 86400)
 
-    ;;; Maximum seconds a header's time may lead the validating clock.
-    (define coin-max-future-drift 7200)
+    ;;; Headers may not lead the validating clock on any network.
+    (define coin-max-future-drift 0)
 
     ;;; Number of trailing headers the median-time-past window spans.
     (define coin-median-time-span 11)
@@ -76,22 +71,20 @@
     (define (policy-seconds? value)
       (and (number? value) (exact? value) (integer? value) (>= value 0)))
 
-    ;; Resolve optional spacing and drift policy. Raising here is deliberate:
-    ;; both values come from the node's chain config, never from the network.
+    ;; Chain configuration is trusted input, so invalid policy raises before
+    ;; the network-header guard. The optional drift value must be zero.
     (define (pacing-arguments args)
       (if (> (length args) 2)
           (error "coin-validate-header-context: too many arguments"))
-      (let ((min-spacing (if (null? args)
-                             coin-min-block-spacing
-                             (car args)))
-            (max-future-drift (if (or (null? args) (null? (cdr args)))
-                                  coin-max-future-drift
-                                  (cadr args))))
-        (if (not (policy-seconds? min-spacing))
-            (error "coin-validate-header-context: expected a spacing floor"))
-        (if (not (policy-seconds? max-future-drift))
-            (error "coin-validate-header-context: expected a future-drift allowance"))
-        (cons min-spacing max-future-drift)))
+      (let ((spacing (if (null? args) coin-min-block-spacing (car args)))
+            (drift (if (or (null? args) (null? (cdr args)))
+                       coin-max-future-drift
+                       (cadr args))))
+        (if (not (and (policy-seconds? spacing) (> spacing 0)))
+            (error "coin-validate-header-context: expected positive slot spacing"))
+        (if (not (and (policy-seconds? drift) (= drift 0)))
+            (error "coin-validate-header-context: future drift must be zero"))
+        spacing))
 
     ;; The trailing `count` items of `xs`, or all of them when it is shorter.
     (define (trailing xs count)
@@ -117,6 +110,29 @@
       (let* ((window (trailing headers coin-median-time-span))
              (times (list-sort < (map block-header-time window))))
         (list-ref times (quotient (length times) 2))))
+
+    ;;; Merkle root over full transaction encodings, including witnesses.
+    ;;; SigilCoin does not use Bitcoin's separate witness commitment, so the
+    ;;; header commits each transaction's `wtxid` directly.
+    (define (coin-block-merkle-root b)
+      (: block? -> bytevector?)
+      (merkle-root (map transaction-wtxid (block-transactions b))))
+
+    (define (distinct-hashes? hashes)
+      (let loop ((remaining hashes) (seen '()))
+        (cond ((null? remaining) #t)
+              ((member (car remaining) seen) #f)
+              (else (loop (cdr remaining) (cons (car remaining) seen))))))
+
+    ;;; True when the header commits every transaction byte, including witness.
+    ;;; Duplicate full transaction ids are rejected so Bitcoin's odd-leaf
+    ;;; duplication cannot create two bodies with the same Merkle root.
+    (define (coin-block-merkle-root-valid? b)
+      (: block? -> boolean?)
+      (let ((hashes (map transaction-wtxid (block-transactions b))))
+        (and (distinct-hashes? hashes)
+             (equal? (block-header-merkle-root (block-header-field b))
+                     (merkle-root hashes)))))
 
     ;;; Serialized size of a block, in bytes, or `#f` when it does not
     ;;; serialize at all.
@@ -150,32 +166,27 @@
     ;;; Check a header against the chain it claims to extend.
     ;;;
     ;;; `previous-headers` runs oldest to newest and is empty only for
-    ;;; genesis, which has no parent to link to, no spacing to satisfy and no
-    ;;; median to clear; the future-drift rule still applies to it. `now` is
-    ;;; the validating node's clock in Unix seconds.
+    ;;; genesis, which has no parent to link to, no slot to satisfy and no
+    ;;; median to clear; it must still not lead `now`, the validating node's
+    ;;; clock in Unix seconds.
     ;;;
-    ;;; Optional `min-spacing` and `max-future-drift` arguments carry chain
-    ;;; policy in seconds. Omitting both applies the mainnet defaults; passing
-    ;;; only spacing preserves the historical API and defaults drift to
-    ;;; `coin-max-future-drift`. They are resolved before the guard because
-    ;;; bad policy is node misconfiguration, not a malformed network header.
+    ;;; Optional `spacing` and `max-future-drift` arguments carry chain
+    ;;; policy in seconds. The defaults are one day and zero; every network's
+    ;;; future drift must be zero.
     ;;;
-    ;;; Rejection reasons are `malformed-header`, `bad-prev-hash`,
-    ;;; `insufficient-spacing`, `time-too-old` and `time-too-far-ahead`. On
-    ;;; success the value is the header.
+    ;;; Rejection reasons are `malformed-header`, `bad-prev-hash`, `bad-slot`,
+    ;;; `time-too-old` and `time-too-far-ahead`. Success returns the header.
     ;;;
     ;;; ```scheme
     ;;; (coin-result-reason (coin-validate-header-context '() header now))
     ;;; ; => #f, when the header is not from the future
-    ;;; (coin-ok? (coin-validate-header-context headers header now 3600 300))
-    ;;; ; => #t, under a one-hour floor and five-minute drift allowance
+    ;;; (coin-ok? (coin-validate-header-context headers header now 3600 0))
+    ;;; ; => #t, at the next one-hour slot once the clock reaches it
     ;;; ```
     (define (coin-validate-header-context previous-headers header now
                                           . maybe-pacing)
       (: any? any? any? integer? ... -> coin-result?)
-      (let* ((pacing (pacing-arguments maybe-pacing))
-             (min-spacing (car pacing))
-             (max-future-drift (cdr pacing)))
+      (let ((spacing (pacing-arguments maybe-pacing)))
         (guard (e (#t (coin-error 'malformed-header
                                   "header context check raised")))
           (cond
@@ -188,9 +199,9 @@
             (else
               (let ((time (block-header-time (validate-block-header header))))
                 (cond
-                  ((> time (+ now max-future-drift))
+                  ((> time now)
                    (coin-error 'time-too-far-ahead
-                               "header time is too far in the future"))
+                               "header slot is in the future"))
                   ((null? previous-headers) (coin-ok header))
                   (else
                     (let ((parent (last-of previous-headers)))
@@ -198,9 +209,9 @@
                         ((not (block-header-links? parent header))
                          (coin-error 'bad-prev-hash
                                      "header does not link to its parent"))
-                        ((< time (+ (block-header-time parent) min-spacing))
-                         (coin-error 'insufficient-spacing
-                                     "header is too close to its parent"))
+                        ((not (= time (+ (block-header-time parent) spacing)))
+                         (coin-error 'bad-slot
+                                     "header is not in the next scheduled slot"))
                         ((<= time (coin-median-time-past previous-headers))
                          (coin-error 'time-too-old
                                      "header time is at or below median time past"))

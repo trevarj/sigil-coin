@@ -36,7 +36,7 @@
     (define %parent-height 31)
     (define %parent-clock 1800000000)
     (define %spacing 3600)
-    ;; ponytail: mirror regtest's frozen target fields without importing the
+    ;; ponytail: mirror regtest's fixed compact bits without importing the
     ;; full node runtime into this deterministic simulator.
     (define %regtest-bits #x2000ffff)
     (define %regtest-params
@@ -51,7 +51,7 @@
         csv-height: 0
         segwit-height: 0
         taproot-height: 0))
-    (define %drift 300)
+    (define %drift 0)
     (define %original-timestamp (+ %parent-clock %spacing))
     (define %original-arrival (- %original-timestamp %drift))
     (define %pre-child-copy-arrival (+ %original-arrival 60))
@@ -171,7 +171,7 @@
     (define (build-strategy-simulation)
       (define %genesis-time (- %parent-clock (* %parent-height %spacing)))
       (define %genesis-block
-        (coin-mine-genesis
+        (coin-genesis-block
           "SigilCoin simulator strategy chain"
           %genesis-time
           %regtest-bits))
@@ -208,20 +208,18 @@
             (coin-ok? length-result)
             (<= (coin-result-value length-result)
                 (puzzle-spec-par spec))
-            (coin-lottery-valid?
-              (block-header-work-value header)
-              (block-header-bits header)
-              (puzzle-spec-par spec)
-              (coin-result-value length-result))
+            (= 0 (block-header-nonce header))
+            (= %regtest-bits (block-header-bits header))
             (= height (length history)))))
 
-      (define (strategy-fork-candidate actor height arrival header)
+      (define (strategy-fork-candidate actor height arrival header chain-score)
         (coin-fork-candidate
           actor
           height
           arrival
           (block-header-hash header)
-          (block-header-previous-block header)))
+          (block-header-previous-block header)
+          chain-score))
 
       ;; Full body connection is the authoritative production check. The helper
       ;; also checks the contextual header fields the body connector intentionally
@@ -244,15 +242,17 @@
             #t
             parent)))
 
-      ;; Result: `(blocks headers utxos)`, all oldest-first where applicable.
+      ;; Result: `(blocks headers utxos chain-score)`, oldest-first where applicable.
       (define %base-chain
         (let ((genesis-header (block-header-field %genesis-block)))
           (let loop ((height 1)
                      (blocks (list %genesis-block))
                      (headers (list genesis-header))
-                     (utxos %initial-utxos))
+                     (utxos %initial-utxos)
+                     (chain-score
+                       (coin-chain-work genesis-header 0 %genesis-block 0)))
             (if (> height 30)
-                (list blocks headers utxos)
+                (list blocks headers utxos chain-score)
                 (let* ((parent (last-of blocks))
                        (parent-header (last-of headers))
                        (complexity (coin-required-complexity headers height))
@@ -263,7 +263,7 @@
                        (candidate
                          (coin-build-block
                            parent-header height complexity bits #f
-                           "strategy-chain" %producer-script timestamp))
+                           #u8() %producer-script timestamp))
                        (updated
                          (connect-production-block
                            parent headers height complexity utxos candidate
@@ -271,12 +271,19 @@
                   (loop (+ height 1)
                         (append blocks (list candidate))
                         (append headers (list (block-header-field candidate)))
-                        updated))))))
+                        updated
+                        (coin-chain-work
+                          (block-header-field candidate)
+                          height candidate chain-score)))))))
 
       (define %height30-block (last-of (list-ref %base-chain 0)))
       (define %height30-header (block-header-field %height30-block))
       (define %height30-headers (list-ref %base-chain 1))
       (define %height30-utxos (list-ref %base-chain 2))
+      (define %height30-chain-score (list-ref %base-chain 3))
+      (define %base-score-check
+        (need (= 30 %height30-chain-score)
+              "genesis plus thirty validated par blocks did not score thirty"))
       (define %parent-complexity
         (coin-required-complexity %height30-headers %parent-height))
       (define %share-global-spec
@@ -459,20 +466,23 @@
         '(key_pool strategy candidates_evaluated candidates_available
           commitments_selected reveals_selected
           original_share_quality copy_share_quality
-          original_nonce copy_nonce original_claimed_length copy_claimed_length
-          quality_only_copy_would_replace copy_replaces_before_child
-          copy_replaces_after_child original_arrival_clock
-          pre_child_copy_arrival_clock child_height child_arrival_clock
-          post_child_copy_arrival_clock child_observed settled_actor
+          producer_par original_producer_bytes copy_producer_bytes
+          original_producer_savings copy_producer_savings
+          original_block_score copy_block_score parent_chain_score
+          original_chain_score copy_chain_score child_block_score child_chain_score
+          copy_replaces_before_child copy_replaces_after_child
+          original_arrival_clock pre_child_copy_arrival_clock
+          child_height child_arrival_clock post_child_copy_arrival_clock
+          child_observed selected_actor selected_chain_score
           original_solver_capture_permille reveal_inclusion_permille
           top_share_payout top_share_payout_permille payout_hhi_million
           scheduled_subsidy fees hypothetical_copy_producer_payout
           hypothetical_copy_share_payout hypothetical_copy_carrier_payout
           hypothetical_attacker_payout hypothetical_total_coinbase
           hypothetical_unminted_subsidy original_no_share_payout
-          realized_original_payout realized_attacker_payout
-          realized_carrier_payout realized_total_coinbase
-          realized_unminted_subsidy))
+          selected_original_payout selected_attacker_payout
+          selected_carrier_payout selected_total_coinbase
+          selected_unminted_subsidy))
 
       (define (strategy-row key-pool strategy)
         (let* ((selection (strategy-selection key-pool strategy))
@@ -494,7 +504,7 @@
                    (coin-required-bits
                      %regtest-params %height30-headers)
                    #f
-                   "strategy commitments"
+                   #u8()
                    %producer-script
                    %parent-clock
                    '()
@@ -510,6 +520,9 @@
                    parent
                    %parent-clock))
                (parent-header (block-header-field parent))
+               (parent-chain-score
+                 (coin-chain-work
+                   parent-header %parent-height parent %height30-chain-score))
                (parent-headers
                  (append %height30-headers (list parent-header)))
                (complexity
@@ -539,7 +552,7 @@
                        complexity
                        bits
                        producer-solution
-                       "original public solution"
+                       #u8()
                        %producer-script
                        %original-timestamp
                        (list %fee-transaction)
@@ -552,7 +565,7 @@
                        bits
                        producer-solution
                        accepted
-                       "copy and attach"
+                       #u8()
                        %attacker-script
                        %original-timestamp
                        (list %fee-transaction)
@@ -577,16 +590,35 @@
                        %pre-child-copy-arrival))
                    (original-header (block-header-field original))
                    (copy-header (block-header-field copy))
-                   (original-nonce (block-header-nonce original-header))
-                   (copy-nonce (block-header-nonce copy-header))
-                   (original-length-result
-                     (coin-version-solution-length
-                       (block-header-version original-header)))
-                   (copy-length-result
-                     (coin-version-solution-length
-                       (block-header-version copy-header)))
-                   (original-length (coin-result-value original-length-result))
-                   (copy-length (coin-result-value copy-length-result))
+                   (original-payload
+                     (coin-result-value (coin-block-coinbase-payload original)))
+                   (copy-payload
+                     (coin-result-value (coin-block-coinbase-payload copy)))
+                   (original-source
+                     (coin-coinbase-payload-solution original-payload))
+                   (copy-source
+                     (coin-coinbase-payload-solution copy-payload))
+                   (producer-par
+                     (puzzle-spec-par
+                       (coin-node-puzzle
+                         (block-header-hash parent-header)
+                         %attack-height complexity)))
+                   (original-length (coin-solution-length original-source))
+                   (copy-length (coin-solution-length copy-source))
+                   (original-savings
+                     (coin-golf-savings producer-par original-length))
+                   (copy-savings
+                     (coin-golf-savings producer-par copy-length))
+                   (original-score
+                     (coin-golf-score producer-par original-length))
+                   (copy-score
+                     (coin-golf-score producer-par copy-length))
+                   (original-chain-score
+                     (coin-chain-work
+                       original-header %attack-height original parent-chain-score))
+                   (copy-chain-score
+                     (coin-chain-work
+                       copy-header %attack-height copy parent-chain-score))
                    (original-q 0)
                    (copy-q quality)
                    (pre-fork
@@ -594,10 +626,10 @@
                        (list
                          (strategy-fork-candidate
                            "original-solver" %attack-height
-                           %original-arrival original-header)
+                           %original-arrival original-header original-chain-score)
                          (strategy-fork-candidate
                            "attacker-copy-pre-child" %attack-height
-                           %pre-child-copy-arrival copy-header))))
+                           %pre-child-copy-arrival copy-header copy-chain-score))))
                    (pre-selected (ref pre-fork 'selected)))
               (need (string=? "original-solver"
                               (coin-fork-candidate-actor pre-selected))
@@ -618,7 +650,7 @@
                          child-complexity
                          child-bits
                          #f
-                         "child settles original"
+                         #u8()
                          %producer-script
                          %child-timestamp))
                      (child-utxos
@@ -630,29 +662,44 @@
                          original-utxos
                          child
                          %child-arrival))
+                     (child-header (block-header-field child))
+                     (child-source
+                       (coin-coinbase-payload-solution
+                         (coin-result-value (coin-block-coinbase-payload child))))
+                     (child-par
+                       (puzzle-spec-par
+                         (coin-node-puzzle
+                           (block-header-hash original-header)
+                           %child-height child-complexity)))
+                     (child-score
+                       (coin-golf-score
+                         child-par (coin-solution-length child-source)))
+                     (child-chain-score
+                       (coin-chain-work
+                         child-header %child-height child original-chain-score))
                      (full-fork
                        (coin-run-fork-observer
                          (list
                            (strategy-fork-candidate
                              "original-solver" %attack-height
-                             %original-arrival original-header)
+                             %original-arrival original-header original-chain-score)
                            (strategy-fork-candidate
                              "attacker-copy-pre-child" %attack-height
-                             %pre-child-copy-arrival copy-header)
+                             %pre-child-copy-arrival copy-header copy-chain-score)
                            (strategy-fork-candidate
                              "original-child" %child-height
-                             %child-arrival (block-header-field child))
+                             %child-arrival child-header child-chain-score)
                            (strategy-fork-candidate
                              "attacker-copy-post-child" %attack-height
-                             %post-child-copy-arrival copy-header))))
+                             %post-child-copy-arrival copy-header copy-chain-score))))
                      (selected (ref full-fork 'selected))
+                     (selected-tip (ref full-fork 'tip))
                      (pre-replaced
                        (not (string=? "original-solver"
                                       (coin-fork-candidate-actor pre-selected))))
                      (post-replaced
                        (not (string=? "original-solver"
                                       (coin-fork-candidate-actor selected))))
-                     (quality-only (> copy-q original-q))
                      (original-values (output-values original))
                      (copy-values (output-values copy))
                      (copy-producer (car copy-values))
@@ -677,31 +724,58 @@
                 ;; Force otherwise-unused branch validation values before the
                 ;; invariant assertions; construction is not accepted on trust.
                 (need (and copy-utxos child-utxos) "connected branch state missing")
-                (need (= quality copy-q)
-                      "fully verified share quality changed")
-                (need (= 0 original-q)
-                      "original no-share block did not derive Q0")
-                (need (= (coin-solution-length producer-solution)
-                         original-length)
-                      "original header length changed")
+                (need (equal? (coin-coinbase-payload-shares copy-payload)
+                              (coin-shares-encode accepted))
+                      "copy did not attach the fully verified shares")
+                (need (equal? (coin-coinbase-payload-shares original-payload)
+                              (coin-shares-encode '()))
+                      "original block carried unexpected shares")
+                (need (and (equal? producer-solution original-source)
+                           (equal? original-source copy-source))
+                      "copy-and-attach changed the validated producer source")
                 (need (= (coin-version-encode
                            complexity original-length)
                          (block-header-version original-header))
                       "original version did not claim its solution length")
                 (need (= original-length copy-length)
-                      "copy changed the claimed producer solution length")
+                      "copy changed the validated producer solution length")
+                (need (= (coin-version-encode complexity copy-length)
+                         (block-header-version copy-header))
+                      "copy version did not claim its validated solution length")
+                (need (and (= original-savings copy-savings)
+                           (= original-score copy-score)
+                           (= original-chain-score copy-chain-score))
+                      "copy-and-attach changed producer savings or score")
+                (need (and (= original-score (+ 1 original-savings))
+                           (= original-chain-score
+                              (+ parent-chain-score original-score))
+                           (= copy-chain-score (+ parent-chain-score copy-score))
+                           (= child-chain-score (+ original-chain-score child-score))
+                           (<= 1 child-score (+ 1 coin-golf-max-savings))
+                           (> child-chain-score original-chain-score))
+                      "validated blocks did not add their producer golf scores")
+                (need (= original-chain-score
+                         (coin-fork-candidate-chain-score (ref pre-fork 'tip)))
+                      "pre-child selection did not retain the incumbent score")
+                (need (and (= child-chain-score
+                              (coin-fork-candidate-chain-score selected-tip))
+                           (equal? (block-header-hash child-header)
+                                   (coin-fork-candidate-id selected-tip)))
+                      "selected branch did not include the scored child")
                 (need (not pre-replaced)
                       "copy replaced original before child")
                 (need (not post-replaced)
                       "copy replaced original after child")
-                (need (ref full-fork 'settled?)
-                      "strategy height was not settled by explicit child")
+                (need (ref full-fork 'child-observed?)
+                      "selected branch did not report its observed child")
                 (if (null? accepted)
                     (need (= (+ (quotient (* 4 %subsidy) 5) %fees)
                              copy-total)
                           "shareless copy did not reserve twenty percent")
                     (need (= (+ %subsidy %fees) copy-total)
                           "cooperative copy did not mint subsidy plus fees"))
+                (need (= (+ copy-producer share-total carrier) copy-total)
+                      "copy payout components did not account for every output")
                 (need (= (+ (quotient (* 4 %subsidy) 5) %fees)
                          original-total)
                       "original solo payout did not reserve twenty percent")
@@ -714,11 +788,18 @@
                   (length accepted)
                   original-q
                   copy-q
-                  original-nonce
-                  copy-nonce
+                  producer-par
                   original-length
                   copy-length
-                  quality-only
+                  original-savings
+                  copy-savings
+                  original-score
+                  copy-score
+                  parent-chain-score
+                  original-chain-score
+                  copy-chain-score
+                  child-score
+                  child-chain-score
                   pre-replaced
                   post-replaced
                   %original-arrival
@@ -726,8 +807,9 @@
                   %child-height
                   %child-arrival
                   %post-child-copy-arrival
-                  (ref full-fork 'settled?)
+                  (ref full-fork 'child-observed?)
                   (coin-fork-candidate-actor selected)
+                  (coin-fork-candidate-chain-score selected-tip)
                   1000
                   reveal-inclusion
                   (maximum-or-zero share-values)
@@ -762,10 +844,9 @@
                         (cons (strategy-row (car pools) (car strategies))
                               rows))))))))
 
-      (define %pre-replacement-index 13)
-      (define %post-replacement-index 14)
-      (define %capture-index 22)
-      (define %quality-only-index 12)
+      (define %pre-replacement-index 20)
+      (define %post-replacement-index 21)
+      (define %capture-index 30)
 
       (define %matrix-check
         (begin
@@ -832,15 +913,6 @@
                 (candidate-member? candidate %largest-revealed))))
           %candidates))
 
-      (define %quality-only-replacements
-        (let loop ((rows %strategy-rows) (count 0))
-          (if (null? rows)
-              count
-              (loop (cdr rows)
-                    (if (list-ref (car rows) %quality-only-index)
-                        (+ count 1)
-                        count)))))
-
       (define %results
         `((parameters .
             ((height . ,%attack-height)
@@ -863,20 +935,20 @@
                                 (length %available-candidates)))))
           (matrix .
             ((rows . ,(length %strategy-rows))
-             (quality_only_copy_advantage_rows . ,%quality-only-replacements)
-             (first_seen_pre_child_replacements . 0)
-             (settled_post_child_replacements . 0)
+             (equal_copy_score_rows . ,(length %strategy-rows))
+             (cumulative_score_pre_child_replacements . 0)
+             (cumulative_score_post_child_replacements . 0)
              (original_solver_capture_permille_min . 1000)
-             (settlement . "explicit accepted child")))
-          (scope . "frozen deterministic copy-and-attach experiment under first-seen sibling selection")))
+             (fork_choice . "strictly taller height; equal height keeps incumbent; score-caused replacement counters are zero")
+             (child_observation . "selected branch extension, not finality")))
+          (scope . "frozen deterministic copy-and-attach experiment over fully validated blocks; producer golf scores report quality only, signed shares affect payouts only")))
 
       (define %summary
         (string-append
-          (format "Strategic mining: 21 rows over key pools 0..1024; ~a/~a semantic candidates available.\n"
+          (format "Producer strategy: 21 rows over key pools 0..1024; ~a/~a semantic candidates available.\n"
                   (length %available-candidates) (length %candidates))
-          (format "Quality-only counterfactual would replace in ~a rows; first-seen pre/post-child replacements: 0/0.\n"
-                  %quality-only-replacements)
-          "Copy-and-attach cannot displace the first observed sibling; settlement is child-observed, never timeout-based.\n"))
+          "Copy-and-attach preserves producer savings and block score; equal heights keep the incumbent regardless of score.\n"
+          "Copy replacements before/after the observed child: 0/0. Selected children add height, not irreversible finality.\n"))
 
       (define %payout-candidates
         (list-sort candidate-pubkey-before? %largest-revealed))

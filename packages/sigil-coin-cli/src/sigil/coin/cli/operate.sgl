@@ -31,10 +31,12 @@
           (sigil sqlite)
           (sigil bitcoin utils)
           (sigil bitcoin p2p)
+          (only (sigil bitcoin consensus) block-header-time)
           (sigil bitcoin node)
           (sigil bitcoin node main)
           (sigil coin consensus)
           (sigil coin node)
+          (only (sigil coin cli mine) coin-validated-tip-header)
           (sigil coin cli args))
   (export
     coin-parse-peer
@@ -210,19 +212,18 @@
 
     ;;; Print a node status snapshot with its branch-aware issued supply.
     ;;;
-    ;;; The Bitcoin fields are reported under the names `sigil-bitcoin` uses
-    ;;; so existing tooling can read them; the mining lines below them are
-    ;;; what a SigilCoin operator actually watches.
+    ;;; The generic node's accumulated work field carries additive golf score.
+    ;;; The next slot always comes from the validated tip, not a bodyless header.
     ;;;
     ;;; ```scheme
-    ;;; (coin-print-status (node-status n) (coin-issued-supply n))
+    ;;; (coin-print-status n (node-status n))
     ;;; ```
-    (define (coin-print-status status issued-supply)
-      (: node-status-snapshot? integer? -> any?)
+    (define (coin-print-status n status)
+      (: node? node-status-snapshot? -> any?)
       (println "chain: ~a" (node-status-snapshot-chain-name status))
       (println "best-height: ~a" (node-status-snapshot-best-height status))
       (println "best-hash: ~a" (node-status-snapshot-best-hash status))
-      (println "best-work: ~a" (node-status-snapshot-best-work status))
+      (println "best-chain-score: ~a" (node-status-snapshot-best-work status))
       (println "best-header-time: ~a"
                (node-status-snapshot-best-header-time status))
       (println "headers: ~a" (node-status-snapshot-header-count status))
@@ -249,10 +250,13 @@
       (let* ((height (node-status-snapshot-best-block-height status))
              (next (+ height 1)))
         (println "next-height: ~a" next)
+        (println "next-slot-time: ~a"
+                 (+ (block-header-time (coin-validated-tip-header n))
+                    (coin-chain-min-block-spacing (node-config n))))
         (println "next-reward: ~a SGL"
                  (cli-daviwils->sgl (coin-block-reward next)))
         (println "issued-supply: ~a SGL"
-                 (cli-daviwils->sgl issued-supply))
+                 (cli-daviwils->sgl (coin-issued-supply n)))
         (println "scheduled-supply-cap: ~a SGL"
                  (cli-daviwils->sgl (coin-cumulative-supply height)))
         (println "max-supply: ~a SGL" (cli-daviwils->sgl coin-max-supply)))
@@ -268,7 +272,7 @@
       (: list? -> any?)
       (cli-with-node args
         (lambda (n)
-          (coin-print-status (node-status n) (coin-issued-supply n)))))
+          (coin-print-status n (node-status n)))))
 
     ;;; Run a `peers` subcommand: `add`, `list`, `remove` or `test`.
     ;;;
@@ -386,7 +390,7 @@
             (let loop ((completed 0) (retries 0) (last-error ""))
               (if (and (> iterations 0) (>= completed iterations))
                   (let ((status (node-mark-sync-idle n)))
-                    (coin-print-status status (coin-issued-supply n))
+                    (coin-print-status n status)
                     status)
                   (let* ((before (run-progress-snapshot (node-status n)))
                          (failure #f)
@@ -403,7 +407,7 @@
                             (not (string=? "failed"
                                            (node-status-snapshot-sync-stage
                                              status))))
-                       (coin-print-status status (coin-issued-supply n))
+                       (coin-print-status n status)
                        (when (and (= iterations 0)
                                   (> retry-delay 0)
                                   (not (run-progress-made? before status)))
@@ -418,8 +422,7 @@
                                          (node-status-snapshot-sync-last-error
                                            status)
                                          last-error)))
-                         (coin-print-status (node-status n)
-                                            (coin-issued-supply n))
+                         (coin-print-status n (node-status n))
                          (when (> retry-delay 0) (sleep retry-delay))
                          (if (and (>= retries max-retries)
                                   (> iterations 0))
@@ -710,5 +713,5 @@
               ;; Re-raised outside the guard handler: a raise from inside one
               ;; escapes every enclosing guard, including `main`'s.
               (when fatal (raise fatal))
-              (coin-print-status (node-status n) (coin-issued-supply n))
+              (coin-print-status n (node-status n))
               result)))))))

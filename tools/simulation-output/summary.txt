@@ -1,18 +1,21 @@
-SigilCoin schema-4 deterministic simulation
-===========================================
+SigilCoin schema-5 deterministic proof-of-golf simulation
+=======================================================
 Puzzles: 420 global + 8 forced-constraint rows.
 Global retries: 83/420 puzzles retried; max 3; fallbacks 0.
 Table bytes min/median/max: 65/114/297; par: 24/29/72.
-Personalized shares: 702/1024 deterministic keys have a semantic under-par candidate.
+Golf scoring: at-par score 1; maximum savings 8; maximum block score 9; chain scores add linearly from genesis zero.
+Score arithmetic examples assume valid programs of the stated lengths; they are not measured solver discoveries.
+Personalized shares: 713/1024 deterministic keys have a semantic under-par candidate.
 Payout matrix: 162 rows; solo mints 80% subsidy plus fees, cooperative blocks mint subsidy plus fees.
 Cooperative rows allocate a 10% contribution-weighted share pool and 5% carrier payout; producer receives fees and rounding residuals.
-Strategic mining: 21 rows over key pools 0..1024; 702/1024 semantic candidates available.
-Quality-only counterfactual would replace in 12 rows; first-seen pre/post-child replacements: 0/0.
-Copy-and-attach cannot displace the first observed sibling; settlement is child-observed, never timeout-based.
-Market observer: 12 mined heights plus height-13 sentinel; 12 explicit child settlements.
+Producer strategy: 21 rows over key pools 0..1024; 713/1024 semantic candidates available.
+Copy-and-attach preserves producer savings and block score; equal heights keep the incumbent regardless of score.
+Copy replacements before/after the observed child: 0/0. Selected children add height, not irreversible finality.
+Market observer: 12 modeled heights plus height-13 sentinel; 12 child observations / 12 selected branches with a child.
+Market golf: declared par 256 bytes, ordinary/strong lengths 256/248; 0 selected savings, root/tip chain score 12/13.
 Market transactions: 76 generated / 71 confirmed; final outstanding 5.
-Market fees: 93250 confirmed, 8450 outstanding; mean/max latency 3492/6700 seconds.
+Market fees: 93250 confirmed, 8450 outstanding; mean/max latency 3514/6700 seconds.
 Distinct attacks: 12 future-time rejections; 16 urgent-censorship observations.
-Rewards are counted only after a child names the selected parent; no timeout or unsettled tip reward is used.
-Market scope: deterministic bounded observer assumptions, not an equilibrium or network simulation.
+Rewards account for selected modeled blocks; child observations are not finality or a reward gate.
+Market scope: bodyless deterministic inputs, not measured producer sources, production execution, equilibrium, or a network simulation.
 Caveat: consensus proves distinct tasks/work only, not distinct owners or identity independence.

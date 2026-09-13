@@ -1,7 +1,7 @@
 ;;; (sigil coin consensus) — canonical SigilCoin consensus
 ;;;
-;;; Pure consensus rules for puzzle derivation, solution verification, lottery
-;;; targeting, retargeting, co-op shares, coinbase payloads and emission.
+;;; Pure consensus rules for puzzle derivation, solution verification, additive
+;;; proof-of-golf scoring, retargeting, co-op shares, coinbase payloads and emission.
 ;;; No database, network or clock exists here beyond values supplied by callers.
 
 (define-library (sigil coin consensus)
@@ -54,6 +54,8 @@
     coin-median-time-span
     coin-median-time-past
     coin-validate-header-context
+    coin-block-merkle-root
+    coin-block-merkle-root-valid?
     coin-block-size
     coin-validate-block-size
 
@@ -79,17 +81,12 @@
     coin-spec-builtin-cap
     coin-check-solution
 
-    ;; Resource reporting and block lottery
+    ;; Resource reporting and proof-of-golf score
     coin-bucket7
     coin-max-bucket
-    coin-lottery-max-bonus
-    coin-lottery-max-integer
-    coin-lottery-target-ceiling
-    coin-lottery-bonus
-    coin-lottery-multiplier
-    coin-lottery-target
-    coin-lottery-expected-rolls
-    coin-lottery-valid?
+    coin-golf-max-savings
+    coin-golf-savings
+    coin-golf-score
 
     ;; Retargeting
     coin-retarget-window

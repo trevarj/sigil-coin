@@ -1,13 +1,13 @@
 ;;; (sigil coin consensus coinbase) — the five-push coinbase payload
 ;;;
-;;; A SigilCoin canonical coinbase input carries the whole mining claim in its
+;;; A SigilCoin canonical coinbase input carries the whole production claim in its
 ;;; scriptSig, as exactly five minimally-encoded data pushes (§6.1):
 ;;;
 ;;;   1. HEIGHT    0-5 B      minimally encoded BIP34 script number
 ;;;   2. SOLUTION  1-512 B    the producer's own solution for puzzle `H`
 ;;;   3. SHARES    1-5145 B   reveals for puzzle `H-1` (§6.2)
 ;;;   4. COMMITS   1-513 B    commitments for puzzle `H` (§7.1)
-;;;   5. GRAFFITI  0-400 B    opaque; consensus never looks inside
+;;;   5. GRAFFITI  0-400 B    genesis marker; empty at every later height
 ;;;
 ;;; SHARES and COMMITS are never zero-length pushes: their count byte is
 ;;; always present. That is what keeps the canonicality re-encode
@@ -150,6 +150,9 @@
         (if (not (graffiti-ok? graffiti))
             (error
               "coin-coinbase-payload-encode: graffiti length out of range"))
+        (if (and (> height 0) (> (bytevector-length graffiti) 0))
+            (error
+              "coin-coinbase-payload-encode: non-genesis graffiti must be empty"))
         (script-append
           (script-push-data (script-number-encode height))
           (script-push-data solution)
@@ -176,27 +179,26 @@
                                     commits: coin-empty-commits
                                     graffiti: #u8()))))
 
-    ;;; Largest legal canonical coinbase scriptSig, in bytes: 6588.
+    ;;; Largest legal canonical coinbase scriptSig, in bytes: 6583.
     ;;;
-    ;;;   HEIGHT      6 = 5 data (`#xffffffff` as a script number, four
-    ;;;                 magnitude bytes plus the sign pad) + 1 opcode
+    ;;;   HEIGHT      1 = genesis height zero as `OP_0`
     ;;;   SOLUTION  515 = 512 data + `OP_PUSHDATA2` and its two length bytes
     ;;;   SHARES   5148 = 5145 data + `OP_PUSHDATA2`
     ;;;   COMMITS   516 = 513 data + `OP_PUSHDATA2`
     ;;;   GRAFFITI  403 = 400 data + `OP_PUSHDATA2`
     ;;;
-    ;;; Derived from the encoder for the same reason as the floor. With ten
-    ;;; outputs and transaction overhead the worst-case coinbase is ~6976
-    ;;; bytes, so it remains under 7 KB against a 16384-byte block.
+    ;;; Genesis has the largest codec envelope because only it may carry
+    ;;; graffiti. Later payloads are at most 6186 bytes at maximum height.
+    ;;; The co-op checks separately forbid genesis shares.
     ;;;
     ;;; ```scheme
-    ;;; coin-max-coinbase-script-bytes ; => 6588
+    ;;; coin-max-coinbase-script-bytes ; => 6583
     ;;; ```
     (define coin-max-coinbase-script-bytes
       (bytevector-length
         (coin-coinbase-payload-encode
           (coin-coinbase-payload
-            height: %max-height
+            height: 0
             solution: (make-bytevector coin-max-solution-bytes 49)
             shares: (make-bytevector coin-max-shares-bytes 0)
             commits: (make-bytevector coin-max-commits-bytes 0)
@@ -209,7 +211,7 @@
     ;;; on every block.
     ;;;
     ;;; ```scheme
-    ;;; coin-coinbase-script-bounds ; => (8 . 6588)
+    ;;; coin-coinbase-script-bounds ; => (8 . 6583)
     ;;; ```
     (define coin-coinbase-script-bounds
       (cons coin-min-coinbase-script-bytes
@@ -243,8 +245,8 @@
     ;;; reasons are `not-bytevector`, `malformed-script`, `wrong-field-count`
     ;;; (five pushes now), `not-a-push`, `bad-height`, `solution-empty`,
     ;;; `solution-oversize`, `shares-malformed`, `shares-oversize`,
-    ;;; `commits-malformed`, `commits-oversize`, `graffiti-oversize` and
-    ;;; `non-canonical`.
+    ;;; `commits-malformed`, `commits-oversize`, `graffiti-oversize`,
+    ;;; `non-canonical-graffiti` and `non-canonical`.
     ;;;
     ;;; ```scheme
     ;;; (coin-result-reason (coin-coinbase-payload-decode #u8(#x02 #x01)))
@@ -300,6 +302,9 @@
                           coin-max-graffiti-bytes)
                        (coin-error 'graffiti-oversize
                                    "graffiti exceeds the byte cap"))
+                      ((and (> height 0) (> (bytevector-length graffiti) 0))
+                       (coin-error 'non-canonical-graffiti
+                                   "non-genesis graffiti must be empty"))
                       (else
                         (let ((payload (coin-coinbase-payload
                                          height: height

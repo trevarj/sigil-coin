@@ -129,9 +129,9 @@ in
       ];
       default = "sigilcoin-main";
       description = ''
-        Chain to run. `sigilcoin-main` is the real chain (magic 8f d1 c0 a5,
-        default port 19444); `sigilcoin-regtest` is the local chain whose
-        block-spacing floor is one second (magic a5 c0 d1 8f, port 19445).
+        Chain to run. `sigilcoin-main` has exact 86400-second slots and
+        default port 19444; `sigilcoin-regtest` is the local chain with exact
+        one-second slots and port 19445.
         Changing this after the data directory exists opens a DIFFERENT
         database file, not the same chain under a new name.
       '';
@@ -139,7 +139,7 @@ in
 
     dataDir = lib.mkOption {
       type = lib.types.path;
-      default = "/var/lib/sigilcoin";
+      default = "/var/lib/sigilcoin-proof-of-golf";
       description = ''
         Node state, mode 0750. Holds `<chain>.sqlite` (headers, blocks,
         UTXOs, mempool, peers) and `wallet/wallet.key` (32-byte secret, mode

@@ -1,5 +1,5 @@
 {
-  "schema": 5,
+  "schema": 4,
   "canonical_apis": [
     "coin-puzzle-for",
     "puzzle-for/constraint",
@@ -11,12 +11,14 @@
     "coin-quality",
     "coin-version-encode",
     "coin-version-solution-length",
-    "coin-required-bits",
-    "coin-chain-work",
-    "coin-golf-max-savings",
-    "coin-golf-savings",
-    "coin-golf-score",
-    "coin-genesis-block",
+    "next-required-bits",
+    "block-header-chain-work",
+    "coin-lottery-bonus",
+    "coin-lottery-multiplier",
+    "coin-lottery-target",
+    "coin-lottery-expected-rolls",
+    "coin-lottery-valid?",
+    "coin-mine-header",
     "coin-payout-plan",
     "coin-build-block",
     "coin-build-coop-block",
@@ -58,91 +60,6 @@
     ],
     "strategy_key_scalars": "1..1024 multiples of secp256k1 G",
     "clock_or_host_randomness": false
-  },
-  "golf_scoring": {
-    "max_savings": 8,
-    "genesis_score": 0,
-    "rule": "block_score = 1 + min(max_savings, max(0, par - solution_bytes)); chain_score is the sum of non-genesis block scores",
-    "scope": "arithmetic examples assume valid programs; no solution discovery is claimed",
-    "examples": [
-      {
-        "par": 100,
-        "solution_bytes": 100,
-        "savings": 0,
-        "block_score": 1,
-        "chain_score": 1
-      },
-      {
-        "par": 100,
-        "solution_bytes": 99,
-        "savings": 1,
-        "block_score": 2,
-        "chain_score": 3
-      },
-      {
-        "par": 100,
-        "solution_bytes": 98,
-        "savings": 2,
-        "block_score": 3,
-        "chain_score": 6
-      },
-      {
-        "par": 100,
-        "solution_bytes": 97,
-        "savings": 3,
-        "block_score": 4,
-        "chain_score": 10
-      },
-      {
-        "par": 100,
-        "solution_bytes": 96,
-        "savings": 4,
-        "block_score": 5,
-        "chain_score": 15
-      },
-      {
-        "par": 100,
-        "solution_bytes": 95,
-        "savings": 5,
-        "block_score": 6,
-        "chain_score": 21
-      },
-      {
-        "par": 100,
-        "solution_bytes": 94,
-        "savings": 6,
-        "block_score": 7,
-        "chain_score": 28
-      },
-      {
-        "par": 100,
-        "solution_bytes": 93,
-        "savings": 7,
-        "block_score": 8,
-        "chain_score": 36
-      },
-      {
-        "par": 100,
-        "solution_bytes": 92,
-        "savings": 8,
-        "block_score": 9,
-        "chain_score": 45
-      },
-      {
-        "par": 100,
-        "solution_bytes": 91,
-        "savings": 8,
-        "block_score": 9,
-        "chain_score": 54
-      },
-      {
-        "par": 100,
-        "solution_bytes": 1,
-        "savings": 8,
-        "block_score": 9,
-        "chain_score": 63
-      }
-    ]
   },
   "puzzles": {
     "global_count": 420,
@@ -204,8 +121,8 @@
   },
   "personalized_shares": {
     "evaluated": 1024,
-    "available": 713,
-    "unavailable": 311,
+    "available": 702,
+    "unavailable": 322,
     "margin_milli": {
       "min": 17,
       "median": 18,
@@ -213,7 +130,7 @@
       "mean_floor": 17
     },
     "contribution_counts": {
-      "one": 713,
+      "one": 702,
       "two": 0,
       "three": 0,
       "four": 0
@@ -261,18 +178,18 @@
     "rows": 32,
     "scope": "H/H+1 contribution payout accounting; no profitability or equilibrium claim"
   },
-  "strategic_golf": {
+  "strategic_mining": {
     "parameters": {
       "height": 32,
       "subsidy": 10000000000,
       "fees": 12345,
       "parent_clock": 1800000000,
       "spacing_seconds": 3600,
-      "future_drift_seconds": 0,
-      "original_arrival_clock": 1800003600,
-      "pre_child_copy_arrival_clock": 1800003660,
-      "child_arrival_clock": 1800007200,
-      "post_child_copy_arrival_clock": 1800007260,
+      "future_drift_seconds": 300,
+      "original_arrival_clock": 1800003300,
+      "pre_child_copy_arrival_clock": 1800003360,
+      "child_arrival_clock": 1800006900,
+      "post_child_copy_arrival_clock": 1800006960,
       "key_pools": [
         0,
         1,
@@ -290,32 +207,26 @@
     },
     "candidate_pool": {
       "evaluated": 1024,
-      "available": 713,
-      "unavailable": 311
+      "available": 702,
+      "unavailable": 322
     },
     "matrix": {
       "rows": 21,
-      "equal_copy_score_rows": 21,
-      "cumulative_score_pre_child_replacements": 0,
-      "cumulative_score_post_child_replacements": 0,
+      "quality_only_copy_advantage_rows": 12,
+      "first_seen_pre_child_replacements": 0,
+      "settled_post_child_replacements": 0,
       "original_solver_capture_permille_min": 1000,
-      "fork_choice": "strictly taller height; equal height keeps incumbent; score-caused replacement counters are zero",
-      "child_observation": "selected branch extension, not finality"
+      "settlement": "explicit accepted child"
     },
-    "scope": "frozen deterministic copy-and-attach experiment over fully validated blocks; producer golf scores report quality only, signed shares affect payouts only"
+    "scope": "frozen deterministic copy-and-attach experiment under first-seen sibling selection"
   },
   "market": {
     "parameters": {
-      "heights_produced": 12,
+      "heights_mined": 12,
       "sentinel_height": 13,
       "start_clock": 1800000000,
-      "exact_slot_seconds": 3600,
-      "max_future_drift_seconds": 0,
-      "synthetic_par_bytes": 256,
-      "ordinary_producer_length_bytes": 256,
-      "strong_producer_length_bytes": 248,
-      "golf_max_savings": 8,
-      "genesis_chain_score": 0,
+      "min_spacing_seconds": 3600,
+      "max_future_drift_seconds": 300,
       "canonical_max_block_bytes": 16384,
       "modeled_block_overhead_bytes": 1400,
       "transaction_byte_cap": 14984
@@ -323,30 +234,20 @@
     "modeled_assumptions": [
       "transaction envelopes use modeled bytes and fees, not wire serialization",
       "arrival-order first-fit mirrors current CLI selection; no fee priority is added",
-      "candidate identities and exact-slot timestamps are synthetic; no block header or program body is constructed or executed",
-      "par and producer lengths are fixed model inputs, not measured source lengths",
-      "ordinary producers are at par; the strong golfer offers an eight-byte shorter producer",
-      "each candidate adds coin-golf-score(par, producer length) to its parent chain score",
-      "only a strictly taller branch replaces the incumbent; equal height keeps it regardless of golf score",
-      "score comparison fields report quality only; score-caused replacement counters remain zero",
-      "an immediate child may extend any observed sibling and is not irreversible finality",
-      "the height-13 sentinel is a lookahead child, not an additional accounted market block",
-      "transaction confirmations and rewards are provisional selected-block accounting within this bounded model",
-      "fees affect payouts and availability policy, not fork selection",
-      "timestamps are exact slots; independent arrivals cannot precede their timestamp with zero future drift",
-      "future-dater publishes an exact-slot timestamp too early, then legally, and never censors",
+      "candidate identities and timestamps are synthetic; no block header or program body is constructed",
+      "each candidate represents a qualifying block arrival; nonce search is outside this bodyless model",
+      "the first observed same-height candidate remains incumbent",
+      "an explicit child of the incumbent settles its sibling height",
+      "the height-13 sentinel settles height 12",
+      "fees do not enter current fork choice",
+      "future-dater retries legally and never censors",
       "urgent-censor uses legal timestamps and never future-dates"
     ],
     "aggregate": {
-      "heights_produced": 12,
+      "heights_mined": 12,
       "sentinel_height": 13,
-      "child_observations": 12,
-      "child_observed_heights": 12,
-      "golf_savings": 0,
-      "golf_savings_per_block": 0,
-      "block_score": 12,
-      "chain_score": 12,
-      "selected_tip_chain_score": 13,
+      "settled_heights": 12,
+      "unsettled_tip_rewards_counted": 0,
       "transactions_generated": 76,
       "transactions_confirmed": 71,
       "transactions_outstanding": 5,
@@ -359,32 +260,23 @@
       "minted_subsidy": 960000000,
       "unminted_subsidy": 240000000,
       "future_drift_rejections": 12,
-      "higher_score_replacements": 0,
-      "score_tie_observations": 36,
-      "lower_score_observations": 0,
-      "sibling_observations_after_child": 0,
+      "first_seen_losses": 48,
+      "settled_late_candidates": 0,
       "censorship_observations": 16,
-      "latency_mean_seconds": 3514,
+      "latency_mean_seconds": 3492,
       "latency_max_seconds": 6700,
       "utilization_mean_permille": 902,
       "mempool_final": 5,
       "pending_arrivals_final": 0
     },
-    "producers": [
+    "miners": [
       {
         "actor": "fair-eager",
         "archetype": "fair eager",
         "candidates": 12,
         "wins": 12,
-        "synthetic_par_bytes": 256,
-        "producer_length_bytes": 256,
-        "golf_savings_per_block": 0,
-        "block_score": 1,
-        "selected_golf_savings": 0,
-        "selected_block_score": 12,
-        "higher_score_replacements": 0,
-        "score_tie_observations": 0,
-        "lower_score_observations": 0,
+        "first_seen_losses": 0,
+        "settled_late_losses": 0,
         "future_drift_rejections": 0,
         "fees_collected": 93250,
         "scheduled_subsidy": 1200000000,
@@ -399,15 +291,8 @@
         "archetype": "fair fee-waiting",
         "candidates": 12,
         "wins": 0,
-        "synthetic_par_bytes": 256,
-        "producer_length_bytes": 256,
-        "golf_savings_per_block": 0,
-        "block_score": 1,
-        "selected_golf_savings": 0,
-        "selected_block_score": 0,
-        "higher_score_replacements": 0,
-        "score_tie_observations": 12,
-        "lower_score_observations": 0,
+        "first_seen_losses": 12,
+        "settled_late_losses": 0,
         "future_drift_rejections": 0,
         "fees_collected": 0,
         "scheduled_subsidy": 0,
@@ -422,15 +307,8 @@
         "archetype": "strong golfer",
         "candidates": 12,
         "wins": 0,
-        "synthetic_par_bytes": 256,
-        "producer_length_bytes": 248,
-        "golf_savings_per_block": 8,
-        "block_score": 9,
-        "selected_golf_savings": 0,
-        "selected_block_score": 0,
-        "higher_score_replacements": 0,
-        "score_tie_observations": 0,
-        "lower_score_observations": 0,
+        "first_seen_losses": 12,
+        "settled_late_losses": 0,
         "future_drift_rejections": 0,
         "fees_collected": 0,
         "scheduled_subsidy": 0,
@@ -445,15 +323,8 @@
         "archetype": "future dater",
         "candidates": 12,
         "wins": 0,
-        "synthetic_par_bytes": 256,
-        "producer_length_bytes": 256,
-        "golf_savings_per_block": 0,
-        "block_score": 1,
-        "selected_golf_savings": 0,
-        "selected_block_score": 0,
-        "higher_score_replacements": 0,
-        "score_tie_observations": 12,
-        "lower_score_observations": 0,
+        "first_seen_losses": 12,
+        "settled_late_losses": 0,
         "future_drift_rejections": 12,
         "fees_collected": 0,
         "scheduled_subsidy": 0,
@@ -468,15 +339,8 @@
         "archetype": "urgent-transaction censor",
         "candidates": 12,
         "wins": 0,
-        "synthetic_par_bytes": 256,
-        "producer_length_bytes": 256,
-        "golf_savings_per_block": 0,
-        "block_score": 1,
-        "selected_golf_savings": 0,
-        "selected_block_score": 0,
-        "higher_score_replacements": 0,
-        "score_tie_observations": 12,
-        "lower_score_observations": 0,
+        "first_seen_losses": 12,
+        "settled_late_losses": 0,
         "future_drift_rejections": 0,
         "fees_collected": 0,
         "scheduled_subsidy": 0,
@@ -495,7 +359,7 @@
         "confirmed": 12,
         "outstanding": 0,
         "fees_paid": 9600,
-        "latency_mean_seconds": 3400,
+        "latency_mean_seconds": 3375,
         "latency_max_seconds": 6700,
         "censorship_observations": 0
       },
@@ -506,7 +370,7 @@
         "confirmed": 11,
         "outstanding": 1,
         "fees_paid": 66000,
-        "latency_mean_seconds": 1800,
+        "latency_mean_seconds": 1772,
         "latency_max_seconds": 4200,
         "censorship_observations": 16
       },
@@ -528,12 +392,12 @@
         "confirmed": 34,
         "outstanding": 2,
         "fees_paid": 850,
-        "latency_mean_seconds": 4294,
+        "latency_mean_seconds": 4267,
         "latency_max_seconds": 6500,
         "censorship_observations": 0
       }
     ],
-    "scope": "bodyless deterministic bounded height-choice, golf-quality, and fee model; checkpoint validity is assumed; not production execution, equilibrium, profitability, or a network simulator"
+    "scope": "bounded deterministic observer experiment; not equilibrium, profitability, or a network simulator"
   },
   "caveat": "Consensus proves distinct pubkey-personalized tasks and verified work, not distinct owners or identity independence."
 }

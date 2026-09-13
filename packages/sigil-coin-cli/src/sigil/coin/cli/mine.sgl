@@ -40,6 +40,7 @@
     coin-block-transaction-fee
     coin-select-block-transactions
     coin-select-verified-share-candidates
+    coin-submit-block!
     run-puzzle
     run-mine
     run-contribute
@@ -233,6 +234,8 @@
       (: node? integer? transaction? list? -> any?)
       (and (transaction? tx)
            (not (coinbase-transaction? tx))
+           (pair? (transaction-inputs tx))
+           (pair? (transaction-outputs tx))
            ;; A lock-time of zero is final at every height and time, so no
            ;; absolute timelock can turn this transaction invalid between
            ;; the mempool and the block.
@@ -268,7 +271,7 @@
     ;;; `build` is called as `(build transactions fees)` and returns the
     ;;; block those arguments produce. Handing selection the real builder is
     ;;; what makes the size cap exact: the candidate block is serialized as
-    ;;; it would be mined, coinbase, solution, graffiti and transaction count
+    ;;; it would be submitted, coinbase, solution and transaction count
     ;;; included, so nothing here has to model the encoding and then drift
     ;;; from it.
     ;;;
@@ -308,29 +311,19 @@
                                       spent)
                               (+ fees fee)))))))))
 
-    ;; Two header rules bracket the timestamp: it must clear the parent's
-    ;; time by the chain's spacing floor, and it must not sit further ahead
-    ;; of the clock than the future-drift allowance. Between them the
-    ;; earliest legal stamp is the floor, so mine at the later of the floor
-    ;; and now, and refuse only when the floor is past the drift limit —
-    ;; which is the case a miner reads as "the next block is not due yet".
-    ;; Refusing here rather than at ingest is the difference between a
-    ;; sentence about the block schedule and one about header acceptance.
-    (define (require-spacing parent spacing max-future-drift)
-      (let ((earliest (+ (block-header-time parent) spacing))
+    ;; Every block keeps its exact parent-derived timestamp, even when a
+    ;; producer arrives late. An early producer waits rather than changing it.
+    (define (require-spacing parent spacing)
+      (let ((slot (+ (block-header-time parent) spacing))
             (now (exact (floor (current-second)))))
-        (when (> earliest (+ now max-future-drift))
+        (when (> slot now)
           (error (string-append
-                   "mine: too early. This chain mines a block every "
-                   (number->string spacing)
-                   " seconds, so the next one cannot be timestamped before "
-                   (number->string earliest)
+                   "mine: too early. The next slot is "
+                   (number->string slot)
                    " — "
-                   (number->string (- earliest now))
-                   " seconds away, further ahead than the "
-                   (number->string max-future-drift)
-                   "-second future-drift limit allows.")))
-        (max earliest now)))
+                   (number->string (- slot now))
+                   " seconds away.")))
+        slot))
 
     (define (report-ref report key)
       (cdr (assq key report)))
@@ -341,18 +334,9 @@
 
     (define (hex bytes) (hex-encode bytes))
 
-    (define (print-lottery bits par length)
-      (let ((target (coin-lottery-target bits par length)))
-        (println "base-target-bits: 0x~a" (number->string bits 16))
-        (println "base-target: ~a" (compact-target->integer bits))
-        (println "lottery-bonus: ~a" (coin-lottery-bonus par length))
-        (println "lottery-multiplier: ~a"
-                 (coin-lottery-multiplier par length))
-        (println "lottery-target: ~a" target)
-        (println "lottery-expected-rolls: ~a"
-                 (coin-lottery-expected-rolls bits par length))
-        (println "lottery-rule: valid at-par work is still lottery-gated; every byte saved doubles nonce odds, up to eight bytes (256x).")
-        target))
+    (define (print-golf par length)
+      (println "savings: ~a" (coin-golf-savings par length))
+      (println "block-score: ~a" (coin-golf-score par length)))
 
 
     ;;; Everything a command needs for one puzzle height.
@@ -384,6 +368,9 @@
               (cons 'parent-hash parent-hash)
               (cons 'complexity complexity)
               (cons 'bits bits)
+              (cons 'next-slot-time
+                    (+ (block-header-time parent)
+                       (coin-chain-min-block-spacing (node-config n))))
               (cons 'spec (coin-puzzle-for parent-hash height complexity)))))
 
     ;;; Everything `puzzle` reports about one  height, as an alist.
@@ -424,8 +411,8 @@
 
     ;;; Print a  puzzle report in the CLI's `key: value` form.
     ;;;
-    ;;; The order is the order a miner reads it in: examples, today's rule,
-    ;;; the guaranteed-valid par witness, then the nonce lottery it enters.
+    ;;; The order is the order a producer reads it in: examples, today's rule,
+    ;;; the guaranteed-valid par witness, then its additive golf score.
     ;;;
     ;;; ```scheme
     ;;; (coin-print-puzzle (coin-puzzle-report parent-hash 1 128 bits))
@@ -435,6 +422,8 @@
       (println "height: ~a" (report-ref report 'height))
       (println "parent: ~a" (report-ref report 'parent))
       (println "seed: ~a" (report-ref report 'seed))
+      (let ((slot (assq 'next-slot-time report)))
+        (when slot (println "next-slot-time: ~a" (cdr slot))))
       (let ((personalized (assq 'personalized-pubkey report)))
         (when personalized
           (println "personalized-pubkey: ~a" (cdr personalized))))
@@ -454,14 +443,13 @@
       (println "par-witness-length: ~a"
                (report-ref report 'par-witness-length))
       (println "par-witness: ~a" (report-ref report 'par-witness))
-      (println "par-witness-validity: guaranteed-valid; nonce lottery still required")
+      (println "par-witness-validity: guaranteed-valid")
       (println "solve: write a ONE-ARGUMENT function reproducing every pair above, then `sigilcoin mine~a --solution '<source>'`."
                (if (assq 'personalized-pubkey report) " --share" ""))
       (if (assq 'personalized-pubkey report)
           (println "share-rule: a share must be strictly shorter than its personalized par; savings determine contribution.")
-          (print-lottery (report-ref report 'bits)
-                         (report-ref report 'par)
-                         (report-ref report 'par-witness-length)))
+          (print-golf (report-ref report 'par)
+                      (report-ref report 'par-witness-length)))
       report)
 
     ;;; Show the  puzzle for the next block, or for `--height`.
@@ -482,12 +470,16 @@
                              (coin-share-puzzle
                                (share-context context '()) pubkey)
                              (report-ref context 'spec)))
-                   (report (coin-puzzle-report/spec
-                             (report-ref context 'parent-hash)
-                             (report-ref context 'height)
-                             (report-ref context 'complexity)
-                             (report-ref context 'bits)
-                             spec)))
+                   (report
+                     (cons
+                       (cons 'next-slot-time
+                             (report-ref context 'next-slot-time))
+                       (coin-puzzle-report/spec
+                         (report-ref context 'parent-hash)
+                         (report-ref context 'height)
+                         (report-ref context 'complexity)
+                         (report-ref context 'bits)
+                         spec))))
               (coin-print-puzzle
                 (if share?
                     (cons (cons 'personalized-pubkey (hex pubkey)) report)
@@ -803,16 +795,14 @@
         (and (pair? rows)
              (block-parse (hex-decode (row-ref (car rows) "block_hex"))))))
 
-    ;; Assemble an unmined candidate only for exact serialized-size probes.
-    ;; The header grinder is called once after transaction selection, so its
-    ;; nonce search never runs for discarded mempool candidates.
+    ;; The exact serialized-size probe is also the complete final candidate.
     (define (build-block-prototype
               parent height complexity bits length solution shares contributions
-              commitments graffiti producer-script carrier-script time
+              commitments producer-script carrier-script time
               txs fees)
       (let* ((coinbase
                (coin-mining-coinbase/coop
-                 height solution shares contributions commitments graffiti
+                 height solution shares contributions commitments #u8()
                  producer-script carrier-script fees))
              (transactions (cons coinbase txs)))
         (block
@@ -821,11 +811,44 @@
               version: (coin-version-encode complexity length)
               previous-block: (block-header-hash parent)
               merkle-root: (merkle-root
-                             (map transaction-txid transactions))
+                             (map transaction-wtxid transactions))
               time: time
               bits: bits
               nonce: 0)
           transactions: transactions)))
+
+    ;;; Submit once. A duplicate or retained side branch need not cause a new
+    ;;; validation event; report pending bodies without calling them valid.
+    (define (coin-submit-block! n b)
+      (: node? block? -> block?)
+      (let* ((header (block-header-field b))
+             (hash (hex (block-header-hash header))))
+        (node-ingest-headers n (list header))
+        (node-store-block n b)
+        (node-validate-blocks n)
+        (let* ((rows
+                 (sqlite-query
+                   (node-db n)
+                   "SELECT b.height, b.status, b.validated, h.work FROM blocks b JOIN headers h ON h.hash = b.hash WHERE b.hash = ? AND h.valid = 1 AND b.block_hex IS NOT NULL"
+                   hash))
+               (row (and (pair? rows) (car rows))))
+          (unless (and row
+                       (member (row-ref row "status") '("downloaded" "valid")))
+            (error (string-append
+                     "mine: node refused block — "
+                     (node-status-snapshot-sync-last-error (node-status n)))))
+          (println "chain-score: ~a" (row-ref row "work"))
+          (println "validation: ~a"
+                   (if (= 1 (row-ref row "validated")) "valid" "pending"))
+          (println "active-chain: ~a"
+                   (if (and (<= (row-ref row "height")
+                                (coin-validated-tip-height n))
+                            (string=? hash
+                                      (hex (block-header-hash
+                                             (coin-header-at-height
+                                               n (row-ref row "height"))))))
+                       "yes" "no")))
+        b))
 
 
     (define (print-contributions commitments commit-rejected shares
@@ -1015,6 +1038,8 @@
               (if share?
                   (begin
                     (println "height: ~a" height)
+                    (println "next-slot-time: ~a"
+                             (report-ref context 'next-slot-time))
                     (println "personalized-pubkey: ~a" (hex pubkey))
                     (println "complexity: ~a"
                              (report-ref context 'complexity))
@@ -1031,21 +1056,17 @@
                     (println "submitted: no")
                     (cons (cons 'contribution preview-contribution) report))
                   (let* ((address (cli-arg args "--address" #f))
-                         (graffiti (cli-arg args "--graffiti" ""))
+                         (parent (report-ref context 'parent))
                          (payout (if address
                                      (coin-address->script-pubkey
                                        "--address" address (node-config n))
                                      (wallet-script-pubkey
                                        (wallet-key data-dir))))
-                         (parent (report-ref context 'parent))
+                         (time (require-spacing
+                                 parent (coin-chain-min-block-spacing
+                                          (node-config n))))
                          (complexity (report-ref context 'complexity))
                          (bits (report-ref context 'bits))
-                         (spacing (coin-chain-min-block-spacing
-                                    (node-config n)))
-                         (max-future-drift
-                           (coin-chain-max-future-drift (node-config n)))
-                         (time (require-spacing parent spacing
-                                                max-future-drift))
                          (decoded-commits
                            (decode-inputs
                              (cli-arg-list args "--commit")
@@ -1092,10 +1113,8 @@
                          (carrier-script
                            (and (pair? shares)
                                 (coin-carrier-script parent-block))))
-                    (when (> (bytevector-length (string->utf8 graffiti))
-                             coin-max-graffiti-bytes)
-                      (error "--graffiti: text exceeds consensus byte cap"))
                     (println "height: ~a" height)
+                    (println "next-slot-time: ~a" time)
                     (println "complexity: ~a" complexity)
                     (println "constraint: ~a"
                              (cli-constraint-detail
@@ -1104,7 +1123,7 @@
                     (println "examples-reproduced: ~a of ~a"
                              (puzzle-spec-k spec) (puzzle-spec-k spec))
                     (print-resources report par)
-                    (let ((target (print-lottery bits par length)))
+                      (print-golf par length)
                       (when origin
                         (println "relay: ~a" origin)
                         (println "relay-commitments: ~a"
@@ -1119,7 +1138,7 @@
                                (lambda (txs fees)
                                  (build-block-prototype
                                    parent height complexity bits length solution
-                                   shares contributions commitments graffiti
+                                   shares contributions commitments
                                    payout carrier-script time txs fees)))
                              (selected
                                (coin-select-block-transactions n height build))
@@ -1132,33 +1151,16 @@
                                    (number->string (or size -1))
                                    " bytes; consensus cap is "
                                    (number->string coin-max-block-bytes))))
-                        (let* ((b (coin-mine-block prototype par))
-                               (header (block-header-field b))
-                               (coinbase-lock-time
-                                 (transaction-lock-time
-                                   (car (block-transactions b)))))
-                          (node-ingest-headers n (list header))
-                          (node-store-block n b)
-                          (unless (= 1 (node-validate-blocks n))
-                            (error (string-append
-                                     "mine: node refused block — "
-                                     (node-status-snapshot-sync-last-error
-                                       (node-status n)))))
-                          (println "qualifying-nonce: ~a"
-                                   (block-header-nonce header))
-                          (println "coinbase-lock-time: ~a"
-                                   coinbase-lock-time)
-                          (println "qualifying-target: ~a" target)
+                        (let* ((b (coin-submit-block! n prototype))
+                               (header (block-header-field b)))
                           (println "block-id: ~a" (block-header-id header))
-                          (println "block-roll: ~a"
-                                   (block-header-work-value header))
                           (println "block-bytes: ~a" size)
                           (println "transactions: ~a"
                                    (length (car selected)))
                           (print-payouts b height (cdr selected)
                                          shares contributions)
                           (println "submitted: yes")
-                          b))))))))))
+                          b)))))))))
 
     ;; ============================================================
     ;; Commit and reveal

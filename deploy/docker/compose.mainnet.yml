@@ -56,7 +56,7 @@ services:
       - "${MAINNET_P2P_BIND:-127.0.0.1}:${MAINNET_P2P_PORT:-19444}:19444/tcp"
     volumes:
       - type: bind
-        source: ${SIGIL_MAINNET_STATE_DIR:-./state/mainnet}
+        source: ${SIGIL_MAINNET_STATE_DIR:-./state/mainnet-proof-of-golf}
         target: /var/lib/sigilcoin
         bind:
           create_host_path: false
@@ -78,7 +78,7 @@ services:
         condition: service_healthy
     volumes:
       - type: bind
-        source: ${SIGIL_MAINNET_STATE_DIR:-./state/mainnet}
+        source: ${SIGIL_MAINNET_STATE_DIR:-./state/mainnet-proof-of-golf}
         target: /var/lib/sigilcoin
         bind:
           create_host_path: false
@@ -108,7 +108,7 @@ services:
         condition: service_healthy
     volumes:
       - type: bind
-        source: ${SIGIL_MAINNET_STATE_DIR:-./state/mainnet}
+        source: ${SIGIL_MAINNET_STATE_DIR:-./state/mainnet-proof-of-golf}
         target: /var/lib/sigilcoin
         read_only: true
         bind:
@@ -117,17 +117,18 @@ services:
   miner:
     <<: *sigilcoin-service
     profiles: ["mainnet-miner"]
-    command: ["miner-loop"]
+    command: ["producer-loop"]
     environment:
       <<: *mainnet-environment
       MINER_ADDRESS: ${MAINNET_MINER_ADDRESS:-}
+      # Low-CPU scheduled slot polling interval, not a nonce-search cadence.
       MINE_INTERVAL: ${MINE_INTERVAL:-60}
     depends_on:
       sync:
         condition: service_healthy
     volumes:
       - type: bind
-        source: ${SIGIL_MAINNET_STATE_DIR:-./state/mainnet}
+        source: ${SIGIL_MAINNET_STATE_DIR:-./state/mainnet-proof-of-golf}
         target: /var/lib/sigilcoin
         bind:
           create_host_path: false

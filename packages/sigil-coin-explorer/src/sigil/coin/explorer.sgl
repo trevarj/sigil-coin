@@ -7,18 +7,18 @@
 ;;;   (sigil coin explorer render)  escaping, HTML pages, JSON bodies
 ;;;   (sigil coin explorer server)  routing and the HTTP/1.1 front door
 ;;;
-;;; SigilCoin producers golf a daily puzzle, then search a nonce lottery whose
-;;; odds double for each byte saved below par (up to the consensus cap). The
-;;; explorer shows the qualifying roll, published program, and direct co-op
-;;; payouts while keeping fork choice separate from lottery odds.
+;;; SigilCoin producers publish a golfed puzzle solution at each scheduled
+;;; slot. Every non-genesis block adds one point plus capped bytes saved below
+;;; par; the explorer shows that score, cumulative chain score, the published
+;;; program, and direct co-op payouts.
 ;;;
 ;;; Two rules shape the whole package:
 ;;;
 ;;;   * IT NEVER WRITES. The database belongs to the node. See
 ;;;     `(sigil coin explorer store)` for the two locks and what they do
 ;;;     not cover.
-;;;   * IT NEVER TRUSTS A BLOCK. Graffiti and solutions are bytes a miner
-;;;     chose. See `(sigil coin explorer render)` for the sanitize-then-
+;;;   * IT NEVER TRUSTS A BLOCK. Genesis quotes and solutions are opaque
+;;;     bytes. See `(sigil coin explorer render)` for the sanitize-then-
 ;;;     escape path every one of them takes.
 ;;;
 ;;; ```scheme
@@ -83,19 +83,14 @@
     ;; Store: blocks, canonical
     explorer-block-complexity
     explorer-block-bits
-    explorer-block-base-target
-    explorer-block-chain-work
+    explorer-block-chain-score
     explorer-block-constraint
     explorer-block-constraint-text
     explorer-block-k
     explorer-block-examples
-    explorer-block-nonce
     explorer-block-claimed-length
-    explorer-block-lottery-roll
-    explorer-block-lottery-target
-    explorer-block-lottery-bonus
-    explorer-block-lottery-multiplier
-    explorer-block-lottery-expected-rolls
+    explorer-block-savings
+    explorer-block-block-score
     explorer-block-share-quality
     explorer-block-share-count
     explorer-block-shares
@@ -186,12 +181,14 @@
     explorer-summary-tip-height
     explorer-summary-tip-id
     explorer-summary-tip-time
+    explorer-summary-chain-score
     explorer-summary-header-height
     explorer-summary-header-count
     explorer-summary-block-count
     explorer-summary-supply
     explorer-summary-max-supply
     explorer-summary-next-height
+    explorer-summary-next-slot
     explorer-summary-next-reward
     explorer-summary-next-halving-height
     explorer-summary-puzzle-par

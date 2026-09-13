@@ -5,8 +5,9 @@ usage() {
   cat <<'EOF'
 Usage: start-mainnet-miner.sh
 
-Start the profiled mainnet miner on this Docker Compose host. It pays every
-producer reward to the configured external address and stores no wallet key.
+Start the profiled scheduled mainnet producer on this Docker Compose host.
+It polls slots with low CPU use, pays every producer reward to the fixed
+external address, and stores no wallet key. Docker keeps it running until stopped.
 EOF
 }
 
@@ -27,7 +28,7 @@ now=$(date -u +%s) || {
   exit 64
 }
 if ((now < launch_time)); then
-  printf 'refusing miner before 2026-09-12T16:00:00Z\n' >&2
+  printf 'refusing producer before 2026-09-12T16:00:00Z\n' >&2
   exit 64
 fi
 
@@ -43,5 +44,5 @@ docker compose -p sigilcoin-mainnet --env-file .env --profile mainnet-miner \
 
 docker compose -p sigilcoin-mainnet --env-file .env --profile mainnet-miner \
   -f compose.mainnet.yml ps miner
-printf 'mainnet miner pays: %s\n' "$MAINNET_MINER_ADDRESS"
+printf 'scheduled mainnet producer pays: %s\n' "$MAINNET_MINER_ADDRESS"
 printf 'logs: cd %q && docker compose -p sigilcoin-mainnet --env-file .env --profile mainnet-miner -f compose.mainnet.yml logs -f miner\n' "$root"

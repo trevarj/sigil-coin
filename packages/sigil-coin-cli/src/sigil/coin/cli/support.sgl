@@ -170,7 +170,7 @@
     ;;;
     ;;; On success the alist carries the exact source `length`, evaluator
     ;;; `cells`, and evaluator `steps`. These are useful diagnostics, not a
-    ;;; block rank: only solution length changes the nonce lottery odds.
+    ;;; block rank: only solution length changes the additive golf score.
     ;;;
     ;;; ```scheme
     ;;; (cdr (assq 'ok (cli-solution-report spec "car"))) ; => #f

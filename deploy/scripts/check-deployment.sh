@@ -124,27 +124,12 @@ assert_fixed '"127.0.0.1:8081:8080/tcp"' deploy/docker/compose.mainnet.yml
 assert_fixed 'profiles: ["mainnet-explorer"]' deploy/docker/compose.mainnet.yml
 assert_fixed 'compose_args=(--profile mainnet-explorer' deploy/scripts/deploy-remote.sh
 assert_fixed 'default_explorer_port=8081' deploy/scripts/run-local.sh
-assert_fixed 'profiles: ["mainnet-miner"]' deploy/docker/compose.mainnet.yml
-assert_fixed 'command: ["miner-loop"]' deploy/docker/compose.mainnet.yml
-assert_fixed 'MINER_ADDRESS: ${MAINNET_MINER_ADDRESS:-}' \
-  deploy/docker/compose.mainnet.yml
-assert_fixed 'MAINNET_MINER_ADDRESS=sgl1qj9f6eeqxhjgynml4glztyrdw5tj5fn72s6shud' \
-  deploy/scripts/start-mainnet-miner.sh
-assert_fixed 'required_address=sgl1qj9f6eeqxhjgynml4glztyrdw5tj5fn72s6shud' \
-  deploy/docker/entrypoint.sh
-assert_fixed 'launch_time=1789228800' deploy/docker/entrypoint.sh
-assert_fixed 'mine canceled: validated tip changed' deploy/docker/entrypoint.sh
-assert_fixed 'for command in chmod date mkdir sleep' deploy/docker/Dockerfile
-assert_fixed 'compose -p sigilcoin-mainnet' deploy/scripts/start-mainnet-miner.sh
-assert_fixed '--wait-timeout 180 miner' deploy/scripts/start-mainnet-miner.sh
-assert_fixed '--profile mainnet-miner rm -sf miner' deploy/scripts/deploy-remote.sh
 if grep -Fq 'MAINNET_EXPLORER_' deploy/docker/compose.mainnet.yml deploy/docker/.env.example; then
   fail 'mainnet explorer host mapping has an environment override'
 fi
 assert_fixed 'user: "${POOL_UID:-1002}:${SIGIL_GID:-1000}"' deploy/docker/compose.testnet.yml
 assert_fixed 'command: ["relay"]' deploy/docker/compose.testnet.yml
 assert_fixed '"127.0.0.1:${POOL_PORT:-8082}:8082/tcp"' deploy/docker/compose.testnet.yml
-assert_fixed 'source: ${SIGIL_TESTNET_POOL_STATE_DIR:-./state/testnet-pool}' deploy/docker/compose.testnet.yml
 assert_fixed 'target: /var/lib/sigilcoin-pool' deploy/docker/compose.testnet.yml
 if grep -Fq 'POOL_UID' deploy/docker/compose.mainnet.yml; then fail 'mainnet Compose includes the testnet pool'; fi
 assert_fixed 'TESTNET_EXPOSURE_ACK' deploy/docker/entrypoint.sh
@@ -163,7 +148,6 @@ assert_fixed 'exec "$coin" relay serve' deploy/docker/entrypoint.sh
 assert_fixed '--state-dir /var/lib/sigilcoin-pool' deploy/docker/entrypoint.sh
 assert_fixed '--relay http://127.0.0.1:8082' deploy/docker/entrypoint.sh
 assert_fixed 'POOL_UID=1002' deploy/docker/.env.example
-assert_fixed 'SIGIL_TESTNET_POOL_STATE_DIR=./state/testnet-pool' deploy/docker/.env.example
 assert_fixed 'POOL_PORT=8082' deploy/docker/.env.example
 grep -Fxq 'MAINNET_P2P_BIND=127.0.0.1' deploy/docker/.env.example ||
   fail 'example mainnet P2P bind is not private'
@@ -219,14 +203,14 @@ expect_exit 64 env ALLOW_MAINNET=maybe BIN_DIR=/nonexistent bash deploy/scripts/
 expect_exit 64 env CHAIN=mainnet sh deploy/docker/entrypoint.sh listener
 expect_exit 64 env CHAIN=mainnet ALLOW_MAINNET=yes sh deploy/docker/entrypoint.sh relay
 expect_exit 64 env CHAIN=testnet MINER_ADDRESS=sgl1qj9f6eeqxhjgynml4glztyrdw5tj5fn72s6shud \
-  sh deploy/docker/entrypoint.sh miner-loop
+  sh deploy/docker/entrypoint.sh producer-loop
 expect_exit 64 env CHAIN=mainnet ALLOW_MAINNET=yes \
-  sh deploy/docker/entrypoint.sh miner-loop
+  sh deploy/docker/entrypoint.sh producer-loop
 expect_exit 64 env CHAIN=mainnet ALLOW_MAINNET=yes MINER_ADDRESS=sgl1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq \
-  sh deploy/docker/entrypoint.sh miner-loop
+  sh deploy/docker/entrypoint.sh producer-loop
 expect_exit 64 env CHAIN=mainnet ALLOW_MAINNET=yes \
   MINER_ADDRESS=sgl1qj9f6eeqxhjgynml4glztyrdw5tj5fn72s6shud MINE_INTERVAL=0 \
-  sh deploy/docker/entrypoint.sh miner-loop
+  sh deploy/docker/entrypoint.sh producer-loop
 expect_exit 64 env CHAIN=testnet sh deploy/docker/entrypoint.sh cli listen
 expect_exit 64 env CHAIN=testnet sh deploy/docker/entrypoint.sh cli -- listen
 expect_exit 64 env CHAIN=testnet sh deploy/docker/entrypoint.sh cli status \
@@ -320,7 +304,7 @@ remote_mainnet=(bash -s -- "$remote_dir" mainnet "$remote_uid" "$remote_gid" \
   "$((remote_uid + 1))" "$((remote_uid + 2))" yes no)
 remote_env=(env PATH="$preflight_state/bin:$PATH"
   FAKE_CADDY_CALLS="$preflight_state/caddy-calls"
-  SIGIL_MAINNET_STATE_DIR=./state/mainnet)
+  SIGIL_MAINNET_STATE_DIR=./state/mainnet-proof-of-golf)
 expect_exit 64 "${remote_env[@]}" MAINNET_P2P_BIND=0.0.0.0 \
   MAINNET_EXPOSURE_ACK= "${remote_mainnet[@]}" <<< "$remote_script"
 expect_exit 64 "${remote_env[@]}" MAINNET_P2P_BIND=0.0.0.0 \
@@ -331,7 +315,7 @@ rm -f -- "$preflight_state/caddy-calls"
 expect_exit 69 env -u MAINNET_P2P_BIND -u MAINNET_EXPOSURE_ACK \
   PATH="$preflight_state/bin:$PATH" \
   FAKE_CADDY_CALLS="$preflight_state/caddy-calls" \
-  SIGIL_MAINNET_STATE_DIR=./state/mainnet \
+  SIGIL_MAINNET_STATE_DIR=./state/mainnet-proof-of-golf \
   "${remote_mainnet[@]}" <<< "$remote_script"
 rm -f -- "$preflight_state/caddy-calls"
 expect_exit 69 "${remote_env[@]}" MAINNET_P2P_BIND=0.0.0.0 \
@@ -360,6 +344,15 @@ mainnet = load('deploy/docker/compose.mainnet.yml')
 assert set(testnet['services']) == {'listener', 'sync', 'explorer', 'pool'}
 assert set(mainnet['services']) == {'listener', 'sync', 'explorer', 'miner'}
 
+for config, expected in (
+    (mainnet, '${SIGIL_MAINNET_STATE_DIR:-./state/mainnet-proof-of-golf}'),
+    (testnet, '${SIGIL_TESTNET_STATE_DIR:-./state/testnet-proof-of-golf}'),
+):
+    for service in config['services'].values():
+        chain_state = next(volume for volume in service['volumes']
+                           if volume['target'] == '/var/lib/sigilcoin')
+        assert chain_state['source'] == expected
+
 mainnet_listener = mainnet['services']['listener']
 assert mainnet_listener['environment']['HOST_P2P_BIND'] == '${MAINNET_P2P_BIND:-127.0.0.1}'
 assert mainnet_listener['environment']['MAINNET_EXPOSURE_ACK'] == '${MAINNET_EXPOSURE_ACK:-}'
@@ -370,7 +363,7 @@ assert mainnet['services']['explorer']['profiles'] == ['mainnet-explorer']
 assert mainnet['services']['explorer']['ports'] == ['127.0.0.1:8081:8080/tcp']
 miner = mainnet['services']['miner']
 assert miner['profiles'] == ['mainnet-miner']
-assert miner['command'] == ['miner-loop']
+assert miner['command'] == ['producer-loop']
 assert miner['environment']['MINER_ADDRESS'] == '${MAINNET_MINER_ADDRESS:-}'
 assert miner['depends_on']['sync']['condition'] == 'service_healthy'
 
@@ -388,9 +381,9 @@ assert pool['ports'] == ['127.0.0.1:${POOL_PORT:-8082}:8082/tcp']
 volumes = {volume['target']: volume for volume in pool['volumes']}
 chain = volumes['/var/lib/sigilcoin']
 state = volumes['/var/lib/sigilcoin-pool']
-assert chain['source'] == '${SIGIL_TESTNET_STATE_DIR:-./state/testnet}'
+assert chain['source'] == '${SIGIL_TESTNET_STATE_DIR:-./state/testnet-proof-of-golf}'
 assert chain['read_only'] is True
-assert state['source'] == '${SIGIL_TESTNET_POOL_STATE_DIR:-./state/testnet-pool}'
+assert state['source'] == '${SIGIL_TESTNET_POOL_STATE_DIR:-./state/testnet-pool-proof-of-golf}'
 assert not state.get('read_only', False)
 assert chain['source'] != state['source']
 PY
@@ -414,24 +407,35 @@ cleanup() {
 trap cleanup EXIT
 
 bash_path=$(command -v bash)
-mkdir -p -- "$tmp/miner-bin"
-cat > "$tmp/miner-bin/date" <<EOF
+mkdir -p -- "$tmp/producer-bin"
+cat > "$tmp/producer-bin/date" <<EOF
 #!$bash_path
-printf '%s\n' "\${FAKE_NOW:?}"
+if [[ -n \${FAKE_CLOCK_FILE:-} ]]; then
+  cat "\$FAKE_CLOCK_FILE"
+else
+  printf '%s\n' "\${FAKE_NOW:?}"
+fi
 EOF
-cat > "$tmp/miner-bin/sigilcoin" <<EOF
+cat > "$tmp/producer-bin/sigilcoin" <<EOF
 #!$bash_path
 case \${1:-} in
   status)
+    : > "\${FAKE_STATUS_READ:?}"
     if [[ -e \${FAKE_TIP_CHANGED:?} ]]; then
-      printf 'best-block-hash: bb\n'
+      printf 'best-block-hash: bb\nnext-slot-time: 1789401600\n'
     else
-      printf 'best-block-hash: aa\n'
+      printf 'best-block-hash: aa\nnext-slot-time: 1789315200\n'
     fi
     ;;
   mine)
-    printf '%s\n' "\$*" > "\${FAKE_MINE_ARGS:?}"
+    printf '%s\n' "\$*" >> "\${FAKE_MINE_ARGS:?}"
+    if [[ \${FAKE_MINE_MODE:-retry} == retry && ! -e \${FAKE_MINE_RETRY:?} ]]; then
+      : > "\$FAKE_MINE_RETRY"
+      printf 'mine: too early\n' >&2
+      exit 1
+    fi
     : > "\${FAKE_MINE_STARTED:?}"
+    [[ \${FAKE_MINE_MODE:-retry} != success ]] || exit 0
     child=
     stop() {
       [[ -z \$child ]] || kill "\$child" 2>/dev/null || true
@@ -444,57 +448,99 @@ case \${1:-} in
   *) exit 64 ;;
 esac
 EOF
-chmod +x -- "$tmp/miner-bin/date" "$tmp/miner-bin/sigilcoin"
-sed -e "s|coin=/opt/sigilcoin/bin/sigilcoin|coin=$tmp/miner-bin/sigilcoin|" \
-  -e "s|/usr/local/bin/date|$tmp/miner-bin/date|" \
+chmod +x -- "$tmp/producer-bin/date" "$tmp/producer-bin/sigilcoin"
+sed -e "s|coin=/opt/sigilcoin/bin/sigilcoin|coin=$tmp/producer-bin/sigilcoin|" \
+  -e "s|/usr/local/bin/date|$tmp/producer-bin/date|" \
   -e 's|sleep 10|sleep 0.05|' \
-  deploy/docker/entrypoint.sh > "$tmp/miner-entrypoint.sh"
+  deploy/docker/entrypoint.sh > "$tmp/producer-entrypoint.sh"
 
 expect_exit 64 env CHAIN=mainnet ALLOW_MAINNET=yes \
   MINER_ADDRESS=sgl1qj9f6eeqxhjgynml4glztyrdw5tj5fn72s6shud \
-  MINE_INTERVAL=1 FAKE_NOW=1789228799 DATA_DIR="$tmp/miner-state" \
-  sh "$tmp/miner-entrypoint.sh" miner-loop
+  MINE_INTERVAL=1 FAKE_NOW=1789228799 DATA_DIR="$tmp/producer-state" \
+  sh "$tmp/producer-entrypoint.sh" producer-loop
 [[ ! -e $tmp/mine-started ]] ||
-  fail 'prelaunch miner reached its child'
+  fail 'prelaunch producer reached its child'
 
+printf '1789315199\n' > "$tmp/clock"
 CHAIN=mainnet ALLOW_MAINNET=yes \
-  FAKE_NOW=1789228800 \
+  FAKE_CLOCK_FILE="$tmp/clock" \
   MINER_ADDRESS=sgl1qj9f6eeqxhjgynml4glztyrdw5tj5fn72s6shud \
-  MINE_INTERVAL=1 DATA_DIR="$tmp/miner-state" \
+  MINE_INTERVAL=1 DATA_DIR="$tmp/producer-state" \
+  FAKE_STATUS_READ="$tmp/status-read" \
   FAKE_TIP_CHANGED="$tmp/tip-changed" \
   FAKE_MINE_ARGS="$tmp/mine-args" \
+  FAKE_MINE_RETRY="$tmp/mine-retry" \
   FAKE_MINE_STARTED="$tmp/mine-started" \
   FAKE_MINE_CANCELED="$tmp/mine-canceled" \
-  sh "$tmp/miner-entrypoint.sh" miner-loop >"$tmp/miner.out" 2>&1 &
+  sh "$tmp/producer-entrypoint.sh" producer-loop >"$tmp/producer.out" 2>&1 &
 miner_runner=$!
+for _ in {1..100}; do
+  [[ -e $tmp/status-read ]] && break
+  kill -0 "$miner_runner" 2>/dev/null || fail 'producer exited before reading its slot'
+  sleep 0.05
+done
+[[ -e $tmp/status-read ]] || fail 'producer did not read its slot'
+sleep 1.1
+[[ ! -e $tmp/mine-args ]] || fail 'producer submitted before the exact slot'
+printf '1789315200\n' > "$tmp/clock"
 for _ in {1..100}; do
   [[ -e $tmp/mine-started ]] && break
   kill -0 "$miner_runner" 2>/dev/null || {
-    cat "$tmp/miner.out" >&2
-    fail 'miner loop exited before launching its child'
+    cat "$tmp/producer.out" >&2
+    fail 'producer exited instead of retrying an early-slot failure'
   }
   sleep 0.05
 done
-[[ -e $tmp/mine-started ]] || fail 'miner loop did not launch its child'
-grep -Fxq "mine --address sgl1qj9f6eeqxhjgynml4glztyrdw5tj5fn72s6shud --data-dir $tmp/miner-state" \
-  "$tmp/mine-args" || fail 'miner did not use the fixed payout address'
-[[ ! -e $tmp/miner-state/wallet/wallet.key ]] ||
-  fail 'fixed-address miner created a wallet key'
+[[ -e $tmp/mine-retry && -e $tmp/mine-started ]] ||
+  fail 'producer did not retry the early-slot failure'
+grep -Fxq "mine --address sgl1qj9f6eeqxhjgynml4glztyrdw5tj5fn72s6shud --data-dir $tmp/producer-state" \
+  "$tmp/mine-args" || fail 'producer did not use the fixed payout address'
+[[ ! -e $tmp/producer-state/wallet/wallet.key ]] ||
+  fail 'fixed-address producer created a wallet key'
 : > "$tmp/tip-changed"
 for _ in {1..100}; do
   [[ -e $tmp/mine-canceled ]] && break
   sleep 0.05
 done
-[[ -e $tmp/mine-canceled ]] || fail 'miner did not cancel after a tip change'
-grep -Fq 'mine canceled: validated tip changed' "$tmp/miner.out" ||
-  fail 'miner did not report stale-work cancellation'
+[[ -e $tmp/mine-canceled ]] || fail 'producer did not cancel after a tip change'
 kill -TERM "$miner_runner"
 for _ in {1..100}; do
   kill -0 "$miner_runner" 2>/dev/null || break
   sleep 0.05
 done
 kill -0 "$miner_runner" 2>/dev/null &&
-  fail 'miner loop did not stop promptly'
+  fail 'producer did not stop promptly'
+wait "$miner_runner" 2>/dev/null || true
+miner_runner=
+
+# A successfully retained candidate must wait for a new tip, not resubmit
+# the identical body each time the idle supervisor wakes.
+CHAIN=mainnet ALLOW_MAINNET=yes FAKE_NOW=1789315200 \
+  MINER_ADDRESS=sgl1qj9f6eeqxhjgynml4glztyrdw5tj5fn72s6shud \
+  MINE_INTERVAL=1 DATA_DIR="$tmp/retained-state" \
+  FAKE_STATUS_READ="$tmp/retained-status" \
+  FAKE_TIP_CHANGED="$tmp/retained-tip" \
+  FAKE_MINE_MODE=success \
+  FAKE_MINE_ARGS="$tmp/retained-args" \
+  FAKE_MINE_STARTED="$tmp/retained-started" \
+  sh "$tmp/producer-entrypoint.sh" producer-loop >"$tmp/retained.out" 2>&1 &
+miner_runner=$!
+for _ in {1..100}; do
+  [[ -e $tmp/retained-started ]] && break
+  kill -0 "$miner_runner" 2>/dev/null || fail 'producer exited before submission'
+  sleep 0.05
+done
+[[ -e $tmp/retained-started ]] || fail 'producer did not submit the due candidate'
+sleep 2.2
+[[ $(wc -l < "$tmp/retained-args") == 1 ]] ||
+  fail 'producer repeated a successful submission on the same tip'
+kill -TERM "$miner_runner"
+for _ in {1..100}; do
+  kill -0 "$miner_runner" 2>/dev/null || break
+  sleep 0.05
+done
+kill -0 "$miner_runner" 2>/dev/null &&
+  fail 'idle producer did not stop promptly'
 wait "$miner_runner" 2>/dev/null || true
 miner_runner=
 

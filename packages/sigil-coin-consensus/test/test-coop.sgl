@@ -1,5 +1,5 @@
 ;;; Consensus coinbase codec, co-op shares, commit-reveal,
-;;; contribution-aware payouts and height-only fork choice.
+;;; and contribution-aware payouts.
 ;;;
 ;;; Every rule here is applied by every node to a block someone else
 ;;; produced, so every one is exercised with hostile input as well as
@@ -11,8 +11,8 @@
 ;;; gate theirs. A workspace-wide run has no secp256k1 native module bound
 ;;; and skips them; running this package on its own builds a harness that
 ;;; does. Everything that can avoid a key does, which is most of the file:
-;;; the codecs, payout arithmetic, the preimage binding and fork choice are
-;;; all pure byte and integer work.
+;;; the codecs, payout arithmetic and preimage binding are all pure byte
+;;; and integer work.
 
 (import (sigil test)
         (sigil math)
@@ -314,25 +314,36 @@
   (test "the minimum scriptSig is eight bytes"
     (assert-equal 8 coin-min-coinbase-script-bytes))
 
-  (test "the maximum scriptSig is 6588 bytes"
+  (test "the maximum scriptSig is 6583 bytes"
     ;; Includes each share's 32-byte blind, revealed so validators can check
     ;; the parent commitment and carrier payment.
-    (assert-equal 6588 coin-max-coinbase-script-bytes))
+    (assert-equal 6583 coin-max-coinbase-script-bytes))
 
   (test "the bounds pair is the two of them"
     (assert-equal 8 (car coin-coinbase-script-bounds))
-    (assert-equal 6588 (cdr coin-coinbase-script-bounds)))
+    (assert-equal 6583 (cdr coin-coinbase-script-bounds)))
 
-  (test "a maximal payload encodes to exactly the maximum"
+  (test "a maximal genesis payload encodes to exactly the maximum"
     (assert-equal
       coin-max-coinbase-script-bytes
+      (bytevector-length
+        (coin-coinbase-payload-encode
+          (payload 0
+                   (filled coin-max-solution-bytes 49)
+                   (filled coin-max-shares-bytes 0)
+                   (filled coin-max-commits-bytes 0)
+                   (filled coin-max-graffiti-bytes 49))))))
+
+  (test "a maximal non-genesis payload has no graffiti"
+    (assert-equal
+      6186
       (bytevector-length
         (coin-coinbase-payload-encode
           (payload #xffffffff
                    (filled coin-max-solution-bytes 49)
                    (filled coin-max-shares-bytes 0)
                    (filled coin-max-commits-bytes 0)
-                   (filled coin-max-graffiti-bytes 49))))))
+                   #u8())))))
 
   (test "the worst case still leaves room for transactions"
     ;; §6.6's real constraint: coinbase under 7 KB against a 16384-byte
@@ -346,19 +357,19 @@
   (test "the smallest payload round-trips"
     (assert-true (round-trips? (simple-payload 0 (bytes-of 49) #u8()))))
 
-  (test "a payload with every field populated round-trips"
+  (test "a non-genesis payload with shares and commitments round-trips"
     (assert-true
       (round-trips?
         (payload 4095
                  (string->bytes %sol-a)
                  (bytevector-append (bytes-of 1) (filled 643 3))
                  (bytevector-append (bytes-of 2) (filled 64 9))
-                 (string->bytes "hello")))))
+                 #u8()))))
 
-  (test "the largest legal payload round-trips"
+  (test "the largest legal genesis payload round-trips"
     (assert-true
       (round-trips?
-        (payload #xffffffff
+        (payload 0
                  (filled coin-max-solution-bytes 49)
                  (filled coin-max-shares-bytes 0)
                  (filled coin-max-commits-bytes 0)
@@ -370,7 +381,8 @@
     (assert-true (round-trips? (simple-payload 127 (bytes-of 49) #u8())))
     (assert-true (round-trips? (simple-payload 128 (bytes-of 49) #u8())))
     (assert-true (round-trips? (simple-payload 65535 (bytes-of 49) #u8())))
-    (assert-true (round-trips? (simple-payload 16777216 (bytes-of 49) #u8())))))
+    (assert-true (round-trips? (simple-payload 16777216 (bytes-of 49) #u8())))
+    (assert-true (round-trips? (simple-payload #xffffffff (bytes-of 49) #u8())))))
 
 (test-group "canonical coinbase codec: hostile input"
   (test "a non-bytevector is not a script"
@@ -462,12 +474,27 @@
                                 (filled (+ coin-max-commits-bytes 1) 0)
                                 (bytes-of)))))
 
-  (test "oversize graffiti is refused"
+  (test "genesis graffiti is bounded at 400 bytes"
     (assert-equal 'graffiti-oversize
                   (decode-reason
                     (raw-script (bytes-of) (bytes-of 49)
                                 coin-empty-shares coin-empty-commits
                                 (filled (+ coin-max-graffiti-bytes 1) 49)))))
+
+  (test "one graffiti byte is allowed only at genesis"
+    (let ((graffiti (bytes-of 49)))
+      (assert-true
+        (round-trips? (simple-payload 0 (bytes-of 49) graffiti)))
+      (assert-true
+        (round-trips? (simple-payload 1 (bytes-of 49) #u8())))
+      (assert-equal 'non-canonical-graffiti
+                    (decode-reason
+                      (raw-script (script-number-encode 1) (bytes-of 49)
+                                  coin-empty-shares coin-empty-commits
+                                  graffiti)))
+      (assert-error
+        (coin-coinbase-payload-encode
+          (simple-payload 1 (bytes-of 49) graffiti)))))
 
   (test "a non-minimal push is not the canonical encoding"
     ;; OP_PUSHDATA1 for one byte of graffiti, where a bare length byte
@@ -1854,7 +1881,7 @@
                                (outs (list (cons %subsidy %burn))))
                   %subsidy 0 shares '(1) %burn)))))
 
-        (test "copying a producer and attaching shares cannot displace it"
+        (test "a copied producer may attach shares only with their payouts"
           (let* ((share (valid-share-of 2))
                  (shares (list share))
                  (context (context-for shares))
@@ -1872,9 +1899,6 @@
                    (map (lambda (item)
                           (coin-share-quality context item))
                         accepted))
-                 (par (puzzle-spec-par %spec))
-                 (solution-length (bytevector-length solution))
-                 (bits #x2000ffff)
                  (honest-tx
                    (coinbase-tx
                      (coin-coinbase-payload-encode honest-body)
@@ -1885,29 +1909,7 @@
                      (coin-coinbase-payload-encode copy-body)
                      (payout-outputs
                        (coin-payout-plan
-                         %subsidy 0 accepted contributions %burn))))
-                 (mine-header
-                   (lambda (tx)
-                     (let loop ((nonce 0))
-                       (let ((header
-                               (block-header
-                                 version:
-                                   (coin-version-encode
-                                     %complexity solution-length)
-                                 previous-block: %zero32
-                                 merkle-root:
-                                   (merkle-root
-                                     (list (transaction-txid tx)))
-                                 time: 1
-                                 bits: bits
-                                 nonce: nonce)))
-                         (if (coin-lottery-valid?
-                               (block-header-work-value header)
-                               bits par solution-length)
-                             header
-                             (loop (+ nonce 1)))))))
-                 (honest-header (mine-header honest-tx))
-                 (copy-header (mine-header copy-tx)))
+                         %subsidy 0 accepted contributions %burn)))))
             (assert-true (coin-ok? honest-checked))
             (assert-true (coin-ok? copy-checked))
             (assert-equal '() (coin-result-value honest-checked))
@@ -1919,22 +1921,14 @@
               (coin-ok?
                 (coin-check-payout
                   copy-tx %subsidy 0 accepted contributions %burn)))
-            (assert-equal bits (block-header-bits honest-header))
-            (assert-equal bits (block-header-bits copy-header))
             (assert-true
-              (coin-lottery-valid?
-                (block-header-work-value honest-header)
-                bits par solution-length))
-            (assert-true
-              (coin-lottery-valid?
-                (block-header-work-value copy-header)
-                bits par solution-length))
-            (assert-true
-              (not (= (block-header-work-value honest-header)
-                      (block-header-work-value copy-header))))
+              (coin-ok?
+                (coin-check-payout honest-tx %subsidy 0 '() '() #f)))
             (assert-equal
-              (block-header-chain-work honest-header)
-              (block-header-chain-work copy-header))))
+              'coinbase-output-shape
+              (coin-result-reason
+                (coin-check-payout
+                  honest-tx %subsidy 0 accepted contributions %burn)))))
 
 
       (test-group "commit-reveal round trip"
@@ -1968,7 +1962,7 @@
                            (payload 2 (string->bytes %sol-d)
                                     (coin-shares-encode (list share))
                                     (commitment-bytes 3 4)
-                                    (string->bytes "co-op"))))
+                                    #u8())))
                  (back (coin-coinbase-payload-decode script)))
             (assert-true (coin-ok? back))
             (assert-true

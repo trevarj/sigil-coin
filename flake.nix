@@ -9,7 +9,7 @@
       flake = false;
     };
     sigil-bitcoin = {
-      url = "git+file:///home/trev/Workspace/sigil/sigil-bitcoin?rev=4ecc1f188c51887450eb448b991dae28ba36dfa0";
+      url = "path:/home/trev/Workspace/sigil/sigil-bitcoin";
       flake = false;
     };
 
@@ -95,7 +95,13 @@
           let
             rel = nixpkgs.lib.removePrefix "${fetched}/" path;
           in
-          rel == "package.sgl" || rel == "packages" || nixpkgs.lib.hasPrefix "packages/" rel;
+          (rel == "package.sgl" || rel == "packages" || nixpkgs.lib.hasPrefix "packages/" rel)
+          && !(builtins.elem (builtins.baseNameOf path) [
+            ".sigilcoin"
+            ".sigilcoin-testnet"
+            ".sigilcoin-proof-of-golf"
+            ".sigilcoin-testnet-proof-of-golf"
+          ]);
       };
       sigilDeps = nixpkgs.lib.filterAttrs (
         name: _:

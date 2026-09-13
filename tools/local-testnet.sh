@@ -140,7 +140,10 @@ sgl_to_daviwils() {
 
 
 if [[ -z $bin_dir ]]; then
-  out=$(nix --offline build "$root/deploy#sigilcoin" --no-link --print-out-paths)
+  out=$(nix --offline build "$root/deploy#sigilcoin" \
+    --override-input sigil "path:$workspace/sigil" \
+    --override-input sigil-bitcoin "path:$workspace/sigil-bitcoin" \
+    --no-link --print-out-paths)
   bin_dir=$out/bin
 fi
 coin=$bin_dir/sigilcoin
@@ -329,9 +332,11 @@ say "full-node wallets: producer A=$address_a sender B=$address_b recipient C=$a
 
 show "$coin" puzzle --regtest --data-dir "$node_a" | tee "$logs/puzzle-h1.out" >/dev/null
 require_line "$logs/puzzle-h1.out" '^par-witness: '
-show "$coin" mine --regtest --data-dir "$node_a" --graffiti "local-testnet H1" \
+show "$coin" mine --regtest --data-dir "$node_a" \
   | tee "$logs/mine-h1.out" >/dev/null
 require_line "$logs/mine-h1.out" '^submitted: yes$'
+require_line "$logs/mine-h1.out" '^savings: 0$'
+require_line "$logs/mine-h1.out" '^block-score: 1$'
 show "$coin" balance --regtest --data-dir "$node_a" \
   | tee "$logs/balance-a-h1.out" >/dev/null
 require_line "$logs/balance-a-h1.out" '^balance: 0\.80000000 SGL$'
@@ -507,7 +512,6 @@ require_line "$logs/pool-phase-one.out" '^private-material-found: no$'
 say "pool phase one: one public receipt; no key, blind, source, consensus share, or reveal signature stored/logged/argv"
 
 show "$coin" mine --relay "$relay_url" --regtest --data-dir "$node_a" \
-  --graffiti "H100 carries D pool commitment" \
   | tee "$logs/mine-h100.out" >/dev/null
 require_line "$logs/mine-h100.out" '^height: 100$'
 require_line "$logs/mine-h100.out" "^accepted-commitment: $commitment$"
@@ -536,7 +540,6 @@ timeout 120 "$coin" puzzle --regtest --data-dir "$node_a" \
   >"$logs/puzzle-h101.out"
 scheduled_h101=$(sgl_to_daviwils "$(field "$logs/puzzle-h101.out" reward)")
 show "$coin" mine --relay "$relay_url" --regtest --data-dir "$node_a" \
-  --graffiti "H101 carries D reveal and A-to-B" \
   | tee "$logs/mine-h101.out" >/dev/null
 require_line "$logs/mine-h101.out" '^height: 101$'
 reveal_contribution=$(awk -v pubkey="$share_pubkey" '
@@ -678,7 +681,6 @@ timeout 120 "$coin" puzzle --regtest --data-dir "$node_a" \
   >"$logs/puzzle-h102.out"
 scheduled_h102=$(sgl_to_daviwils "$(field "$logs/puzzle-h102.out" reward)")
 show "$coin" mine --regtest --data-dir "$node_a" \
-  --graffiti "H102 carries peer-relayed B-to-C" \
   | tee "$logs/mine-h102.out" >/dev/null
 require_line "$logs/mine-h102.out" '^height: 102$'
 require_line "$logs/mine-h102.out" '^transactions: 1$'
@@ -705,7 +707,6 @@ show "$coin" status --regtest --data-dir "$node_a" \
   | tee "$logs/reopen-a-h102.out" >/dev/null
 require_line "$logs/reopen-a-h102.out" '^best-block-height: 102$'
 show "$coin" mine --regtest --data-dir "$node_a" \
-  --graffiti "H103 durable restart child" \
   | tee "$logs/mine-h103.out" >/dev/null
 require_line "$logs/mine-h103.out" '^height: 103$'
 require_line "$logs/mine-h103.out" '^transactions: 0$'
@@ -736,7 +737,7 @@ for role in a b c; do
     >"$logs/puzzle-$role-final.out"
 done
 for role in b c; do
-  for key in best-block-height best-block-hash validated-blocks blocks; do
+  for key in best-block-height best-block-hash best-chain-score validated-blocks blocks; do
     [[ $(field "$logs/status-a.out" "$key") == \
        "$(field "$logs/status-$role.out" "$key")" ]] || {
       echo "local-testnet: nodes A and ${role^^} disagree on $key" >&2
@@ -749,8 +750,9 @@ cb=$(awk '/^complexity:/{print $2}' "$logs/puzzle-b-final.out")
 cc=$(awk '/^complexity:/{print $2}' "$logs/puzzle-c-final.out")
 [[ $ca == "$cb" && $ca == "$cc" ]]
 require_line "$logs/status-a.out" '^best-block-height: 103$'
+require_line "$logs/status-a.out" '^best-chain-score: 103$'
 require_line "$logs/status-a.out" '^validated-blocks: 103$'
-say "agreement: A/B/C height=103 C(next)=$ca validated-bodies=103 tip=$(field "$logs/status-a.out" best-block-hash)"
+say "agreement: A/B/C height=103 chain-score=103 C(next)=$ca validated-bodies=103 tip=$(field "$logs/status-a.out" best-block-hash)"
 
 show "$coin" balance --regtest --data-dir "$node_a" \
   | tee "$logs/balance-a.out" >/dev/null
@@ -784,7 +786,8 @@ for endpoint in summary block/100 block/101 block/102 block/103 difficulty \
     "$base_url/api/$endpoint" >"$http/${endpoint//\//-}.json"
 done
 jq -e '.tip_height == 103 and .block_count == 103 and
-       .chain == "sigilcoin-regtest"' "$http/summary.json" >/dev/null
+       .chain == "sigilcoin-regtest" and .chain_score == 103' \
+  "$http/summary.json" >/dev/null
 jq -e --arg id "$block_h100" \
   '.id == $id and .height == 100 and .commitments == 1' \
   "$http/block-100.json" >/dev/null
@@ -792,14 +795,10 @@ jq -e --arg id "$block_h101" --arg contributor "$address_d" \
   --arg producer "$address_a" --argjson q "$q" \
   '.id == $id and .height == 101 and .share_count == 1 and
    .share_quality == $q and .transactions == 2 and
-   .lottery.roll == $id and
-   (.lottery.nonce >= 0 and .lottery.nonce < 4294967296) and
-   (.lottery.claimed_length >= 1 and .lottery.claimed_length <= 512) and
-   .lottery.base_bits == 536936447 and
-   (.lottery.base_target | test("^[0-9a-f]{64}$")) and
-   (.lottery.target | test("^[0-9a-f]{64}$")) and
-   (.lottery.chain_work | test("^[1-9][0-9]*$")) and
-   .lottery.expected_rolls >= 1 and
+   .golf.claimed_length == .golf.par and
+   (.golf.claimed_length >= 1 and .golf.claimed_length <= 512) and
+   .golf.savings == 0 and .golf.block_score == 1 and
+   .golf.chain_score == 101 and
    any(.outputs[]; .role == "share" and .address == $contributor and .value > 0) and
    any(.outputs[]; .role == "carrier" and .address == $producer and .value > 0)' \
   "$http/block-101.json" >/dev/null

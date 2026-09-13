@@ -46,6 +46,7 @@
   (import (sigil struct)
           (sigil fs)
           (sigil math)
+          (sigil io)
           (sigil sqlite)
           (sigil bitcoin utils)
           (sigil bitcoin encoding)
@@ -103,19 +104,14 @@
     ;; Canonical blocks
     explorer-block-complexity
     explorer-block-bits
-    explorer-block-base-target
-    explorer-block-chain-work
+    explorer-block-chain-score
     explorer-block-constraint
     explorer-block-constraint-text
     explorer-block-k
     explorer-block-examples
-    explorer-block-nonce
     explorer-block-claimed-length
-    explorer-block-lottery-roll
-    explorer-block-lottery-target
-    explorer-block-lottery-bonus
-    explorer-block-lottery-multiplier
-    explorer-block-lottery-expected-rolls
+    explorer-block-savings
+    explorer-block-block-score
     explorer-block-share-quality
     explorer-block-share-count
     explorer-block-shares
@@ -206,12 +202,14 @@
     explorer-summary-tip-height
     explorer-summary-tip-id
     explorer-summary-tip-time
+    explorer-summary-chain-score
     explorer-summary-header-height
     explorer-summary-header-count
     explorer-summary-block-count
     explorer-summary-supply
     explorer-summary-max-supply
     explorer-summary-next-height
+    explorer-summary-next-slot
     explorer-summary-next-reward
     explorer-summary-next-halving-height
     explorer-summary-puzzle-par
@@ -438,7 +436,7 @@
             default)))
 
     (define %header-columns
-      "hash, prev_hash, height, time, work, header_hex")
+      "hash, prev_hash, height, time, work, header_hex, valid")
 
     (define (header-row store hash-text)
       (query-row store
@@ -492,19 +490,14 @@
       (problem default: #f)
       (complexity default: #f)
       (bits default: #f)
-      (base-target default: #f)
-      (chain-work default: #f)
+      (chain-score default: #f)
       (constraint default: #f)
       (constraint-text default: #f)
       (k default: #f)
       (examples default: '())
-      (nonce default: #f)
       (claimed-length default: #f)
-      (lottery-roll default: #f)
-      (lottery-target default: #f)
-      (lottery-bonus default: #f)
-      (lottery-multiplier default: #f)
-      (lottery-expected-rolls default: #f)
+      (savings default: #f)
+      (block-score default: #f)
       (share-quality default: #f)
       (share-count default: #f)
       (shares default: '())
@@ -620,10 +613,9 @@
              (guard (e (#t #f))
                (puzzle-print-expression (puzzle-result-value parsed))))))
 
-    ;; The header a row carries, or #f. Complexity and claimed solution length
-    ;; live in `bits`; the nonce chooses a lottery roll. A header-only row can
-    ;; therefore expose those claims and their derived odds without inventing
-    ;; any body content or validated execution metrics.
+    ;; Complexity and claimed solution length live in `version`. Header-only
+    ;; rows expose their derived golf score without inventing body content or
+    ;; validated execution metrics.
     (define (row-header hrow)
       (guard (e (#t #f))
         (let ((hex (row-ref hrow 'header_hex)))
@@ -884,6 +876,17 @@
 
     ;; Wire payloads and nested
     ;; SHARES/COMMITS fields are decoded only by consensus-owned codecs.
+    (define (configured-genesis-quote chain)
+      (string->utf8
+        (let ((name (chain-config-name chain)))
+          (cond ((string=? name "sigilcoin-main")
+                 "SigilCoin proof-of-golf mainnet")
+                ((string=? name "sigilcoin-testnet")
+                 "SigilCoin proof-of-golf testnet")
+                ((string=? name "sigilcoin-regtest")
+                 "SigilCoin proof-of-golf regtest")
+                (else "")))))
+
     (define (canonical-fields store base header parsed parent-hash detail?)
       (let* ((height (explorer-block-height base))
              (bits (block-header-bits header))
@@ -937,37 +940,27 @@
                  contributions
                  carrier-script))
              (outputs (make-outputs chain raw-outputs share-count expected-plan))
-             (graffiti (and payload
-                            (coin-coinbase-payload-graffiti payload)))
+             (graffiti
+               (if payload
+                   (coin-coinbase-payload-graffiti payload)
+                   (and (= height 0)
+                        (configured-genesis-quote chain))))
              (solution (and payload
                             (coin-coinbase-payload-solution payload)))
              (par (and view (car view)))
              (length-used (and solution (bytevector-length solution)))
-             (lottery-target
-               (and par claimed-length
-                    (guard (e (#t #f))
-                      (coin-lottery-target bits par claimed-length))))
-             (lottery-bonus
-               (and par claimed-length
-                    (guard (e (#t #f))
-                      (coin-lottery-bonus par claimed-length))))
-             (lottery-multiplier
-               (and par claimed-length
-                    (guard (e (#t #f))
-                      (coin-lottery-multiplier par claimed-length))))
-             (lottery-expected-rolls
-               (and par claimed-length
-                    (guard (e (#t #f))
-                      (coin-lottery-expected-rolls bits par claimed-length))))
-             (roll-value (guard (e (#t #f))
-                           (block-header-work-value header)))
-             (lottery-valid?
-               (and (number? roll-value)
-                    par
-                    claimed-length
-                    (guard (e (#t #f))
-                      (coin-lottery-valid?
-                        roll-value bits par claimed-length))))
+             (savings
+               (if (= height 0)
+                   0
+                   (and par claimed-length (<= claimed-length par)
+                        (guard (e (#t #f))
+                          (coin-golf-savings par claimed-length)))))
+             (block-score
+               (if (= height 0)
+                   0
+                   (and (number? savings)
+                        (guard (e (#t #f))
+                          (coin-golf-score par claimed-length)))))
              (share-quality
                (and detail?
                     contributions
@@ -1002,6 +995,8 @@
                             '())
           size: (and parsed (coin-block-size parsed))
           problem: (cond
+                     ((eq? 'invalid-header (explorer-block-problem base))
+                      'invalid-header)
                      ((= height 0) (explorer-block-problem base))
                      ((coin-failed? complexity-result)
                       (coin-result-reason complexity-result))
@@ -1011,8 +1006,6 @@
                            (number? claimed-length)
                            (> claimed-length par))
                       'solution-over-par)
-                     ((and (number? lottery-target) (not lottery-valid?))
-                      'lottery-not-qualified)
                      ((not parsed)
                       (or (explorer-block-problem base)
                           'block-unparsable))
@@ -1033,19 +1026,14 @@
                      (else #f))
           complexity: complexity
           bits: bits
-          base-target: (guard (e (#t #f)) (compact-target->integer bits))
-          chain-work: (explorer-block-chain-work base)
+          chain-score: (explorer-block-chain-score base)
           constraint: (and view (car (cdr view)))
           constraint-text: (and view (car (cdr (cdr view))))
           k: (and view (car (cdr (cdr (cdr view)))))
           examples: (if view (car (cdr (cdr (cdr (cdr view))))) '())
-          nonce: (block-header-nonce header)
           claimed-length: claimed-length
-          lottery-roll: (explorer-block-id base)
-          lottery-target: lottery-target
-          lottery-bonus: lottery-bonus
-          lottery-multiplier: lottery-multiplier
-          lottery-expected-rolls: lottery-expected-rolls
+          savings: savings
+          block-score: block-score
           share-quality: share-quality
           share-count: share-count
           shares: (let loop ((xs (if shares shares '()))
@@ -1104,7 +1092,7 @@
                      id: (hash-text->id hash-text)
                      hash-text: hash-text
                      time: time
-                     chain-work:
+                     chain-score:
                        (let ((text (row-ref hrow 'work)))
                          (and (string? text) (string->number text)))
                      parent-id: (and (string? prev-text)
@@ -1114,7 +1102,9 @@
                      ;; body, so genesis is permanently body-less. Saying
                      ;; so is honest; calling it "not downloaded yet" is
                      ;; not, because it never will be.
-                     problem: (cond (hex #f)
+                     problem: (cond ((eqv? 0 (row-ref hrow 'valid))
+                                     'invalid-header)
+                                    (hex #f)
                                     ((= height 0) 'genesis)
                                     (else 'body-not-downloaded)))))
         (cond
@@ -1132,7 +1122,7 @@
         hash-text: (explorer-block-hash-text b)
         time: (explorer-block-time b)
         parent-id: (explorer-block-parent-id b)
-        chain-work: (explorer-block-chain-work b)
+        chain-score: (explorer-block-chain-score b)
         reward: (explorer-block-reward b)
         problem: reason))
 
@@ -1155,6 +1145,8 @@
       (max-supply integer?)
       (next-height integer?)
       (next-reward integer?)
+      (chain-score default: #f)
+      (next-slot default: #f)
       (next-halving-height default: #f)
       (puzzle-par default: #f)
       (puzzle-seed default: #f)
@@ -1221,6 +1213,9 @@
           tip-height: tip-height
           tip-id: (hash-text->id tip-text)
           tip-time: tip-time
+          chain-score:
+            (let ((text (row-ref tip-row 'work)))
+              (and (string? text) (string->number text)))
           header-height: (let ((row (query-row
                                       store
                                       "SELECT MAX(height) AS count FROM headers")))
@@ -1235,6 +1230,12 @@
                     "SELECT COALESCE(SUM(value), 0) AS count FROM utxos WHERE active = 1")
           max-supply: coin-max-supply
           next-height: next-height
+          next-slot:
+            (and tip-row
+                 (+ (block-header-time (chain-config-genesis-header config))
+                    (* next-height
+                       (consensus-params-target-spacing
+                         (chain-config-consensus-params config)))))
           next-reward: (guard (e (#t 0)) (coin-block-reward next-height))
           next-halving-height: (explorer-next-halving-height tip-height)
           puzzle-par: (and view (car view))

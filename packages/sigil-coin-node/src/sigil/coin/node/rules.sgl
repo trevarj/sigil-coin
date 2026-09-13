@@ -1,14 +1,12 @@
 ;;; (sigil coin node rules) — header acceptance and fork choice
 ;;;
 ;;; Header `version` commits chain-derived puzzle complexity and producer
-;;; length. `bits` is the chain-retargeted compact base target and `nonce` is
-;;; lottery entropy. Acceptance verifies linkage/timestamps, exact required
-;;; complexity and target, `L <= par`, then the golf-weighted full-header roll.
+;;; length. `bits` is the fixed network identifier and `nonce` is zero.
+;;; Acceptance verifies linkage, the exact scheduled slot, complexity,
+;;; fixed bits and `L <= par`; the body later proves that length exact.
 ;;;
-;;; Fork choice follows cumulative base work. The golf bonus substitutes
-;;; verified program work for hashes when admitting one block; it does not
-;;; discount that block's chain work. Exact accumulated-work and height ties
-;;; remain first-seen.
+;;; Fork choice follows strictly greater accumulated proof-of-golf score.
+;;; Equal scores retain the durable active incumbent, regardless of height.
 
 (define-library (sigil coin node rules)
   (import (sigil math)
@@ -32,7 +30,7 @@
     coin-required-complexity
     coin-required-bits
 
-    ;; Cumulative base-work chain selection
+    ;; Cumulative proof-of-golf chain selection
     coin-chain-work
     coin-better-chain?
 
@@ -204,35 +202,39 @@
               (and (coin-retarget-height? height)
                    (coin-window-margins previous-headers height))))))
 
-    ;;; Compact base target required for the next header.
+    ;;; Fixed compact bits required for every header on this network.
     (define (coin-required-bits params previous-headers)
       (: consensus-params? list? -> integer?)
-      (next-required-bits params previous-headers))
+      (consensus-params-pow-limit-bits params))
 
     ;; ============================================================
-    ;; Cumulative base-work chain selection
+    ;; Cumulative proof-of-golf score and longest-chain selection
     ;; ============================================================
 
-    ;;; Accumulated base work of the chain ending at `header`.
-    ;;;
-    ;;; A shorter solution widens admission odds, but every admitted block
-    ;;; contributes the work represented by its chain-required base target.
-    (define (coin-chain-work header b previous-work)
-      (: block-header? any? integer? -> integer?)
-      (+ previous-work (block-header-chain-work header)))
+    ;;; Add one provisional point for a bodyless header. Once the body
+    ;;; validates, replace that floor with its verified golf score.
+    ;;; Genesis contributes zero and is not an earned production slot.
+    (define (coin-chain-work header height b previous-work)
+      (: block-header? integer? any? integer? -> integer?)
+      (cond
+        ((= height 0) previous-work)
+        ((not b) (+ previous-work 1))
+        (else
+          (+ previous-work
+             (coin-golf-score
+               (puzzle-spec-par
+                 (coin-node-puzzle
+                   (block-header-previous-block header)
+                   height
+                   (stored-complexity header)))
+               (stored-length header))))))
 
-    ;;; Whether `candidate` strictly outranks the incumbent chain tip.
-    ;;;
-    ;;; Greater accumulated base work wins; equal work prefers greater height.
-    ;;; An exact work-and-height tie retains the first-seen incumbent.
+    ;;; A strictly taller chain displaces the incumbent. Golf score stays
+    ;;; visible as competition quality, but cannot rewrite history.
     (define (coin-better-chain? candidate incumbent)
       (: chain-candidate? chain-candidate? -> boolean?)
-      (let ((candidate-work (chain-candidate-work candidate))
-            (incumbent-work (chain-candidate-work incumbent)))
-        (or (> candidate-work incumbent-work)
-            (and (= candidate-work incumbent-work)
-                 (> (chain-candidate-height candidate)
-                    (chain-candidate-height incumbent))))))
+      (> (chain-candidate-height candidate)
+         (chain-candidate-height incumbent)))
 
     ;; ============================================================
     ;; Header acceptance
@@ -243,9 +245,9 @@
 
     ;;; Whether `header` may extend `previous-headers` under chain policy.
     ;;;
-    ;;; The order is cost: version shape, linkage/timestamps, required
-    ;;; complexity and compact base target, then puzzle derivation and one
-    ;;; full-header hash. The body later proves the encoded length claim exact.
+    ;;; The order is cost: version/nonce shape, linkage and slot, required
+    ;;; complexity and fixed bits, then puzzle derivation. The body later
+    ;;; proves the encoded length claim exact.
     ;;;
     ;;; Total: any argument, however hostile, yields a boolean.
     (define (policy-seconds? value)
@@ -256,28 +258,29 @@
         ((null? args) coin-max-future-drift)
         ((not (null? (cdr args)))
          (error (string-append who ": too many arguments")))
-        ((policy-seconds? (car args)) (car args))
+        ((and (policy-seconds? (car args)) (= (car args) 0)) 0)
         (else
-          (error (string-append who
-                                ": expected a future-drift allowance in seconds")))))
+          (error (string-append who ": future drift must be zero")))))
 
-    (define (coin-accept-header? params previous-headers header min-spacing
+    (define (coin-accept-header? params previous-headers header spacing
                                  . maybe-max-future-drift)
       (: any? list? any? integer? integer? ... -> boolean?)
       (guard (e (#t #f))
         (let ((max-future-drift
                 (drift-argument "coin-accept-header?"
                                 maybe-max-future-drift)))
-          (and (policy-seconds? min-spacing)
+          (and (policy-seconds? spacing)
+               (> spacing 0)
                (block-header? header)
                (list? previous-headers)
+               (= (block-header-nonce header) 0)
                (coin-ok?
                  (coin-version-decode (block-header-version header)))
                (coin-ok? (coin-validate-header-context previous-headers
-                                                          header
-                                                          (current-unix-second)
-                                                          min-spacing
-                                                          max-future-drift))
+                                                       header
+                                                       (current-unix-second)
+                                                       spacing
+                                                       max-future-drift))
                (let* ((height (coin-header-height previous-headers))
                       (required-complexity
                         (coin-required-complexity previous-headers height))
@@ -285,38 +288,29 @@
                         (coin-check-version
                           (block-header-version header)
                           required-complexity))
-                      (length (coin-header-solution-length header))
-                      (required-bits
-                        (coin-required-bits params previous-headers)))
+                      (length (coin-header-solution-length header)))
                  (and (coin-ok? complexity)
                       (coin-ok? length)
-                      (= required-bits (block-header-bits header))
-                      (let* ((c (coin-result-value complexity))
-                             (l (coin-result-value length))
-                             (par
-                               (puzzle-spec-par
-                                 (coin-node-puzzle
-                                   (block-header-previous-block header)
-                                   height
-                                   c))))
-                        (and (<= l par)
-                             (coin-lottery-valid?
-                               (block-header-work-value header)
-                               required-bits
-                               par
-                               l)))))))))
+                      (= (coin-required-bits params previous-headers)
+                         (block-header-bits header))
+                      (<= (coin-result-value length)
+                          (puzzle-spec-par
+                            (coin-node-puzzle
+                              (block-header-previous-block header)
+                              height
+                              (coin-result-value complexity))))))))))
 
     ;;; Build canonical header rules for a chain's timestamp policy.
     ;;;
-    ;;; Omitting `max-future-drift` applies the mainnet default.
+    ;;; Omitting `max-future-drift` applies the required zero drift.
     ;;;
     ;;; ```scheme
-    ;;; (header-rules? (coin-header-rules 1 7200)) ; => #t
+    ;;; (header-rules? (coin-header-rules 86400 0)) ; => #t
     ;;; ```
-    (define (coin-header-rules min-spacing . maybe-max-future-drift)
+    (define (coin-header-rules spacing . maybe-max-future-drift)
       (: integer? integer? ... -> header-rules?)
-      (if (not (policy-seconds? min-spacing))
-          (error "coin-header-rules: expected a spacing floor in seconds"))
+      (if (not (and (policy-seconds? spacing) (> spacing 0)))
+          (error "coin-header-rules: expected positive slot spacing"))
       (let ((max-future-drift
               (drift-argument "coin-header-rules" maybe-max-future-drift)))
         (header-rules
@@ -324,7 +318,7 @@
                      (coin-accept-header? params
                                           previous-headers
                                           header
-                                          min-spacing
+                                          spacing
                                           max-future-drift))
           chain-work: coin-chain-work
           better-chain?: coin-better-chain?)))))

@@ -59,15 +59,8 @@
 (define %script-a (explorer-address->script %miner-a))
 (define %script-b (explorer-address->script %miner-b))
 
-(define %hostile-tag "<img src=x onerror=\"y\">")
 (define %hostile-blind
   (bytevector-append (string->utf8 "<blind>&\"'") (make-bytevector 22 #xff)))
-(define %hostile-graffiti
-  (bytevector-append
-    (string->utf8
-      (string-append "/" %hostile-tag
-                     "/ <script>alert(1)</script> & \"quoted\" 'single'"))
-    #u8(#x00 #x1b #xff #x80)))
 
 (define (bytes<? a b)
   (let loop ((i 0))
@@ -151,9 +144,7 @@
 (define %genesis-block
   (coin-genesis-block
     coin-regtest-genesis-quote coin-regtest-genesis-time
-    coin-regtest-pow-limit-bits
-    coin-regtest-genesis-coinbase-lock-time-constant
-    coin-regtest-genesis-nonce-constant))
+    coin-regtest-pow-limit-bits))
 (define %genesis-header (block-header-field %genesis-block))
 (define %spacing coin-regtest-min-block-spacing)
 
@@ -165,7 +156,7 @@
                     coin-genesis-complexity
                     coin-regtest-pow-limit-bits
                     #f
-                    "/producer/ prototype"
+                    #u8()
                     %script-a
                     (+ coin-regtest-genesis-time %spacing)))
 (define %share-context (coin-parent-context %prototype-parent))
@@ -209,7 +200,7 @@
                     coin-genesis-complexity
                     coin-regtest-pow-limit-bits
                     #f
-                    "/producer/ commitments"
+                    #u8()
                     %script-a
                     (+ coin-regtest-genesis-time %spacing)
                     '()
@@ -224,7 +215,7 @@
          coin-regtest-pow-limit-bits
          #f
          %shares
-         %hostile-graffiti
+         #u8()
          %script-b
          (+ (block-header-time (block-header-field %producer-block)) %spacing))))
 
@@ -276,26 +267,25 @@
                   (node-status-snapshot-validated-block-count
                     (car (cdr (cdr %node-built))))))
 
-  (test "canonical headers surface their qualifying lottery"
+  (test "canonical blocks add their golf score to the active chain"
     (with-store
       (lambda (store)
         (let* ((b (explorer-block-by-height store 2))
-               (header (block-header-field %coop-block))
-               (complexity (explorer-block-complexity b))
-               (par (explorer-block-par b))
-               (length (explorer-block-claimed-length b)))
-          (assert-equal (explorer-block-id b)
-                        (explorer-block-lottery-roll b))
-          (assert-equal (explorer-block-solution-length b) length)
-          (assert-equal (block-header-nonce header)
-                        (explorer-block-nonce b))
-          (assert-equal
-            (coin-lottery-target (block-header-bits header) par length)
-            (explorer-block-lottery-target b))
-          (assert-true
-            (coin-lottery-valid?
-              (block-header-work-value header)
-              (block-header-bits header) par length))))))
+               (value (json-of "/api/block/2"))
+               (golf (dict-get value "golf")))
+          (assert-equal (block-header-id (block-header-field %coop-block))
+                        (dict-get value "id"))
+          (assert-equal (explorer-block-par b)
+                        (explorer-block-solution-length b))
+          (assert-equal (explorer-block-solution-length b)
+                        (dict-get golf "claimed_length"))
+          (assert-equal 0 (dict-get golf "savings"))
+          (assert-equal 1 (dict-get golf "block_score"))
+          (assert-equal 2 (dict-get golf "chain_score"))
+          (assert-equal 2 (explorer-summary-chain-score
+                            (explorer-chain-summary store)))
+          (assert-equal (+ coin-regtest-genesis-time (* 3 %spacing))
+                        (dict-get (json-of "/api/summary") "next_slot"))))))
 
   (test "summary reports actual solo plus cooperative issuance"
     (let ((issued (+ (coinbase-total %producer-block)
@@ -427,7 +417,7 @@
                coin-genesis-complexity
                coin-regtest-pow-limit-bits
                #f
-               "/solo-reorg/ sibling"
+               #u8()
                %script-b
                (block-header-time (block-header-field %coop-block))))
            (solo-child
@@ -437,7 +427,7 @@
                coin-genesis-complexity
                coin-regtest-pow-limit-bits
                #f
-               "/solo-reorg/ child"
+               #u8()
                %script-b
                (+ (block-header-time (block-header-field solo-sibling))
                   %spacing)))
@@ -453,8 +443,8 @@
                       (explorer-summary-supply
                         (explorer-chain-summary store)))
         (explorer-close store))
-      ;; The first-seen sibling remains the active branch until the other
-      ;; branch becomes taller.
+      ;; An equal-height sibling retains the active incumbent. Its child makes
+      ;; that branch strictly taller; block ID and golf score are irrelevant.
       (assert-equal 0 (submit-block n solo-sibling))
       (assert-equal 2 (submit-block n solo-child))
       (assert-equal (block-header-hash (block-header-field solo-child))
@@ -476,8 +466,8 @@
       (node-close n)
       (remove-tree dir))))
 
-(test-group "consensus-valid hostile block stays inert"
-  (test "hostile share, author, and UTF-8 reached validated block"
+(test-group "consensus-valid hostile share stays inert"
+  (test "hostile blind reaches the validated block with canonical empty graffiti"
     (let* ((payload-result (coin-block-coinbase-payload %coop-block))
            (payload (coin-result-value payload-result))
            (decoded (coin-shares-decode (coin-coinbase-payload-shares payload))))
@@ -485,14 +475,11 @@
       (assert-true (coin-ok? decoded))
       (assert-true (member %hostile-blind
                            (map coin-share-blind (coin-result-value decoded))))
-      (assert-equal %hostile-graffiti
+      (assert-equal #u8()
                     (coin-coinbase-payload-graffiti payload))))
 
-  (test "HTML escapes every attacker-controlled field"
+  (test "HTML renders a hostile blind as inert hexadecimal"
     (let ((page (body-of "/block/2")))
-      (assert-true (has? page "&lt;script&gt;"))
-      (assert-true (has? page "&lt;script&gt;alert(1)&lt;/script&gt;"))
-      (assert-true (has? page "&lt;img src=x onerror=&quot;y&quot;&gt;"))
       (assert-true (has? page (hex-encode %hostile-blind)))
       (assert-true (not (has? page "<script>")))
       (assert-true (not (has? page "<img src=x")))
@@ -503,12 +490,11 @@
               (assert-true (or (>= b #x20) (= b #x0a)))
               (loop (+ i 1))))))))
 
-  (test "JSON remains valid and preserves sanitized hostile text"
+  (test "JSON preserves hostile share bytes as hexadecimal"
     (let* ((value (json-of "/api/block/2"))
            (shares (json-list (dict-get value "shares"))))
-      (assert-equal %hostile-tag (dict-get value "author"))
-      (assert-true (has? (dict-get value "graffiti")
-                         "<script>alert(1)</script>"))
+      (assert-equal 'null (dict-get value "author"))
+      (assert-equal "" (dict-get value "graffiti"))
       (assert-true (member (hex-encode %hostile-blind)
                            (map (lambda (share) (dict-get share "blind"))
                                 shares))))))

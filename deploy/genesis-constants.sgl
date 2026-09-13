@@ -1,8 +1,8 @@
 ;;; Print every canonical genesis value from the configured quote and timestamp.
 ;;;
-;;; mainnet, reset public-testnet and regtest genesis templates from current
-;;; source, then prints the coinbase, outer lock-time, compact base target,
-;;; header nonce, header, hash, and display id that move together.
+;;; Replacement mainnet, public-testnet and regtest genesis templates from
+;;; current source, then prints the zero-cursor coinbase, fixed compact bits,
+;;; header, hash, and display id that move together.
 ;;;
 ;;; Run from the repository root:
 ;;;
@@ -38,7 +38,7 @@
          (quote (cadr input))
          (time (caddr input))
          (bits (list-ref input 3))
-         (built (coin-mine-genesis quote time bits))
+         (built (coin-genesis-block quote time bits))
          (coinbase (car (block-transactions built)))
          (header (block-header-field built))
          (hash (block-header-hash header)))

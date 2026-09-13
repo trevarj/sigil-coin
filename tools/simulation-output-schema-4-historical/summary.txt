@@ -1,0 +1,18 @@
+SigilCoin schema-4 deterministic simulation
+===========================================
+Puzzles: 420 global + 8 forced-constraint rows.
+Global retries: 83/420 puzzles retried; max 3; fallbacks 0.
+Table bytes min/median/max: 65/114/297; par: 24/29/72.
+Personalized shares: 702/1024 deterministic keys have a semantic under-par candidate.
+Payout matrix: 162 rows; solo mints 80% subsidy plus fees, cooperative blocks mint subsidy plus fees.
+Cooperative rows allocate a 10% contribution-weighted share pool and 5% carrier payout; producer receives fees and rounding residuals.
+Strategic mining: 21 rows over key pools 0..1024; 702/1024 semantic candidates available.
+Quality-only counterfactual would replace in 12 rows; first-seen pre/post-child replacements: 0/0.
+Copy-and-attach cannot displace the first observed sibling; settlement is child-observed, never timeout-based.
+Market observer: 12 mined heights plus height-13 sentinel; 12 explicit child settlements.
+Market transactions: 76 generated / 71 confirmed; final outstanding 5.
+Market fees: 93250 confirmed, 8450 outstanding; mean/max latency 3492/6700 seconds.
+Distinct attacks: 12 future-time rejections; 16 urgent-censorship observations.
+Rewards are counted only after a child names the selected parent; no timeout or unsettled tip reward is used.
+Market scope: deterministic bounded observer assumptions, not an equilibrium or network simulation.
+Caveat: consensus proves distinct tasks/work only, not distinct owners or identity independence.

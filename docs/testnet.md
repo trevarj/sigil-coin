@@ -1,110 +1,161 @@
 # Public testnet operator runbook
 
-This runbook covers the compressed 48-hour public `sigilcoin-testnet` gate
-starting at the reset on `2026-09-06T05:30:15Z`. The stable seed is a RackNerd
-host at `seed.testnet.sigilcoin.lol:19446`; community nodes may join and leave.
+This runbook covers the replacement `sigilcoin-testnet` network from height 0.
+The stable seed endpoint is `seed.testnet.sigilcoin.lol:19446`; community nodes
+may join and leave. Start a new 48-hour observation gate only after the
+replacement genesis and fresh state are verified.
+
+The earlier gate beginning `2026-09-06T05:30:15Z` belonged to the retired
+nonce-PoW testnet and is superseded, not evidence for this replacement. The
+launched mainnet was also retired before height 1 because its compute burn
+contradicted the project's intent; its historical identity remains in
+[LAUNCH.md](../LAUNCH.md).
 
 Testnet coins are worthless. Never use a production key, address, seed phrase,
 wallet backup, or unrevealed production material on testnet. Do not promote
 this chain, its state, or its keys to mainnet, and do not push a mainnet launch
 because a testnet gate passed.
 
-## Frozen testnet parameters
+## Replacement testnet parameters
 
 - Chain: `sigilcoin-testnet`, selected with `--testnet`.
 - DNS seed and P2P endpoint: `seed.testnet.sigilcoin.lol:19446`.
-- P2P transport: TCP port `19446`, network magic `d3 7a 91 c5`.
 - Address HRP: `tsgl`, producing `tsgl1...` addresses.
-- Genesis marker: `SigilCoin public testnet reset - 2026-09-02`.
-- Genesis timestamp: `1788307200` (`2026-09-02T00:00:00Z`).
-- Genesis hashes: use the all-network constants generated from this reset
-  marker, timestamp, compact pow limit and searched nonce; older hashes are
-  incompatible.
-- Target cadence: one hour. The one-second parent floor only keeps timestamps
-  monotone; it does not schedule blocks.
-- Maximum future drift: five minutes.
-- Producer validity: `L <= par`; shares require `L < personalized_par`.
-  The generated par witness is an eligible producer candidate, not a block.
-- Header `version`:
-  `0x20600000 | ((L - 1) << 12) | C`, with mask `0xffe00000`.
-- Header `bits`: canonical compact base target, initially `0x1f00ffff` and
-  retargeted every 16 blocks from the preceding 15 timestamp intervals.
-- Lottery: the effective target is
-  `min(2^255-1,(compact-target(bits)+1)*2^min(max(par-L,0),8)-1)`.
-- Initial odds: 65,538 expected rolls at par and 257 at `par - 8`.
-- Fork choice: cumulative base work, then height, then first-seen on an exact
-  tie. The golf bonus changes admission odds, not credited work.
-- Explorer: `https://explorer.testnet.sigilcoin.lol` through Caddy to the
-  container's loopback-only `127.0.0.1:8080` mapping.
-- Co-op relay: `https://pool.testnet.sigilcoin.lol` through Caddy to the
-  container's loopback-only `127.0.0.1:8082` mapping. This is a non-custodial
-  public-testnet convenience service, not a consensus service or a mainnet pool.
-- Exercise duration: 48 consecutive hours, ending no earlier than `2026-09-08T05:30:15Z`.
+- Genesis marker, timestamp, and display/internal hashes: use the reviewed
+  replacement all-network output from `deploy/genesis-constants.sgl` for this
+  build. Do not use the retired public-testnet identity.
+- Transport magic: `SGT3` (final byte `0x33`); mainnet uses `SGM3` and regtest
+  `SGR3`. This isolates older score-ranked peers without changing proof-of-golf
+  genesis hashes, genesis timestamps, or block wire bytes. Existing proof-of-golf
+  H0 state may be reused; retired nonce-PoW state may not.
+- Timestamp: exactly `parent.time + configured testnet spacing`, with zero
+  future drift. Testnet retains its configured shorter slots; mainnet uses
+  exactly 86,400 seconds. `puzzle` and `status` report `next-slot-time` as a UTC
+  epoch timestamp.
+- Producer validity: the unchanged puzzle VM must accept the program and
+  `L <= par`. The generated at-par witness is a valid fallback.
+- Savings: `min(8, max(0, par - L))`; non-genesis block score is `1 + savings`,
+  in `1..9`. Genesis score is 0. Scores display competition quality, not fork
+  weight, and currently do not alter subsidy.
+- Fork choice: only a strictly taller valid branch wins. Equal height retains
+  the durable active incumbent across restart; score, hash, and arrival metadata
+  do not break ties.
+- Checkpoints: chain configs hardcode `(height . internal-hash)` pairs.
+  Incompatible branches cannot cross them. Only reviewed software releases
+  advance checkpoints; nodes must upgrade to share a newer one. Public testnet
+  and regtest still pin H0 only, protecting genesis but no later history.
+  Mainnet now pins H0 and the live H1 block listed in
+  [the consensus specification](consensus.md#58-hardcoded-release-checkpoints):
+  reorgs below H1 are rejected, while reorgs above H1 remain possible.
+  There is no automatic or signed-checkpoint finality service.
+- Headers remain 80 bytes, with canonical packed length/complexity in
+  `version`, nonce 0, and fixed network pow-limit `bits` as a compatibility
+  field. There is no hash target validation or hash-difficulty retarget.
+- Non-genesis coinbase: lock-time 0, empty graffiti, canonical sequence/version.
+- Production: build a complete candidate once after its slot is due; no
+  grinding. Puzzle-complexity retargeting remains.
+- Shares: unchanged strict `L < personalized_par`, commitments, delayed
+  reveals, contribution checks, and direct signed payouts.
+- Explorer: `https://explorer.testnet.sigilcoin.lol` through Caddy to
+  loopback-only `127.0.0.1:8080`.
+- Co-op relay: `https://pool.testnet.sigilcoin.lol` through Caddy to
+  loopback-only `127.0.0.1:8082`. It is a non-custodial public-testnet
+  convenience service, not a consensus service or a mainnet pool.
+- Exercise duration: at least 48 consecutive hours on the replacement network;
+  extend it until every required boundary has been exercised.
 
-One hour is the network's target operating cadence, enforced by the retargeted
-base target rather than a spacing throttle. The parent timestamp floor is one
-second and a header may lead a validating clock by at most five minutes.
-Community miners are not assigned slots, are not required to remain online, and
-must not mine catch-up bursts.
+The schedule fixes admissible header timestamps, not volunteer availability.
+A late block keeps its scheduled time; never substitute the current wall clock
+or a future timestamp. A due at-par candidate needs no further search.
+Community producers are not assigned slots or required to remain online.
+
+This is a hobby chain, not settlement-grade security. Equal-height alternatives
+are cheap to build, but better golf score cannot make them win. Missed slots
+offer a takeover opportunity if a replacement becomes strictly taller, and
+partitions can preserve different local incumbents. Parent-template manipulation
+and reorgs above the latest checkpoint remain possible. Clock spacing and
+additional confirmations do not remove these limitations.
 
 ## Reset cutover
 
-This public testnet is a genesis reset, not a height activation. Producer
-`L <= par`, the packed `version`, retargeted compact `bits`, and the full-header
-nonce lottery all change genesis. The chain starts at height 0 from the marker
-above, using fresh chain state. Heights from the previous public testnet are
-not canonical on the reset chain. Old chain and relay databases, histories,
-and backups are incompatible. An archived wallet key may still be a valid key
-format, but no old-chain balance, history, or relay receipt carries over; keep
-both old state directories out of reset operation.
+Moving from retired nonce-PoW is a replacement network, not a height activation
+or a database upgrade. Every participant must use the proof-of-golf genesis,
+longest-height rules, and released checkpoints from height 0. A chain name,
+address prefix, port, or successful wire handshake
+does not prove that a peer has that identity. Old chain and relay databases,
+histories, and backups stay archived; no old balance or receipt carries over.
+Never open retired state with the replacement binary.
+The later longest-height/checkpoint cutover changes transport magic, not
+proof-of-golf genesis; existing proof-of-golf H0 state may be reused. When
+upgrading for a later checkpoint, preserve state before restarting. The node
+refuses to open active history that conflicts with the installed checkpoint
+rather than silently rewriting it; compare the reviewed release's checkpoint
+list when diagnosing that refusal.
 
-The network magic remains `d3 7a 91 c5`; magic alone therefore does not
-distinguish an old node from the reset. Genesis validation is the boundary.
-Upgrade every participant before reconnecting.
+Before starting on a host that ran the retired testnet:
 
-Before starting reset software on a host that ran the old testnet:
+1. Stop listener, sync, explorer, pool, producers, contributors, observers, and
+   every CLI process that can open either database, including out-of-Compose
+   jobs.
+2. Archive the retired state offline and label it with the old genesis and
+   source revision. Move both old chain and pool directories out of active use.
+3. Create distinct empty `state/testnet-proof-of-golf` and
+   `state/testnet-pool-proof-of-golf` directories with restrictive permissions.
+   Do not copy any retired SQLite file, receipt, or wallet into them.
+4. Set the new paths in `.env`, then start the replacement stack.
+5. Compare the display genesis id and relay context with the reviewed
+   replacement constants before adding peers, contributors, or producers.
 
-1. Stop listener, sync, explorer, pool, miners, contributors, and every CLI
-   process that can open either database.
-2. If the history is worth retaining, take verified offline chain and pool
-   archives and label them with the old genesis and source revision.
-3. Move both old state directories aside. Do not open them with the reset
-   binary.
-4. Create distinct empty chain and pool directories with restrictive
-   permissions.
-5. Start the reset stack and verify the display genesis id and relay context
-   before adding peers, contributors, or miners.
-
-For the Docker default, an operator may perform the non-destructive directory
-cutover explicitly:
+For a host using the retired Docker defaults, the non-destructive archive and
+directory creation are:
 
 ```sh
 (
 set -euo pipefail
 cd /srv/sigilcoin/sigil-coin/deploy/docker
 docker compose --env-file .env -f compose.testnet.yml stop
-state_dir=${SIGIL_TESTNET_STATE_DIR:-"$PWD/state/testnet"}
-pool_state_dir=${SIGIL_TESTNET_POOL_STATE_DIR:-"$PWD/state/testnet-pool"}
-[[ $state_dir == /* ]] || state_dir=$PWD/${state_dir#./}
-[[ $pool_state_dir == /* ]] || pool_state_dir=$PWD/${pool_state_dir#./}
+old_state_dir=$PWD/state/testnet
+old_pool_state_dir=$PWD/state/testnet-pool
+new_state_dir=$PWD/state/testnet-proof-of-golf
+new_pool_state_dir=$PWD/state/testnet-pool-proof-of-golf
+[[ ! -e $new_state_dir && ! -e $new_pool_state_dir ]]
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
-mv -- "$state_dir" "${state_dir}.pre-reset-$stamp"
-if [[ -d $pool_state_dir ]]; then
-  mv -- "$pool_state_dir" "${pool_state_dir}.pre-reset-$stamp"
+mv -- "$old_state_dir" "${old_state_dir}.retired-nonce-pow-$stamp"
+if [[ -d $old_pool_state_dir ]]; then
+  mv -- "$old_pool_state_dir" "${old_pool_state_dir}.retired-nonce-pow-$stamp"
 fi
-install -d -m 0750 "$state_dir"
-install -d -m 0770 -g "$(id -g)" "$pool_state_dir"
-docker compose --env-file .env -f compose.testnet.yml up -d
+install -d -m 0750 "$new_state_dir"
+install -d -m 0770 -g "$(id -g)" "$new_pool_state_dir"
 )
 ```
 
-The fail-fast subshell never reaches restart after a failed stop, move, or
-directory creation. Leave the stack down, preserve what exists, and investigate
-before retrying.
+If the old `.env` used non-default paths, substitute those actual retired paths
+before running this block. The example assumes the remote login user's UID/GID
+match `SIGIL_UID`/`SIGIL_GID`; retain the configured ownership otherwise.
+The fail-fast subshell never restarts services. A failed stop, move, or
+directory creation leaves the stack down; preserve what exists and investigate.
+Keep the retired directories as offline archives, with a verified encrypted
+copy outside the host.
 
-Nothing in the node or deployment automation deletes old operator data. If an
-archive is not wanted, disposal remains a deliberate operator action outside
-startup.
+Only after that succeeds, edit `.env` to select:
+
+```sh
+SIGIL_TESTNET_STATE_DIR=./state/testnet-proof-of-golf
+SIGIL_TESTNET_POOL_STATE_DIR=./state/testnet-pool-proof-of-golf
+```
+
+Then start from those fresh paths:
+
+```sh
+cd /srv/sigilcoin/sigil-coin/deploy/docker
+$EDITOR .env
+docker compose --env-file .env -f compose.testnet.yml up -d
+```
+
+Apply the same archive/fresh-directory boundary to any observer, contributor,
+or local node state. Deployment automation never deletes or migrates old
+operator data. A newly named directory containing an old database is not fresh
+state.
 
 ## Safety boundary
 
@@ -178,7 +229,8 @@ REMOTE_PEER_IP=
 EXPLORER_PORT=8080
 POOL_PORT=8082
 POOL_UID=1002
-SIGIL_TESTNET_POOL_STATE_DIR=./state/testnet-pool
+SIGIL_TESTNET_STATE_DIR=./state/testnet-proof-of-golf
+SIGIL_TESTNET_POOL_STATE_DIR=./state/testnet-pool-proof-of-golf
 ```
 
 The exact acknowledgement is intentional approval of Internet-facing P2P. A
@@ -202,16 +254,19 @@ Require P2P on the intended public interface, explorer only at
 `127.0.0.1:8080`, pool only at `127.0.0.1:8082`, all four containers healthy,
 and no unexpected listener. The pool must have a distinct UID, a read-only
 chain-state mount, and a separate writable state directory. Before connecting
-miners, compare node status and explorer/API display order with the reviewed
-all-network genesis output produced by this build. Any mismatch or
-previous-testnet tip is a failed cutover.
+producers, compare node status and explorer/API display order with the reviewed
+replacement all-network genesis output produced by this build. Any mismatch or
+retired-testnet tip is a failed cutover.
 
 ## Community bootstrap
 
-A current node automatically reads the canonical DNS seed. An operator may
-also make bootstrap explicit:
+A current node automatically reads the canonical DNS seed. For a new community
+node, select an unused state path; never use a retired database. An operator may
+make bootstrap explicit:
 
 ```sh
+DATA="$PWD/state/testnet-proof-of-golf"
+install -d -m 0750 "$DATA"
 sigilcoin peers add seed.testnet.sigilcoin.lol:19446 --testnet \
   --data-dir "$DATA"
 sigilcoin peers test seed.testnet.sigilcoin.lol:19446 --testnet \
@@ -222,9 +277,9 @@ sigilcoin sync --peer seed.testnet.sigilcoin.lol:19446 --testnet \
 
 A community operator may manually configure any trusted reachable testnet peer.
 DNS is bootstrap, not an authority over consensus. Every node independently
-validates the reset genesis and rules. A previous-testnet history, an `sgl1...`
-address, or any genesis mismatch is grounds to stop; reset-testnet addresses
-must begin `tsgl1...`.
+validates the replacement genesis and rules. A retired-testnet history, an
+`sgl1...` address, or any genesis mismatch is grounds to stop; replacement-testnet
+addresses must begin `tsgl1...`.
 
 ## Contribute without a node
 
@@ -257,7 +312,8 @@ CA-verified, bounded curl without redirects or curlrc processing; if curl is
 unavailable it fails before creating a wallet or commitment. Plain HTTP is
 accepted only for a literal loopback regtest relay.
 
-The watcher defaults to `.sigilcoin-testnet`. Back up that disposable wallet
+The watcher defaults to `.sigilcoin-testnet-proof-of-golf`; do not reuse or copy
+the retired `.sigilcoin-testnet` directory. Back up the new disposable wallet
 key and keep the command running through the following block, or resume it with
 the printed commitment. Before block `H`, it sends only public context, pubkey,
 commitment, and a context-bound relay authorization. The private key, blind,
@@ -296,30 +352,47 @@ saved receipt rather than generating a new blind. Relay authorization controls
 admission only: an attacker with many keys can still fill all 16 slots, and the
 per-address limit of eight new mutations per 60 seconds is not Sybil resistance.
 Every accepted current-context commitment is offered to the producer in
-canonical digest order; the grindable digest does not decide admission.
+canonical digest order; the digest does not decide admission.
 
 Relay participation does not change solution validity: the producer's global
 solution must satisfy `L <= par`, while every personalized share supplied by
-the relay must satisfy `L < personalized_par`. The generated par witness
-provides an eligible at-par candidate. After the complete body and merkle root
-are final, `mine` searches nonce values automatically for a qualifying
-full-header roll; shorter producer programs double the odds per saved byte,
-through the eight-byte bonus cap.
+the relay must satisfy `L < personalized_par`. The generated at-par witness
+is a valid score-1 fallback. Each byte saved adds one point, capped at eight
+savings and score 9. After the complete body and merkle root are final, `mine`
+submits that candidate once with the canonical nonce, coinbase, fixed `bits`,
+and scheduled timestamp. It does not search for a header hash.
 
-A producer opts in explicitly:
+After synchronizing, inspect the current puzzle and `next-slot-time`:
+
+```sh
+sigilcoin puzzle --testnet --data-dir "$DATA"
+```
+
+At or after that UTC epoch time, opt into the relay with a complete at-par
+candidate:
 
 ```sh
 sigilcoin mine --relay https://pool.testnet.sigilcoin.lol \
-  --solution '(lambda(x)...)' --testnet
+  --testnet --data-dir "$DATA"
 ```
 
-The miner requires the relay context to match its own active chain, applies the
+With no `--solution`, `mine` uses the valid generated at-par fallback without a
+prompt. To improve displayed competition quality, pass `--solution` with your
+valid shortened program for the current parent; this does not improve fork
+position or the current subsidy. Wait after an early-slot refusal; do not retry
+in a tight loop or alter the timestamp. A changed tip requires a fresh
+parent-specific puzzle and candidate.
+The result's `validation` and `active-chain` fields are distinct: a valid
+side-branch block need not become active. Record its `savings`, `block-score`,
+and `chain-score` as quality metrics; an accepted block is not a settlement guarantee.
+
+The producer requires the relay context to match its own active chain, applies the
 normal commitment checks, fully revalidates every reveal against its actual
 producer solution, deduplicates pubkeys/solutions, ranks eligible reveals by
 contribution descending and pubkey ascending, and includes at most eight. The
 relay's first-16 admission therefore does not promise one of the
 consensus R8 share positions. If an explicitly configured relay is unavailable,
-stale, malformed, oversized, or contradictory, mining fails; an operator may
+stale, malformed, oversized, or contradictory, production fails; an operator may
 deliberately rerun without `--relay` to construct a solo block.
 
 The relay can delay or omit work, and either the relay or a producer can censor
@@ -350,6 +423,8 @@ The explorer is available only at `http://127.0.0.1:8080/`. No exposure
 acknowledgement is needed for this fail-closed loopback mode. Ctrl-C stops the
 foreground stack and preserves state. This workflow is for a trusted local
 host, not the public RackNerd seed.
+The helper defaults to `deploy/state/local-testnet-proof-of-golf`; archive the
+retired local state and never override `DATA_DIR` to point back at it.
 
 ## Explorer and pool TLS reverse proxy
 
@@ -390,10 +465,12 @@ Record evidence in UTC. Do not record environment dumps, wallet material,
 contributor request bodies, encoded reveals, or unsanitized relay details. At
 least daily:
 
-1. Capture node status: tip height/hash, nonce, full-header roll and target,
-   expected rolls, validated bodies, next complexity and corresponding base
-   target, peer successes/failures, last sync outcome, `issued-supply`, and
-   `scheduled-supply-cap`.
+1. Capture node status: tip height/hash, validated bodies, `next-slot-time`,
+   next puzzle complexity, `best-chain-score`, peer successes/failures, last
+   sync outcome, `issued-supply`, and `scheduled-supply-cap`. Record producer
+   `mine` results separately for `savings`, `block-score`, `chain-score`,
+   `validation`, and `active-chain`. The producer should sleep between due
+   slots, not consume CPU searching.
 2. Compare the seed with the separate observer process and database at the same
    height. The compressed gate does not claim host-level independence.
 3. Probe DNS, public P2P, HTTPS explorer, pool `/healthz` and `/v1/context`, and
@@ -410,22 +487,25 @@ least daily:
 7. Check freshness of both chain and pool backups without printing or opening
    wallet or contribution material.
 
-On `racknerd-chi`, `sigilcoin-testnet-observer` continuously validates into
-`state/testnet-observer`. Cron runs `/srv/sigilcoin/collect-testnet-evidence.sh`
-at minute 7 each hour and writes hashed, sanitized snapshots below
-`/srv/sigilcoin/evidence/testnet/`; it records no wallet or contribution body.
+Any retained observer must also start from fresh
+`state/testnet-observer-proof-of-golf` state with the replacement genesis.
+Archive the retired observer database and old evidence separately. Update any
+external evidence collector to record the replacement golf fields before
+reenabling its cron job; old network snapshots do not count toward this gate.
 
-The seed operator targets roughly one accepted block per hour without catch-up
-mining. Community blocks may change the observed count, so do not treat a
-volunteer's missed hour as an incident or impose a participation roster.
+Use `next-slot-time` rather than a wall-clock mining roster. A due slot can stay
+empty when nobody produces; a late block still has the exact scheduled header
+time. Inspect synchronization, clocks, and producer availability when it is
+late. Never change `bits`, search nonces, or future-date a block to catch up.
 
 ## Consensus and interoperability evidence
 
 Complete these before the 48-hour gate closes:
 
-- Retargets: capture H15, H16, and H17 puzzle complexity, compact base target,
-  cumulative base work, and historical queries. Both independent 16-block
-  boundaries must agree across nodes.
+- Puzzle retarget: capture H15, H16, and H17 complexity and historical queries.
+  The 16-block puzzle-complexity boundary must agree across nodes. Require
+  fixed network `bits`, exact slot timestamps with no future drift, and
+  cumulative golf scores; there is no second hash-target retarget.
 - Maturity: show the H1 coinbase cannot be spent in H1 and is selectable for
   H2, then send a small amount between disposable `tsgl1...` wallets.
 - Co-op: use the node-free watcher to carry a commitment at H and its
@@ -434,12 +514,13 @@ Complete these before the 48-hour gate closes:
   contribution-weighted share pool, 5% carrier target, and the producer's fee
   and integer residual. Exercise every watcher status and a reorg that moves a
   receipt backward or makes it stale/missed.
-- Four-role smoke: producer A mines D's commitment in H100; light contributor D
-  has no node database and the pre-H100 relay row contains no private key,
+- Four-role local regtest smoke: use [local-testnet.md](local-testnet.md) with
+  fresh regtest state. Producer A includes D's commitment in H100; light
+  contributor D has no node database and the pre-H100 relay row contains no private key,
   blind, solution source, consensus share signature, or encoded share; H101
   includes D's reveal and A's signed A-to-B transaction; ordinary node B sends
   its exact signed B-to-C transaction over a normal P2P session, A records it
-  from a peer before mining H102, C receives the expected output, and B pays the
+  from a peer before producing H102, C receives the expected output, and B pays the
   fee; after reopening H102, H103 proves durability and A/B/C plus explorer
   agree on transactions, balances, payouts, and the full cooperative subsidy
   (zero unminted reserve).
@@ -448,33 +529,42 @@ Complete these before the 48-hour gate closes:
 - Supply: compare branch-aware `issued-supply` from active UTXOs with the
   separately labeled `scheduled-supply-cap`; issued supply may be lower after
   solo blocks and must never exceed the cap.
-- Reorg: create qualifying equal-height siblings with different solution
-  lengths, contributions, nonces, and hashes. Require the first valid arrival
-  to remain incumbent, extend it, and require all nodes and explorer canonical
-  views to converge after the explicit child without database editing. None of
-  those sibling differences is a tie-break.
+- Reorg: create valid equal-height branches with different golf scores and
+  require each node to retain its durable active incumbent across restart,
+  irrespective of score, hash, or arrival metadata. Local equal-height
+  disagreement is allowed. A shorter higher-score branch must not displace it;
+  propagate a strictly taller checkpoint-compatible branch, even with lower
+  golf score, and require nodes and explorer to switch without database editing.
+  Children and confirmation counts do not finalize history above the latest
+  checkpoint.
+- Checkpoints: record the installed release's `(height . internal-hash)` list
+  on each node and require agreement with every reached checkpoint. Public
+  testnet's H0-only checkpoint protects genesis, not post-genesis history; this
+  gate cannot demonstrate later finality until a reviewed release pins a later
+  public-testnet block. Mainnet's H1 checkpoint does not apply to testnet.
 - Restart: cleanly restart each service and preserve tip, balance, peers,
   explorer state, and idempotent pool receipts.
 - Hard kill: once while the listener is idle, kill only one node, recover via
   normal SQLite opening/sync, and verify no lost validated state.
-- Restore: restore matching reset-genesis chain and pool offline backups into
-  empty test locations and verify status, disposable address, balance, sync,
-  pool health/context, and explorer routes.
-- Explorer and pool: check canonical block/PBE/lottery roll, target, bonus,
-  multiplier, expected rolls, co-op and address HTML/JSON; issued-supply and
-  scheduled-maximum labels; read-only behavior; relay status against exact
-  block membership; and escaping of harmless hostile-looking graffiti such as
-  `<b>test</b>`.
+- Restore: restore matching replacement-genesis chain and pool offline backups
+  into empty test locations and verify status, disposable address, balance,
+  sync, pool health/context, and explorer routes. Never restore retired state.
+- Explorer and pool: check canonical block/PBE, golf, co-op and address
+  HTML/JSON; the golf object contains `claimed_length`, `par`, `savings`,
+  `block_score`, and `chain_score`. Require issued-supply and
+  scheduled-maximum labels, read-only behavior, relay status against exact
+  block membership, and rejection of nonempty non-genesis graffiti.
 
 Never coordinate a fault drill that takes every reachable bootstrap node down
-at once. Announce a bounded drill window, but do not assign mining obligations
+at once. Announce a bounded drill window, but do not assign production obligations
 to community members.
 
 ## Backups and restore
 
 A plain filesystem archive is consistent only while listener, sync, explorer,
-pool, and every command that can write either database are stopped. Keep chain
-and pool state in distinct archives:
+pool, producers, and every command that can write either database are stopped.
+Keep chain and pool state in distinct archives. If `.env` overrides either
+state path, export the same values in this shell before using these commands:
 
 ```sh
 (
@@ -484,8 +574,8 @@ docker compose --env-file .env -f compose.testnet.yml stop
 backup_dir=$HOME/sigilcoin-testnet-backups
 install -d -m 0700 "$backup_dir"
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
-state_dir=${SIGIL_TESTNET_STATE_DIR:-"$PWD/state/testnet"}
-pool_state_dir=${SIGIL_TESTNET_POOL_STATE_DIR:-"$PWD/state/testnet-pool"}
+state_dir=${SIGIL_TESTNET_STATE_DIR:-"$PWD/state/testnet-proof-of-golf"}
+pool_state_dir=${SIGIL_TESTNET_POOL_STATE_DIR:-"$PWD/state/testnet-pool-proof-of-golf"}
 [[ $state_dir == /* ]] || state_dir=$PWD/${state_dir#./}
 [[ $pool_state_dir == /* ]] || pool_state_dir=$PWD/${pool_state_dir#./}
 tar -C "$state_dir" -czf "$backup_dir/$stamp-chain.tgz" .
@@ -526,10 +616,11 @@ Before every upgrade:
    and an independent node.
 
 Rollback only to a reviewed image compatible with the chain database, pool
-schema, and reset genesis. Never restore a previous-testnet database or backup
-into either current state directory. If compatibility is uncertain, stop and
-preserve both directories rather than trying binaries against them. Never make
-an unreviewed source or mainnet push to repair public testnet.
+schema, and replacement genesis. The retired nonce-PoW image is not a rollback
+target. Never restore a retired-testnet database or backup into either current
+state directory. If compatibility is uncertain, stop and preserve both
+directories rather than trying binaries against them. Never make an unreviewed
+source or mainnet push to repair public testnet.
 
 ## Incident shutdown
 
@@ -541,7 +632,7 @@ event that cannot be safely bounded:
 1. For a pool incident, disable the public Caddy pool route and stop the pool
    container. For a chain incident, block new public TCP/19446 at provider and
    host firewalls. Keep restricted admin access available.
-2. Stop mining and sync, then stop listener, pool, and explorer cleanly when
+2. Stop production and sync, then stop listener, pool, and explorer cleanly when
    their state may be involved.
 3. Do not expose port 8080 or 8082 as a workaround. Keep the unaffected public
    route only when its read-only dependency and evidence are trustworthy.
@@ -562,18 +653,22 @@ DNS changes.
 
 Continue only when all of these are evidenced:
 
-1. Seed and an independent node agree on canonical tip and validated bodies.
+1. Seed and an independent node validate the same proof-of-golf genesis and
+   released checkpoints, and agree on bodies/quality scores for the same branch.
+   Both adopt an available strictly taller valid checkpoint-compatible branch;
+   durable equal-height local choices are recorded.
 2. DNS bootstrap, public TCP/19446, HTTPS explorer, and HTTPS pool health/context
    work off-host while direct TCP/8080 and TCP/8082 remain unreachable.
-3. H16 complexity and base-target retarget, H1-to-H2 maturity/transfer, solo
-   under-minting, issued-versus-scheduled supply labels, and one node-free
+3. H16 puzzle-complexity retarget, fixed `bits`, exact slots, capped additive
+   scores, H1-to-H2 maturity/transfer, solo under-minting,
+   issued-versus-scheduled supply labels, and one node-free
    contribution-weighted commit/reveal payout cycle pass where their heights
    have been reached. The four-role smoke must show the co-op reveal alongside
    an ordinary signed transaction and a later B-to-C transaction crossing P2P
    before inclusion. If cadence has not reached a boundary, extend the gate
    rather than waive it.
 4. Relay admission proves first-16 acceptance, seventeenth rejection, one slot
-   per pubkey/context, and miner-owned contribution-first R8 selection without
+   per pubkey/context, and producer-owned contribution-first R8 selection without
    claiming Sybil resistance or guaranteed inclusion.
 5. A chain/status reorg, exact receipt replay after restart, clean restart,
    hard-kill recovery, matching offline backups, and restore pass.
@@ -594,11 +689,17 @@ control.
 
 The compressed public testnet exercise completes only when:
 
-- it operated for 48 consecutive hours with one hour as the target cadence;
-- seed and an independent node agree on the reset-genesis canonical tip,
-  validated bodies, next complexity, compact base target, cumulative work,
-  branch-aware issued supply, and UTXO-derived balances;
-- H15, H16, and H17 prove both independent retargets and historical queries;
+- it operated for 48 consecutive hours using the configured shorter testnet
+  slots, with exact parent-plus-spacing timestamps and no future drift;
+- seed and an independent node agree on a strictly taller valid
+  checkpoint-compatible canonical branch when one is available; equal-height
+  local incumbents and their durable behavior are recorded without score, hash,
+  or arrival-metadata tie-breaks;
+- nodes agree on replacement genesis, validated bodies on the same branch,
+  next complexity and slot, capped additive scores, branch-aware issued supply,
+  and UTXO-derived balances;
+- H15, H16, and H17 prove puzzle-complexity retargeting, fixed network `bits`,
+  cumulative score, and historical queries;
 - one node-free commit/reveal/co-op cycle produces a valid contribution, direct
   contributor output, and contribution-weighted payout without custody;
 - restart, hard-kill, matching chain/pool backup, and restore exercises recover
@@ -609,4 +710,7 @@ The compressed public testnet exercise completes only when:
   IP, and no production key or mainnet state entered the exercise.
 
 Archive only sanitized evidence. This compressed gate does not establish
-long-duration stability; mainnet must launch as experimental and low-value.
+long-duration stability or settlement-grade security. Mainnet remains an
+experimental hobby chain with cheap equal-height alternatives, missed-slot
+takeover opportunities, partitions, parent-template manipulation, and reorgs
+above the latest release checkpoint. H0 alone protects no post-genesis history.

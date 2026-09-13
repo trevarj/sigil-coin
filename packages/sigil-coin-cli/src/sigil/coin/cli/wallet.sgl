@@ -75,6 +75,7 @@
           (sigil bitcoin script)
           (sigil bitcoin tx)
           (sigil bitcoin node)
+          (sigil coin consensus)
           (sigil coin node)
           (sigil coin cli args))
   (export
@@ -588,23 +589,22 @@
             ((wallet-outpoint=? op (car ops)) #t)
             (else (wallet-outpoint-member? op (cdr ops)))))
 
-    ;;; Transactions the node's mempool holds and would relay, in the order
-    ;;; the node itself lists them.
-    ;;;
-    ;;; `node-mempool` hands back entries without their bytes, so the rows
-    ;;; are read here. The ordering is the node's own — first seen, then
-    ;;; txid — so two callers agree on it.
-    ;;;
-    ;;; ```scheme
-    ;;; (length (wallet-mempool-transactions n)) ; => 1
-    ;;; ```
+    ;; Bound what the one-shot producer parses even if a public peer filled the
+    ;; relay cache. A transaction larger than the whole SigilCoin block can
+    ;; never be selected, and 128 candidates keep the first-fit scan finite.
+    (define %producer-mempool-candidates 128)
+
+    ;;; Transactions the node's mempool holds and would relay, in deterministic
+    ;;; first-seen order, bounded for one producer attempt.
     (define (wallet-mempool-transactions n)
       (: node? -> list?)
       (map (lambda (row)
              (transaction-parse (hex-decode (row-ref row "tx_hex"))))
            (sqlite-query
              (node-db n)
-             "SELECT txid, tx_hex FROM mempool WHERE tx_hex IS NOT NULL AND status = 'available' ORDER BY updated_at ASC, txid ASC")))
+             "SELECT txid, tx_hex FROM mempool WHERE tx_hex IS NOT NULL AND status = 'available' AND length(tx_hex) <= ? ORDER BY updated_at ASC, txid ASC LIMIT ?"
+             (* 2 coin-max-block-bytes)
+             %producer-mempool-candidates)))
 
     ;;; Outpoints the node's mempool is already spending.
     ;;;

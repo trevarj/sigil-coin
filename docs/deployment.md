@@ -1,11 +1,10 @@
 # SigilCoin deployment
 
-This tooling runs the public testnet on a Docker Compose host or as a
-foreground stack in the workspace. It also contains a guarded mainnet path.
-Mainnet genesis is final, but public activation still requires the explicit
-exposure acknowledgements and operator-controlled Caddy cutover. The tooling
-does not publish DNS, configure firewalls, issue TLS certificates, commit, or
-push.
+This tooling runs replacement proof-of-golf networks from height 0 on a Docker
+Compose host or as a foreground stack in the workspace. Mainnet activation
+requires explicit exposure acknowledgements and an operator-controlled Caddy
+cutover. The tooling does not publish DNS, configure firewalls, issue TLS
+certificates, commit, or push.
 
 > **Public exposure warning:** `P2P_BIND=0.0.0.0` with
 > `TESTNET_EXPOSURE_ACK=public-testnet-approved` exposes unauthenticated P2P,
@@ -14,31 +13,68 @@ push.
 > and incident shutdown before selecting them. The relay's authentication and
 > limits do not prevent Sybil slot filling or guarantee inclusion.
 
-## Public testnet reset boundary
+## Replacement-network boundary
 
-The configured public testnet starts from a new genesis marker
-`SigilCoin public testnet reset - 2026-09-02` at timestamp `1788307200`
-(`2026-09-02T00:00:00Z`). Its display/internal hashes come from the
-all-network constants generated with the current lottery header rules.
+The launched nonce-PoW mainnet was retired before height 1 because its compute
+burn contradicted the project's intent. Its launch identity and evidence remain
+historical and superseded in [LAUNCH.md](../LAUNCH.md); they are not the identity
+of this replacement. Mainnet, public testnet, and regtest began again at height
+0 with the proof-of-golf genesis constants from `deploy/genesis-constants.sgl`.
+Compare the reviewed output for the exact build before connecting peers; a
+matching chain name, port, address prefix, or wire magic is not enough.
 
-This is not an activation on the previous chain. Producer `L <= par`, the
-`bits` encoding of `L` and `C`, and the searched coinbase-lock-time/header-nonce
-lottery all change genesis; shares retain `L < personalized_par`. The selected
-at-par witness guarantees an eligible producer candidate, not an immediate
-block.
-Old public-testnet databases, history, and backups are incompatible and
-old-chain balances do not carry over. The `d3 7a 91 c5` magic is intentionally
-unchanged, so a successful frame handshake does not prove that a peer has the
-reset genesis.
+Every valid producer program still satisfies `L <= par` in the puzzle VM.
+Its displayed score is `1 + min(8, max(0, par - L))`, from 1 at par to 9;
+genesis contributes 0. Score measures competition quality, not fork choice,
+and currently does not alter subsidy. Only a strictly taller valid branch
+replaces the active chain. Equal height retains the durable active incumbent
+across restart; score, hash, and arrival metadata do not break ties.
 
-Deployment scripts never delete operator data. Before deploying a reset to a
-host that ran an older testnet, stop every chain and pool database user, take
-matching offline archives if desired, move both
-`SIGIL_TESTNET_STATE_DIR` and `SIGIL_TESTNET_POOL_STATE_DIR` aside, and create
-fresh distinct directories. Never open either old directory with the reset
-binary or restore old-chain receipts into current state. The exact
-non-destructive Docker cutover is in
-[testnet.md](testnet.md#reset-cutover).
+Chain configs hardcode `(height . internal-hash)` checkpoints. Incompatible
+branches cannot cross a checkpoint. Checkpoints advance only in reviewed
+software releases, not automatically or through signed broadcasts; operators
+must upgrade nodes to share a newer checkpoint. Mainnet now pins H0 and the
+live H1 block; public testnet and regtest still pin H0 only, protecting genesis
+but no later history. Mainnet rejects reorgs below H1; reorgs above H1 remain
+possible.
+
+Mainnet H1 internal hash:
+`24f2cbbf4a5dbbce67abbcc047e300cda17c600e7ab3565846d27a0eb6b041d2`.
+Its reversed display ID is
+`d241b0b60e7ad2465856b37a0e607ca1cd00e347c0bcab67cebb5d4abfcbf224`.
+
+This cutover preserves proof-of-golf block bytes, genesis hashes, and genesis
+timestamps. Transport magic changes to `SGM3` / `SGT3` / `SGR3` on mainnet /
+testnet / regtest to isolate older score-ranked nodes. Existing proof-of-golf
+H0 state may be reused; retired nonce-PoW state must stay archived. A node
+refuses to open active history that conflicts with an installed checkpoint
+rather than silently rewriting it. Preserve the database and compare the
+reviewed release's checkpoints when diagnosing such a refusal.
+
+Each header timestamp must equal `parent.time + network spacing` and must not
+be in the validating node's future. Mainnet spacing is exactly 86,400 seconds;
+test networks retain their configured shorter slots. The 80-byte header stays,
+but nonce is zero and `bits` is fixed at the network's pow-limit compatibility
+value, not a hash target. Non-genesis coinbase lock-time is zero, graffiti is
+empty, and coinbase sequence/version are canonical. Producers build one complete
+candidate per attempt, without grinding. The generated at-par witness is a
+valid fallback, not merely eligibility for another search. Puzzle-complexity
+retargeting and strict `L < personalized_par` co-op shares remain.
+
+This is a hobby chain, not settlement-grade security. Public witnesses make
+equal-height alternatives cheap to construct, but extra golf score cannot make
+them win. Missed slots offer a chance for a replacement to become strictly
+taller; partitions can preserve different local incumbents. Parent-template
+manipulation and reorgs above the latest checkpoint remain possible. A daily
+slot or a string of confirmations does not eliminate those limits.
+
+When replacing retired nonce-PoW state on an existing host, stop every chain
+and pool database user and archive that retired chain and receipt state with
+its genesis and source revision. Move it out of all active paths, then select
+fresh distinct `state/*-proof-of-golf` directories. Never open a retired database with
+the replacement binary, restore its receipts, or carry its balances forward.
+Deployment scripts do not delete or migrate old operator data. The explicit
+non-destructive Docker cutover is in [testnet.md](testnet.md#reset-cutover).
 
 ## Workspace and tools
 
@@ -125,8 +161,8 @@ $EDITOR deploy/docker/.env
 Set `SIGIL_UID` and `SIGIL_GID` to the remote login user's numeric IDs. Choose
 `EXPLORER_UID` and `POOL_UID` values that differ from the node and each other;
 the defaults are 1001 and 1002. Keep
-`SIGIL_TESTNET_STATE_DIR=./state/testnet`,
-`SIGIL_TESTNET_POOL_STATE_DIR=./state/testnet-pool`,
+`SIGIL_TESTNET_STATE_DIR=./state/testnet-proof-of-golf`,
+`SIGIL_TESTNET_POOL_STATE_DIR=./state/testnet-pool-proof-of-golf`,
 `EXPLORER_PORT=8080`, and `POOL_PORT=8082` distinct.
 
 The reviewed RackNerd handoff deploys the four-service testnet stack and then
@@ -226,6 +262,19 @@ solo block mints only `floor(4*S/5)` of scheduled subsidy; cooperative blocks
 mint full scheduled subsidy and route fees and integer residuals to the
 producer.
 
+`puzzle` and `status` expose `next-slot-time` as a UTC epoch timestamp.
+`puzzle` reports `savings` and `block-score` for its at-par witness; `status`
+reports the active `best-chain-score`. `mine` reports the submitted block's
+`savings`, `block-score`, `chain-score`, `validation`, and `active-chain`.
+These score fields report quality on the named branch, not its selection
+weight or subsidy. Use height, active-chain membership, and the installed
+release's checkpoints when investigating a branch change.
+A validated side-branch block need not be active or keep its payout after a
+reorg. A slot is the earliest admissible wall-clock time, not a promise that
+somebody will produce a block. Investigate clocks, producer availability, and
+peer synchronization when a due slot remains unfilled; do not tune a hash target
+or run a search worker.
+
 ## Static site, explorer, pool, and TLS
 
 `compose.testnet.yml` hardcodes the explorer host mapping to
@@ -296,16 +345,18 @@ single-user development host. To stop after a disconnected terminal:
 MODE=testnet bash deploy/scripts/stop-local.sh
 ```
 
-Default paths are under `deploy/state/local-testnet`,
+Default paths are under `deploy/state/local-testnet-proof-of-golf`,
 `deploy/logs/local-testnet`, and `deploy/run/local-testnet`; they are ignored by
-Git.
+Git. Archive any retired local testnet state rather than pointing `DATA_DIR`
+back at it.
 
 ## State and permissions
 
 Compose mounts testnet chain state from `SIGIL_TESTNET_STATE_DIR` (default
-`./state/testnet`), pool receipts from `SIGIL_TESTNET_POOL_STATE_DIR` (default
-`./state/testnet-pool`), and mainnet from separate
-`SIGIL_MAINNET_STATE_DIR`. Listener and sync run as `SIGIL_UID:SIGIL_GID` with
+`./state/testnet-proof-of-golf`), pool receipts from `SIGIL_TESTNET_POOL_STATE_DIR`
+(default `./state/testnet-pool-proof-of-golf`), and mainnet from
+`SIGIL_MAINNET_STATE_DIR` (default `./state/mainnet-proof-of-golf`).
+Listener and sync run as `SIGIL_UID:SIGIL_GID` with
 umask `0027`; explorer and pool use distinct `EXPLORER_UID` and `POOL_UID`
 values, share only `SIGIL_GID`, and receive the chain mount read-only. Only the
 pool receives its separate receipt directory read-write; the deploy script
@@ -314,8 +365,21 @@ creates it as the remote operator with group `SIGIL_GID` and mode `0770`.
 The pool starts only after healthy sync and runs with a read-only root,
 temporary writable files on tmpfs, all capabilities dropped,
 `no-new-privileges`, `pids_limit: 64`, `mem_limit: 256m`, and `cpus: "0.5"`.
+
 Its durable file is `sigilcoin-pool.sqlite` under the pool state directory; it
 never writes the node database.
+
+Public relay admission is bounded before SQLite persistence: one transaction
+may serialize to at most 16384 bytes, and the whole mempool table is capped at
+1024 rows while available bodies are capped at 1048576 serialized bytes.
+Disconnected or stale request placeholders are removed, and only inventory in
+the bounded requested prefix is persisted. A one-shot producer considers only
+the first 128 block-sized candidates. Header sync caps the entire unsettled
+header/body cache at 4096 rows; only accepted, previously unknown headers make
+room by evicting oldest leaves, which peers may announce again later. Body
+requests fill across attempt-count bands. These are node policy limits, not
+consensus; they prevent public relay traffic from turning the scheduled
+producer back into sustained CPU or disk load.
 
 SQLite database, WAL, SHM, and journal files are normalized to `0640` so the
 read-only services can traverse chain state. Keep `wallet/` at `0700` and
@@ -326,7 +390,8 @@ even though test coins are worthless. Never use production keys on testnet.
 ## Backups
 
 Stop every chain and pool database user before a filesystem backup, and archive
-the two state directories separately:
+the two state directories separately. If `.env` overrides either state path,
+export the same values in this shell before using the following commands:
 
 ```sh
 (
@@ -335,8 +400,8 @@ cd /srv/sigilcoin/sigil-coin/deploy/docker
 docker compose --env-file .env -f compose.testnet.yml stop
 install -d -m 0700 "$HOME/sigilcoin-testnet-backups"
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
-state_dir=${SIGIL_TESTNET_STATE_DIR:-"$PWD/state/testnet"}
-pool_state_dir=${SIGIL_TESTNET_POOL_STATE_DIR:-"$PWD/state/testnet-pool"}
+state_dir=${SIGIL_TESTNET_STATE_DIR:-"$PWD/state/testnet-proof-of-golf"}
+pool_state_dir=${SIGIL_TESTNET_POOL_STATE_DIR:-"$PWD/state/testnet-pool-proof-of-golf"}
 [[ $state_dir == /* ]] || state_dir=$PWD/${state_dir#./}
 [[ $pool_state_dir == /* ]] || pool_state_dir=$PWD/${pool_state_dir#./}
 tar -C "$state_dir" -czf "$HOME/sigilcoin-testnet-backups/$stamp-chain.tgz" .
@@ -356,7 +421,8 @@ preserve the partial evidence for diagnosis.
 
 A live `cp` or `tar` may capture torn SQLite state. Store backups encrypted and
 offline; never commit or rsync them into source. Restore only a matching
-reset-genesis pair into distinct empty locations. Start sync before pool and
+replacement-genesis pair into distinct empty locations, never retired nonce-PoW
+state. Start sync before pool and
 explorer so chain SQLite can recover normally, then compare genesis, status,
 relay context, issued supply, and balance with an independent node.
 
@@ -384,25 +450,48 @@ SIGIL_IMAGE="$rollback_image" docker compose --env-file .env \
 ```
 
 An image rollback does not migrate or restore either state directory. The
-chain database, pool schema, consensus rules, and genesis must all be
-compatible. In particular, state from before the packed `version`, compact
-target `bits`, and nonce-lottery genesis cutover requires a fresh matching chain
-state; never open it with the cutover binary.
+chain database, pool schema, consensus rules, and replacement genesis must all
+be compatible. The retired nonce-PoW image and its archives are not rollback
+targets for a proof-of-golf deployment; never open either generation's state
+with the other binary.
 If compatibility is uncertain, preserve both current directories and restore
 a matching pair into empty locations. An incident or testnet success does not
 authorize a mainnet push or deployment.
 
 ## Mainnet launch configuration
 
-Mainnet uses port `19444`, separate state, and loopback explorer port `8081`.
-The co-op relay service and public pool hostname are testnet-only; mainnet
-Compose has no pool. Mainnet's selected genesis uses the generated par
-candidate, commits its length and complexity in `version`, carries the compact
-base target in `bits`, and searches a coinbase-lock-time/header-nonce cursor
-against the effective full-header target. The final cursor is `(6,
-3129183091)`. This lottery cutover changed genesis, so older chain state is
-incompatible. Both helper scripts and every container refuse mainnet unless
-the operator sets exactly `ALLOW_MAINNET=yes`.
+Mainnet Docker uses port `19444`, fresh `./state/mainnet-proof-of-golf` state, and
+loopback explorer port `8081`. The co-op relay service and public pool hostname
+are testnet-only; mainnet Compose has no pool. Compare the replacement genesis
+with the reviewed all-network constants, not the superseded launch record.
+Both helper scripts and every container refuse mainnet unless the operator sets
+exactly `ALLOW_MAINNET=yes`.
+
+The local helper defaults to `deploy/state/local-mainnet-proof-of-golf`.
+The Docker replacement must set
+`SIGIL_MAINNET_STATE_DIR=./state/mainnet-proof-of-golf` in `.env`; a changed
+default does not override an old environment file. On a host that used the
+retired default, first stop every external database user and archive the old
+mainnet directory before changing its active state path:
+
+```sh
+(
+set -euo pipefail
+cd /srv/sigilcoin/sigil-coin/deploy/docker
+docker compose -p sigilcoin-mainnet --env-file .env --profile mainnet-miner \
+  -f compose.mainnet.yml stop
+[[ ! -e state/mainnet-proof-of-golf ]]
+stamp=$(date -u +%Y%m%dT%H%M%SZ)
+mv -- state/mainnet "state/mainnet.retired-nonce-pow-$stamp"
+install -d -m 0750 state/mainnet-proof-of-golf
+)
+```
+
+Substitute the actual retired path if `.env` used an override. Keep an encrypted
+offline copy labeled with the retired genesis and revision. Only after this
+archive step succeeds, save the new `.env` state path and run the reviewed
+deployment. Do not restore the retired database, wallet, or receipts. Fresh
+hosts skip the archive step but still select an unused replacement directory.
 
 ```sh
 ALLOW_MAINNET=yes MODE=mainnet bash deploy/scripts/run-local.sh
@@ -410,17 +499,27 @@ ALLOW_MAINNET=yes MODE=mainnet REMOTE_HOST=host.example \
   REMOTE_DIR=/srv/sigilcoin bash deploy/scripts/deploy-remote.sh
 ```
 
-These commands document the future safety gate; they are not launch approval.
-The public testnet must complete its 48-hour gate before the separate 24-hour
-private mainnet rehearsal. See [testnet.md](testnet.md) and
-[LAUNCH.md](../LAUNCH.md).
+These commands document the safety gate; they are not launch approval. Complete
+the replacement public-testnet gate before a separate private mainnet rehearsal.
+See [testnet.md](testnet.md) and [LAUNCH.md](../LAUNCH.md).
 
-### Automatic mainnet mining
+### Scheduled mainnet production
 
 On the Docker host, `start-mainnet-miner.sh` starts the non-default
-`mainnet-miner` profile only after the launch timestamp. It pays every producer
-reward to `sgl1qj9f6eeqxhjgynml4glztyrdw5tj5fn72s6shud`, stores no wallet key
-on the seed, and cancels an in-flight search whenever the validated tip changes.
+`mainnet-miner` profile and `miner` service. Those operator-facing names remain,
+but the container runs `producer-loop`: it waits for `next-slot-time`, builds
+and submits one complete candidate, then waits again. There is no nonce, hash,
+or coinbase search. The generated at-par program is a valid score-1 fallback.
+`MINE_INTERVAL=60` controls idle tip polling and retry delay, not consensus
+spacing; mainnet header times are exactly one day apart. The supervisor checks
+for a changed validated tip while waiting and cancels a stale in-flight child.
+An early-slot refusal is retried after waiting, never worked around by altering
+the timestamp.
+
+Producer rewards go to
+`sgl1qj9f6eeqxhjgynml4glztyrdw5tj5fn72s6shud`; the seed stores no wallet key.
+Review the configured `MINER_ADDRESS` before starting. Keep the producer
+low-CPU: sleeping between slots is normal, and hash-rate tuning is irrelevant.
 
 ```sh
 bash /srv/sigilcoin/sigil-coin/deploy/scripts/start-mainnet-miner.sh
@@ -429,9 +528,9 @@ docker compose -p sigilcoin-mainnet --env-file .env --profile mainnet-miner \
   -f compose.mainnet.yml logs -f miner
 ```
 
-Normal mainnet deployment stops and removes an active miner before replacing
+Normal mainnet deployment stops and removes an active producer before replacing
 node binaries. Run the guarded launcher again after every deployment. To stop
-only mining:
+only production:
 
 ```sh
 cd /srv/sigilcoin/sigil-coin/deploy/docker

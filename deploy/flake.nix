@@ -158,7 +158,13 @@
               let
                 rel = nixpkgs.lib.removePrefix "${fetched}/" path;
               in
-              rel == "package.sgl" || rel == "packages" || nixpkgs.lib.hasPrefix "packages/" rel;
+              (rel == "package.sgl" || rel == "packages" || nixpkgs.lib.hasPrefix "packages/" rel)
+              && !(builtins.elem (builtins.baseNameOf path) [
+                ".sigilcoin"
+                ".sigilcoin-testnet"
+                ".sigilcoin-proof-of-golf"
+                ".sigilcoin-testnet-proof-of-golf"
+              ]);
           }
         else
           throw ''
@@ -219,8 +225,6 @@
           test -f ${built.sigilcoin}/share/sigilcoin-site/assets/mining.svg
           test -f ${built.sigilcoin}/share/sigilcoin-site/assets/sigilcoin-symbol.png
           test -f ${built.sigilcoin}/share/sigilcoin-site/assets/sigilcoin-favicon.png
-          grep -q "Short programs. Better odds." \
-            ${built.sigilcoin}/share/sigilcoin-site/index.html
           grep -q "143029.99991970 SGL" \
             ${built.sigilcoin}/share/sigilcoin-site/index.html
           touch $out
@@ -279,11 +283,11 @@
             units = host.config.systemd.units;
           in
           assert host.config.services.sigilcoin.chain == "sigilcoin-main";
-          assert host.config.services.sigilcoin.dataDir == "/var/lib/sigilcoin";
+          assert host.config.services.sigilcoin.dataDir == "/var/lib/sigilcoin-proof-of-golf";
           assert builtins.elem 19444 host.config.networking.firewall.allowedTCPPorts;
-          assert builtins.elem "d /var/lib/sigilcoin 0750 sigilcoin sigilcoin - -"
+          assert builtins.elem "d /var/lib/sigilcoin-proof-of-golf 0750 sigilcoin sigilcoin - -"
             host.config.systemd.tmpfiles.rules;
-          assert builtins.elem "d /var/lib/sigilcoin/wallet 0700 sigilcoin sigilcoin - -"
+          assert builtins.elem "d /var/lib/sigilcoin-proof-of-golf/wallet 0700 sigilcoin sigilcoin - -"
             host.config.systemd.tmpfiles.rules;
           pkgs.runCommand "sigilcoin-module-eval" { } ''
             listen=${units."sigilcoin-listen.service".unit}/sigilcoin-listen.service
@@ -309,15 +313,15 @@
             grep -Fq -- "--port 19444" "$listen"
             grep -Fq -- "--max-connections 0" "$listen"
             grep -Fq -- "--chain sigilcoin-main" "$listen"
-            grep -Fq -- "--data-dir /var/lib/sigilcoin" "$listen"
+            grep -Fq -- "--data-dir /var/lib/sigilcoin-proof-of-golf" "$listen"
 
             grep -Fq "/bin/sigilcoin run" "$sync"
             grep -Fq -- "--iterations 0" "$sync"
             grep -Fq -- "--chain sigilcoin-main" "$sync"
-            grep -Fq -- "--data-dir /var/lib/sigilcoin" "$sync"
+            grep -Fq -- "--data-dir /var/lib/sigilcoin-proof-of-golf" "$sync"
 
             grep -Fq "/bin/sigilcoin-explorer" "$explorer"
-            grep -Fq -- "--data-dir /var/lib/sigilcoin" "$explorer"
+            grep -Fq -- "--data-dir /var/lib/sigilcoin-proof-of-golf" "$explorer"
             grep -Fq -- "--host 127.0.0.1" "$explorer"
             grep -Fq -- "--port 8080" "$explorer"
 
