@@ -272,6 +272,9 @@ the launch-day gate.
 that message. Post it once, do not follow up with a thread, and answer only
 direct questions.
 
+The operator confirmed this announcement was sent by
+`2026-09-13T05:56:52Z`.
+
 Draft, to send as-is:
 
 > SigilCoin is up: a blockchain where program golf weights a lightweight
@@ -288,14 +291,14 @@ Draft, to send as-is:
 
 Before sending:
 
-- [ ] The claims match what shipped: worth nothing, no premine, one block a
+- [x] The claims match what shipped: worth nothing, no premine, one block a
       day, producer `L <= par`, and shorter programs improve capped lottery
       odds rather than deterministically winning.
-- [ ] The three commands were run against the real mainnet build, in that
-      order, on a machine that is not the seed.
+- [x] A fresh off-host mainnet node ran `sync`, printed the puzzle and 26-byte
+      par witness, then began mining that witness against the public seed.
 - [x] The quote in genesis needs no third-party credit:
       `Sigil - Practical Symbolic Power` is the operator's own line.
-- [ ] Nobody is asked to install anything unsigned from a stranger.
+- [x] Nobody is asked to install anything unsigned from a stranger.
 
 Do not post it as a coin launch, do not mention value, price, exchanges or
 scarcity, and do not repeat it in other channels. The chain is a toy for one
