@@ -1,6 +1,14 @@
 explorer.sigilcoin.lol {
 	encode zstd gzip
-	reverse_proxy 127.0.0.1:8081
+
+	@site_assets path /assets/sigilcoin-symbol.png /assets/sigilcoin-favicon.png /assets/plus-jakarta.woff2 /assets/jetbrains-mono.woff2
+	handle @site_assets {
+		root * /srv/sigilcoin/site
+		file_server
+	}
+	handle {
+		reverse_proxy 127.0.0.1:8081
+	}
 
 	header {
 		Strict-Transport-Security "max-age=31536000"
@@ -17,7 +25,7 @@ explorer.sigilcoin.lol {
 explorer.testnet.sigilcoin.lol {
 	encode zstd gzip
 
-	@site_assets path /assets/sigilcoin-symbol.png /assets/plus-jakarta.woff2 /assets/jetbrains-mono.woff2
+	@site_assets path /assets/sigilcoin-symbol.png /assets/sigilcoin-favicon.png /assets/plus-jakarta.woff2 /assets/jetbrains-mono.woff2
 	handle @site_assets {
 		root * /srv/sigilcoin/site
 		file_server

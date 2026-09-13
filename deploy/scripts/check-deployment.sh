@@ -53,7 +53,10 @@ assert_fixed 'reverse_proxy 127.0.0.1:8081' deploy/Caddyfile
 if grep -Fq 'respond 404' deploy/Caddyfile; then
   fail 'public mainnet explorer still returns the prelaunch 404'
 fi
-assert_fixed '@site_assets path /assets/sigilcoin-symbol.png /assets/plus-jakarta.woff2 /assets/jetbrains-mono.woff2' deploy/Caddyfile
+asset_route='@site_assets path /assets/sigilcoin-symbol.png /assets/sigilcoin-favicon.png /assets/plus-jakarta.woff2 /assets/jetbrains-mono.woff2'
+assert_fixed "$asset_route" deploy/Caddyfile
+[[ $(grep -Fc "$asset_route" deploy/Caddyfile) == 2 ]] ||
+  fail 'both explorer hosts must serve the same branding assets'
 assert_fixed 'reverse_proxy 127.0.0.1:8080' deploy/Caddyfile
 assert_fixed 'pool.testnet.sigilcoin.lol {' deploy/Caddyfile
 assert_fixed 'reverse_proxy 127.0.0.1:8082 {' deploy/Caddyfile

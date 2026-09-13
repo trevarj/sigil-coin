@@ -438,6 +438,7 @@
               "<!DOCTYPE html>\n<html lang=\"en\"><head>"
               "<meta charset=\"utf-8\">"
               "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+              "<link rel=\"icon\" type=\"image/png\" sizes=\"64x64\" href=\"/assets/sigilcoin-favicon.png\">"
               "<title>" (explorer-escape title) "</title>"
               "<style>" %style "</style>"
               "<script src=\"/assets/explorer.js\" defer></script>"

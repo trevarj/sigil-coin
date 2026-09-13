@@ -1998,6 +1998,9 @@
         (has? page
               "<img class=\"wordmark-symbol\" src=\"/assets/sigilcoin-symbol.png\" width=\"32\" height=\"32\" alt=\"\">"))
       (assert-true
+        (has? page
+              "<link rel=\"icon\" type=\"image/png\" sizes=\"64x64\" href=\"/assets/sigilcoin-favicon.png\">"))
+      (assert-true
         (not (has? page
                    "<span class=\"wordmark-symbol\" aria-hidden=\"true\">S</span>")))
       (assert-true (has? page "SigilCoin <small>Explorer</small>"))
