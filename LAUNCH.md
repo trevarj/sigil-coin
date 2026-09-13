@@ -161,8 +161,8 @@ host. It is gone.
 
 - [x] `seed.sigilcoin.lol` A resolves publicly to `104.223.122.157`.
 - [x] `seed-peers` in `chain.sgl` is `(("seed.sigilcoin.lol" . 19444))`.
-- [ ] Re-run the suite, rebuild, and confirm a fresh data directory finds the
-      seed with no `--peer` flag and no manual `peers add`.
+- [x] A fresh off-host data directory found the DNS seed with no `--peer` flag,
+      completed one sync pass, and matched the published H0 hash and work.
 
 DNS must resolve before step 5. Otherwise every new node needs a hand-typed
 peer, and the first thing anyone would ask in the channel is what to type.
@@ -181,20 +181,20 @@ should be in the same place the code is.
       `809061200000000000000000000000000000000000000000000000000000000000000000f7278556687a298a5f50eeea93a1bf1a6fabb91b164d6fca115ff754c90d5cd90077a56a04cf2b1c738b83ba`;
       coinbase lock-time `6`, header nonce `3129183091`, quote
       `Sigil - Practical Symbolic Power`.
-- [ ] Network magic `8f d1 c0 a5`, default port 19444, protocol version
+- [x] Network magic `8f d1 c0 a5`, default port 19444, protocol version
       70015, user agent `/sigilcoin-node:0.1.0/`.
-- [ ] Address format: bech32, HRP `sgl`, so addresses read `sgl1…`.
-- [ ] Scheduled subsidy: 1 SGL per block for heights 1..30, then 100 SGL
+- [x] Address format: bech32, HRP `sgl`, so addresses read `sgl1…`.
+- [x] Scheduled subsidy: 1 SGL per block for heights 1..30, then 100 SGL
       halving every 730 blocks. The sum
       `14302999991970` daviwils (`143029.99991970 SGL`) is the scheduled
       maximum, not guaranteed issuance. Genesis is unspendable and pays zero.
-- [ ] Actual issuance and payout: solo blocks mint `floor(4*S/5)` subsidy and
+- [x] Actual issuance and payout: solo blocks mint `floor(4*S/5)` subsidy and
       route all fees to the producer, leaving the reserve unminted. Cooperative
       blocks mint `S+F`; shares in canonical pubkey order divide
       `floor(S/10)` by verified contributions 1..4, the parent carrier receives
       `floor(S/20)`, and output 0 receives fees and every integer residual.
       Required share/carrier outputs remain even at value zero.
-- [ ] Rules a miner hits: producer solutions must be at most their generated
+- [x] Rules a miner hits: producer solutions must be at most their generated
       par (`L <= par`) and 512 bytes; shares must be strictly below their
       personalized par (`L < personalized_par`); graffiti is at most 400 bytes,
       blocks at most 16384 bytes, and puzzles contain at most 8 example pairs.
@@ -209,7 +209,7 @@ should be in the same place the code is.
       intervals retarget bits with a 0.25x..4x clamp toward one block per day.
       The one-second parent floor only keeps timestamps monotone; future drift
       is 7200 seconds. Coinbase maturity is 1; the mainnet wallet waits six.
-- [ ] Fork choice, stated plainly: greater cumulative compact-target base work
+- [x] Fork choice, stated plainly: greater cumulative compact-target base work
       wins; equal work prefers greater height; an exact work-and-height tie
       retains the first valid arrival. Golf savings change admission odds, not
       credited chain work.
@@ -246,32 +246,25 @@ the launch-day gate.
       Fresh containers returned zero for `sigilcoin help`, `sigilcoin version`,
       `sigilcoin-explorer --help`, and `sigilcoin-explorer --version`; both
       versions print `0.1.0`.
-- [ ] Host deployed with `services.sigilcoin.enable = true`,
-      `chain = "sigilcoin-main"`, `listen.bind = "0.0.0.0"`,
-      `openFirewall = true`.
-- [ ] 19444/tcp reachable from off-host. Check from somewhere else, not from
-      the seed: `nc -vz seed.sigilcoin.lol 19444`.
-- [ ] `systemctl is-active sigilcoin-listen` says `active`. The node process
-      itself holds 19444; there is no socket unit and no proxy.
-- [ ] `sigilcoin status` on the seed reports the published genesis hash.
-- [ ] Wallet key backed up, encrypted, offline, before the seed can earn
-      anything. It is `/var/lib/sigilcoin/wallet/wallet.key`, inside a 0700
-      directory the explorer cannot enter; `stat -c '%A' /var/lib/sigilcoin`
-      must still read `drwxr-x---` after the key exists, because that is
-      what the explorer traverses.
-- [ ] `timeout 5 sigilcoin-explorer --version` prints
-      `sigilcoin-explorer 0.1.0` and returns. If it blocks instead, the
-      build predates `--help`/`--version` handling and every explorer
-      command has to be run under `timeout`.
-- [ ] Explorer up at `explorer.sigilcoin.lol` behind a TLS reverse proxy. The
-      mainnet explorer itself stays bound to `127.0.0.1:8081`; the proxy is the
-      only public path. Smoke-test canonical routes `/`, `/blocks`, `/difficulty`,
-      `/block/0`, `/api/summary`, `/api/blocks`, `/api/difficulty`, and
-      `/api/block/0`. If explorer is not ready, launch without it and say so
-      rather than delaying — a chain with no explorer is fine; a chain with no
-      seed is not.
-- [ ] A second node, on different hardware and a different network, syncs
-      from the seed and reaches the same tip. One node is not a network.
+- [x] Docker mainnet stack is deployed with the listener bound directly to
+      `0.0.0.0:19444`, sync healthy, and explorer host-loopback-only on 8081.
+- [x] `19444/tcp` is reachable from an off-host network through
+      `seed.sigilcoin.lol`.
+- [x] `sigilcoin-mainnet-listener-1` is healthy and directly owns host port
+      19444; there is no socket proxy.
+- [x] Seed status reports the published genesis hash, H0, cumulative work
+      `25098045880`, and a successful public peer connection.
+- [x] The operator confirmed an encrypted offline backup for external payout
+      address `sgl1qj9f6eeqxhjgynml4glztyrdw5tj5fn72s6shud` before the automatic
+      miner was resumed. The public seed stores no wallet key.
+- [x] A fresh image invocation of `sigilcoin-explorer --version` printed
+      `sigilcoin-explorer 0.1.0` and returned zero.
+- [x] Explorer is live at `explorer.sigilcoin.lol` behind Caddy with valid TLS.
+      The origin remains bound to `127.0.0.1:8081`; `/`, `/blocks`,
+      `/difficulty`, `/block/0`, `/api/summary`, `/api/blocks`,
+      `/api/difficulty`, and `/api/block/0` all returned 200.
+- [x] A fresh node on different hardware and a different network discovered
+      the public seed without an explicit peer and reached the same H0 tip.
 
 ## 6. The announcement
 
@@ -452,7 +445,7 @@ DNS and TLS, and nothing unresolved here can be deferred past step 5.
 | 5 | ~~Where the repository is published~~ — RESOLVED and confirmed: `https://github.com/trevarj/sigil-coin`, the operator's account. Every `package.sgl` and the announcement now say so. | `package.sgl` files, the step 6 announcement |
 | 6 | ~~`depsHash`~~ — RESOLVED. There is no vendoring derivation and no hash to fill in: every `from-git` dependency is a pinned flake input, so Nix fetches it and the sandbox stays offline. Bumping one is `nix flake update <input>` in `deploy/`. | — |
 | 7 | ~~Confirm the explorer's flags~~ — RESOLVED. `--regtest`, `--data-dir`, `--host`, `--port` confirmed against `explorer-main` and against `sigilcoin-explorer --help` run from the built binary. | `services.sigilcoin-explorer.command` in `deploy/module.nix` |
-| 8 | The TLS certificate for `explorer.sigilcoin.lol` | Still owed. The domain is `sigilcoin.lol` and the explorer's public name is `explorer.sigilcoin.lol` (`deploy/RUNBOOK.md`), but nothing in the tree issues or terminates a certificate: that is the reverse proxy's job on the host. |
+| 8 | ~~The TLS certificate for `explorer.sigilcoin.lol`~~ — RESOLVED. Caddy terminates a publicly verified certificate and proxies only to the loopback mainnet explorer on port 8081. | `deploy/Caddyfile` |
 | 9 | Whether to launch without an explorer if it is not ready | Recommendation: yes |
 | 10 | Complete the 48-hour public-testnet gate, then run the 24-hour private mainnet rehearsal | Required for the compressed experimental launch; see [Complete the public testnet](#0-complete-the-public-testnet) and [Pre-launch mainnet soak](#pre-launch-mainnet-soak). |
 | 11 | Whether to accept untested payout incentives | Still owed. Solo targets 80%; cooperative targets 85% producer, 10% contribution-weighted shares, and 5% carrier, with fees and residuals to the producer. Regtest proves exact enforcement, not public participant behaviour. |
