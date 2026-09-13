@@ -880,7 +880,7 @@
       (string->utf8
         (let ((name (chain-config-name chain)))
           (cond ((string=? name "sigilcoin-main")
-                 "SigilCoin proof-of-golf mainnet")
+                 "Sigil - Practical Symbolic Power")
                 ((string=? name "sigilcoin-testnet")
                  "SigilCoin proof-of-golf testnet")
                 ((string=? name "sigilcoin-regtest")

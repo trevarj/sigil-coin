@@ -50,17 +50,19 @@ The previously launched nonce-PoW genesis was retired **before height 1** becaus
 
 A valid branch replaces the active chain only at a **strictly greater height**. Equal height retains the durable active incumbent, even across a restart; score, hash, and arrival metadata do not break the tie. Different nodes can therefore retain different equal-height branches.
 
-Each network's chain config hardcodes `(height . internal-hash)` checkpoints. An incompatible branch cannot cross a checkpoint. Checkpoints advance only in reviewed software releases, and nodes must upgrade to share a newer one; there is no automatic or signed-checkpoint finality service. **Mainnet pins H0 and the live H1 block**; public testnet and regtest still pin **H0 only**, protecting genesis but no later history. Mainnet rejects reorgs below H1; reorgs above H1 remain possible.
+Each network's chain config hardcodes `(height . internal-hash)` checkpoints. An incompatible branch cannot cross a checkpoint. Checkpoints advance only in reviewed software releases, and nodes must upgrade to share a newer one; there is no automatic or signed-checkpoint finality service. **Mainnet currently pins H0 and H1** on the replacement slogan chain; public testnet and regtest remain **H0 only**. Reorgs remain possible above H1 on mainnet and above H0 on testnet and regtest.
 
-Mainnet H1 internal hash: `24f2cbbf4a5dbbce67abbcc047e300cda17c600e7ab3565846d27a0eb6b041d2`. Its reversed display ID is `d241b0b60e7ad2465856b37a0e607ca1cd00e347c0bcab67cebb5d4abfcbf224`.
+The authorized mainnet reset restores the exact genesis quote `Sigil - Practical Symbolic Power`, retaining timestamp `1789228800` (`2026-09-12T16:00:00Z`). Mainnet H0 internal hash: `d15ecce0c8a3e4dc07c8136eb68770c2e59683cbad4bd268c420ec24ae040d3a`. Its reversed display ID is `3a0d04ae24ec20c468d24badcb8396e5c27087b66e13c807dce4a3c8e0cc5ed1`.
 
-The longest-height/checkpoint cutover preserves proof-of-golf block bytes, genesis hashes, and genesis timestamps. Transport magic changes to `SGM3` / `SGT3` / `SGR3` (mainnet / testnet / regtest) to isolate older score-ranked nodes. Existing proof-of-golf H0 state may be reused; retired nonce-PoW state may not.
+The replacement slogan-chain H1 is produced and pinned. H1 internal hash: `ec3ef647e87a3b54e832b10f0788e2494ac7934096b7357576b263504281637d`. Its reversed display ID is `7d6381425063b2767535b7964093c74a49e288070fb132e8543b7ae847f63eec`.
+
+The mistaken marker-quote mainnet H0/H1 and its H1 checkpoint are abandoned, not continued. Archive that chain and relay state and start mainnet with fresh state; do not reuse its H0 database. Mainnet transport magic is `SGM4`. Testnet and regtest retain their genesis identities, timestamps, and `SGT3` / `SGR3` transport magic; their existing proof-of-golf H0 state may be reused. Retired nonce-PoW state remains archived.
 
 ## Network
 
 | Parameter | Mainnet |
 |---|---|
-| Status | Replacement proof-of-golf network; prior launch retired at H0 |
+| Status | Mainnet slogan chain pins H0 and H1; prior marker-quote H0/H1 abandoned |
 | DNS seed | `seed.sigilcoin.lol:19444` |
 | Explorer | [explorer.sigilcoin.lol](https://explorer.sigilcoin.lol) |
 | Address prefix | `sgl1…` |
@@ -125,7 +127,7 @@ sigilcoin address \
 
 The command creates `wallet/wallet.key` with mode `0600`. That 32-byte key is the wallet: there is no seed phrase or recovery service. Back it up encrypted and offline before receiving rewards. Never commit it, paste it into chat, or place it in the Nix store.
 
-Use this fresh directory for proof-of-golf. Back up and archive the retired network's directory separately; copying its database into the new directory is not a migration.
+Use a fresh directory for the slogan-reset mainnet. Back up and archive both retired nonce-PoW and abandoned marker-quote mainnet state separately; copying either database into the new directory is not a migration.
 
 ### Sync and inspect the puzzle
 

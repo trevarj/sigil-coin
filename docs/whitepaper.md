@@ -53,7 +53,7 @@ Nothing here makes programs scarce or alternative branches costly to build.
 Cheap equal-height alternatives cannot displace a local incumbent, but missed
 slots offer takeover opportunities and partitions can leave nodes split.
 Reorgs remain possible above the latest release checkpoint: H1 on mainnet,
-H0 on public testnet and regtest.
+H0 on testnet and regtest.
 Valid parent templates can still be manipulated to sample future puzzles.
 SigilCoin is not money, not a fair-distribution claim, and not safe for valuable
 settlement.
@@ -556,14 +556,25 @@ above it.
 Checkpoints advance only when a reviewed software release hardcodes a later
 pair. Nodes must upgrade to share the newer checkpoint. This is a release
 coordination and trust boundary, not automatic finality, signed checkpoint
-broadcasts, or a confirmation-count guarantee. Mainnet now pins H0 and the
-live H1 block, whose internal hash is
-`24f2cbbf4a5dbbce67abbcc047e300cda17c600e7ab3565846d27a0eb6b041d2`
-and reversed display ID is
-`d241b0b60e7ad2465856b37a0e607ca1cd00e347c0bcab67cebb5d4abfcbf224`.
-Mainnet rejects reorgs below H1; reorgs above H1 remain possible. Public testnet
-and regtest still pin H0 only: genesis is fixed, but no post-genesis history
-is finalized.
+broadcasts, or a confirmation-count guarantee. Mainnet currently pins H0 and
+H1 on the replacement slogan chain; public testnet and regtest remain
+H0-only, fixing genesis but no post-genesis history.
+
+The authorized mainnet reset restores the exact genesis quote
+`Sigil - Practical Symbolic Power`, retaining timestamp `1789228800`
+(`2026-09-12T16:00:00Z`). Mainnet H0 internal hash is
+`d15ecce0c8a3e4dc07c8136eb68770c2e59683cbad4bd268c420ec24ae040d3a`
+and its reversed display ID is
+`3a0d04ae24ec20c468d24badcb8396e5c27087b66e13c807dce4a3c8e0cc5ed1`.
+
+The replacement slogan-chain H1 is produced and pinned. H1 internal hash is
+`ec3ef647e87a3b54e832b10f0788e2494ac7934096b7357576b263504281637d`
+and its reversed display ID is
+`7d6381425063b2767535b7964093c74a49e288070fb132e8543b7ae847f63eec`.
+
+The mistaken marker-quote mainnet H0/H1 and its H1 checkpoint are abandoned,
+not continued. Reorgs remain possible above H1 on mainnet and above H0 on
+testnet and regtest.
 
 ## 8. Puzzle complexity
 
@@ -1048,9 +1059,8 @@ be rebuilt from available witnesses without hash search. Past slots are
 already time-eligible. Extra golf score cannot make a shorter or equal-height
 branch win; a replacement must become strictly taller, for example after a
 missed slot or during a partition, and match all reached release checkpoints.
-Reorgs remain possible above the latest checkpoint: H1 on mainnet, H0 on public
-testnet and regtest. Advancing that boundary requires a reviewed software
-release and node upgrades.
+Reorgs remain possible above the latest checkpoint: H0 on all networks.
+Advancing that boundary requires a reviewed software release and node upgrades.
 
 **Equal-height forks remain local.** Equality retains each node's durable
 active incumbent, regardless of score, hash, or arrival metadata. Nodes that
@@ -1093,12 +1103,14 @@ nonce-lottery APIs and validation are removed, not retained as aliases or a
 second mode. Current generated genesis constants identify each replacement
 network. No archived nonce-PoW database may be reused as that network's state.
 
-The longest-height/checkpoint cutover preserves proof-of-golf genesis hashes,
-genesis timestamps, and block wire bytes. It changes transport magic to `SGM3`,
-`SGT3`, and `SGR3` on mainnet, testnet, and regtest to isolate older score-ranked
-nodes. Existing proof-of-golf H0 state may be reused. Mainnet now pins H0 and
-the live H1 block; public testnet and regtest still pin H0 only. Later
-checkpoints require reviewed releases and node upgrades.
+The authorized mainnet slogan reset changes its genesis identity and transport
+magic to `SGM4`, retaining timestamp `1789228800`. Archive the abandoned
+marker-quote mainnet chain and relay state and start with fresh state; its H0
+database may not be reused. Testnet and regtest retain their genesis identities,
+timestamps, and `SGT3` / `SGR3` transport magic; their existing proof-of-golf H0
+state may be reused. Mainnet now pins slogan-chain H0 and H1; public testnet
+and regtest remain H0-only. Later checkpoints require reviewed releases and
+node upgrades.
 
 This document specifies the cutover; it does not claim a new validation run,
 deployment soak, or security result.
@@ -1137,8 +1149,8 @@ deployment soak, or security result.
 | `bits` | fixed per-network compatibility field |
 | `nonce` | 0 |
 | fork choice | strictly taller valid branch; equal height retains durable active incumbent |
-| checkpoints | hardcoded reviewed release pairs; mainnet H0 + H1, public testnet/regtest H0 only |
-| transport magic main/test/reg | `SGM3` / `SGT3` / `SGR3` |
+| checkpoints | hardcoded reviewed release pairs; mainnet slogan-chain H0 + H1, public testnet/regtest H0 only |
+| transport magic main/test/reg | `SGM4` / `SGT3` / `SGR3` |
 | non-genesis coinbase version / sequence / lock time | 1 / `0xffffffff` / 0; no witness |
 | max shares / commitments | 8 / 16 |
 | payout | solo `floor(4*S/5)+F`; cooperative 10% weighted shares, 5% carrier, producer residual |

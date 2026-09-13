@@ -24,10 +24,11 @@ because a testnet gate passed.
 - Genesis marker, timestamp, and display/internal hashes: use the reviewed
   replacement all-network output from `deploy/genesis-constants.sgl` for this
   build. Do not use the retired public-testnet identity.
-- Transport magic: `SGT3` (final byte `0x33`); mainnet uses `SGM3` and regtest
-  `SGR3`. This isolates older score-ranked peers without changing proof-of-golf
-  genesis hashes, genesis timestamps, or block wire bytes. Existing proof-of-golf
-  H0 state may be reused; retired nonce-PoW state may not.
+- Transport magic: `SGT3` (final byte `0x33`); mainnet uses `SGM4` and regtest
+  `SGR3`. Testnet and regtest retain their proof-of-golf genesis identities,
+  timestamps, and block wire bytes. Their existing proof-of-golf H0 state may
+  be reused; retired nonce-PoW state may not. Mainnet's slogan reset requires
+  fresh chain and relay state instead.
 - Timestamp: exactly `parent.time + configured testnet spacing`, with zero
   future drift. Testnet retains its configured shorter slots; mainnet uses
   exactly 86,400 seconds. `puzzle` and `status` report `next-slot-time` as a UTC
@@ -44,9 +45,11 @@ because a testnet gate passed.
   Incompatible branches cannot cross them. Only reviewed software releases
   advance checkpoints; nodes must upgrade to share a newer one. Public testnet
   and regtest still pin H0 only, protecting genesis but no later history.
-  Mainnet now pins H0 and the live H1 block listed in
-  [the consensus specification](consensus.md#58-hardcoded-release-checkpoints):
-  reorgs below H1 are rejected, while reorgs above H1 remain possible.
+  Mainnet now pins H0 and H1 on the replacement slogan chain.
+  Its authorized slogan reset abandons the mistaken marker-quote H0/H1 and
+  its H1 checkpoint; see
+  [the consensus specification](consensus.md#58-hardcoded-release-checkpoints).
+  Reorgs remain possible above H1 on mainnet and above H0 on testnet and regtest.
   There is no automatic or signed-checkpoint finality service.
 - Headers remain 80 bytes, with canonical packed length/complexity in
   `version`, nonce 0, and fixed network pow-limit `bits` as a compatibility

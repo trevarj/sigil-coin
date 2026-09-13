@@ -33,23 +33,32 @@ across restart; score, hash, and arrival metadata do not break ties.
 Chain configs hardcode `(height . internal-hash)` checkpoints. Incompatible
 branches cannot cross a checkpoint. Checkpoints advance only in reviewed
 software releases, not automatically or through signed broadcasts; operators
-must upgrade nodes to share a newer checkpoint. Mainnet now pins H0 and the
-live H1 block; public testnet and regtest still pin H0 only, protecting genesis
-but no later history. Mainnet rejects reorgs below H1; reorgs above H1 remain
-possible.
+must upgrade nodes to share a newer checkpoint. Mainnet currently pins H0
+and H1 on the replacement slogan chain; public testnet and regtest remain
+H0-only, protecting genesis but no later history. Reorgs remain possible
+above H1 on mainnet and above H0 on testnet and regtest.
 
-Mainnet H1 internal hash:
-`24f2cbbf4a5dbbce67abbcc047e300cda17c600e7ab3565846d27a0eb6b041d2`.
+The authorized mainnet reset restores the exact genesis quote
+`Sigil - Practical Symbolic Power`, retaining timestamp `1789228800`
+(`2026-09-12T16:00:00Z`). Mainnet H0 internal hash:
+`d15ecce0c8a3e4dc07c8136eb68770c2e59683cbad4bd268c420ec24ae040d3a`.
 Its reversed display ID is
-`d241b0b60e7ad2465856b37a0e607ca1cd00e347c0bcab67cebb5d4abfcbf224`.
+`3a0d04ae24ec20c468d24badcb8396e5c27087b66e13c807dce4a3c8e0cc5ed1`.
 
-This cutover preserves proof-of-golf block bytes, genesis hashes, and genesis
-timestamps. Transport magic changes to `SGM3` / `SGT3` / `SGR3` on mainnet /
-testnet / regtest to isolate older score-ranked nodes. Existing proof-of-golf
-H0 state may be reused; retired nonce-PoW state must stay archived. A node
-refuses to open active history that conflicts with an installed checkpoint
-rather than silently rewriting it. Preserve the database and compare the
-reviewed release's checkpoints when diagnosing such a refusal.
+The replacement slogan-chain H1 is produced and pinned. H1 internal hash:
+`ec3ef647e87a3b54e832b10f0788e2494ac7934096b7357576b263504281637d`.
+Its reversed display ID is
+`7d6381425063b2767535b7964093c74a49e288070fb132e8543b7ae847f63eec`.
+
+The mistaken marker-quote mainnet H0/H1 and its H1 checkpoint are abandoned.
+Mainnet transport magic is `SGM4`. Archive its abandoned chain and relay
+state and start with fresh state; never reuse its H0 database. Testnet and
+regtest retain their genesis identities, timestamps, and `SGT3` / `SGR3`
+transport magic; their existing proof-of-golf H0 state may be reused. Retired
+nonce-PoW state must stay archived. A node refuses to open active history that
+conflicts with an installed checkpoint rather than silently rewriting it.
+Preserve the database and compare the reviewed release's genesis and
+checkpoints when diagnosing such a refusal.
 
 Each header timestamp must equal `parent.time + network spacing` and must not
 be in the validating node's future. Mainnet spacing is exactly 86,400 seconds;

@@ -73,10 +73,13 @@ quality; they do not select branches or currently alter subsidy.
 
 Production chain configs hardcode `(height . internal-hash)` checkpoints, and
 incompatible branches cannot cross them. Checkpoints advance only in reviewed
-software releases; nodes must upgrade to share a newer one. Mainnet now pins H0
-and the live H1 block listed in [the consensus specification](consensus.md#58-hardcoded-release-checkpoints),
-rejecting reorgs below H1 while allowing reorgs above it. Public testnet and
-regtest still pin H0 only, protecting genesis but no post-genesis history.
+software releases; nodes must upgrade to share a newer one. Mainnet currently
+pins H0 and H1 on the replacement slogan chain; public testnet and regtest
+remain H0-only, protecting genesis but no post-genesis history. Reorgs remain
+possible above H1 on mainnet and above H0 on testnet and regtest. The mistaken
+marker-quote mainnet H0/H1 and its H1 checkpoint are abandoned; the current
+slogan-chain identity and H1 hashes are in
+[the consensus specification](consensus.md#58-hardcoded-release-checkpoints).
 There is no automatic or signed-checkpoint finality.
 
 Headers stay 80 bytes. Non-genesis time is exactly
@@ -242,10 +245,11 @@ the project's intent. Replacement networks start from new genesis identities
 in fresh `state/*-proof-of-golf` directories; old state is archived and never
 reused. A low-CPU scheduled producer builds a complete candidate once. No old
 hash-search compatibility path is retained.
-The later longest-height/checkpoint cutover preserves proof-of-golf block
-bytes, genesis hashes, and genesis timestamps. Transport magic becomes
-`SGM3` / `SGT3` / `SGR3` on mainnet / testnet / regtest to isolate older
-score-ranked peers; existing proof-of-golf H0 state may be reused.
+The authorized mainnet slogan reset changes its genesis identity and transport
+magic to `SGM4`, retaining timestamp `1789228800`. Abandoned marker-quote
+mainnet chain and relay state must be archived, not reused. Testnet and regtest
+retain their genesis identities, timestamps, and `SGT3` / `SGR3` magic; their
+existing proof-of-golf H0 state may be reused.
 
 The bounded simulation does not exercise durable-node restart persistence,
 arbitrary deep branches, real peers, network convergence, propagation delay,
@@ -259,8 +263,9 @@ these production limitations:
 - Equal-height forks retain local durable incumbents, not a globally agreed
   hash winner. Partitions can preserve different local branches.
 - Reorgs remain possible above the latest release checkpoint: H1 on mainnet,
-  H0 on public testnet and regtest. Only reviewed releases and node upgrades
-  advance that boundary. A child adds height, not finality.
+  H0 on testnet and regtest. Only reviewed releases and node upgrades advance
+  that boundary.
+  A child adds height, not finality.
 - Fixed nonce and coinbase metadata do not eliminate parent-template
   manipulation through valid source, payout, transaction, commitment, or reveal
   choices that change the next puzzle.

@@ -19,14 +19,15 @@ metadata; nodes can retain different local incumbents.
 Chain configs hardcode `(height . internal-hash)` checkpoints; incompatible
 branches cannot cross them. Only reviewed releases advance checkpoints, and
 nodes must upgrade to share a newer one. Public testnet and regtest still pin
-H0 only, protecting genesis but no later history. Mainnet now pins H0 and the
-live H1 block listed in [the consensus specification](consensus.md#58-hardcoded-release-checkpoints),
-rejecting reorgs below H1 while allowing reorgs above it. The
-longest-height/checkpoint change preserves proof-of-golf block bytes, genesis
-hashes, and genesis timestamps, but bumps transport magic to `SGM3` / `SGT3` /
-`SGR3` to isolate older score-ranked nodes. Existing proof-of-golf H0 state may
-be reused outside this deliberately fresh-state drill; retired nonce-PoW state
-must remain archived.
+H0 only, protecting genesis but no later history. Mainnet now pins H0 and H1
+on the replacement slogan chain. Its authorized slogan reset abandons the
+mistaken marker-quote H0/H1 and its H1 checkpoint; see
+[the consensus specification](consensus.md#58-hardcoded-release-checkpoints).
+Mainnet transport magic is `SGM4` and requires fresh chain and relay state.
+Testnet and regtest retain their genesis identities, timestamps, and
+`SGT3` / `SGR3` magic. Their existing proof-of-golf H0 state may be reused
+outside this deliberately fresh-state drill; retired nonce-PoW state must
+remain archived.
 
 This is hobby-chain evidence, not settlement security. Equal-height alternatives
 are cheap to build; missed slots offer takeover opportunities, partitions can

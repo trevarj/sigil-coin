@@ -27,10 +27,10 @@ The replacement rules are:
   and arrival metadata do not break ties. Equal-height local tips can differ.
 - Chain configs hardcode `(height . internal-hash)` checkpoints. Incompatible
   branches cannot cross them. Only reviewed software releases advance
-  checkpoints, and nodes must upgrade to share a newer one. Mainnet now pins
-  H0 and the live H1 block; public testnet and regtest still pin H0 only.
-  Mainnet rejects reorgs below H1; reorgs above H1 remain possible. This is not
-  automatic or signed-checkpoint finality.
+  checkpoints, and nodes must upgrade to share a newer one. Mainnet currently
+  pins H0 and H1 on the replacement slogan chain; public testnet and regtest
+  remain H0-only. Reorgs remain possible above H1 on mainnet and above H0 on
+  testnet and regtest. This is not automatic or signed-checkpoint finality.
 - Mainnet header time is exactly `parent.time + 86400`. Each test network uses
   its configured shorter spacing. No network accepts a future slot. Late
   production can fill elapsed slots; this is not a guarantee of daily arrival.
@@ -41,16 +41,24 @@ The replacement rules are:
 - Bounded puzzle evaluation, puzzle-complexity retarget, co-op commitments and
   shares, ordinary transactions, and payouts remain.
 
-Mainnet H1 is pinned by internal hash
-`24f2cbbf4a5dbbce67abbcc047e300cda17c600e7ab3565846d27a0eb6b041d2`;
+The authorized mainnet reset restores the exact genesis quote
+`Sigil - Practical Symbolic Power`, retaining timestamp `1789228800`
+(`2026-09-12T16:00:00Z`). Mainnet H0 internal hash is
+`d15ecce0c8a3e4dc07c8136eb68770c2e59683cbad4bd268c420ec24ae040d3a`;
 its reversed display ID is
-`d241b0b60e7ad2465856b37a0e607ca1cd00e347c0bcab67cebb5d4abfcbf224`.
+`3a0d04ae24ec20c468d24badcb8396e5c27087b66e13c807dce4a3c8e0cc5ed1`.
 
-The longest-height/checkpoint cutover keeps proof-of-golf block bytes, genesis
-hashes, and genesis timestamps unchanged. Transport magic becomes `SGM3`,
-`SGT3`, and `SGR3` on mainnet, testnet, and regtest to isolate older score-ranked
-nodes. Existing proof-of-golf H0 state may be reused; retired nonce-PoW state
-must remain archived.
+The replacement slogan-chain H1 is produced and pinned. Its internal hash is
+`ec3ef647e87a3b54e832b10f0788e2494ac7934096b7357576b263504281637d`;
+its reversed display ID is
+`7d6381425063b2767535b7964093c74a49e288070fb132e8543b7ae847f63eec`.
+
+The mistaken marker-quote mainnet H0/H1 and its H1 checkpoint are abandoned.
+Mainnet transport magic is `SGM4`; archive its abandoned chain and relay state
+and start with fresh state, never reusing the marker-quote H0 database.
+Testnet and regtest retain their genesis identities, timestamps, and
+`SGT3` / `SGR3` transport magic; their existing proof-of-golf H0 state may be
+reused. Retired nonce-PoW state must remain archived.
 
 When replacing retired nonce-PoW state, archive its chain and relay databases
 before starting proof-of-golf binaries. Never reuse them or treat the old H0 hash
@@ -67,8 +75,9 @@ make equal-height alternative branches cheap to construct, but neither a
 shorter nor an equal-height branch wins by improving golf score. A missed slot
 can let a replacement branch become strictly taller; partitions can leave nodes
 with different incumbents. Reorgs remain possible above the latest released
-checkpoint: H1 on mainnet, H0 on public testnet and regtest. Fixing nonce, locktime, graffiti, and slots still
-leaves parent-template manipulation through the remaining valid block choices.
+checkpoint: H1 on mainnet, H0 on testnet and regtest. Fixing nonce, locktime,
+graffiti, and slots still leaves parent-template manipulation through the
+remaining valid block choices.
 Commit–reveal binds contributions and payouts, not finality. Do not treat
 confirmations as financial settlement.
 

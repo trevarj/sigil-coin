@@ -451,18 +451,28 @@ are fixed under that release. Reorgs remain possible above `K`.
 
 Checkpoints advance only in reviewed software releases. Nodes MUST upgrade to
 share a newer checkpoint; there is no automatic, signed-broadcast, or
-confirmation-count finality mechanism. Mainnet pins H0 and the live H1 block:
+confirmation-count finality mechanism. Mainnet currently pins H0 and H1 on the
+replacement slogan chain. Public testnet and regtest remain H0-only, fixing
+genesis but no post-genesis history. Reorgs remain possible above H1 on mainnet
+and above H0 on testnet and regtest.
 
-- H1 internal hash: `24f2cbbf4a5dbbce67abbcc047e300cda17c600e7ab3565846d27a0eb6b041d2`.
-- H1 reversed display ID: `d241b0b60e7ad2465856b37a0e607ca1cd00e347c0bcab67cebb5d4abfcbf224`.
+The authorized mainnet reset restores the exact genesis quote
+`Sigil - Practical Symbolic Power`, retaining timestamp `1789228800`
+(`2026-09-12T16:00:00Z`):
 
-Mainnet rejects reorgs below H1; reorgs above H1 remain possible. Public
-testnet and regtest still pin H0 only, fixing genesis but no post-genesis
-history. This fork-choice/checkpoint cutover leaves block bytes, proof-of-golf
-genesis hashes, and genesis timestamps
-unchanged. Transport magic becomes `SGM3` / `SGT3` / `SGR3` on mainnet /
-testnet / regtest to isolate older score-ranked peers. Existing proof-of-golf
-H0 state may be reused; retired nonce-PoW state may not.
+- H0 internal hash: `d15ecce0c8a3e4dc07c8136eb68770c2e59683cbad4bd268c420ec24ae040d3a`.
+- H0 reversed display ID: `3a0d04ae24ec20c468d24badcb8396e5c27087b66e13c807dce4a3c8e0cc5ed1`.
+
+The replacement slogan-chain H1 is produced and pinned:
+
+- H1 internal hash: `ec3ef647e87a3b54e832b10f0788e2494ac7934096b7357576b263504281637d`.
+- H1 reversed display ID: `7d6381425063b2767535b7964093c74a49e288070fb132e8543b7ae847f63eec`.
+
+The mistaken marker-quote mainnet H0/H1 and its H1 checkpoint are abandoned.
+Mainnet transport magic is `SGM4`; its abandoned chain and relay state MUST
+be archived, not reused. Testnet and regtest retain their genesis identities,
+timestamps, and `SGT3` / `SGR3` transport magic; their existing proof-of-golf
+H0 state may be reused. Retired nonce-PoW state may not.
 
 Opening durable state whose active branch conflicts with an installed
 checkpoint fails rather than silently replacing active history. Operators
@@ -1331,8 +1341,8 @@ puzzles but adds no hash-search cost; past slots are already eligible.
 Better golf score cannot make a shorter or equal-height rewrite win.
 A replacement must become strictly taller, for example when the incumbent
 misses a slot or during a partition, and must match every reached checkpoint.
-Only reviewed release upgrades advance that boundary: currently H1 on mainnet,
-H0 on public testnet and regtest. The latter protect genesis, not later history.
+Only reviewed release upgrades advance that boundary: currently H0 on all
+networks, protecting genesis but no later history.
 
 **7. Equal-height forks are local, and template manipulation remains possible.**
 Equal height preserves each node's durable active incumbent, so observers
@@ -1370,12 +1380,14 @@ drift. Fixed pow-limit `bits` are compatibility fields, not measured security
 targets. Current network definitions and the all-network genesis generator are
 the source of genesis timestamps, quotes, and display/internal hashes; old
 launch identifiers must not be copied into replacement state.
-The longest-height/checkpoint change preserves those replacement genesis
-identities, timestamps, and block bytes. Mainnet/testnet/regtest transport magic
-is `SGM3` / `SGT3` / `SGR3` (final byte `0x33`), isolating older score-ranked
-peers. Existing proof-of-golf H0 state may be reused. Nodes must install
-reviewed release updates to share newer checkpoints; the initial release pins
-only each network's H0.
+The authorized mainnet slogan reset (§5.8) changes mainnet genesis identity
+and transport magic to `SGM4` (final byte `0x34`), abandoning the mistaken
+marker-quote H0/H1 and its checkpoint. Its timestamp stays `1789228800`.
+Testnet and regtest retain their genesis identities, timestamps, and
+`SGT3` / `SGR3` magic (final byte `0x33`); only their existing proof-of-golf H0
+state may be reused. Mainnet requires fresh chain and relay state. Nodes must
+install reviewed release updates to share newer checkpoints; currently each
+network pins H0 only, before a replacement mainnet H1 is produced.
 
 The 2026-09-12 nonce-PoW mainnet launch was retired before height 1: no
 post-genesis blocks existed, and compute burn contradicted the hobby project's

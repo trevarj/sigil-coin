@@ -234,14 +234,14 @@
                     (list 'figure (attrs '(class "diagram reveal"))
                           (list 'img (attrs '(src "assets/score-fork.svg")
                                             '(alt "A valid height-two branch beats height one regardless of golf score; equal height keeps the durable active incumbent, and hardcoded release checkpoints bound reorgs")))
-                          (list 'figcaption "Switch only to a strictly taller valid branch that matches release checkpoints. Equal height retains the durable active incumbent. Mainnet pins H0 and H1; public testnet and regtest pin H0 only.")))
+                          (list 'figcaption "Switch only to a strictly taller valid branch that matches release checkpoints. Equal height retains the durable active incumbent. Mainnet pins H0 and H1 on the replacement slogan chain; public testnet and regtest remain H0-only.")))
               (list 'div (attrs '(class "exact-grid reveal"))
                     (list 'details
                           (list 'summary "Header and golf score")
                           (list 'p "Version uses prefix 0x20600000 under mask 0xffe00000, with L−1 in bits 20..12 and C in bits 11..0. Valid producer programs satisfy L ≤ par. Savings are min(8, max(0, par − L)); block score is 1 + savings, from 1 through 9. Genesis contributes zero. The 80-byte header keeps fixed per-network bits and nonce zero; non-genesis coinbase locktime is zero, graffiti is empty, and transaction version and sequence remain canonical. There is no hash admission target."))
                     (list 'details
                           (list 'summary "Fork choice")
-                          (list 'p "A valid candidate branch must be strictly taller to replace the active chain. Equal height retains the durable active incumbent, including after restart; golf score, hash and arrival metadata never displace it. Chain configs publish hardcoded (height . internal-hash) checkpoints: incompatible branches cannot cross them. Checkpoints advance only in reviewed software releases, and nodes must upgrade to share newer checkpoints. Mainnet now pins H0 and the live H1 block; public testnet and regtest still pin H0 only, protecting genesis but no later history. Mainnet rejects reorgs below H1; reorgs above H1 remain possible."))
+                          (list 'p "A valid candidate branch must be strictly taller to replace the active chain. Equal height retains the durable active incumbent, including after restart; golf score, hash and arrival metadata never displace it. Chain configs publish hardcoded (height . internal-hash) checkpoints: incompatible branches cannot cross them. Checkpoints advance only in reviewed software releases, and nodes must upgrade to share newer checkpoints. Mainnet currently pins H0 and H1 on the replacement slogan chain; public testnet and regtest remain H0-only, protecting genesis but no later history. Reorgs remain possible above H1 on mainnet and above H0 on testnet and regtest."))
                     (list 'details
                           (list 'summary "Exact slots and puzzle retarget")
                           (list 'p "Header time must equal parent time plus the configured spacing: exactly 86400 seconds on mainnet, shorter on test networks. No network allows a future slot. Missed slots can be filled late, so this is not a guarantee of daily block arrival. Every 16 blocks, median relative golf margin adjusts C, changing grammar width, examples and constraint tier. Bits and validator caps never move.")))
@@ -253,8 +253,10 @@
               (list 'div (attrs '(class "section-heading reveal"))
                     (list 'p (attrs '(class "eyebrow")) "Limits, plainly")
                     (list 'h2 "A hobby chain, not financial settlement.")
-                    (list 'p "Valid equal-height branches are cheap to construct and can remain local to different nodes. A missed slot gives a rival an opportunity to become strictly taller; partitions can leave competing incumbents. Reorgs remain possible above the latest release checkpoint: H1 on mainnet, H0 on public testnet and regtest. Fixing nonce and coinbase fields does not prevent parent-template manipulation through remaining valid block choices. There is no settlement-grade security."))
-              (list 'p "The earlier nonce-PoW genesis was retired before height 1 because sustained compute burn contradicted the project's intent. Archive that retired state; never reuse its database. This longest-height/checkpoint update preserves proof-of-golf genesis hashes, timestamps and block bytes, and existing proof-of-golf H0 state may be reused. Transport magic changes to SGM3/SGT3/SGR3 (last byte 0x33) to isolate older score-ranked nodes.")
+                    (list 'p "Valid equal-height branches are cheap to construct and can remain local to different nodes. A missed slot gives a rival an opportunity to become strictly taller; partitions can leave competing incumbents. Reorgs remain possible above the latest release checkpoint: H1 on mainnet, H0 on testnet and regtest. Fixing nonce and coinbase fields does not prevent parent-template manipulation through remaining valid block choices. There is no settlement-grade security."))
+              (list 'p "The earlier nonce-PoW genesis was retired before height 1 because sustained compute burn contradicted the project's intent. Archive that retired state; never reuse its database. The authorized mainnet reset restores the exact genesis quote Sigil - Practical Symbolic Power at unchanged timestamp 1789228800. The mistaken marker-quote mainnet H0/H1 and its H1 checkpoint are abandoned; archive their chain and relay state and start fresh. Mainnet transport magic is SGM4 (last byte 0x34). Testnet and regtest retain their genesis identities, timestamps and SGT3/SGR3 magic (last byte 0x33); only their existing proof-of-golf H0 state may be reused.")
+              (list 'p "Mainnet H0 internal hash: d15ecce0c8a3e4dc07c8136eb68770c2e59683cbad4bd268c420ec24ae040d3a. Reversed display ID: 3a0d04ae24ec20c468d24badcb8396e5c27087b66e13c807dce4a3c8e0cc5ed1.")
+              (list 'p "The replacement slogan-chain H1 is produced and pinned. H1 internal hash: ec3ef647e87a3b54e832b10f0788e2494ac7934096b7357576b263504281637d. Reversed display ID: 7d6381425063b2767535b7964093c74a49e288070fb132e8543b7ae847f63eec.")
               (list 'p "SGL is intended to have no monetary value. There is no sale, bridge or promise of future value. Commit–reveal binds contributions and payouts, not finality. Checkpoints are hardcoded release policy, not automatic or signed finality."))
             (list
               'section (attrs '(id "ecosystem") '(class "section-shell section-block"))
@@ -281,16 +283,16 @@
                     (list 'p "Use the CLI as a full node, wallet and scheduled producer, or contribute to the public testnet pool without running a node. Read each command before running it."))
               (list 'div (attrs '(class "path"))
                     (step "1" "Download"
-                          "Published builds appear on Releases. If none matches your system, build the source with the repository's pinned Nix environment. Upgrade for newer reviewed checkpoints: mainnet now pins H0 and H1; public testnet and regtest still pin H0 only."
+                          "Published builds appear on Releases. If none matches your system, build the source with the repository's pinned Nix environment. Upgrade for the mainnet slogan reset and its reviewed H0 and H1 checkpoints; public testnet and regtest remain H0-only."
                           #f)
                     (list 'div (attrs '(class "step-links reveal"))
                           (link %release "Latest release" "button button-primary")
                           (link %github "Source fallback" "button button-secondary"))
                     (step "2" "Create and back up your wallet"
-                          "Start with a fresh state directory or reuse existing proof-of-golf H0 state. Back up state/mainnet-proof-of-golf/wallet/wallet.key before receiving SGL. Losing that file loses access; never share it or import a retired nonce-PoW database."
+                          "Start mainnet with a fresh state directory; do not reuse abandoned marker-quote H0/H1 or retired nonce-PoW databases. Back up state/mainnet-proof-of-golf/wallet/wallet.key before receiving SGL. Losing that file loses access; never share it."
                           '("sigilcoin address --chain sigilcoin-main --data-dir ./state/mainnet-proof-of-golf"))
                     (step "3" "Sync the chain"
-                          "Use upgraded software to download and validate headers and blocks from the configured public seed; older score-ranked nodes use incompatible transport magic."
+                          "Use upgraded software to download and validate headers and blocks from the configured public seed; abandoned mainnet peers use incompatible transport magic."
                           '("sigilcoin sync --chain sigilcoin-main --data-dir ./state/mainnet-proof-of-golf"))
                     (step "4" "Solve and submit"
                           "Inspect the puzzle and next slot time. Once due, mine builds and submits one candidate using the valid at-par fallback. Pass --solution with your own shorter program to improve displayed golf quality, not fork weight or subsidy."

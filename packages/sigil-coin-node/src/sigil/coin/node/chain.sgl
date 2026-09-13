@@ -61,12 +61,13 @@
     ;;; Longest-chain/checkpoint public-testnet transport magic: "SGT3".
     (define coin-testnet-network-magic #u8(#x53 #x47 #x54 #x33))
 
-    ;;; Internal hash pinned by the first post-genesis mainnet checkpoint.
+    ;;; Internal hash pinned by the first slogan-mainnet checkpoint.
     (define coin-main-checkpoint-one-hash
-      #u8(#x24 #xf2 #xcb #xbf #x4a #x5d #xbb #xce
-          #x67 #xab #xbc #xc0 #x47 #xe3 #x00 #xcd
-          #xa1 #x7c #x60 #x0e #x7a #xb3 #x56 #x58
-          #x46 #xd2 #x7a #x0e #xb6 #xb0 #x41 #xd2))
+      #u8(#xec #x3e #xf6 #x47 #xe8 #x7a #x3b #x54
+          #xe8 #x32 #xb1 #x0f #x07 #x88 #xe2 #x49
+          #x4a #xc7 #x93 #x40 #x96 #xb7 #x35 #x75
+          #x76 #xb2 #x63 #x50 #x42 #x81 #x63 #x7d))
+
 
     ;;; Exact timestamp spacing on the smaller networks.
     (define coin-testnet-min-block-spacing 3600)
@@ -84,7 +85,7 @@
 
     ;;; Mainnet genesis quote.
     (define coin-genesis-quote
-      "SigilCoin proof-of-golf mainnet")
+      "Sigil - Practical Symbolic Power")
 
     ;;; Mainnet timestamp: 2026-09-12T16:00:00Z.
     (define coin-genesis-time 1789228800)
@@ -256,7 +257,7 @@
     (define sigilcoin-main-chain
       (config "sigilcoin-main"
               "sigilcoin-main"
-              #u8(#x53 #x47 #x4d #x33)
+              #u8(#x53 #x47 #x4d #x34)
               19444
               '(("seed.sigilcoin.lol" . 19444))
               coin-min-block-spacing

@@ -76,8 +76,8 @@
     "sigil-bitcoin": {
       "flake": false,
       "locked": {
-        "lastModified": 1789313465,
-        "narHash": "sha256-PZaW7t+4O50wb79kCVeeaJV+1ZghB/6CsDlDov+7TT0=",
+        "lastModified": 1789322805,
+        "narHash": "sha256-NJ/akB9+tkbrkoltftu+MCzmoh8kvpa4iQSYJqmrvzE=",
         "path": "/home/trev/Workspace/sigil/sigil-bitcoin",
         "type": "path"
       },
